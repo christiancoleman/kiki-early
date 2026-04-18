@@ -430,24 +430,427 @@ The bridge failure is the main blocker preventing further init progress. Two pos
 
 The UART closing immediately (0 reads, 0 writes) suggests the game detects something wrong before even trying to communicate — possibly the termios setup fails or a follow-up check fails. This needs RE of the bridge init code (`sub_d15aa8` and related functions).
 
-## Current State Summary (end of session)
+## Step 13: Unblocking bridge init via Sidekick RE + shim path/syscall hooks (2026-04-17)
+
+### 13.0: Why this session and how we approached it
+
+**Entry state:** Stuck on `"failed to initialize bridge: No such file or directory"`. The leading hypothesis from Step 12 was a bug in our `faccessat` shim. We also didn't really know what "the bridge" was at the code level — we'd been inferring from surrounding files.
+
+**Decision — get definitive RE before guessing more.** The user has Binary Ninja Sidekick (AI assistant in Binary Ninja). Instead of continuing to poke at the shim blindly, we wrote a structured research task asking for: string xrefs to the error messages, full pseudocode of the bridge init functions, the file-access map, the call graph up to main, and the UART close path. The goal was to stop guessing and start building on real code.
+
+**What the first Sidekick round revealed that changed our model:**
+
+1. **The "bridge" is an RP2040 microcontroller** (the netbridge) that the main CPU flashes via SWD at boot. This was a surprise — we expected libs; instead, the game shells out to `openocd` as an external process. Nobody was going to guess that.
+2. **The failing call is `access()`, not `faccessat()`.** That's the real reason our shim didn't help. On aarch64 glibc, `access()` uses `INLINE_SYSCALL_CALL` to hit the `faccessat` *syscall* directly — bypassing the libc `faccessat` *function*. Our LD_PRELOAD of the libc wrapper never fired. This is a libc implementation quirk we'd never have found without seeing the source call.
+3. **Expected CRC comes from the bridge itself** via `send_bridge_message_with_response(cmd=0x30)` over UART — not from EEPROM or a hardcoded constant as we'd assumed. That makes the CRC verify dependent on the UART thread being alive: circular. A dead bridge thread can never self-report, so the game will always want to re-flash when emulated.
+4. **The UART bridge thread (`sub_d15aa8`) is spawned BEFORE the file checks in `sub_d19580`.** So the thread is already running (and failing) by the time `access()` is called. The `data_490e5b0 & 1` success flag is independently set by the thread — not by any return value of `sub_d19580`.
+5. **`sub_a75ae0` tail-calls `perror("failed to initialize bridge")` on any `sub_d19580` failure and returns** — it does NOT continue with later init. So as long as `sub_d19580` returns 0, the rest of init runs (EEPROM phase, sub_ced270, etc.), even if the bridge thread itself died.
+
+**The plan these findings suggested:**
+
+Two levers to pull, both to make `sub_d19580` return 0 cleanly:
+
+- **Lever A — path resolution.** Add `access()` to the shim (plus `stat`/`lstat`/`__xstat*` for good measure since they have the same glibc-bypass problem). This alone fixes the "file(s) missing" branch.
+- **Lever B — block `openocd`.** When the CRC inevitably mismatches (dead bridge thread → `expected_crc = 0`), the game will try to flash the RP2040. Intercept `system()` and return 0 for any `openocd`/`/games/spike3/` command. We don't care about the flash "succeeding" — the thread-ready flag is checked independently.
+
+**What we deliberately chose NOT to do yet:** We did NOT try to emulate the UART bridge protocol. We don't have enough RE on `sub_d15aa8` / `sub_cf7c10` to know the packet format or what message triggers `data_490e5b0 |= 1`. Attempting to fake the protocol now would be guessing. We'll pull the unabridged HLIL first.
+
+### 13.1: Call graph
+
+```
+main (0x861270)
+  → sub_a78bc0 (0xa78bc0)
+    → sub_a75ae0 (0xa75ae0)              ← prints "failed to initialize bridge"
+      → sub_d19580 (0xd19580)            ← the bridge init master function
+        → pthread_create(sub_d15aa8+8)   ← spawns UART bridge thread
+        → sub_d1e0e0(...timeout 0x3e8)   ← waits up to 1000 ms for thread ready
+        → access(spike3-swd.cfg, 4)      ← returns -1 if missing → "file(s) missing"
+        → access(rp2040.cfg, 4)
+        → access(netbridge.elf, 4)
+        → sub_d19250(netbridge.elf)      ← zlib CRC32 of .text + .rodata + .binary_info
+        → sub_d181d0(&expected_crc)      ← queries bridge via cmd 0x30 over UART
+        → system("openocd -d0 ...")      ← flashes RP2040 if CRC mismatch
+        → check data_490e5b0 & 1         ← "failed to init bridge thread" if unset
+```
+
+### 13.2: Important findings from the Sidekick RE (reference)
+
+- **`sub_d19580` spawns the thread BEFORE checking files.** The UART bridge thread is already running (and failing) by the time the `access()` calls happen.
+- **Expected CRC is not hardcoded** — `sub_d181d0` calls `send_bridge_message_with_response(cmd=0x30)` over UART; the bridge itself reports what CRC to expect. So the CRC check depends on the UART thread being alive.
+- **CRC is zlib/PKZIP poly 0xEDB88320** over specific ELF sections of `netbridge.elf` (not the whole file).
+- **`data_490e5b0 & 1`** is the thread-ready flag. Set inside `sub_d15aa8` on a successful handshake; never set if the thread bails.
+- **`sub_a75ae0` tail-calls `perror("failed to initialize bridge")` if `sub_d19580` returns nonzero** and does NOT continue — so bridge init failure blocks all subsequent init (sub_ced270, sub_ced280, EEPROM read/write at 0x1800, final 1s poll of sub_d17b60 waiting for `b == 2`).
+- **EEPROM schema** (partial, from sub_a75ae0 usage of data_4882198, 32 bytes from I2C 0x57 / offset 0x1800):
+  - `0x00..0x1d` — payload (unknown fields)
+  - `0x1e` — checksum byte = `~sum(bytes[0..0x1d])` (low byte only)
+  - `0x1f` — unused
+- **VERSION.txt consumer** is `sub_a4fbf0 (0xa4fbf0)`. Parses `"%19s %c%d.%d.%d"` (e.g. `spike3_secure R0.81.0`). Failure is non-fatal — zeroes the version and continues.
+
+### 13.3: Shim changes and why
+
+**The specific fix for the "spike3-swd.cfg missing" error** came directly from finding 2 above: glibc bypasses the libc `faccessat` wrapper. So we added an `access()` hook with the same `remap_path` treatment. While we were there, we did the same for `stat/lstat/__xstat/__lxstat/__xstat64/__lxstat64` — these have the identical glibc-bypass problem and we'd rather fix them proactively than discover the same bug twice when stat() calls start showing up later.
+
+**Why also hook `system()`:** Finding 3 told us the CRC check would fail because the bridge thread is dead. The game's fallback is `system("openocd -d0 -f ... -c \"program netbridge.elf ...\"")`. We don't want that running at all in emulation — there's no RP2040 to flash, `openocd` might not even be installed on the host, and most importantly the command could have unpredictable side effects. Returning 0 from `system()` for any command containing `openocd` or `/games/spike3/` is a small, targeted block. Finding 4 made this safe: the thread-ready flag is independent of programming success.
+
+**Latent bug spotted in existing hooks:** `fstatat` and `__fxstatat` were sharing a single static `real_fstatat` function pointer. Whichever was called first would `dlsym` to ITS symbol, and the other would then call the wrong underlying function. Separated them with their own static pointers. Not the cause of today's issue, but a bug worth fixing.
+
+Concrete additions to `_emulation/spi_shim.c`:
+- `access()` with remap
+- `stat()`, `lstat()`
+- `__xstat`, `__lxstat`, `__xstat64`, `__lxstat64` (glibc compat)
+- `__fxstatat64` (parity with `__fxstatat`)
+- `system()` with openocd/spike3 block
+- Separated fn pointers for `fstatat` / `__fxstatat` / `__fxstatat64`
+
+### 13.4: Test results after shim fixes
+
+```
+stdout:
+  netbridge image CRC mismatch, write new image
+  failed to init bridge thread
+
+stderr (filtered, collapsed):
+  [shim] OPEN /dev/spidev4.0  → fake fd 1023
+  [shim] SPI ioctl WR_MAX_SPEED_HZ = 100000 Hz
+  [shim] SPI ioctl WR_MODE = 3
+  [shim] OPEN /dev/i2c-10     → fake fd 1022
+  [shim] I2C ioctl SET_SLAVE addr=0x57  (×2 — before and after bridge init)
+  [shim] I2C ioctl RDWR       (EEPROM read & write-back)
+  [shim] OPEN /dev/ttyAMA5    → fake fd 1021
+  [shim] UART ioctl FIONREAD → 0
+  [shim] UART ioctl TIOCOUTQ → 0
+  [shim] CLOSE UART (fd 1021) after 0 reads, 0 writes
+  [shim] access REMAP: /games/spike3/netbridge/spike3-swd.cfg → /mnt/.../spike3-swd.cfg  (all 3 files)
+  [shim] BLOCKED system(): openocd -d0 -f ... (full command, intercepted)
+```
+
+Key observations:
+- No `perror("failed to initialize bridge")` — `sub_d19580` returned 0, not -1. `sub_a75ae0` proceeded past bridge init.
+- Second `I2C SET_SLAVE 0x57` is `sub_a75ae0`'s EEPROM write-back → confirms EEPROM phase ran.
+- **TCSETS is NEVER called** on the UART (0 occurrences in the entire log). Only FIONREAD + TIOCOUTQ + close. This means `sub_cf7c10`'s termios setup block is NOT being reached — the UART path is taking an early exit somewhere before `tcsetattr`.
+- Only ONE `/dev/ttyAMA5` open — thread does not retry after close.
+- No other devices opened (no DRM, no framebuffer, no audio, no GPIO). Game appears stuck in `sub_a75ae0`'s final 1-second poll of `sub_d17b60` (which waits for `var_40 == 2`, times out, and returns).
+
+### 13.5: What the test revealed, and the new mystery
+
+Progress is real: the first two levers worked. We're past the bridge file checks and past the openocd block. `sub_d19580` returned 0. `sub_a75ae0` advanced into the EEPROM phase (the second `I2C SET_SLAVE 0x57` is the write-back after the checksum verify). Both signs that the main init path is running again.
+
+But **one observation from the test is genuinely strange and changes what we need next: TCSETS is never issued on the UART.** Zero occurrences in the whole log. The entire UART lifecycle is just `open → FIONREAD → TIOCOUTQ → close`, with no `read()`, no `write()`, and no termios configuration. Per Sidekick, `sub_cf7c10` is supposed to do cfsetspeed + cfmakeraw + TCSETS + TCFLSH + TIOCMSET. None of those are happening.
+
+Three hypotheses, in rough order of likelihood:
+1. **`sub_cf7c10` bails before `tcsetattr`.** A validation check on a parameter (baud code, csize, stopbits, parity) fails early and returns -1 without going near termios. `sub_d15aa8` interprets the failure, calls `tcdrain`/`close` (which is where FIONREAD+TIOCOUTQ come from — `tcdrain` uses TIOCOUTQ internally to wait for output).
+2. **`sub_d15aa8` itself has a pre-config "bridge alive?" probe** that opens `/dev/ttyAMA5`, calls FIONREAD to see if there's already data queued (there should be, from a running bridge), gets 0 from our shim, and decides "no bridge present, abort".
+3. **`sub_cf7c10` does run termios but through a different ioctl path** that we're not catching (e.g., the older `TCSETS2` variant `0x402c542b` — we only hook `TCSETS` = `0x5402`).
+
+Hypothesis 2 feels most likely given the pattern. FIONREAD returning 0 on a real bridge would be unusual (the RP2040 should be spamming status). Our EAGAIN-on-read might not even matter — the code may never get to read() if FIONREAD=0 is the abort signal.
+
+**Why we can't just guess the fix:** We don't have `sub_cf7c10`'s exact parameter list or its error branches. We don't know whether `sub_d15aa8` calls FIONREAD before or after `sub_cf7c10`. And even if we fix the close, we still need the wire protocol to set `data_490e5b0 |= 1` — returning random bytes from UART reads won't do it. The next logical step is another Sidekick round for the unabridged function bodies and the wire protocol.
+
+**In parallel, the offline CRC work:** We read `netbridge.elf`'s section headers directly (`readelf -WS`) and computed zlib CRC32 of the three relevant sections offline in Python. Results:
+- `.text` (off=0x1100, size=0x9a48): `0x2933163d`
+- `.rodata` (off=0xab48, size=0x8fe0): `0xeb9ef215`
+- `.binary_info` (off=0x13b28, size=0x18): `0x1d150d91`
+- **Chained forward (.text → .rodata → .binary_info): `0x357f5327`** — our expected answer to cmd 0x30 once we build the bridge protocol shim
+- Chained reverse (safety backup): `0x90aeceac`
+
+We pre-compute this now so when we know the wire format we can hardcode the response immediately instead of re-deriving.
+
+### 13.6: Decisions made this session, and why
+
+| Decision | Alternative | Why we chose this |
+|----------|-------------|-------------------|
+| Ask Sidekick for full RE before touching shim | Keep guessing based on strace output | We'd already spent a session on guesswork; an RE pass dwarfs the hours of speculative iteration |
+| Hook `access()` specifically (not `access`-via-faccessat tricks) | Intercept at syscall level via seccomp/ptrace | LD_PRELOAD of the libc function is simplest; works because the game uses libc's `access()` which resolves through the PLT, not via inline-syscall |
+| Add `stat`/`lstat`/`__xstat*` proactively | Wait until they fail in practice | Same glibc-bypass class of bug; cheap to fix all at once; avoids repeat debugging |
+| Block `openocd` via `system()` hook | Let it run and fail naturally | Unpredictable host side effects; `openocd` may not be installed; easier to verify in logs that it was blocked than to reason about what happened if it ran |
+| Return 0 (success) from blocked `system()` | Return -1 (failure) | Finding 4 says thread-ready flag is independent; return value of `system()` in this path only logs "failed to verify/update bridge", no hard abort |
+| DON'T emulate the UART protocol yet | Start crafting fake response bytes | Without the wire format we'd just generate noise; the protocol RE is Sidekick's next task |
+| Pre-compute CRC offline while waiting for Sidekick | Defer until we know the wire format | Orthogonal work; confirms the algorithm identification and gives us the target value regardless of when we wire it up |
+| Keep `service_s_worker` out of scope | Start RE'ing `service_s_worker` in parallel | One blocker at a time; `service_s_worker` only matters if `game` explicitly waits on something `service_s_worker` provides, which we haven't seen evidence of |
+
+---
+
+## Step 14: Resolving the address mismatch and unblocking the UART thread (2026-04-17, later)
+
+### 14.0: Why this step and how we got here
+
+Coming out of Step 13 we had one open mystery — `TCSETS` was never issued on the UART despite `sub_cf7c10` supposedly being a termios configuration function. Sidekick gave us specific instruction addresses for a "csize validation bug" hypothesis, but when we cross-checked against `aarch64-linux-gnu-objdump` the instructions at those addresses didn't match at all (we saw `add x3, x3, #0x830` where Sidekick showed `sub sp, sp, #0x190`). The concern: either Sidekick was hallucinating, or we were looking at different binaries.
+
+**Decision — pause patching, confirm the binary.** Rather than spend cycles verifying each Sidekick claim via objdump, ask the user to run `sha256sum` on both sides (theirs via BN's Python console using `bv.file.raw`, ours on the repo file). If hashes matched, something subtler was happening.
+
+**What we found.** Same hash (`7eaae301bb4491652adb38a84c5d7c3cf8a85071ab9630b299c3f50b47724eaa`), same 71,349,568-byte file. The discrepancy was entirely that **Binary Ninja rebases PIE binaries by +0x400000**, so every address Sidekick cites is `file_offset + 0x400000`. My objdump uses natural ELF VAs (which equal file offsets for this binary). Once we subtracted 0x400000 from Sidekick's addresses, bytes matched perfectly at all four spot-checks. Sidekick's analysis had been correct all along.
+
+**Address translation rule for future sessions:** `file_offset = BN_VA − 0x400000`. Keeping a translation table in Step 14.1 below.
+
+### 14.1: Address translation table
+
+| Symbol (Sidekick name) | BN VA | File offset / natural VA |
+|---|---|---|
+| `main` | 0x861270 | 0x461270 |
+| `sub_a78bc0` | 0xa78bc0 | 0x678bc0 |
+| `sub_a75ae0` | 0xa75ae0 | 0x675ae0 |
+| `sub_d19580` | 0xd19580 | 0x919580 |
+| `sub_d15aa8` (UART thread entry) | 0xd15aa8 | 0x915aa8 (2 NOPs, body at +8) |
+| `sub_cf7c10` (UART open wrapper) | 0xcf7c10 | 0x8f7c10 |
+| `sub_d181d0` (queries cmd 0x30) | 0xd181d0 | 0x9181d0 |
+| `sub_d19250` (CRC over netbridge.elf) | 0xd19250 | 0x919250 |
+| `sub_d164a0` (send_bridge_message_with_response) | 0xd164a0 | 0x9164a0 |
+| `sub_d1e0e0` (pthread_cond_timedwait wrapper) | 0xd1e0e0 | 0x91e0e0 |
+| `sub_d1e1e0` (sets `data_490e5b0 \|= 1`) | 0xd1e1e0 | 0x91e1e0 |
+| `data_490e5b0` (thread-ready flag) | 0x490e5b0 | 0x450e5b0 |
+| `data_3bce450` (baud rate table) | 0x3bce450 | 0x37ce450 |
+
+### 14.2: Disassembling `sub_cf7c10` at the correct offset
+
+With addresses reconciled, I disassembled `sub_cf7c10` (0x8f7c10) end-to-end. The structure:
+
+```
+prologue (0x8f7c10-0x8f7cb4)   allocates 400 bytes, copies 240-byte baud table to stack
+baud lookup loop (0x8f7ccc-0x8f7cd4)   linear scan for matching baud code
+speed bit-31 check (0x8f7ce4)   branch to 0x8f7ecc if invalid
+csize check (0x8f7ce8-0x8f7cf8)   ldrb + sub #5 + cmp #3; branch to 0x8f7e88 if >3
+stopbits check (0x8f7cfc-0x8f7d0c)   ldrb + sub #1 + cmp #1; branch to 0x8f7e0c if >1
+open() (0x8f7d10-0x8f7d20)   O_RDWR | O_NOCTTY; branch to 0x8f7e4c if fd<0
+ioctl FIONREAD (0x8f7d24-0x8f7d2c)   our shim handles
+ioctl TIOCOUTQ (0x8f7d34-0x8f7d4c)   our shim handles
+cfmakeraw (0x8f7d50-0x8f7d54)   pure userspace
+baud→termios conversion (0x8f7d58-0x8f7d8c)
+cfsetspeed (0x8f7d8c-0x8f7d90)   pure userspace
+tcsetattr (0x8f7db4)             ← FAILS: bit 31 of return set → branch to 0x8f7e38
+tcflow (0x8f7dc4)                skipped on failure path
+tcflush (0x8f7dd0)               skipped on failure path
+0x8f7e38 error path: close(fd), w20 = -1, jump to epilogue
+```
+
+With `w22 = 0` (the silent-mode arg passed from `sub_d15aa8`), each failure branch takes the "silent" variant — no fprintf, just set w20=-1 and cleanup. That's why our test log had no diagnostic string from `sub_cf7c10`; just the observable fd open/close pattern.
+
+### 14.3: Root cause — `tcsetattr` uses INLINE_SYSCALL, bypassing our `ioctl` hook
+
+The game calls `tcsetattr(fd, 0, &termios)` via the PLT. glibc's `tcsetattr` is implemented in `sysdeps/unix/sysv/linux/tcsetattr.c` using `INLINE_SYSCALL` to invoke the `ioctl(TCSETS)` syscall directly — **it does not call the libc `ioctl()` function**. Our LD_PRELOAD of `ioctl()` therefore never fires for this path.
+
+Under QEMU user-mode, the TCSETS syscall on our fake fd 1021 (which is not a real kernel fd) returns `-EBADF`. `tcsetattr` returns -1, the game takes the error branch and closes the fd.
+
+**This is the same bug class as `access()` in Step 13.** glibc's short-circuit optimizations for system calls break LD_PRELOAD intercepts that hook the function layer. The fix is always the same: hook the higher-level libc function directly.
+
+The `FIONREAD` and `TIOCOUTQ` ioctls DID hit our hook because the game's code calls them as `ioctl(fd, FIONREAD, ...)` — a public libc function call through the PLT. So `ioctl`-via-game-code works; `ioctl`-via-glibc-internal doesn't.
+
+### 14.4: Shim changes and why
+
+Added hooks for every termios function that glibc typically inline-syscalls:
+
+- `tcsetattr` — the immediate fix for the UART close
+- `tcgetattr` — likely used by callers we haven't seen yet; returns zeroed termios on fake fd
+- `tcflush`, `tcflow`, `tcdrain`, `tcsendbreak` — called on the success path or error cleanup; return 0 on fake fd
+
+Explicitly NOT hooked:
+- `cfmakeraw`, `cfsetspeed`, `cfsetispeed`, `cfsetospeed` — these modify the termios struct in memory only; no syscall involved. LD_PRELOAD wouldn't help and isn't needed.
+
+### 14.5: Test results — the bridge protocol is now alive
+
+```
+UART writes observed from the game:
+  02 20 01 df 03   ← cmd 0x20 (hw version info query)
+  02 30 01 cf 03   ← cmd 0x30 (expected CRC query)
+
+Frame validates to Sidekick's B2 specification:
+  [0x02][CMD][ID][...optional data...][CKSUM][0x03]
+  Checksum = sum of all bytes including itself == 0 (mod 256)
+  0x20 + 0x01 + 0xdf = 0x100 → low byte 0x00 ✓
+  0x30 + 0x01 + 0xcf = 0x100 → low byte 0x00 ✓
+
+New stdout:
+  bridge message (cmd=30, id=1) response failed 110: Connection timed out
+  netbridge image CRC mismatch, write new image
+  bridge message (cmd=20, id=1) response failed 110: Connection timed out
+
+New stderr:
+  failed to initialize bridge: Invalid argument
+```
+
+What this tells us:
+- **The UART thread is alive.** `sub_d15aa8` entered its main loop and is driving the wire protocol.
+- **`data_490e5b0 |= 1` was set** (otherwise we'd still see "failed to init bridge thread" — we don't).
+- **The game's protocol stack is working correctly** — it's producing valid frames with correct checksums in the exact format Sidekick described.
+- **Queries are timing out** because our shim's UART `read()` returns EAGAIN; the game's `send_bridge_message_with_response` waits 1000 ms per cmd via `pthread_cond_timedwait` then gives up with errno 110 (ETIMEDOUT).
+- **`sub_d19580` now returns non-zero** (because cmd 0x10 pwrdist version also times out), so `sub_a75ae0` calls `perror("failed to initialize bridge")`. But this is the *next* blocker — not the thread-init one we started with.
+
+### 14.6: Decisions made and the next-step tradeoff
+
+| Decision | Alternative | Why we chose this |
+|----------|-------------|-------------------|
+| Verify binary hashes before accepting Sidekick's addresses at face value | Trust Sidekick and patch based on its citations | Patching wrong bytes could corrupt the binary silently. 10 minutes of verification saved a potential disaster. |
+| Disassemble `sub_cf7c10` ourselves at the corrected file offset | Ask Sidekick for more detail | Now that the address translation was known, we had enough in objdump to trace the function end-to-end without another round-trip |
+| Hook termios functions at libc level | Hook the kernel syscalls via seccomp or QEMU plugin | LD_PRELOAD consistency with the rest of the shim; minimal new infrastructure; works for this binary which calls tcsetattr via the PLT |
+| Return 0 from fake-fd termios calls (no state) | Maintain a termios state per fake fd | Currently nothing in the game reads back what was set; if that changes (e.g., tcgetattr after tcsetattr expecting round-trip), we'll add state then |
+| Accept the "timing out on bridge responses" blocker rather than immediately synthesizing fake responses | Synthesize fake responses now | Response formats aren't fully known yet — guessing would burn time on incorrect guesses. Better to read `netbridge.elf` firmware or ask Sidekick for `send_bridge_message_with_response`'s response-side parsing before crafting replies. |
+
+### 14.7: What's next — options to unblock bridge responses
+
+Three plausible paths, all of which probably converge:
+
+1. **Real pipe for the UART fd.** Replace the fake 1021 fd with one side of a `pipe2()`. The game's read() will actually block on the pipe. The shim holds the other end and can push synthetic responses whenever we want. Cleaner than EAGAIN-spam and lets us implement proper request/response timing.
+2. **Synthesize responses for cmd 0x10, 0x20, 0x30.** Need the exact response frame for each. Options for learning that:
+   - Ask Sidekick for `send_bridge_message_with_response` (0xd164a0) full body + the response-side parser in `sub_d15aa8`'s message loop (it must know how to decode frames the bridge sends back)
+   - Disassemble `netbridge.elf` (ARM32 Cortex-M0+, 188KB) which is the actual RP2040 firmware — it's the authoritative source of what the bridge actually sends
+3. **For cmd 0x30 specifically**, the response value is already known: the CRC32 `0x357f5327` we pre-computed in Step 13.5. We just need the framing.
+
+Recommended order: (1) pipe plumbing first so reads block properly → (2a) Sidekick round for the response parser → (3) hardcode the three response frames the game needs for this init phase → observe what the game asks for next.
+
+---
+
+## Step 15: UART fd refactor to real socketpair (2026-04-18)
+
+### 15.1: Why this change
+
+Step 14 exposed a design limitation: our fake UART fd (1021) meant `read()` had to return something synthetic. Returning EAGAIN on a supposedly-blocking fd was wrong semantics — it was working by accident, and would have misled the thread as soon as the protocol started expecting blocking reads. Before adding response synthesis, upgrade the plumbing so the fd behaves like a real serial device.
+
+### 15.2: The change
+
+Replaced `FAKE_FD_UART = 1021` with a `socketpair(AF_UNIX, SOCK_STREAM)`. The game receives one end (`uart_game_fd`); the shim holds the other (`uart_shim_fd`). Game-side `read()` now blocks on the real socketpair and will unblock whenever the shim writes to `uart_shim_fd`. Game-side `write()` goes through to the real socketpair, which means bytes written by the game are readable by the shim on `uart_shim_fd` — setting us up for request-frame parsing in the next step.
+
+Kept fake fds for SPI (1023) and I2C (1022) — those are pure ioctl interfaces, no `read`/`write` involved, so no need to change them. Termios function hooks (`tcsetattr` et al) stay — a socketpair isn't a tty, so the kernel still returns `-ENOTTY` for TCSETS on it if we don't intercept.
+
+Introduced `is_uart_fd(fd)` helper; `is_fake_fd(fd)` no longer matches UART.
+
+### 15.3: Test results
+
+```
+[shim] OPEN /dev/ttyAMA5 -> real socketpair game=3 shim=4 (UART bridge)
+[shim] UART ioctl FIONREAD -> 0
+[shim] UART ioctl TIOCOUTQ -> 0
+[shim] UART tcsetattr(actions=0) -> fake OK
+[shim] UART tcflow(action=1) -> fake OK
+[shim] UART tcflush(q=2) -> fake OK
+[shim] UART write #1 (5 bytes): 02 30 01 cf 03
+[shim] UART write #2 (5 bytes): 02 20 01 df 03
+```
+
+- End-to-end UART bring-up identical to Step 14 (tcsetattr hook works, writes emitted correctly)
+- No more EAGAIN spam — log is far quieter; the UART thread sits in `read()` patiently
+- Game still times out on bridge responses (expected — we don't push replies yet); stdout and final error unchanged
+- Game runs indefinitely without crashes
+
+### 15.4: What's ready for the next step
+
+All the plumbing to implement the bridge protocol is in place:
+
+- Game-side reads block naturally → whenever we `real_write(uart_shim_fd, response_frame, n)` the game's read unblocks
+- Game-side writes are already readable on `uart_shim_fd` → we can parse request frames synchronously in the write hook, or asynchronously via a reader thread on `uart_shim_fd`
+- Termios/ioctl/close all correctly handle the real fd
+
+Once Sidekick returns the response frame format for cmd 0x10 / 0x20 / 0x30 (Round 4 task is out), we can wire up the synthesis in the write hook directly: parse the CMD byte, build the matching response frame with the known values (CRC = `0x357f5327` for cmd 0x30), and `real_write(uart_shim_fd, ...)`.
+
+---
+
+## Step 16: Bridge protocol half-working; the address-space discovery and the pwrdist dispatch mystery (2026-04-18)
+
+### 16.0: Why this session and the arc
+
+Coming in, we had a working socketpair UART but no response synthesis. Sidekick's Round 4 RE gave us the framing, checksum rule, and per-cmd payload sizes. We wired response synthesis into the shim's `write()` hook: when the game writes a request frame, parse the CMD, build a matching response, push it to `uart_shim_fd` so the game's next `read()` unblocks with the payload.
+
+This worked immediately for **cmd 0x30 (CRC query)**. Game log shows `netbridge image okay, CRC32=0x357f5327` — the pre-computed zlib CRC32 of netbridge.elf's `.text+.rodata+.binary_info` sections is exactly what the game expects. The entire OpenOCD reprogramming branch is now skipped on a clean match.
+
+It did **not** work for cmd 0x10 (pwrdist version query). Symptom: game prints `BRIDGE_ProcessMessage unknown command: 0x00` and falls back to "Spike 1/2 power distribution board". Root cause — discovered by disassembling `sub_d15aa8`'s dispatch at file offset 0x915d00:
+
+```asm
+sub w0, w2, #0x10        ; w0 = cmd - 0x10
+cmp w0, #0x31
+b.ls 0x915e00            ; dispatch ONLY if (cmd-0x10) u<= 0x31
+                         ; i.e., cmd in [0x10, 0x41]
+; otherwise fall through to "BRIDGE_ProcessMessage unknown command"
+```
+
+**Sidekick's "response cmd 0x00 → pwrdist handler" mapping was wrong.** Cmd 0x00 under-flows the `sub` and fails the range check, so the dispatch handler that actually writes to `data_490e61c` never runs. The channel *is* still signaled via the unknown-cmd path (that's why `send_bridge_message_with_response` returned 0), but the payload was never parsed. `data_490e61c` stayed 0, triggering the `x19 = -6` fallback, which propagates up as the `failed to initialize bridge` perror.
+
+### 16.1: The binary-address confusion episode (and what we learned)
+
+Before landing on the above, we spent a detour verifying Sidekick's addresses. Sidekick claimed specific bytes at `0xd15aa8` / `0xcf7c10` that didn't match what my objdump showed at those file offsets. Hash comparison proved we were both looking at the same binary (`7eaae301...`, 71349568 bytes). The discrepancy was entirely **Binary Ninja rebasing PIE binaries by +0x400000**. Once I subtracted 0x400000 from BN VAs to get file offsets, everything matched.
+
+**Convention going forward:** when talking to Sidekick or using BN's Python console, use BN VAs. When doing our own objdump / shim work, use file offsets. `file_offset = BN_VA − 0x400000`. (Full translation table in Step 14.1.)
+
+### 16.2: Shim changes in this session
+
+Added to `spi_shim.c`:
+- **UART fd refactor** (Step 15): replaced fake fd 1021 with a real `socketpair(AF_UNIX, SOCK_STREAM)`. `uart_game_fd` is returned from `open()`; `uart_shim_fd` is held by the shim. Reads block naturally; writes pass through.
+- **Response synthesis** in the `write()` hook: parses outgoing request frames, builds a response, pushes via `real_write(uart_shim_fd, ...)`. Currently handles cmd 0x20 → 0x10 reply, cmd 0x30 → 0x20 reply (with pre-computed CRC). Cmd 0x10 handler is there but with the wrong response cmd — see 16.3.
+- **errno save/restore** around the response-synthesis work so our extra `real_write` on `uart_shim_fd` can't leak errno into the game's view of the primary write.
+- **Diagnostic perror hook** that logs `errno` at call time. This let us confirm that when `sub_a75ae0` tail-calls `perror("failed to initialize bridge")`, errno = 22 (EINVAL) — separate mystery from the pwrdist blocker and currently ignored.
+
+### 16.3: Immediate pick-up point for next session
+
+The one concrete unknown: **which response-CMD byte routes to the dispatch handler that writes 7 bytes of pwrdist version into `data_490e61c`?**
+
+Two cheap ways to find out:
+1. Look at the dispatch ladder/table at file offset 0x915e00 (BN 0xd15e00) and find which cmd case jumps to the handler at file 0x916194 (BN 0xd16194). That's the RE answer.
+2. Empirically: our current code tentatively uses response cmd 0x10 (untested but in range). Run the emulation — if data_490e61c gets set and init progresses past the pwrdist fallback, we're right. If not, iterate (try 0x11, 0x12, 0x14, etc., all in range).
+
+Option 1 is faster and more reliable. Easiest path: ask Sidekick to show the dispatch at BN 0xd15e00 (raw disassembly of the first ~40 instructions) so we can see the cmd ladder structure and identify which cmd byte handles the pwrdist response payload.
+
+### 16.4: External reference discovered — `[REFERENCE_TOOL_B]/`
+
+Rust crate by Researcher E that drives Spike **2** hardware from a custom app [Redacted: identifying demonstration title]. Not a direct solution for us but a strong architectural cross-check:
+
+- Confirms **SPI = local CPU-board switch state** (`/dev/spidev1.0` on Spike 2; `spidev4.0` on Spike 3). Our 8-byte SPI polling read matches this role.
+- Confirms **UART = node bus** (`/dev/ttymxc1` on Spike 2 @ 460800 baud; `ttyAMA5` on Spike 3 @ 2000000 baud).
+- Confirms the **checksum algorithm** `(256 − sum%256) % 256` — identical to what we derived.
+- **Different framing:** Spike 2 sends raw byte messages with no `0x02/0x03` frame bytes; Spike 3 added framing.
+- **Different cmd numbers:** Spike 2 uses 0x0a (GetBridgeState), 0x03 (GetBridgeVersion), 0x05 (GetBridgeStatus), 0x07 (SetPower), etc. Spike 3 uses 0x10/0x20/0x30 and a different numbering scheme. Not directly portable but a useful shape reference.
+- **Init sequence on Spike 2:** SetPower(true), SetPower(false), 500ms, SetAmpPower(true), 500ms, SetPower(true), 500ms, Reset node 0, 250ms, then Poll loop to discover nodes. Likely close to what Spike 3 does after bridge init completes.
+
+Doesn't unblock the pwrdist dispatch question, but worth a read before tackling the post-bridge init phase.
+
+---
+
+## Current State Summary (end of session — 2026-04-18)
+
+### Where we are right now
+
+The bridge protocol is **half-working**. The CRC response handshake succeeds; the game confirms `netbridge image okay, CRC32=0x357f5327`. But the pwrdist version query response is getting rejected by the dispatch (wrong response CMD byte), so `data_490e61c` stays 0, `sub_d19580` returns -6, and `sub_a75ae0` perror's out of init.
 
 **What's working:**
-- Game binary runs under QEMU user-mode aarch64 (v10.0.8)
-- All 31 shared libraries load from sysroot
-- SPI node bus emulated (open, config, 8-byte transfers with RX[2]=0x04)
-- I2C bus intercepted (slave 0x57, RDWR transfers accepted)
-- UART bridge intercepted (open/close/ioctls handled)
-- `image.bin` asset container opened successfully
-- Game does NOT crash — runs indefinitely
+- Game binary runs under QEMU user-mode aarch64 (v10.0.8); 31 libs load
+- SPI fake fd + 8-byte transfers with `RX[2]=0x04`
+- I2C fake fd (slave 0x57 EEPROM)
+- UART on a real socketpair, full termios config via shim hooks
+- Path remapping via `SPIKE3_SYSROOT`; access/stat family all hooked
+- `system()` hook blocks all openocd shell-outs
+- UART bridge thread `sub_d15aa8` alive, driving protocol
+- Response synthesis for cmd 0x30 (CRC) → game accepts, skips OpenOCD reflash
+- Thread-ready flag set; "failed to init bridge thread" is gone
+- Game runs indefinitely without crashing
 
 **What's not working:**
-- Bridge init fails ("failed to initialize bridge")
-- SPI TX data stays all-zeros (game not sending real node commands yet)
-- Path remapping (`SPIKE3_SYSROOT`) not verified working
-- `faccessat` shim may have a bug (returning 3 instead of 0/-1)
+- Pwrdist version response uses wrong response CMD byte — game says `BRIDGE_ProcessMessage unknown command: 0x00` and falls back to Spike 1/2 path → `sub_d19580` returns -6 → perror fires
+- Cmd 0x20 (HW version) response is probably in the same situation but hasn't been validated — we don't see it rejected currently because the pwrdist failure aborts first
+- SPI TX still all-zeros (gated on bridge being fully up)
+- No display / audio / GPIO activity yet
+- Separate mystery: errno=22 (EINVAL) at the perror site. Incidental — not on the critical path once we fix the pwrdist dispatch
 
-**Run command:**
+### Where we're headed
+
+**Immediate next step:** identify the correct response CMD byte for the pwrdist handler that writes `data_490e61c` (BN function at 0xd16194 / file 0x916194). The dispatch ladder in `sub_d15aa8` at file 0x915e00 (BN 0xd15e00) has the answer. Easiest path: one short Sidekick query or 20 lines of objdump will expose the cmd mapping.
+
+**Once that's fixed:** `sub_d19580` should return 0, `sub_a75ae0` proceeds past the perror into `sub_ced270` / `sub_ced280` / `sub_cf5f10` / the EEPROM read-write at 0x1800 / final 1s poll of `sub_d17b60`. From there we'll see the **next layer of init** — likely some mix of:
+- DRM/KMS display setup (`/dev/dri/*`)
+- libEGL / libGLESv2 context creation
+- ALSA audio init (`/dev/snd/*`)
+- GStreamer / ffmpeg pipeline setup for LCD/NUK animations
+- GPIO device opens (`/dev/gpiochip*`)
+- A second wave of SPI activity once node bus is up (non-zero TX bytes)
+
+Each of those will be its own stub-or-forward decision per Researcher A's architecture.
+
+### Why it matters
+
+The bridge is the **single hardest gate** between "binary loads" and "game logic alive". Every other hardware subsystem depends on it being up first, both directly (the game uses node bus for switches/coils/LEDs) and indirectly (init sequence is gated on `sub_a75ae0` completing). Once bridge init returns 0 cleanly, a huge amount of downstream init runs in one sweep — we'll know within one session whether we're 3 more sessions away from "system thinks it's on and at the attract screen" or further. Right now we can't tell because the gate is closed.
+
+Past this gate the character of the work changes. Today was protocol RE and byte-level shim bug fixing. Next it becomes library stubbing (libEGL, libdrm, gstreamer) — different tooling, but the kind of work Researcher A has already proven viable.
+
+### Address translation rule (Binary Ninja ↔ our tools)
+`file_offset = BN_VA − 0x400000`
+Lookup table: Step 14.1.
+
+### Run command (unchanged)
 ```bash
 cd /mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le && \
 qemu-aarch64 -L /mnt/c/Workspace/pokemon-le-0.81.0 \
@@ -456,8 +859,15 @@ qemu-aarch64 -L /mnt/c/Workspace/pokemon-le-0.81.0 \
   ./game
 ```
 
-**Next steps (pick up here):**
-1. Debug the `faccessat` shim — it's returning 3 instead of 0/-1. Might be our `fstatat` override causing issues, or QEMU weirdness.
-2. RE the bridge init code (`sub_d15aa8` or related) to understand why UART closes immediately and what the "No such file or directory" actually refers to.
-3. Once bridge init is resolved, see what the next layer of init looks like (likely DRM/display, audio, GPIO).
-4. Get SPI TX data to become non-zero — this would mean the game is actually trying to talk to hardware nodes.
+### Pre-computed values ready to use
+- zlib CRC32 of `netbridge.elf` `.text + .rodata + .binary_info` (forward chain): **`0x357f5327`** — verified as correct CRC response for cmd 0x30
+
+### Reference: `[REFERENCE_TOOL_B]/`
+Rust crate driving Spike **2** hardware (Reference tool B). Useful architectural reference only — Spike 2 and Spike 3 differ in baud rate, framing, and cmd numbers. See Step 16.4.
+
+### Next steps (pick up here)
+1. **Find the correct pwrdist response CMD byte.** Either ask Sidekick to show the dispatch ladder at BN 0xd15e00 and identify which cmd routes to BN 0xd16194, or disassemble file 0x915e00 in the game binary directly.
+2. Patch `synthesize_bridge_response()`'s case 0x10 in `_emulation/spi_shim.c` with the correct response CMD byte (currently tentatively 0x10).
+3. Re-run. Expect: `sub_d19580` returns 0, no perror, new init activity appears (look for fresh device opens or new stdout messages).
+4. For whatever blocks next: repeat the pattern — trace, stub, test. Display/audio likely need library forwarding to host equivalents (Researcher A model).
+5. Optional polish: fix the incidental errno=22 at perror site (only if init continues blocking on it — probably won't once `sub_d19580` returns 0).
