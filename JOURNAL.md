@@ -1813,3 +1813,292 @@ This is a strictly better trade than the original B plan (real GL via SURFACELES
 
 ### Run command unchanged. Rebuild command unchanged (`-ldl -lpthread`).
 
+## Step 24: Capture pipeline wired into the shim (2026-04-18)
+
+### 24.1: Implementation
+
+All five Step 23.3 hooks landed in `spi_shim.c`. Build is clean with `-Wall -Wextra` (one pre-existing unused-static warning for `uart_is_active`, unrelated).
+
+**DRM fd → real socketpair.** Replaced `FAKE_FD_DRM = 1020` + `drm_active` with `drm_game_fd` / `drm_shim_fd` (same pattern as UART). `is_fake_fd` no longer covers DRM; new `is_drm_fd()` helper tests membership. `intercept_device` creates the socketpair on `/dev/dri/card1` open with `drm_shim_fd` set `O_NONBLOCK`. `close()` tears down both ends. `read()` and `ioctl()` both route DRM fd traffic explicitly (ioctl early-exits before the generic passthrough, which was the fix for "the socketpair would reject DRM ioctls"). The DRM switch in `ioctl()` kept its full body — only the guard changed (`fd == FAKE_FD_DRM` → `is_drm_fd(fd)`).
+
+**Page-flip event synthesis.** New helper `drm_synthesize_flip_event(crtc_id, user_data)` writes a 32-byte `drm_event_vblank`-shaped struct to `drm_shim_fd` whenever `DRM_IOCTL_MODE_PAGE_FLIP` comes in with `DRM_MODE_PAGE_FLIP_EVENT` set (flag bit 0). The struct's `length` field is the full 32, so libdrm's `drmHandleEvent` will consume the right number of bytes regardless of which `drm_event_vblank` revision it was compiled against (older libdrm stops at `sequence`; newer includes `crtc_id`). Sequence counter increments per flip; timestamps come from `CLOCK_MONOTONIC`. This is what makes the render loop self-drive: the game's `select(drm_fd+1, …)` wakes, `drmHandleEvent` reads the event, and `sub_d01880` returns, letting the callback-driven render thread start its next iteration.
+
+**GBM BO tracking + map/unmap.** New side table `gbm_bo_table[32]` guarded by a pthread mutex. `gbm_bo_create` and `gbm_bo_create_with_modifiers` register `(w, h, format, flags, stride=w*4)` per BO; the `is_dmd` flag gets set when `w=1024 && h=256 && format=GBM_FORMAT_ABGR8888 (0x34324241)`. `gbm_bo_get_{width,height,stride,format}` now consult the table so the DMD BO correctly reports 1024×256 ABGR8888 instead of 1920×1080 XR24. `gbm_bo_map` allocates `calloc(stride*height)` backing on first map, hands back `(backing, stride)`. `gbm_bo_unmap` dumps the backing to `_emulation/dmd/frame_NNNNNN.bgra` when `is_dmd`, then frees it. `gbm_bo_destroy` unregisters.
+
+**Shader source capture.** `glCreateShader` now records the shader's type in `gl_shader_type[id]` (indexed by id, max 1024). `glShaderSource` concatenates the count×(string, length) args into a single buffer and writes it to `_emulation/shaders/shader_NNN_idM_typeXXXX.glsl`. Length arg is honored (glShaderSource's contract: non-negative length overrides strlen).
+
+**Texture capture.** `glTexImage2D` and `glTexSubImage2D` now call `gl_capture_tex` when `data != NULL`, which computes bytes-per-pixel from `(format, type)` using a small table of GLES 3.1 enum values (packed types like `UNSIGNED_SHORT_5_6_5` return total bytes directly) and dumps `w*h*bpp` to `_emulation/textures/tex_NNNNNN_WxH_fmtXXXX_typeYYYY.raw`. Compressed variants (`glCompressedTexImage2D` already existed as a no-op; added `glCompressedTexSubImage2D` as a new hook) dump raw `size` bytes to `tex_compressed_NNNNNN_...bin`.
+
+**Capture-dir bootstrap.** `__attribute__((constructor))` `shim_init_capture_dirs` mkdirs `_emulation/{dmd,shaders,textures}` at `LD_PRELOAD` time. Relative paths resolve against the game's cwd, which is `games/pokemon_le/` per the documented run command. Could not `#include <sys/stat.h>` (it conflicts with the shim's loose-typed stat/lstat/fstatat wrappers — `void *statbuf` vs `struct stat *`); forward-declared `mkdir` directly.
+
+### 24.2: What to look for on next run
+
+| Artifact | Signal of success |
+|---|---|
+| `_emulation/dmd/frame_000000.bgra` … | DMD upload path (`create_gbm_bo_and_upload`, `0xcffe80`) executed at least once — means `gbm_bo_map` and `gbm_bo_unmap` are being reached instead of the previous NULL+0x48 SEGV. 1024×256×4 = 1 MB per file. Opens cleanly in GIMP as "Raw image data → ABGR8888 no alpha plane" or in ImageMagick as `-size 1024x256 -depth 8 ABGR:frame.bgra out.png`. |
+| `_emulation/shaders/shader_NNN_*.glsl` | 22 files expected (Step 21 observed 11 vertex + 11 fragment). If we see those plus extra later, those are runtime scene shaders. |
+| `_emulation/textures/tex_NNNNNN_*.raw` | Non-DMD scene textures. StreamingImage_Bind path (`0xca7210`) is the primary source. Sizes and fmt fields tell us what's being uploaded. Compressed variants (DXT1/DXT5) land in `tex_compressed_*.bin`. |
+| Render loop keeps running | `[shim] DRM ioctl MODE_PAGE_FLIP #N …` messages increment, and `DRM read #N got 32 bytes` messages appear — confirms `drmHandleEvent` is consuming our events and the loop is self-driving. |
+
+### 24.3: Known unknowns for follow-up
+
+- `drm_event_vblank` layout compat: if the game's libdrm is old enough that `drmHandleEvent` rejects 32-byte events, we'd see a read-but-no-callback symptom. Easy test: check whether PAGE_FLIP count keeps advancing after the first event. (If not, shorten the event to 28 bytes — drop `crtc_id`.)
+- Other BO paths: the game may call `gbm_bo_map` on BOs allocated via a path we didn't register (e.g., through `gbm_surface_*`). The unknown-BO fallback in `gbm_bo_map` allocates scratch sized by the caller's `w*h`, which is enough to avoid a SEGV, but the unmap will just `free(map_data)` without capturing. If we see a missing DMD-shaped BO, check whether it came via gbm_surface_ rather than gbm_bo_create.
+- Capture volume: if per-frame BGRA at 1MB adds up fast, may need a frame-stride cap (`dmd_frame_counter % N == 0`). Not doing that pre-emptively — easier to rate-limit later once we know the real frame rate the loop produces.
+
+### 24.4: Build
+
+    aarch64-linux-gnu-gcc -shared -fPIC -Wall -Wextra -o spi_shim.so spi_shim.c -ldl -lpthread
+
+Clean. New symbols in `spi_shim.so`: `gbm_bo_map`, `gbm_bo_unmap`, `glCompressedTexSubImage2D`. Existing `glShaderSource` body replaced; existing `glTexImage2D`/`glTexSubImage2D`/`glCompressedTexImage2D` now capture. `drm_synthesize_flip_event` is internal (`static`).
+
+## Step 25: First capture run — the SEGV is gone, ALSA is the new blocker (2026-04-18)
+
+### 25.1: What happened
+
+Game was launched with the Step-24 shim. It ran for several seconds (11.89M SPI transfers worth) before aborting on an ALSA assertion:
+
+```
+game: pcm.c:1239: snd_pcm_prepare: Assertion `pcm' failed.
+qemu: uncaught target signal 6 (Aborted) - core dumped
+```
+
+The prior NULL+0x48 SEGV inside the DMD path is gone. The render thread reached the point of flipping at least one frame, and we captured artifacts.
+
+### 25.2: What landed on disk
+
+- `_emulation/dmd/frame_000000.bgra` — 1,048,576 bytes, i.e. 1024×256×4 BGRA. Proves `gbm_bo_map` → `memcpy` → `gbm_bo_unmap` path executes end-to-end and that the BO the game uses for the LCD DMD is exactly 1024×256 ABGR8888 (`is_dmd` flag matched, shim wrote the frame). Only one frame captured because the game died shortly after.
+- `_emulation/shaders/` — **24 files** (12 vertex `type=0x8b31`, 12 fragment `type=0x8b30`). This refines the prior "11 programs / 22 objects" count from Step 21 — actual is **12 programs / 24 objects**. First shader (`shader_000_id1_type8b31.glsl`) is a standard `#version 300 es` model/projection sprite vertex shader; source text is clean GLSL. Total shader source is ~7.5 KB.
+- `_emulation/textures/` — **17 files**, all uncompressed `GL_RGBA` + `GL_UNSIGNED_BYTE`:
+  - `tex_000000_1920x1080` (8 MB) — SternLogo splash (rendered into the 1920×1080 screen canvas from an 800×480 PNG — matches the Step 21 observation).
+  - 16 more at 1024×{64,128,256,512} — consistent with LCD-oriented font atlases or line-oriented tile strips, not mipmap chains (mipmap progression would be power-of-two descending and halving each axis).
+  - Zero compressed-texture hits. The game's active texture path in this window is entirely uncompressed RGBA.
+
+### 25.3: Did the render loop actually self-drive?
+
+Only one DMD frame captured before abort, so we cannot distinguish between:
+- (a) the flip-event synthesis worked, the loop iterated once, then ALSA killed it, or
+- (b) the first DMD upload happened during init *before* any page flip (the DMD upload in `create_gbm_bo_and_upload` happens as part of scene construction, possibly eagerly), and the flip-event path was never exercised.
+
+Verdict deferred — once ALSA is fixed and the game runs longer, we'll see whether DMD frames keep coming. If they do, (a) is confirmed. If we get exactly one and then silence, (b) and the flip path still needs work.
+
+### 25.4: The new blocker — ALSA
+
+`aarch64-linux-gnu-nm -D --undefined-only games/pokemon_le/game | grep snd_` lists 18 imported ALSA symbols, all playback-side:
+
+```
+snd_pcm_open, snd_pcm_close, snd_pcm_prepare, snd_pcm_drain, snd_pcm_nonblock,
+snd_pcm_writei,
+snd_pcm_hw_params, snd_pcm_hw_params_any, snd_pcm_hw_params_sizeof,
+snd_pcm_hw_params_set_access/format/channels/rate/rate_near/buffer_size/period_size,
+snd_pcm_hw_params_get_channels/get_rate
+```
+
+No capture, no sequencer, no mixer. The assertion fires inside glibc's `snd_pcm_prepare` at `pcm.c:1239`, which checks `assert(pcm != NULL)` at function entry. The game apparently calls `snd_pcm_open` (which fails under QEMU user-mode because there is no `/dev/snd/*`), does not check the return code, and passes the uninitialized PCM pointer to `snd_pcm_prepare`. Glibc asserts, game aborts.
+
+**Fix strategy** (same pattern as GBM/EGL — hook all imported symbols, hand back fake handles, swallow data):
+
+| Symbol | Stub behavior |
+|---|---|
+| `snd_pcm_open(pcm_out, name, stream, mode)` | Allocate a small `calloc(256)` scratch and return it via `*pcm_out`; return 0. Log first call. |
+| `snd_pcm_close / prepare / drain / nonblock(pcm, ...)` | Return 0, no-op. |
+| `snd_pcm_hw_params_sizeof` | Return a plausible size (≥1 KB so the caller's stack or heap allocation is big enough). |
+| `snd_pcm_hw_params` + `snd_pcm_hw_params_any` + all `snd_pcm_hw_params_set_*` | Return 0. |
+| `snd_pcm_hw_params_get_channels` | `*val = 2`, return 0. |
+| `snd_pcm_hw_params_get_rate` | `*val = 44100; *dir = 0`, return 0. |
+| `snd_pcm_writei(pcm, buf, frames)` | Return `frames` (claim all frames consumed). No sleep — game's own audio thread should gate itself. If it spins, add a `usleep(frames * 1000000 / 44100)` to pace. |
+
+This should let audio init succeed silently, the game continues, and we get long-run captures.
+
+### 25.5: What to verify after the ALSA fix
+
+1. DMD frame counter advances past 1 → render-loop self-drive confirmed (§25.3 question resolved).
+2. Shader capture count either stays at 24 or grows — if it grows, runtime-generated scene shaders are a thing (so Radium lazy-compiles, not just an init-time batch).
+3. Texture captures grow — we'll start seeing game-content textures beyond the 1920×1080 SternLogo + 17 atlas-shaped uploads.
+4. New asset classes may open: look for `libavcodec` / gstreamer opens (video), new `openat` patterns into `image.bin` (PCM audio).
+
+### 25.6: Questions for Binary Ninja (not blocking — ALSA stub should work without them)
+
+Useful follow-up, in order of value:
+
+1. **Who calls `snd_pcm_open` in the game and does it check the return code?** If it doesn't, the no-op-succeeds stub above will work. If it does but still proceeds on error to `snd_pcm_prepare`, there's a weirder bug to reason about.
+2. **Does `snd_pcm_writei` get called in a tight loop or one-shot-per-sample-block?** Determines whether a no-op stub needs to pace itself to avoid the audio thread spinning at 100% CPU.
+3. **What format / sample rate does the audio subsystem set via `snd_pcm_hw_params_set_rate` / `set_format`?** So we can return matching values from the getters and so we know what to expect in the captured PCM (when we add PCM capture via `snd_pcm_writei`).
+
+## Step 26: ALSA stub — fake-succeed + capture PCM stream (2026-04-19)
+
+### 26.1: Decision
+
+Used the BN answers (Step 25.6 investigation summary) to go with the **fake-success with capture** approach rather than fail-gracefully. Rationale: the project's asset-tracking goal (memory `project_asset_tracking.md`) explicitly lists "sounds" as a capture target, so exercising the audio thread and dumping `snd_pcm_writei` payloads delivers data we want. The fallback to fail-gracefully stays one-line-easy if this approach misbehaves.
+
+BN-confirmed facts that shaped the stub:
+
+| Fact | Source | Stub implication |
+|---|---|---|
+| `snd_pcm_open` return is checked at `0xce6270` (tbnz bit 31) | BN of `alsa_pcm_init` @ `0xce61e0` | `fail-gracefully` path would work (return `-ENODEV`) but loses audio |
+| `snd_pcm_writei` is in a tight loop, **no usleep** | BN of `alsa_audio_thread` @ `0xce5f68` | Stub MUST pace itself — added `usleep(size * 1000000 / rate)` |
+| Format: S16_LE, 2 channels, interleaved, 2048 frames/buffer, default 44100 Hz | BN of hw_params setters | Getters return 44100 Hz + 2 ch; `set_rate_near` writes back 44100 |
+
+### 26.2: Implementation
+
+Added 18 ALSA hooks in `spi_shim.c` (after `/* --- end GL stubs --- */` block). All playback-side — matching `nm -D --undefined-only games/pokemon_le/game | grep snd_` exactly:
+
+- `snd_pcm_open` — allocates `calloc(256)` scratch handle on first call, returns 0, writes handle via `*pcm_out`.
+- `snd_pcm_close / prepare / drain / nonblock` — no-op return 0.
+- `snd_pcm_hw_params_sizeof` — returns 1024 (safe upper bound; caller's stack or heap alloc won't under-allocate).
+- All 7 `snd_pcm_hw_params_set_*` + `snd_pcm_hw_params` + `snd_pcm_hw_params_any` — return 0.
+- `snd_pcm_hw_params_set_rate_near` — writes `*rate = 44100, *dir = 0` (matches what the game asks for anyway).
+- `snd_pcm_hw_params_get_channels` — `*val = 2`.
+- `snd_pcm_hw_params_get_rate` — `*val = 44100, *dir = 0`.
+- `snd_pcm_writei(pcm, buffer, size)`:
+  - appends `size * 4` bytes (stereo × S16_LE = 4 B/frame) to `_emulation/audio/stream.s16le` under mutex,
+  - `fflush()` every 64th call so partial data survives a kill,
+  - paces with `usleep(size * 1000000 / 44100)` — at 2048 frames that's 46.4 ms, matching the real audio buffer duration,
+  - returns `size` to claim all frames consumed.
+
+Constructor now mkdir's `_emulation/audio/` alongside the other capture dirs.
+
+### 26.3: Stream playback / conversion
+
+The captured file is raw S16_LE stereo interleaved at 44100 Hz. Convert with:
+
+```bash
+# Listen:
+ffplay -f s16le -ar 44100 -ac 2 _emulation/audio/stream.s16le
+
+# Convert to WAV:
+ffmpeg -f s16le -ar 44100 -ac 2 -i _emulation/audio/stream.s16le stream.wav
+
+# Inspect duration:
+python3 -c 'import os; print(os.path.getsize("_emulation/audio/stream.s16le")/(44100*4), "seconds")'
+```
+
+### 26.4: What the Step 26 run should show
+
+1. Game progresses past the `snd_pcm_prepare(NULL)` assertion (the first concrete proof that the ALSA stubs work).
+2. DMD frame counter > 1 — with audio out of the way, the render loop should run long enough to produce many frames, which also resolves the §25.3 open question (was flip-event synthesis actually consumed, or did we get one frame from eager DMD init?).
+3. `_emulation/audio/stream.s16le` grows at ≈176 KB/s. First kilobytes will likely be silence or attract-mode music, depending on how fast the audio thread starts feeding.
+4. Shim log shows `snd_pcm_open` → `snd_pcm_writei #1 frames=2048 bytes=8192` → continues.
+
+### 26.5: If this approach misbehaves
+
+Fallback 1 (audio thread spinning despite usleep): increase the usleep a bit — maybe the game's frame_count is variable and sometimes too small for the resulting usleep to be meaningful.
+
+Fallback 2 (weird game-state interactions because we fake-succeed): swap `snd_pcm_open` body to:
+
+```c
+int snd_pcm_open(void **pcm, const char *name, int stream, int mode) {
+    if (pcm) *pcm = NULL;
+    return -19;  /* -ENODEV */
+}
+```
+
+That's the fail-gracefully path BN proved works (error code 7 from `alsa_pcm_init`, game skips audio). Loses captures but is zero-risk.
+
+### 26.6: Build / run unchanged
+
+```
+aarch64-linux-gnu-gcc -shared -fPIC -Wall -Wextra -o spi_shim.so spi_shim.c -ldl -lpthread
+```
+
+Clean (one pre-existing `uart_is_active` unused-static warning, unrelated). `nm -D spi_shim.so | grep snd_pcm_` lists all 18 expected exports.
+
+## Step 27: ALSA stubs green; scene loader ran deep; SEGV 11 in what is almost certainly video (2026-04-19)
+
+### 27.1: Run headline
+
+Game executed ~4× longer than before (49.5 M SPI transfers) then died with `qemu: uncaught target signal 11 (Segmentation fault) - core dumped`. No glibc assertion, no message — raw memory access fault.
+
+### 27.2: What landed on disk
+
+| Capture | Step 25 | Step 27 | Delta |
+|---|---|---|---|
+| `_emulation/dmd/` | 1 | (not re-examined; at least 1) | — |
+| `_emulation/shaders/` | 24 objects / 12 programs | **58 objects / 29 programs** | +34 objects = +17 programs |
+| `_emulation/textures/` | 17 | **445** | +428 |
+| `_emulation/audio/stream.s16le` | — | **11,716,160 bytes** (66.4 s of S16_LE stereo @ 44100 Hz) | — |
+
+The audio file size directly confirms ALSA pacing worked: 66 s of real-time buffer duration means the audio thread was NOT spinning — `usleep(size*1e6/rate)` kept it behaved. Roughly 1436 `snd_pcm_writei` calls at the 2048-frame default.
+
+### 27.3: Observations from the texture list
+
+- **Explicit mipmap pyramids.** Many assets are uploaded as a descending chain `1800×600 → 900×300 → 450×150 → 225×75 → 112×37 → 56×18 → 28×9 → 14×4 → 7×2 → 3×1 → 1×1` with each level = prev/2 (floor). The game does NOT rely on `glGenerateMipmap` for these — it hands every level to `glTexSubImage2D` explicitly. The chain repeats ~15 times for different base-size assets (1800×600 is by far the most common, plus a few with other bases).
+- **Font atlases.** 79 × `256×256 fmt=0x190a (GL_LUMINANCE_ALPHA) type=0x1401 (UNSIGNED_BYTE)` textures. LA@256×256 is the classic SDF / glyph-grid shape — this is almost certainly the LCD font set rasterized into slots.
+- **UI-size sprites.** Several `1920×1080` (fullscreen), `2210×884` (ultra-wide?), `2048×2560` (vertical big atlas), `1536×1536`, `1032×896`, `695×658`, `564×583` (repeated 6×), `851×1045`, `2048×2048` — all `fmt=0x1907 (RGB)` or `0x1908 (RGBA)` `type=0x1401`.
+- **Unknown enum** `fmt=0x8d99` on a single 4×4 texture (Step 27-texture #69). Not in the standard GLES core enum space; belongs to an extension. Ignored for now — 4×4 is placeholder-sized so it's not data-bearing.
+- **Depth placeholder.** `4×4 fmt=0x1902 (DEPTH_COMPONENT) type=0x1403 (UNSIGNED_SHORT)` — sized like a scratch/default shadow-map that never gets a real upload.
+- **No compressed textures landed.** `_emulation/textures/tex_compressed_*.bin` never materialized — the game's active texture path in this run is entirely uncompressed.
+
+### 27.4: The stderr JSON leak
+
+Mixed in with the SPI log spam, the game printed (via its own logging/debug path, not the shim):
+
+```json
+{
+  "Coast":       "res://gfx/bknd/Coast/Lake_01_22_26_h265.mp4",
+  "Desert":      "res://gfx/bknd/Desert/desert_battle_med_h265.mp4",
+  "Forest":      "res://gfx/bknd/Forest/Forest_01_22_26_h265_2.mp4",
+  "Mountain":    "res://gfx/bknd/Mountain/Mountain_01_22_26_h265.mp4",
+  "Rocket_Lab":  "res://gfx/bknd/Rocket_Lab/TeamRocketLab_h265.mp4",
+  "Rocket_HQ":   "res://gfx/bknd/Rocket_HQ/RocketOffice_01_22_26_h265.mp4",
+  "Arena":       "res://gfx/bknd/Arena/Stadium_01_22_26_h265.mp4",
+  "Arena_Neon":  "res://gfx/bknd/Arena_Neon/Tournament_Neon_01_22_26_h265.mp4"
+}
+```
+
+This tells us:
+1. The game has a **Godot-flavored `res://` resource system** — same convention as the standalone `assets/godot/pokemon_battle_previs/` tool in the repo.
+2. **Eight battle environment backdrops**, H.265-encoded, keyed by environment name. Matches the previs tool's Ctrl+B battle mode background set.
+3. The naming suffix `01_22_26` looks like a date (Jan 22, 2026) — consistent with a recent build iteration.
+4. SPI TX byte 7 transitioned from `0x2c → 0x6c` right around this print, indicating the game advanced into a new state (probably "scene loader active" or similar).
+
+Shortly after this print, the SEGV fires. Strong circumstantial evidence that **the video loader is the crash site**: game imports `libavcodec.so.59`, `libgstapp-1.0.so.0`, `libgstvideo-1.0.so.0`; none of them are stubbed; any one of them can SEGV against our fake GBM/EGL/DRM state when it tries to open a device for decode.
+
+### 27.5: What we still don't know about the SEGV
+
+- Which function was in-flight? No backtrace captured in this run.
+- Did the SEGV happen inside a shim hook (NULL-deref of scratch state) or inside real library code reading game state?
+- Did it happen on the audio thread, render thread, or main thread?
+
+### 27.6: Investigation plan — cheapest first
+
+**(a) Redirect stderr to a log.** The interesting shim lines (the last hook call before SEGV) scroll off-screen in an interactive terminal. Add a wrapper:
+
+```bash
+cd /mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le && \
+qemu-aarch64 -L /mnt/c/Workspace/pokemon-le-0.81.0 \
+  -E LD_PRELOAD=/mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le/_emulation/spi_shim.so \
+  -E SPIKE3_SYSROOT=/mnt/c/Workspace/pokemon-le-0.81.0 \
+  ./game 2> _emulation/run_step27.log
+```
+
+Then `tail -n 300 _emulation/run_step27.log` after SEGV. The last shim-line tells us which subsystem was active.
+
+**(b) Add a SIGSEGV handler to the shim.** ~20 lines; uses `backtrace()` + `backtrace_symbols_fd(2)` in a signal handler. Under QEMU user-mode the backtrace resolves to aarch64 stack frames (but may not always demangle cleanly). Worth trying if (a) is ambiguous.
+
+**(c) Run under gdb-multiarch with `qemu-aarch64 -g 1234`.** Gives the exact crash frame with source context. Heaviest setup; fall back to this if (a) and (b) fail.
+
+### 27.7: Decisions
+
+- **Do NOT swap to fail-gracefully ALSA.** The audio capture is delivering data we want, and the ALSA path is provably not the crash site (the crash came ~66 s in, audio was still flowing, and the final shim line was a shim SPI log not an ALSA call).
+- **Document the texture/audio/video observations** before chasing the SEGV — the data we have is valuable even if the next hour is spent diagnosing.
+- **Treat the JSON leak as primary evidence** for the video-loader hypothesis. BN follow-up: find the function that prints that dictionary and trace its callers.
+
+### 27.8: Proven-fact updates to land in PROTOCOL
+
+- ALSA playback stubs work — 18 symbols intercepted, audio thread pacing verified by 66 s real-time run.
+- Texture format 0x1908 + 0x1401 (RGBA byte) is the game's default upload format for scene assets.
+- Texture format 0x190a + 0x1401 (LA byte) at 256×256 is the font-glyph atlas shape.
+- Explicit-mipmap convention: the game hands every pyramid level to `glTexSubImage2D`; `glGenerateMipmap` is not load-bearing.
+
+### 27.9: User tool note — ffplay on the captured audio
+
+`ffplay -f s16le -ar 44100 -ac 2 …` fails with `Option not found` in ffplay 7.1 (the `-ac` alias was dropped from ffplay's AVOptions). Working invocations:
+
+```bash
+ffplay -f s16le -ar 44100 -ch_layout stereo _emulation/audio/stream.s16le
+# or convert to WAV first:
+ffmpeg -f s16le -ar 44100 -ac 2 -i _emulation/audio/stream.s16le _emulation/audio/stream.wav
+ffplay _emulation/audio/stream.wav
+```
+

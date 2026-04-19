@@ -33,8 +33,14 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
+
+/* Not including <sys/stat.h> because it conflicts with the shim's
+ * loose-typed stat/lstat/fstatat wrappers below. Just forward-declare
+ * the one thing we need from it. */
+extern int mkdir(const char *, unsigned int);
 
 /* ---- Path remapping ----
  * QEMU user-mode's -L only affects the dynamic linker, not regular file ops.
@@ -133,21 +139,24 @@ static uint32_t drm_next_fb_id = 100;
 
 #define FAKE_FD_SPI   1023
 #define FAKE_FD_I2C   1022
-#define FAKE_FD_DRM   1020   /* /dev/dri/card1 */
+/* DRM is a real socketpair (same pattern as UART) so the game's select() +
+ * drmHandleEvent loop can drive forward on synthesized page-flip events. */
 
 /* ---- Device state ---- */
 
 static int spi_active = 0;
 static int i2c_active = 0;
-static int drm_active = 0;
 static int uart_game_fd = -1;   /* returned from open(); real socketpair end */
 static int uart_shim_fd = -1;   /* held by the shim for pushing responses */
+static int drm_game_fd  = -1;   /* returned from open(/dev/dri/card1) */
+static int drm_shim_fd  = -1;   /* shim end; we write synthetic flip events here */
 static uint32_t spi_transfer_count = 0;
 static uint32_t i2c_ioctl_count = 0;
 static uint32_t uart_read_count = 0;
 static uint32_t uart_write_count = 0;
 
 static int uart_is_active(void) { return uart_game_fd >= 0; }
+static int is_drm_fd(int fd) { return drm_game_fd >= 0 && fd == drm_game_fd; }
 
 #define SHIM_LOG(fmt, ...) fprintf(stderr, "[shim] " fmt "\n", ##__VA_ARGS__)
 
@@ -164,6 +173,64 @@ static real_close_t real_close = NULL;
 static real_ioctl_t real_ioctl = NULL;
 static real_read_t real_read = NULL;
 static real_write_t real_write = NULL;
+
+/* ---- Capture pipeline (Step 23.3) ----
+ *
+ * Writes DMD frames, shader source, and texture bytes to _emulation/{dmd,
+ * shaders,textures}/ as the game runs. Hooks that feed these live further
+ * down in the file (gbm_bo_map/unmap, glShaderSource, glTex*Image2D,
+ * glCompressedTexSubImage2D). The constructor creates the dirs up front.
+ */
+
+__attribute__((constructor))
+static void shim_init_capture_dirs(void) {
+    /* Paths are relative to the game's cwd, which is games/pokemon_le/ per
+     * the documented run command (see Step 23.3). mkdir returns EEXIST when
+     * rerunning, which we ignore. */
+    mkdir("_emulation",           0755);
+    mkdir("_emulation/dmd",       0755);
+    mkdir("_emulation/shaders",   0755);
+    mkdir("_emulation/textures",  0755);
+    mkdir("_emulation/audio",     0755);
+}
+
+/* Synthesize a page-flip completion event on the shim side of the DRM
+ * socketpair. Format matches `struct drm_event_vblank` from <drm/drm.h>
+ * (32 bytes; libdrm reads the length field to know how much to consume,
+ * so forward-compat across libdrm versions). DRM_EVENT_FLIP_COMPLETE = 2. */
+struct shim_drm_event_vblank {
+    uint32_t type;
+    uint32_t length;
+    uint64_t user_data;
+    uint32_t tv_sec;
+    uint32_t tv_usec;
+    uint32_t sequence;
+    uint32_t crtc_id;
+};
+
+static uint32_t drm_flip_sequence = 0;
+
+static void drm_synthesize_flip_event(uint32_t crtc_id, uint64_t user_data) {
+    if (drm_shim_fd < 0) return;
+    struct shim_drm_event_vblank ev;
+    ev.type = 2;                    /* DRM_EVENT_FLIP_COMPLETE */
+    ev.length = sizeof(ev);
+    ev.user_data = user_data;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ev.tv_sec = (uint32_t)ts.tv_sec;
+    ev.tv_usec = (uint32_t)(ts.tv_nsec / 1000);
+    ev.sequence = __atomic_fetch_add(&drm_flip_sequence, 1, __ATOMIC_SEQ_CST);
+    ev.crtc_id = crtc_id;
+    /* ioctl() calls resolve_all() first, so real_write is set by the time
+     * this helper runs. Fall back to libc write() just in case. */
+    ssize_t n = real_write ? real_write(drm_shim_fd, &ev, sizeof(ev))
+                           : write(drm_shim_fd, &ev, sizeof(ev));
+    if (n != (ssize_t)sizeof(ev)) {
+        SHIM_LOG("DRM flip-event write short: n=%zd err=%s",
+                 n, strerror(errno));
+    }
+}
 
 static void resolve_all(void) {
     if (!real_open)  real_open  = (real_open_t)dlsym(RTLD_NEXT, "open");
@@ -191,9 +258,20 @@ static int intercept_device(const char *pathname) {
         return FAKE_FD_I2C;
     }
     if (strcmp(pathname, "/dev/dri/card1") == 0) {
-        drm_active = 1;
-        SHIM_LOG("OPEN %s -> fake fd %d (DRM)", pathname, FAKE_FD_DRM);
-        return FAKE_FD_DRM;
+        if (drm_game_fd < 0) {
+            int sv[2];
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+                SHIM_LOG("socketpair() failed for %s: %s", pathname, strerror(errno));
+                return 0;
+            }
+            drm_game_fd = sv[0];
+            drm_shim_fd = sv[1];
+            int flags = fcntl(drm_shim_fd, F_GETFL, 0);
+            if (flags >= 0) fcntl(drm_shim_fd, F_SETFL, flags | O_NONBLOCK);
+        }
+        SHIM_LOG("OPEN %s -> real socketpair game=%d shim=%d (DRM)",
+                 pathname, drm_game_fd, drm_shim_fd);
+        return drm_game_fd;
     }
     if (strcmp(pathname, "/dev/ttyAMA5") == 0 ||
         strcmp(pathname, "/dev/ttyAMA2") == 0) {
@@ -220,12 +298,11 @@ static int intercept_device(const char *pathname) {
 }
 
 static int is_fake_fd(int fd) {
-    /* UART is NOT fake anymore — it's a real socketpair fd; callers that
-     * need to check for "any intercepted device" should call both this
-     * and uart_game_fd explicitly. */
+    /* UART and DRM are NOT fake — both are real socketpair fds; callers
+     * that need to check for "any intercepted device" should call both
+     * this and uart_game_fd / drm_game_fd explicitly. */
     return (fd == FAKE_FD_SPI && spi_active) ||
-           (fd == FAKE_FD_I2C && i2c_active) ||
-           (fd == FAKE_FD_DRM && drm_active);
+           (fd == FAKE_FD_I2C && i2c_active);
 }
 
 static int is_uart_fd(int fd) {
@@ -584,12 +661,84 @@ void gbm_surface_destroy(void *surface) {
  * can return a valid BO. */
 static void *gbm_bo_latest = NULL;
 
+/* ---- Per-BO side table ----
+ *
+ * Needed so gbm_bo_map can hand back the BO's real width/stride/backing
+ * and so gbm_bo_unmap can flush the DMD backing to disk as a BGRA frame.
+ * The game's `DMDEmulationScene` uses a 1024×256 ABGR8888 BO (see BN
+ * analysis in _emulation/ASSETS.md); that pair of dimensions + format
+ * uniquely identifies the DMD among the few BOs the game allocates. */
+
+#define GBM_BO_TABLE_SIZE   32
+#define GBM_FORMAT_ABGR8888 0x34324241u   /* 'AB24' — DMD format */
+
+struct gbm_bo_entry {
+    void    *bo;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint32_t flags;
+    uint32_t stride;
+    void    *mapped;        /* allocated in gbm_bo_map, freed in gbm_bo_unmap */
+    int      is_dmd;
+};
+
+static struct gbm_bo_entry gbm_bo_table[GBM_BO_TABLE_SIZE];
+static pthread_mutex_t gbm_bo_table_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct gbm_bo_entry *gbm_bo_register(void *bo, uint32_t w, uint32_t h,
+                                            uint32_t fmt, uint32_t flags) {
+    pthread_mutex_lock(&gbm_bo_table_lock);
+    struct gbm_bo_entry *out = NULL;
+    for (int i = 0; i < GBM_BO_TABLE_SIZE; i++) {
+        if (!gbm_bo_table[i].bo) {
+            gbm_bo_table[i].bo      = bo;
+            gbm_bo_table[i].width   = w;
+            gbm_bo_table[i].height  = h;
+            gbm_bo_table[i].format  = fmt;
+            gbm_bo_table[i].flags   = flags;
+            gbm_bo_table[i].stride  = w * 4;   /* 32-bpp assumed */
+            gbm_bo_table[i].mapped  = NULL;
+            gbm_bo_table[i].is_dmd  = (w == 1024 && h == 256
+                                        && fmt == GBM_FORMAT_ABGR8888);
+            out = &gbm_bo_table[i];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gbm_bo_table_lock);
+    return out;
+}
+
+static struct gbm_bo_entry *gbm_bo_lookup(void *bo) {
+    pthread_mutex_lock(&gbm_bo_table_lock);
+    struct gbm_bo_entry *out = NULL;
+    for (int i = 0; i < GBM_BO_TABLE_SIZE; i++) {
+        if (gbm_bo_table[i].bo == bo) { out = &gbm_bo_table[i]; break; }
+    }
+    pthread_mutex_unlock(&gbm_bo_table_lock);
+    return out;
+}
+
+static void gbm_bo_unregister(void *bo) {
+    pthread_mutex_lock(&gbm_bo_table_lock);
+    for (int i = 0; i < GBM_BO_TABLE_SIZE; i++) {
+        if (gbm_bo_table[i].bo == bo) {
+            if (gbm_bo_table[i].mapped) free(gbm_bo_table[i].mapped);
+            memset(&gbm_bo_table[i], 0, sizeof(gbm_bo_table[i]));
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gbm_bo_table_lock);
+}
+
 void *gbm_bo_create(void *gbm, uint32_t width, uint32_t height,
                     uint32_t format, uint32_t flags) {
     void *bo = alloc_fake_gbm_object();
     gbm_bo_latest = bo;
-    SHIM_LOG("gbm_bo_create(%ux%u, fmt=0x%x, flags=0x%x) -> %p",
-             width, height, format, flags, bo);
+    struct gbm_bo_entry *e = gbm_bo_register(bo, width, height, format, flags);
+    SHIM_LOG("gbm_bo_create(%ux%u, fmt=0x%x, flags=0x%x) -> %p%s",
+             width, height, format, flags, bo,
+             (e && e->is_dmd) ? " [DMD]" : "");
     (void)gbm;
     return bo;
 }
@@ -599,20 +748,123 @@ void *gbm_bo_create_with_modifiers(void *gbm, uint32_t width, uint32_t height,
                                    unsigned int count) {
     void *bo = alloc_fake_gbm_object();
     gbm_bo_latest = bo;
-    SHIM_LOG("gbm_bo_create_with_modifiers(%ux%u) -> %p", width, height, bo);
-    (void)gbm; (void)format; (void)modifiers; (void)count;
+    struct gbm_bo_entry *e = gbm_bo_register(bo, width, height, format, 0);
+    SHIM_LOG("gbm_bo_create_with_modifiers(%ux%u) -> %p%s",
+             width, height, bo, (e && e->is_dmd) ? " [DMD]" : "");
+    (void)gbm; (void)modifiers; (void)count;
     return bo;
 }
 
-void gbm_bo_destroy(void *bo) { free(bo); }
+void gbm_bo_destroy(void *bo) { gbm_bo_unregister(bo); free(bo); }
 
-uint32_t gbm_bo_get_width(void *bo)  { (void)bo; return FAKE_MODE_HDISPLAY; }
-uint32_t gbm_bo_get_height(void *bo) { (void)bo; return FAKE_MODE_VDISPLAY; }
-uint32_t gbm_bo_get_stride(void *bo) { (void)bo; return FAKE_MODE_HDISPLAY * 4; }
-uint32_t gbm_bo_get_format(void *bo) { (void)bo; return 0x34325258; /* XR24 */ }
+/* Per-BO getters: consult the side table so each BO reports its real
+ * dimensions/format (the DMD is 1024×256 ABGR8888, not the screen size).
+ * Unknown BOs fall back to the screen defaults. */
+uint32_t gbm_bo_get_width(void *bo) {
+    struct gbm_bo_entry *e = gbm_bo_lookup(bo);
+    return e ? e->width : FAKE_MODE_HDISPLAY;
+}
+uint32_t gbm_bo_get_height(void *bo) {
+    struct gbm_bo_entry *e = gbm_bo_lookup(bo);
+    return e ? e->height : FAKE_MODE_VDISPLAY;
+}
+uint32_t gbm_bo_get_stride(void *bo) {
+    struct gbm_bo_entry *e = gbm_bo_lookup(bo);
+    return e ? e->stride : (FAKE_MODE_HDISPLAY * 4);
+}
+uint32_t gbm_bo_get_format(void *bo) {
+    struct gbm_bo_entry *e = gbm_bo_lookup(bo);
+    return e ? e->format : 0x34325258; /* XR24 */
+}
 uint64_t gbm_bo_get_modifier(void *bo) { (void)bo; return 0; /* LINEAR */ }
 int gbm_bo_get_fd(void *bo) { (void)bo; return -1; }
 uint32_t gbm_bo_get_handle_u(void *bo) { (void)bo; return 1; }
+
+/* ---- gbm_bo_map / gbm_bo_unmap ----
+ *
+ * The game's DMD upload path (create_gbm_bo_and_upload, BN VA 0xcffe80)
+ * calls gbm_bo_map to get a writable pointer + stride, memcpys pixel rows
+ * into it, then calls gbm_bo_unmap. We allocate `stride*height` zero-
+ * initialized backing on first map and hand back (backing, stride). On
+ * unmap of a DMD-sized BO we write the backing to _emulation/dmd/ and
+ * free it.
+ *
+ * Libgbm signature:
+ *   void *gbm_bo_map(bo, x, y, w, h, flags, *stride_out, **map_data_out)
+ *   void  gbm_bo_unmap(bo, map_data)
+ */
+
+static uint32_t dmd_frame_counter = 0;
+
+void *gbm_bo_map(void *bo, uint32_t x, uint32_t y,
+                 uint32_t w, uint32_t h, uint32_t flags,
+                 uint32_t *stride_out, void **map_data_out) {
+    (void)x; (void)y;
+    struct gbm_bo_entry *e = gbm_bo_lookup(bo);
+    if (!e) {
+        /* Unknown BO (created through a path we didn't track). Still hand
+         * back scratch of the asked-for region so the caller doesn't SEGV. */
+        size_t sz = (size_t)w * (size_t)h * 4;
+        void *scratch = calloc(1, sz ? sz : 16);
+        if (stride_out) *stride_out = w * 4;
+        if (map_data_out) *map_data_out = scratch;
+        SHIM_LOG("gbm_bo_map(%p, unknown BO, %ux%u) -> %p (scratch)",
+                 bo, w, h, scratch);
+        return scratch;
+    }
+    pthread_mutex_lock(&gbm_bo_table_lock);
+    if (!e->mapped) {
+        size_t sz = (size_t)e->stride * (size_t)e->height;
+        e->mapped = calloc(1, sz);
+    }
+    void *backing = e->mapped;
+    uint32_t stride = e->stride;
+    int is_dmd = e->is_dmd;
+    pthread_mutex_unlock(&gbm_bo_table_lock);
+    if (stride_out)   *stride_out = stride;
+    if (map_data_out) *map_data_out = backing;
+    static int map_log_budget = 6;
+    if (map_log_budget > 0) {
+        map_log_budget--;
+        SHIM_LOG("gbm_bo_map(%p, %ux%u, flags=0x%x) -> %p stride=%u%s",
+                 bo, w, h, flags, backing, stride, is_dmd ? " [DMD]" : "");
+    }
+    return backing;
+}
+
+void gbm_bo_unmap(void *bo, void *map_data) {
+    struct gbm_bo_entry *e = gbm_bo_lookup(bo);
+    if (!e) {
+        /* Scratch path: just free and return. */
+        free(map_data);
+        return;
+    }
+    /* Dump DMD frames before freeing. */
+    if (e->is_dmd && e->mapped) {
+        uint32_t n = __atomic_fetch_add(&dmd_frame_counter, 1, __ATOMIC_SEQ_CST);
+        char path[128];
+        snprintf(path, sizeof(path), "_emulation/dmd/frame_%06u.bgra", n);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            size_t sz = (size_t)e->stride * (size_t)e->height;
+            fwrite(e->mapped, 1, sz, f);
+            fclose(f);
+            if (n < 8 || (n % 60) == 0) {
+                SHIM_LOG("DMD frame %u -> %s (%zu bytes)", n, path, sz);
+            }
+        } else {
+            SHIM_LOG("DMD frame %u: fopen %s failed: %s",
+                     n, path, strerror(errno));
+        }
+    }
+    pthread_mutex_lock(&gbm_bo_table_lock);
+    if (e->mapped) {
+        free(e->mapped);
+        e->mapped = NULL;
+    }
+    pthread_mutex_unlock(&gbm_bo_table_lock);
+    (void)map_data;
+}
 
 /* gbm_bo_get_handle returns a union; declaring it as returning uint32_t
  * by value works because union gbm_bo_handle is layout-compatible with a
@@ -958,8 +1210,14 @@ void glGenVertexArrays(int n, unsigned *out) {
 }
 void glDeleteVertexArrays(int n, const unsigned *ids) { (void)n; (void)ids; }
 
+/* Per-shader-id type tracking so glShaderSource captures can name the
+ * right file suffix (vertex=0x8B31, fragment=0x8B30). Indexed by shader id. */
+#define GL_SHADER_TYPE_MAX 1024
+static uint32_t gl_shader_type[GL_SHADER_TYPE_MAX];
+
 unsigned glCreateShader(unsigned type) {
     unsigned id = gl_next_shader_id++;
+    if (id < GL_SHADER_TYPE_MAX) gl_shader_type[id] = type;
     GLLOG(object_create, "glCreateShader(type=0x%x) -> %u", type, id);
     return id;
 }
@@ -981,25 +1239,118 @@ void glBindRenderbuffer(unsigned target, unsigned rb)   { (void)target; (void)rb
 void glBindVertexArray(unsigned array)                   { (void)array; }
 void glActiveTexture(unsigned tex)                       { (void)tex; }
 
-/* --- Texture data / params --- */
+/* --- Texture data / params ---
+ *
+ * Capture policy (Step 23.3): when `data` is non-NULL, dump the payload to
+ * _emulation/textures/. StreamingImage_Bind (BN VA 0xca7210) drives most
+ * of these calls with pixel data sourced from decoded image.bin entries;
+ * capturing them gives us the game's runtime texture stream. */
+
+static uint32_t gl_tex_capture_count = 0;
+
+static int gl_bytes_per_pixel(unsigned format, unsigned type) {
+    /* Packed types carry their own total width; return it directly. */
+    switch (type) {
+    case 0x8363: return 2;  /* UNSIGNED_SHORT_5_6_5 */
+    case 0x8033: return 2;  /* UNSIGNED_SHORT_4_4_4_4 */
+    case 0x8034: return 2;  /* UNSIGNED_SHORT_5_5_5_1 */
+    case 0x8368: return 4;  /* UNSIGNED_INT_2_10_10_10_REV */
+    case 0x8DAD: return 4;  /* UNSIGNED_INT_24_8 (depth-stencil) */
+    default: break;
+    }
+    int comp;
+    switch (format) {
+    case 0x1906: comp = 1; break;   /* ALPHA */
+    case 0x1909: comp = 1; break;   /* LUMINANCE */
+    case 0x190A: comp = 2; break;   /* LUMINANCE_ALPHA */
+    case 0x1903: comp = 1; break;   /* RED */
+    case 0x8227: comp = 2; break;   /* RG */
+    case 0x1907: comp = 3; break;   /* RGB */
+    case 0x1908: comp = 4; break;   /* RGBA */
+    case 0x80E0: comp = 3; break;   /* BGR */
+    case 0x80E1: comp = 4; break;   /* BGRA (EXT_texture_format_BGRA8888) */
+    case 0x1902: comp = 1; break;   /* DEPTH_COMPONENT */
+    default:     comp = 4; break;
+    }
+    int byte_per_comp;
+    switch (type) {
+    case 0x1400: case 0x1401: byte_per_comp = 1; break; /* [U]BYTE */
+    case 0x1402: case 0x1403: byte_per_comp = 2; break; /* [U]SHORT */
+    case 0x1404: case 0x1405: byte_per_comp = 4; break; /* [U]INT */
+    case 0x1406: byte_per_comp = 4; break;              /* FLOAT */
+    case 0x140B: byte_per_comp = 2; break;              /* HALF_FLOAT */
+    default:     byte_per_comp = 1; break;
+    }
+    return comp * byte_per_comp;
+}
+
+static void gl_capture_tex(const char *call, int w, int h,
+                           unsigned format, unsigned type, const void *data) {
+    if (!data || w <= 0 || h <= 0) return;
+    int bpp = gl_bytes_per_pixel(format, type);
+    size_t sz = (size_t)w * (size_t)h * (size_t)bpp;
+    uint32_t seq = __atomic_fetch_add(&gl_tex_capture_count, 1, __ATOMIC_SEQ_CST);
+    char path[160];
+    snprintf(path, sizeof(path),
+             "_emulation/textures/tex_%06u_%dx%d_fmt%04x_type%04x.raw",
+             seq, w, h, format, type);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(data, 1, sz, f);
+        fclose(f);
+        if (seq < 12 || (seq % 100) == 0) {
+            SHIM_LOG("%s capture %u: %dx%d fmt=0x%x type=0x%x -> %s (%zu B)",
+                     call, seq, w, h, format, type, path, sz);
+        }
+    }
+}
 
 void glTexImage2D(unsigned target, int level, int internalfmt,
                   int w, int h, int border, unsigned format, unsigned type,
                   const void *data) {
     GLLOG(object_create, "glTexImage2D %dx%d internal=0x%x fmt=0x%x type=0x%x data=%s",
           w, h, internalfmt, format, type, data ? "<ptr>" : "NULL");
+    gl_capture_tex("glTexImage2D", w, h, format, type, data);
     (void)target; (void)level; (void)border;
 }
 void glTexSubImage2D(unsigned target, int level, int xoff, int yoff,
                      int w, int h, unsigned format, unsigned type,
                      const void *data) {
+    gl_capture_tex("glTexSubImage2D", w, h, format, type, data);
     (void)target; (void)level; (void)xoff; (void)yoff;
-    (void)w; (void)h; (void)format; (void)type; (void)data;
 }
+
+static uint32_t gl_ctex_capture_count = 0;
+
+static void gl_capture_ctex(const char *call, int w, int h,
+                            unsigned format, int size, const void *data) {
+    if (!data || size <= 0) return;
+    uint32_t seq = __atomic_fetch_add(&gl_ctex_capture_count, 1, __ATOMIC_SEQ_CST);
+    char path[160];
+    snprintf(path, sizeof(path),
+             "_emulation/textures/tex_compressed_%06u_%dx%d_fmt%04x.bin",
+             seq, w, h, format);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(data, 1, (size_t)size, f);
+        fclose(f);
+        if (seq < 12 || (seq % 100) == 0) {
+            SHIM_LOG("%s capture %u: %dx%d fmt=0x%x size=%d -> %s",
+                     call, seq, w, h, format, size, path);
+        }
+    }
+}
+
 void glCompressedTexImage2D(unsigned target, int level, unsigned internalfmt,
                             int w, int h, int border, int size, const void *data) {
-    (void)target; (void)level; (void)internalfmt;
-    (void)w; (void)h; (void)border; (void)size; (void)data;
+    gl_capture_ctex("glCompressedTexImage2D", w, h, internalfmt, size, data);
+    (void)target; (void)level; (void)border;
+}
+void glCompressedTexSubImage2D(unsigned target, int level, int xoff, int yoff,
+                               int w, int h, unsigned format, int size,
+                               const void *data) {
+    gl_capture_ctex("glCompressedTexSubImage2D", w, h, format, size, data);
+    (void)target; (void)level; (void)xoff; (void)yoff;
 }
 void glTexParameteri(unsigned target, unsigned pname, int param) {
     (void)target; (void)pname; (void)param;
@@ -1025,8 +1376,40 @@ unsigned char glUnmapBuffer(unsigned target) { (void)target; return GL_TRUE; }
 
 /* --- Shader --- */
 
+static uint32_t gl_shader_capture_count = 0;
+
 void glShaderSource(unsigned shader, int count, const char *const *string, const int *length) {
-    (void)shader; (void)count; (void)string; (void)length;
+    if (count <= 0 || !string) return;
+    size_t total = 0;
+    for (int i = 0; i < count; i++) {
+        size_t n = (length && length[i] >= 0) ? (size_t)length[i]
+                                               : (string[i] ? strlen(string[i]) : 0);
+        total += n;
+    }
+    char *buf = (char *)malloc(total + 1);
+    if (!buf) return;
+    size_t off = 0;
+    for (int i = 0; i < count; i++) {
+        size_t n = (length && length[i] >= 0) ? (size_t)length[i]
+                                               : (string[i] ? strlen(string[i]) : 0);
+        if (n && string[i]) memcpy(buf + off, string[i], n);
+        off += n;
+    }
+    buf[total] = 0;
+    uint32_t seq = __atomic_fetch_add(&gl_shader_capture_count, 1, __ATOMIC_SEQ_CST);
+    uint32_t type = (shader < GL_SHADER_TYPE_MAX) ? gl_shader_type[shader] : 0;
+    char path[160];
+    snprintf(path, sizeof(path),
+             "_emulation/shaders/shader_%03u_id%u_type%04x.glsl",
+             seq, shader, type);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(buf, 1, total, f);
+        fclose(f);
+        SHIM_LOG("shader capture %u: id=%u type=0x%x -> %s (%zu B)",
+                 seq, shader, type, path, total);
+    }
+    free(buf);
 }
 void glCompileShader(unsigned shader) { (void)shader; }
 void glAttachShader(unsigned program, unsigned shader) { (void)program; (void)shader; }
@@ -1195,6 +1578,122 @@ void glReadPixels(int x, int y, int w, int h, unsigned fmt, unsigned type, void 
 
 /* --- end GL stubs --- */
 
+/* ---- Hooked: libasound (ALSA) ----
+ *
+ * Game has no fallback — under QEMU user-mode with no /dev/snd devices, the
+ * real `snd_pcm_open` fails, and although the game *does* check the
+ * return code (BN: `alsa_pcm_init` at `0xce61e0` tests bit 31 at
+ * `0xce6270`, jumps to error-7 path), it still crashes later when the
+ * audio subsystem calls `snd_pcm_prepare(NULL)`. Our fix: fake-succeed
+ * every ALSA call so the audio thread runs, and capture the PCM
+ * stream via `snd_pcm_writei`.
+ *
+ * Audio format (BN confirmed Step 25.6 research):
+ *   44100 Hz, 2 channels, S16_LE, interleaved. Default buffer = 2048
+ *   frames = 8192 bytes = 46.4 ms. The audio thread is a tight loop
+ *   around `snd_pcm_writei` with no sleep — if our stub returns
+ *   instantly it will spin at 100% CPU. We pace with `usleep(size *
+ *   1000000 / 44100)` inside writei to match real ALSA timing.
+ *
+ * Capture: every `snd_pcm_writei` buffer is appended to
+ * `_emulation/audio/stream.s16le`. Playback / conversion:
+ *   ffplay -f s16le -ar 44100 -ac 2 stream.s16le
+ *   ffmpeg -f s16le -ar 44100 -ac 2 -i stream.s16le stream.wav
+ */
+
+#define ALSA_FAKE_PARAMS_SIZE 1024  /* upper bound; caller alloc stack-safe */
+#define ALSA_DEFAULT_RATE     44100
+#define ALSA_DEFAULT_CHANNELS 2
+
+static void *fake_pcm_handle     = NULL;
+static FILE *alsa_capture_file   = NULL;
+static pthread_mutex_t alsa_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t alsa_writei_count = 0;
+
+int snd_pcm_open(void **pcm, const char *name, int stream, int mode) {
+    if (!fake_pcm_handle) fake_pcm_handle = calloc(1, 256);
+    if (pcm) *pcm = fake_pcm_handle;
+    SHIM_LOG("snd_pcm_open(name=%s, stream=%d, mode=%d) -> %p (fake)",
+             name ? name : "(null)", stream, mode, fake_pcm_handle);
+    return 0;
+}
+int snd_pcm_close(void *pcm)                      { (void)pcm; return 0; }
+int snd_pcm_prepare(void *pcm)                    { (void)pcm; return 0; }
+int snd_pcm_drain(void *pcm)                      { (void)pcm; return 0; }
+int snd_pcm_nonblock(void *pcm, int nonblock)     { (void)pcm; (void)nonblock; return 0; }
+
+size_t snd_pcm_hw_params_sizeof(void) { return ALSA_FAKE_PARAMS_SIZE; }
+
+int snd_pcm_hw_params(void *pcm, void *params)          { (void)pcm; (void)params; return 0; }
+int snd_pcm_hw_params_any(void *pcm, void *params)      { (void)pcm; (void)params; return 0; }
+int snd_pcm_hw_params_set_access(void *pcm, void *params, int access) {
+    (void)pcm; (void)params; (void)access; return 0;
+}
+int snd_pcm_hw_params_set_format(void *pcm, void *params, int format) {
+    (void)pcm; (void)params; (void)format; return 0;
+}
+int snd_pcm_hw_params_set_channels(void *pcm, void *params, unsigned channels) {
+    (void)pcm; (void)params; (void)channels; return 0;
+}
+int snd_pcm_hw_params_set_rate(void *pcm, void *params, unsigned rate, int dir) {
+    (void)pcm; (void)params; (void)rate; (void)dir; return 0;
+}
+int snd_pcm_hw_params_set_rate_near(void *pcm, void *params, unsigned *rate, int *dir) {
+    (void)pcm; (void)params;
+    if (rate) *rate = ALSA_DEFAULT_RATE;
+    if (dir)  *dir  = 0;
+    return 0;
+}
+int snd_pcm_hw_params_set_buffer_size(void *pcm, void *params, unsigned long size) {
+    (void)pcm; (void)params; (void)size; return 0;
+}
+int snd_pcm_hw_params_set_period_size(void *pcm, void *params, unsigned long size, int dir) {
+    (void)pcm; (void)params; (void)size; (void)dir; return 0;
+}
+int snd_pcm_hw_params_get_channels(const void *params, unsigned *val) {
+    (void)params;
+    if (val) *val = ALSA_DEFAULT_CHANNELS;
+    return 0;
+}
+int snd_pcm_hw_params_get_rate(const void *params, unsigned *val, int *dir) {
+    (void)params;
+    if (val) *val = ALSA_DEFAULT_RATE;
+    if (dir) *dir = 0;
+    return 0;
+}
+
+/* Return type is snd_pcm_sframes_t (signed long) — see alsa-lib. */
+long snd_pcm_writei(void *pcm, const void *buffer, unsigned long size) {
+    (void)pcm;
+    /* Append the raw S16_LE interleaved buffer to the session stream. */
+    if (buffer && size > 0) {
+        size_t bytes = (size_t)size * 4; /* stereo × 2 bytes = 4 B/frame */
+        pthread_mutex_lock(&alsa_capture_lock);
+        if (!alsa_capture_file) {
+            alsa_capture_file = fopen("_emulation/audio/stream.s16le", "ab");
+        }
+        if (alsa_capture_file) {
+            fwrite(buffer, 1, bytes, alsa_capture_file);
+            /* Flush occasionally so cold-pickup gets partial data if we
+             * get killed — every 64 writes ≈ 3 s at 46 ms/buffer. */
+            if ((alsa_writei_count & 63) == 0) fflush(alsa_capture_file);
+        }
+        uint32_t n = ++alsa_writei_count;
+        pthread_mutex_unlock(&alsa_capture_lock);
+        if (n <= 4 || (n % 500) == 0) {
+            SHIM_LOG("snd_pcm_writei #%u frames=%lu bytes=%zu",
+                     n, size, bytes);
+        }
+    }
+    /* Pace the audio thread to real-time rate. Without this the game's
+     * tight writei loop would spin at 100% CPU (BN: no usleep between
+     * generate-samples → writei → loop). */
+    unsigned long delay_us = (size * 1000000UL) / ALSA_DEFAULT_RATE;
+    if (delay_us) usleep((unsigned)delay_us);
+    return (long)size;
+}
+
+
 void (*eglGetProcAddress(const char *name))(void) {
     /* Funnel every game-queried extension through our stubs. These match
      * the names BN showed the game resolving inside glWindow::setGlContext
@@ -1361,6 +1860,15 @@ int close(int fd) {
         real_close(shim_fd);
         return real_close(game_fd);
     }
+    if (is_drm_fd(fd)) {
+        SHIM_LOG("CLOSE DRM (game=%d shim=%d)", drm_game_fd, drm_shim_fd);
+        int shim_fd = drm_shim_fd;
+        int game_fd = drm_game_fd;
+        drm_game_fd = -1;
+        drm_shim_fd = -1;
+        real_close(shim_fd);
+        return real_close(game_fd);
+    }
     return real_close(fd);
 }
 
@@ -1384,6 +1892,18 @@ ssize_t read(int fd, void *buf, size_t count) {
             for (ssize_t i = 0; i < n && i < 32; i++) fprintf(stderr, " %02x", data[i]);
             if (n > 32) fprintf(stderr, " ...");
             fprintf(stderr, "\n");
+        }
+        return n;
+    }
+
+    if (is_drm_fd(fd)) {
+        /* drmHandleEvent reads here after select() wakes — it will get the
+         * synthesized drm_event_vblank we pushed from PAGE_FLIP. */
+        ssize_t n = real_read(fd, buf, count);
+        static uint32_t drm_read_count = 0;
+        drm_read_count++;
+        if (n > 0 && drm_read_count <= 8) {
+            SHIM_LOG("DRM read #%u got %zd bytes", drm_read_count, n);
         }
         return n;
     }
@@ -1803,8 +2323,8 @@ int ioctl(int fd, unsigned long request, ...) {
         }
     }
 
-    /* ---- Pass through non-fake fds ---- */
-    if (!is_fake_fd(fd)) {
+    /* ---- Pass through non-fake, non-DRM fds ---- */
+    if (!is_fake_fd(fd) && !is_drm_fd(fd)) {
         return real_ioctl(fd, request, arg);
     }
 
@@ -1853,7 +2373,7 @@ int ioctl(int fd, unsigned long request, ...) {
     }
 
     /* ---- DRM ioctls ---- */
-    if (fd == FAKE_FD_DRM) {
+    if (is_drm_fd(fd)) {
         switch (request) {
 
         case DRM_IOCTL_VERSION: {
@@ -2061,8 +2581,20 @@ int ioctl(int fd, unsigned long request, ...) {
         case DRM_IOCTL_MODE_PAGE_FLIP: {
             struct drm_mode_crtc_page_flip *p =
                 (struct drm_mode_crtc_page_flip *)arg;
-            SHIM_LOG("DRM ioctl MODE_PAGE_FLIP crtc=%u fb=%u",
-                     p->crtc_id, p->fb_id);
+            /* If the caller requested an event (DRM_MODE_PAGE_FLIP_EVENT = 1),
+             * synthesize a drm_event_vblank on the shim side of the socketpair.
+             * The game's select() on drm_fd wakes, drmHandleEvent reads the
+             * event, and the page-flip callback fires — driving the next
+             * render-loop iteration (see _emulation/JOURNAL.md Step 23.3). */
+            if (p->flags & 1 /* DRM_MODE_PAGE_FLIP_EVENT */) {
+                drm_synthesize_flip_event(p->crtc_id, p->user_data);
+            }
+            static uint32_t flip_count = 0;
+            flip_count++;
+            if (flip_count <= 4 || (flip_count % 60) == 0) {
+                SHIM_LOG("DRM ioctl MODE_PAGE_FLIP #%u crtc=%u fb=%u flags=0x%x",
+                         flip_count, p->crtc_id, p->fb_id, p->flags);
+            }
             return 0;
         }
 
