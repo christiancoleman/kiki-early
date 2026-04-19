@@ -34,6 +34,8 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <signal.h>
+#include <execinfo.h>
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
 
@@ -192,6 +194,71 @@ static void shim_init_capture_dirs(void) {
     mkdir("_emulation/shaders",   0755);
     mkdir("_emulation/textures",  0755);
     mkdir("_emulation/audio",     0755);
+}
+
+/* ---- SIGSEGV/SIGBUS backtrace handler ----
+ *
+ * QEMU user-mode currently reports `uncaught target signal 11` for every
+ * crash in the guest binary. Installing a guest-side sigaction lets us
+ * catch the fault inside the guest process (the shim is loaded into the
+ * guest's address space via LD_PRELOAD) and dump a backtrace before
+ * chaining to the default handler for the core dump.
+ *
+ * Frame addresses are runtime addresses in the guest's address space.
+ * `dladdr()` resolves each frame to module + offset, so we can translate
+ * to file offsets by subtracting the module base and map into Binary
+ * Ninja via `BN_VA = file_offset + 0x400000` (PROTOCOL.md).
+ *
+ * Async-signal safety: snprintf() isn't strictly async-signal-safe, but
+ * in practice it doesn't take locks or allocate, and we only care about
+ * getting output out before the inevitable re-crash.
+ */
+
+static void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
+    (void)ucontext;
+
+    char hdr[256];
+    int hn = snprintf(hdr, sizeof(hdr),
+        "\n=== SHIM SIGSEGV: sig=%d si_code=%d fault_addr=%p ===\n",
+        sig, info->si_code, info->si_addr);
+    ssize_t u = write(STDERR_FILENO, hdr, (size_t)hn);
+    (void)u;
+
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    for (int i = 0; i < n; i++) {
+        Dl_info di;
+        char line[512];
+        int ln;
+        if (dladdr(frames[i], &di) && di.dli_fname) {
+            unsigned long off =
+                (unsigned long)((uintptr_t)frames[i] - (uintptr_t)di.dli_fbase);
+            ln = snprintf(line, sizeof(line),
+                "[%02d] %p  %s+0x%lx  %s\n",
+                i, frames[i], di.dli_fname, off,
+                di.dli_sname ? di.dli_sname : "");
+        } else {
+            ln = snprintf(line, sizeof(line),
+                "[%02d] %p  (no dladdr)\n", i, frames[i]);
+        }
+        u = write(STDERR_FILENO, line, (size_t)ln);
+    }
+
+    /* Chain to default handler so QEMU's "uncaught target signal 11"
+     * + core dump still happen (unchanged external behaviour). */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+__attribute__((constructor))
+static void shim_install_crash_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = shim_sigsegv_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
 }
 
 /* Synthesize a page-flip completion event on the shim side of the DRM
@@ -1159,14 +1226,67 @@ const unsigned char *glGetStringi(unsigned name, unsigned index) {
     (void)name; (void)index; return (const unsigned char *)"";
 }
 
+/* Track which pnames glGetIntegerv has been asked about, so we can log each
+ * unknown pname exactly once without swamping the log. 1 KB bitmap indexed
+ * by the low bits of the pname (sufficient since GL enum low bits rarely
+ * collide within a session). */
+static unsigned char gl_getint_seen[4096];
+static void gl_getint_log_unknown(unsigned pname) {
+    unsigned slot = pname & 0xFFF;
+    if (gl_getint_seen[slot]) return;
+    gl_getint_seen[slot] = 1;
+    SHIM_LOG("GL glGetIntegerv(pname=0x%x) -> 0 (unknown, defaulting)", pname);
+}
+
 void glGetIntegerv(unsigned pname, int *params) {
     if (!params) return;
     switch (pname) {
-    case GL_MAX_TEXTURE_SIZE:         *params = 4096; break;
-    case GL_MAX_VIEWPORT_DIMS:        params[0] = 4096; params[1] = 4096; break;
-    case GL_MAX_TEXTURE_IMAGE_UNITS:  *params = 16; break;
-    case GL_MAX_VERTEX_ATTRIBS:       *params = 16; break;
-    default:                          *params = 0; break;
+    /* Sizes / dims */
+    case GL_MAX_TEXTURE_SIZE:                    *params = 4096; break;
+    case GL_MAX_VIEWPORT_DIMS:                   params[0] = 4096; params[1] = 4096; break;
+    case 0x851C: /* GL_MAX_CUBE_MAP_TEXTURE_SIZE */ *params = 2048; break;
+    case 0x84E8: /* GL_MAX_RENDERBUFFER_SIZE */  *params = 4096; break;
+    case 0x88FF: /* GL_MAX_3D_TEXTURE_SIZE */    *params = 2048; break;
+    case 0x88FE: /* GL_MAX_ARRAY_TEXTURE_LAYERS */ *params = 256; break;
+
+    /* Texture units */
+    case GL_MAX_TEXTURE_IMAGE_UNITS:             *params = 16; break;
+    case 0x8B4C: /* GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS */ *params = 16; break;
+    case 0x8B4D: /* GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS */ *params = 32; break;
+
+    /* Vertex pipeline */
+    case GL_MAX_VERTEX_ATTRIBS:                  *params = 16; break;
+    case 0x8DFB: /* GL_MAX_VERTEX_UNIFORM_VECTORS */   *params = 256; break;
+    case 0x8A2B: /* GL_MAX_VERTEX_UNIFORM_COMPONENTS */ *params = 1024; break;
+    case 0x8B4A: /* GL_MAX_VERTEX_UNIFORM_BLOCKS */    *params = 12; break;
+    case 0x8B4B: /* GL_MAX_VARYING_COMPONENTS */ *params = 60; break;
+    case 0x8DFC: /* GL_MAX_VARYING_VECTORS */    *params = 15; break;
+    case 0x9122: /* GL_MAX_VERTEX_OUTPUT_COMPONENTS — ES 3.x per-stage */ *params = 64; break;
+
+    /* Fragment pipeline */
+    case 0x8DFD: /* GL_MAX_FRAGMENT_UNIFORM_VECTORS */ *params = 224; break;
+    case 0x8B49: /* GL_MAX_FRAGMENT_UNIFORM_COMPONENTS */ *params = 896; break;
+    case 0x8A2D: /* GL_MAX_FRAGMENT_UNIFORM_BLOCKS */ *params = 12; break;
+    case 0x9125: /* GL_MAX_FRAGMENT_INPUT_COMPONENTS — ES 3.x per-stage */ *params = 60; break;
+
+    /* Framebuffer */
+    case 0x8CDF: /* GL_MAX_COLOR_ATTACHMENTS */  *params = 4; break;
+    case 0x8824: /* GL_MAX_DRAW_BUFFERS */       *params = 4; break;
+    case 0x8D57: /* GL_MAX_SAMPLES */            *params = 4; break;
+
+    /* Uniform buffers */
+    case 0x8A2E: /* GL_MAX_COMBINED_UNIFORM_BLOCKS */ *params = 24; break;
+    case 0x8A2F: /* GL_MAX_UNIFORM_BUFFER_BINDINGS */ *params = 24; break;
+    case 0x8A30: /* GL_MAX_UNIFORM_BLOCK_SIZE */ *params = 16384; break;
+    case 0x8A34: /* GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT */ *params = 256; break;
+
+    /* Program binary formats (count only; we claim zero since none supported) */
+    case 0x87FE: /* GL_NUM_PROGRAM_BINARY_FORMATS */ *params = 0; break;
+
+    default:
+        *params = 0;
+        gl_getint_log_unknown(pname);
+        break;
     }
 }
 void glGetFloatv(unsigned pname, float *params) {

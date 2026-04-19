@@ -2102,3 +2102,788 @@ ffmpeg -f s16le -ar 44100 -ac 2 -i _emulation/audio/stream.s16le _emulation/audi
 ffplay _emulation/audio/stream.wav
 ```
 
+## Step 28: stderr log captured; the game is Godot 4.4.1 + Radium (2026-04-19)
+
+### 28.1: The project-defining discovery
+
+The stderr log for the Step 27 run (saved to `_emulation/run_step27.log`) contained this line among the init messages:
+
+```
+Godot Engine v4.4.1.stable.custom_build - https://godotengine.org
+OpenGL API OpenGL ES 3.1 (stub) - Compatibility - Using Device: shim - shim GLES3
+```
+
+**The game is a Godot 4.4.1 game with a Stern-custom build, plus a proprietary module called "Radium".** This reframes the entire project:
+
+- `res://gfx/bknd/Coast/Lake_01_22_26_h265.mp4` — Godot's `res://` ResourceLoader convention. The game's resources live inside a Godot project root or a PCK archive.
+- `shader_type canvas_item;` / `varying vec4 vertex_color;` / `uniform sampler2D color_texture;` — that's **Godot Shader Language (GSL)**, not raw GLSL. The shader strings we capture via `glShaderSource` are Godot's GSL→GLSL compiler output, not the source the game author wrote.
+- The `--Main Shader--` error format with `E   N-> <line>` is Godot's internal shader-compiler error reporter (surfaced here with `varying` rejected because Godot 4.x canvas_item vertex/fragment don't share `varying` the same way; but Godot logs them as errors and proceeds regardless — we can see rendering continues).
+- `[Radium Error] VideoStreamDecoder: Cannot open input file ''` — **Radium** is Stern's Godot module (statically linked into the game binary) that provides `VideoStreamDecoder`, scene animation decoding, hardware bridging, and the canvas-item passes. It's the same Radium that the `assets/lcd/*.radium` files belong to.
+- `Warning: Failsafe file not found at res://gfx/attack_anim_sheets/None/none_attack_v1_2k.png` — Godot's fallback-resource pattern. Verified this resource DOES exist in `assets/godot/main.pck_extracted/gfx/attack_anim_sheets/None/`. So the resource files are present on the SD card; the game just can't see them under emulation.
+- `can't create directory '/data/'` (×9) — Godot's user data directory is not writable.
+
+**Correction to initial hypothesis: image.bin is NOT the Godot PCK.** Per `_extraction/README.md` (authoritative reference):
+
+- Godot PCK: **`assets/godot/main.pck`**, 210 MB, extracted into `assets/godot/main.pck_extracted/` (untouched, via GodotPCKExplorer — use this as the ground-truth reference). All 8 battle backdrops confirmed present at `gfx/bknd/<env>/*_h265.mp4`, plus the failsafe `none_attack_v1_2k.png`. The user has a derived project at `assets/godot/pokemon_battle_previs/` via GDRETools — that one is a working/modified copy, NOT the reference.
+- Stern asset container: **`image.bin`**, 1.1 GB, Stern's proprietary format with a 10-section header, 2,452 assets (231 PCM audio SFX/speech + 2,221 animation/texture/Radium-scene data). Per README "not encrypted" (attributes high entropy to audio + compressed textures); the user believes parts may be encrypted, treat as open question. Music tracks are NOT in image.bin — likely in the PCK.
+
+The two stores cross-reference via `ManualGodotScene` (vtable at game addr `0x04630230`): image.bin's scene bytecode can contain type-0x0b records referencing Godot resources from the PCK.
+
+**Actual blocker:** the game can't find/mount `main.pck` under QEMU user-mode. Godot 4.x normally loads its PCK from one of: (a) appended to the end of the executable, (b) `<binary>.pck` next to the binary, (c) an explicit `ProjectSettings::load_resource_pack(path)` call. For this game the PCK lives at `assets/godot/main.pck` — a non-standard path, so method (c) must be used. Under the emulation environment, either the hardcoded path doesn't resolve (cwd issues, `res://` path lookup failing before the pack is mounted, `/data/` mkdir failure blocking init), or the mount call itself fails. Not yet determined which.
+
+### 28.2: Full run-order from the log (first occurrence of each event)
+
+1. Netbridge + pwrdist init — green.
+2. DRM/GBM/EGL — prints `failed to get fd for bo: -1` + `failed to create framebuffer` (our `gbm_bo_get_fd` returns -1 unconditionally; the game tries to wrap a BO as a DMA-BUF framebuffer and the `-1` fd path fails). Non-fatal — game continues.
+3. `can't create directory '/data/'` × 9 — repeated fails, probably from different Godot subsystems each attempting `/data/` during their own init.
+4. **TAS57XX audio amp init** over I2C (address range 0x29–0x5b): 10 EQ filters + HP/LP filters + bass/treble shelves configured. Each write is followed by a `reads back as ffffffff` verify-fail message — our I2C SMBUS passthrough returns zeros, but the game reads `0xff` (uninitialized slave data or our shim returning wrong default). Non-fatal.
+5. `MAX9850: headphone amp/line out init complete` — matching verify-fails.
+6. `bridge message (cmd=25, id=1) response failed 110: Connection timed out` (×2) — two new bridge commands not in our synthesizer table.
+7. `bridge message (cmd=41, id=1) response failed 110: Connection timed out` (×20+) — the game retries cmd 41 many times, no response synthesized, times out each time.
+8. `failed to open chip: No such file or directory` — GPIO chip (probably `/dev/gpiochip0`) attempted open.
+9. **`Godot Engine v4.4.1.stable.custom_build`** — the big reveal.
+10. `--Main Shader--` errors with `varying vec4 vertex_color` (×8 or so) — Godot's shader compiler logging errors for `canvas_item` shaders. Rendering appears to continue regardless.
+11. `[Radium Error] VideoStreamDecoder: Cannot open input file ''` (×3) — empty filename going into Radium's video decoder.
+12. More shader compile messages, `samplerExternalOES` variant.
+13. `Warning: Failsafe file not found at res://gfx/attack_anim_sheets/None/none_attack_v1_2k.png`.
+14. The 8-environment JSON dump (battle backgrounds).
+15. **SEGV.**
+
+### 28.3: Crash hypothesis
+
+The sequence `empty-filename → failsafe-not-found → JSON-dump-of-8-environments → SEGV` is consistent with this story:
+
+- Godot's `res://` resolver can't resolve anything because `main.pck` isn't mounted under emulation.
+- The game's battle-environment initializer builds the 8-env map (the JSON), prints it, then iterates to preload each environment's video stream.
+- Either Radium's VideoStreamDecoder or libavformat/libavcodec — called with a `res://` path that resolved to empty — NULL-derefs somewhere in the preload chain.
+
+This is **not** a shim regression; it's the game running out of resources because the PCK isn't mounted. Before Step 27 we weren't even getting this deep — the ALSA stub unblocked us into this layer.
+
+### 28.4: Next-move decision tree
+
+**(a) Figure out how the game tries to mount main.pck.** Strings-search the game binary for "main.pck" and "load_resource_pack" — whichever path or call site appears, we trace whether the game has a hardcoded absolute path, a relative path from cwd, an `ENVVAR`-derived path, or a binary-appended PCK. From that we can decide: remap the path through `SPIKE3_SYSROOT`, arrange symlinks, or stub the mount call to succeed silently. This is the root-cause fix for the empty `res://` paths.
+
+**(b) Cheap long-shot — give the game a writable `/data/`.** If `/data/` being unwritable is what's blocking Godot's pack-mount or user-fs init, a writable `/data/` might unblock things:
+
+```bash
+sudo mkdir -p /data && sudo chmod 777 /data
+# re-run
+```
+
+If the `can't create directory '/data/'` spam disappears AND `res://` paths start resolving, we've scored.
+
+**(c) Backtrace the SEGV.** Add a SIGSEGV handler to `spi_shim.c` using `backtrace()` + `backtrace_symbols_fd(STDERR_FILENO)`. ~30 lines. Tells us the exact crash frame — probably inside Radium's VideoStreamDecoder or libavformat, called with an empty path.
+
+**(d) Stub libavformat's `avformat_open_input` to return an error.** That's already the observed behavior (Radium logs the decoder-open failure), but the game eventually NULL-derefs downstream. A more aggressive stub might return an error before the NULL-deref site is reached.
+
+**Recommended order**: (a) first — understanding the PCK-mount mechanism is the root-cause fix and also informs everything else. (b) and (c) in parallel if (a) doesn't produce an obvious hook.
+
+### 28.5: Worth adding to PROTOCOL (proven by Step 27-28 run)
+
+- Game engine: **Godot 4.4.1 custom_build** + **Radium** (Stern-proprietary module, statically linked). Cross-reference `_extraction/README.md` for image.bin layout; `_extraction/CLAUDE.md` for the loader call chain; `assets/godot/main.pck_extracted/` for the unmodified PCK reference tree.
+- `res://` convention used for all game-side resource paths — resolves into `main.pck` at runtime.
+- **image.bin is NOT the PCK.** Separate 1.1 GB Stern container with 2,452 assets (SFX, animation, Radium data) — PCK is separate at `assets/godot/main.pck` (210 MB).
+- I2C readback semantics: TAS57XX and MAX9850 audio-amp slaves expect writes to be read back with the same value for verify. Our shim returns zeros, game logs errors, proceeds anyway.
+- DMA-BUF framebuffer path: game uses `gbm_bo_get_fd` to get a fd to pass into `drmModeAddFB2`-like calls; our -1 return fails that path. Game continues.
+- Bridge commands 25 and 41 not in our synthesis table — log-only failures, not fatal.
+
+### 28.6: Audio content finding
+
+66.4 seconds of real-time audio captured, format verified by ffplay. User reports playing the file produces no audible sound — most likely early-init silence (the game was still resolving resources and never started its audio source stream). Verify via `xxd _emulation/audio/stream.s16le | head -5`: if all `0000`, the game wrote all-zero buffers (expected during init); if non-zero, real samples are in there and playback is a local WSL-audio issue rather than a capture issue.
+
+## Step 29–31: shader fix, SIGSEGV handler, crash localized to PopupMenu logger (2026-04-19)
+
+### 29: `glGetIntegerv` filled in for GLES 3.x caps
+Added `GL_MAX_VARYING_VECTORS=15`, `_COMPONENTS=60`, vertex/fragment uniform sizes, texture unit counts, render-target limits, etc. "Too many varyings" errors went from many → 6. Adding `GL_MAX_VERTEX_OUTPUT_COMPONENTS=64` and `GL_MAX_FRAGMENT_INPUT_COMPONENTS=60` in Step 30 drove it to **0**. All 58 captured shaders now compile from Godot's perspective.
+
+### 30: Still same runtime cap
+With shaders compiling, runtime extended ~3× (audio grew from 66 s → 188 s) but capture counts plateaued (DMD=1, shaders=58, textures=445) — the game ran much longer but didn't progress past a new wall. Added a one-shot logger to `glGetIntegerv` for unknown pnames; unknowns found were cosmetic (`GL_BLEND_SRC_ALPHA`, `GL_NUM_EXTENSIONS`).
+
+### 31: Backtrace pinpoints Godot's error logger
+Added `SIGSEGV`/`SIGBUS` handler to the shim with `backtrace()` + `dladdr()` resolution. Crash identified:
+
+- Fault: `si_code=SEGV_MAPERR`, `fault_addr=0x40`, crashing instruction is glibc's `cpyfp` (aarch64 ARMv8.8 memcpy primitive) — so a `memcpy()` with a NULL pointer.
+- Thread: **DisplayRenderer** — frame 12 at game offset `0x7b7c3c` puts us 1372 bytes into `sub_bb76e0` (BN VA `0xbb76e0`, the DisplayRenderer render loop identified in Step 23).
+- Call site (frame 3): game offset `0x11e2208` / BN VA `0x15e2208`. Rodata strings loaded by that function's arg-setup: `"items.size()"`, `"p_idx"`, `"scene/gui/popup_menu.cpp"`, `"set_item_language"`, `"scroll_to_item"`, etc. Passes `w2 = 1764` as line number.
+- Godot 4.4.1 source at `scene/gui/popup_menu.cpp:1764`: `ERR_FAIL_INDEX(p_idx, items.size())` inside `PopupMenu::set_item_language(int p_idx, const String &p_language)`.
+- Verdict: **Game calls `PopupMenu::set_item_language(p_idx, lang)` on a PopupMenu where `items.size() == 0`** (or `p_idx` is otherwise out-of-range). The ERR_FAIL macro fires correctly; then Godot's error-logger function itself SEGVs because a thread-local or singleton pointer is NULL. Highly plausible cause: the custom Stern/Radium DisplayRenderer thread isn't registered with Godot's TLS setup, so `StringName` / memory-pool / `OS::get_singleton()` reads NULL inside the logger path, and vformat → memcpy(NULL, …) faults.
+
+### 31.1: AnimationPlayer — skipped for now with a note
+
+User observation: the `Node not found: "AnimationPlayer" (relative to "/root/pokemon_battle_scene")` error also appears in the log. User says this is either a bug or a deliberate non-inclusion in the 0.81.0 build — the Godot project (`assets/godot/pokemon_battle_previs/` / `main.pck_extracted/scenes/pokemon_battle_scene.tscn` equivalent) runs fine in the Godot editor without it. Hypothesis: **`AnimationPlayer` may be dynamically instantiated and populated at runtime by Stern's Radium module for Radium-specific animation playback.** The scene file ships without it because the engine creates it on the fly. Under our emulation, whatever subsystem would do that isn't running (yet) — so the node is missing, but this is orthogonal to the PopupMenu crash we localized above.
+
+**⚠️ REMEMBER:** If later work unblocks scene-render progress and we see new crashes that reference `AnimationPlayer`, `Tween`, or animation-track playback, revisit this assumption. Radium probably has its own `Node` subclass that inherits `AnimationPlayer`-like semantics and registers under `/root/pokemon_battle_scene/AnimationPlayer`. A smoking gun would be a `memnew(AnimationPlayer)` or `add_child` call in Radium's init path.
+
+### 31.2: Why not chase the PopupMenu crash further
+
+- The crash is in the game's own code / Godot interaction, not in our shim.
+- Fixing it would require either (a) patching the game binary to replace Godot's logger with a no-op, (b) hooking libc's memcpy with a NULL guard (overhead on every frame), or (c) solving the TLS/thread-registration mismatch so the logger stops hitting NULL pool pointers.
+- None of those give us meaningful asset-capture progress beyond what we already have (445 textures, 58 shaders, 1 DMD frame, 66–188 s audio across runs).
+- Parking it. If we need to push past later, register dump from the SIGSEGV handler is the cheap diagnostic to try first.
+
+## Step 32: System UI architecture discovered — NUK = Nuklear, service_s_worker = Service S daemon (2026-04-19)
+
+Pivot away from live emulation to static investigation of the non-Radium pieces of the platform. User flagged that the interesting understanding is in `/lcd` (Radium) and `/nuk` (Spike 3 system UI). Started with `/nuk` because it has less of a chance of duplicating existing `_extraction/` work.
+
+### 32.1: NUK is Nuklear
+
+`assets/nuk/` is **[Nuklear](https://github.com/Immediate-Mode-UI/Nuklear)** — the open-source single-header immediate-mode C UI library. Confirmed by C++ mangled class names in the main game binary:
+
+- `12NuklearLayer`
+- `12NuklearScene`
+- `16NuklearDialogBox`
+
+Plus `nk_spi_system` (Stern's custom Nuklear input backend — almost certainly maps flipper/start/action buttons to Nuklear navigation) and the full `NK_COLOR_*` style-enum set that Nuklear exposes.
+
+Nuklear is a tiny single-header library, so most `nk_*` API functions get inlined away by the compiler — we only see one `nk_*` literal string (`nk_spi_system`). But it's definitively Nuklear: the class naming + the NK_COLOR enum set + the asset layout (fonts + image sheets organised as UI-widget art) are all diagnostic.
+
+**What Nuklear actually renders in this game:**
+
+- Boot splash (`assets/nuk/images/System/Spike3_Boot/Spike3_logo.png`)
+- Test-mode diagnostic menus (16 PNG illustrations in `assets/nuk/images/System/TestMode/` — cabinets, speaker panels, shaker motor, headphone kit, plumb-bob, slam-tilt, CPU board from manual, etc.)
+- Coil/switch-test overlays (3 PNGs in `assets/nuk/images/Test/` — pokemon_playfield_le, pokemon_playfield_pro, pokemon_backpanel_scaled)
+- Additional service UI. [Redacted: identifying asset paths and feature inventory.]
+
+**Fonts** (`assets/nuk/fonts/`): `Hack-Regular.ttf` (mono/debug console), `Stern_FjallaOne.ttf` + `_MONONUMBERS.ttf` (branded display font), `Stern_WorkSans.ttf` + `_Bold.ttf` (branded UI body).
+
+**Retroactive link to Step-27 captures:** The 79 × `256×256 fmt=0x190a (LUMINANCE_ALPHA) type=0x1401 (UNSIGNED_BYTE)` texture uploads at the tail of `_emulation/textures/` are almost certainly Nuklear's font-glyph atlases rasterized from the above TTFs — LA@256×256 is Nuklear's classic glyph-grid shape.
+
+### 32.2: Three coexisting UI/render layers in one binary
+
+The main `game` binary is a fat ELF hosting **three** distinct UI/render frameworks simultaneously:
+
+| Layer | What it draws | How it integrates |
+|---|---|---|
+| **Godot 4.4.1** | Pokemon battle/discover/capture/Pokedex scenes, menus driven by `tscn` scene graphs | Game engine; owns main window; loads resources from `main.pck` via `res://`; [Redacted: service-specific class names.] |
+| **Radium** (Stern proprietary) | Pinball scene rendering, DMD frames, animation playback, LCD/auto-loaded scenes from `assets/lcd/` | Statically linked into the game binary; integrates with Godot via `ManualGodotScene` (vtable at game `0x04630230`) and probably a custom `AnimationPlayer` subclass (see `project_animation_player_gap.md`). Scene bytecode format documented in `_extraction/README.md` |
+| **Nuklear** (NUK) | System boot, test mode, Service S login/QR/avatars/achievements | Statically linked; Stern wraps it in `NuklearLayer` / `NuklearScene` / `NuklearDialogBox`; `nk_spi_system` custom input backend |
+
+**Open architectural question, flagged for BN dig:** How exactly does `NuklearLayer` / `NuklearScene` hook into the render pipeline — does it render onto Godot's main canvas as a `CanvasLayer` or `Control` node, does it render to its own framebuffer that gets composited, or does it target a different display surface entirely (secondary LCD / HDMI)? Knowing which determines a lot:
+
+- If Nuklear draws onto Godot's main canvas → same GLES pipeline we already capture via the shim → Nuklear frames show up in `_emulation/textures/` captures as a byproduct.
+- If Nuklear draws to a separate framebuffer / secondary display → there's another output path we haven't instrumented.
+
+### 32.3: Separate service process
+
+> [Redacted: service-specific endpoints, authentication details, identifying
+> strings, process-control commands and feature inventories.]
+
+The investigation identified a separate service process and considered whether
+the game's initialization depended on it. That dependency was a hypothesis,
+not an established explanation of the rendering failure.
+
+### 32.4: Explicit future-work item — NuklearLayer/Scene → render pipeline via BN
+
+**Next time we're in BN:**
+
+1. Find the ctors / vtables of `NuklearLayer`, `NuklearScene`, `NuklearDialogBox`. The mangled names are `_ZN12NuklearLayer…`, `_ZN12NuklearScene…`, `_ZN16NuklearDialogBox…`. BN's symbol table should demangle automatically or we can grep the string table.
+2. From the ctor, trace:
+   - Where it's instantiated (who `new NuklearLayer()`s it) — that's the framework owner.
+   - What display surface it targets (EGL surface? Godot Viewport? A raw framebuffer?).
+   - The render method: is it a `NuklearLayer::render()` that walks Nuklear's command list and emits GLES calls, or does it go through a Godot `CanvasLayer::_draw()` hook?
+3. Also hunt `nk_spi_system`: find its usage to understand the pinball-button → Nuklear-input mapping (what button navigates up/down, what selects, etc.).
+4. Cross-reference the 79 × 256×256 LA captured textures against Nuklear's font atlas format to confirm our retroactive-link hypothesis.
+
+Expected outcome: a one-paragraph architecture sketch of how Nuklear frames end up on pixels, so we know whether our existing shim captures them as a byproduct or whether there's a separate output path we haven't instrumented.
+
+### 32.5: Pivot — now digging into `/lcd/` (Radium)
+
+With NUK architecturally understood, moving to `assets/lcd/` — Radium scenes. User's stated primary interest. Existing references available:
+
+- `Reference tool A` tool at `[REFERENCE_TOOL_A]/` (outside repo) — with `reference-player.py` and `convert_radium.sh` for JSON conversion
+- `_extraction/README.md` — image.bin scene bytecode format, section 5 offset table, `ManualGodotScene` vtable reference
+- `_extraction/CLAUDE.md` — loader call chain (`select_and_load_scene → load_image_bin_file → get_image_section_ptr → get_asset_by_id → load_scene_assets → initialize_scene_asset`)
+- External observations on asset containers and an audio-encryption hypothesis. [Redacted: private source identities, paths and wording.]
+
+Step 33+ will cover that work.
+
+## Step 33: Radium scene format — decoded structure, display layout, integration model (2026-04-19)
+
+### 33.1: Scope of `/lcd/`
+
+- 1.015 GB total. Sub-repo (has its own `.git`).
+- **21 scenes in `auto_loaded/`, 15 scenes in `demand_loaded/`** — 36 total.
+- Each scene in a SHA-1-named directory containing `scene.radium` (binary) + `scene.radium.json` (Reference tool A decoded output) + optional `scene.assets/` tree for heavy external media (2 scenes use this).
+- Size range: 85 bytes (empty stub) → 81 MB (largest attract scene with embedded video).
+- `Reference tool A` at `[REFERENCE_TOOL_A]/` is the existing decoder (Researcher A, blackbox RE + decomp-backed).
+
+### 33.2: Scene-graph object taxonomy (all 36 scenes)
+
+The `.radium` binary decodes to a Flash/SWF-style structured object graph:
+
+```
+FrameSize (Right, Bottom)  +  FrameRate  +  BackgroundColor[4]
+Dictionary of Characters (each has Id, optional Name)
+  └── polymorphic types:
+      Font (FontName, Bold, Italic, Characters[codepoints])
+      Text (Text, Font ref, Bounds, Color, Alignment, LineSpacing…)
+      Sprite (FrameCount, Elements[keyframed])
+      Bitmap (Dimensions, Image { Format, Buffer })
+      Shape (Rectangle, Bitmap)
+      Video (Dimensions, FrameCount, Buffer{NAMED_SLOTS})
+```
+
+Counts across all 36 scenes: **29 Font, 29 Text, 28 Sprite, 11 Bitmap, 7 Shape, 2 Video**. Scenes are mostly text+sprites; bitmaps and videos are relatively rare.
+
+**Animation model** (Sprite.Elements[]): each Element has `Visible` (keyframes of bool), `ColorTransform` (keyframes), `Transform` (keyframes of **Matrix4x4**). Flash-style timeline semantics — no skeletal rigging. The Matrix4x4 allows 3D transforms even in 2D LCD scenes.
+
+### 33.3: Display resolution distribution
+
+FrameSize values across the 36 scenes:
+
+- **1360 × 768** — 22 scenes (WXGA; most common; likely the primary LCD playfield panel)
+- **1920 × 1080** — 12 scenes (FHD backbox HDMI)
+- **800 × 480** — 1 scene (matches `games/spike3/bin/SternLogo_800x480.png` — probably the boot-splash Radium wrapper)
+- **454 × 256** — 1 scene (near the 1024×256 DMD we've been capturing; possibly a different small LCD or mini-DMD surface)
+
+So the platform has at least **3 distinct display surfaces** targeted by Radium: main backbox (1920×1080), playfield LCD (1360×768), and a small LCD/DMD (454×256 or 1024×256). Plus the boot-splash-specific 800×480.
+
+### 33.4: Content-addressed scene lookup — proven
+
+Tested three scene SHA-1s against the main game binary with `strings -n 40`:
+
+- `18dad27e209b169855855422f6578e527adbb5cf` → 1 hit
+- `6cd5668f1f8189d6aa5e79203f12a0d0a4c90038` → 1 hit
+- `bc0792d8dc81e8aa30b987246a5ce97c40cd6833` → 8 hits
+
+Plus the path prefixes `/lcd/auto_loaded` and `/lcd/demand_loaded` both appear in the game binary. So the game resolves "scene X" → SHA-1 → `/lcd/{auto,demand}_loaded/<SHA-1>/scene.radium`. This is a **content-addressed store** — the SHA-1 is probably of the original build-side path (Stern's internal scene naming), making the SD-card layout reproducible across builds without leaking internal paths.
+
+**Corollary**: we can grep the game binary for each scene SHA-1 to find the callsite that loads it, which will identify what gameplay mode each scene corresponds to (attract / battle / Pokédex / capture / menu). This is a concrete next-step if we want to map all 36 scenes to functions.
+
+### 33.5: Asset-buffer storage
+
+Within `Bitmap.Image.Buffer` and `Video.Buffer[NAME]`:
+
+- **External path**: `"FileName": "<N>.asset/<M>.asset"` — points into the scene's `scene.assets/` subtree for large blobs. Seen in 2 scenes (the compound ones), where e.g. `ATTRACT_LOOP1` → `2.asset/0.asset` (3 MB of video).
+- **Inline blob**: `FileName: ""`, `Buffer` contains raw bytes inline in the `.radium` binary. Reference tool A dumps these to `/tmp/blob_*.bin` when converting to JSON (the JSON references them via `"_ref": "/tmp/blob_*.bin"`).
+- Either way, a `Length` field gives the byte count.
+
+**Attract-mode video scene** (`auto_loaded/bc0792d8.../45a4e8c6.../`): has a Video object named `video.in_attract_videos` with 6+ buffer slots like `ATTRACT_LOOP1`, `ATTRACT_LOOP1_BW`, `ATTRACT_LOOP2`, `ATTRACT_LOOP2_BW`, `ATTRACT_LOOP3`, each → a `.asset` file. The `_BW` suffix is almost certainly **monochrome versions** of each loop for the DMD/low-color display.
+
+### 33.6: Integration with Godot + Radium render pipeline (mental model, not yet verified in BN)
+
+- `ManualGodotScene` (vtable at game VA `0x04630230`, per `_extraction/README.md`) wraps a Radium scene as a Godot Node.
+- `initialize_scene_asset` (pseudo-C in `_extraction/`) is the entry point: scene ID → mmap'd image.bin bytes / `/lcd/*/scene.radium` → `ManualGodotScene` → Godot's scene tree.
+- Godot's `_process(dt)` tick advances Radium's animation by dt (updates the keyframe state per Element), and Radium's renderer emits GLES 3.x draw calls — the 58 GLSL shaders captured in Step 27/30 are what Radium uses to composite Text/Sprite/Bitmap/Shape onto GL.
+- The LCD DMD (1024×256 ABGR8888) we captured in Step 25 is rendered by a different Radium path (the `DMDEmulationScene` from Step 23) — this is Radium-for-DMD, rendering at the small resolution. The 454×256 Radium scene found here may feed that.
+
+### 33.7: Open questions / next-sessions threads
+
+1. **Which scene is which gameplay mode?** Grep each of the 36 SHA-1s in the game binary, identify enclosing functions in BN, name each scene.
+2. **The `_BW` variants** — confirm whether they're DMD-specific (renderer picks based on display target).
+3. **`Format` integer in Bitmap.Image** — seen values 4 and 5. Need to map these to pixel formats (RGBA8, RGB8, etc.) from the Radium decoder source.
+4. **How does `ManualGodotScene` actually tick and render?** BN dig — same expected scope as the Nuklear question (Step 32.4).
+5. **What does `454 × 256` mean** — is that a third LCD panel, or a rendering intermediate?
+
+### 33.8: Proven-fact additions for PROTOCOL
+
+- Radium scene layout, object taxonomy, FrameSize distribution, content-addressed SHA-1 lookup.
+
+## Step 34: Every Radium scene classified — each SHA-1 to a role (2026-04-19)
+
+### 34.1: Method
+
+Wrote `/tmp/radium_xref/analyze.py`. For each of the 36 `scene.radium` files:
+
+1. Decoded Reference tool A JSON → pulled `FrameSize`, `FrameRate`, object-type counts, `Character.Name` values, `Sprite.Element.Name` values, sample `Text.Text` strings, `Font.FontName`s, `Video.Buffer` slot names, and all external `FileName` refs.
+2. `grep -abo <SHA-1> game` to find all literal byte-offset occurrences of the scene's directory-name hash in the game binary.
+3. Dumped a ±320 byte rodata window around each occurrence, stripped other SHA-1-looking 40-hex strings, and recorded the first printable runs ≥ 6 chars as "nearby strings" context.
+4. Combined scene-internal content + binary-adjacent context to classify each scene's purpose.
+
+35 of 36 SHA-1s appear as literal strings in the game binary (1 occurrence each for most; 8 occurrences for `bc0792d8…` — the attract/system parent). 5 scenes have zero literal-string hits, likely referenced indirectly (nested under `bc0792d8…` and loaded by composition from the parent, or enumerated at runtime from the directory listing).
+
+**Major additional discovery**: found the Godot scene-load callsite at BN VA `0x3a07cb0` / file offset `56655024`, which contains the game's core scene table:
+
+```
+res://scenes/info.tscn
+./assets/godot/main.pck
+res://scenes/discover/discover.tscn
+res://scenes/capture_battle/capture_battle.tscn
+res://scenes/pokemon_battle/pokemon_battle.tscn
+discover_scene
+capture_scene
+battle_scene
+null_scene
+```
+
+So the game has 3 core gameplay Godot scenes (discover / capture_battle / pokemon_battle, matching the Godot previs tool's Ctrl+D / Ctrl+C / Ctrl+B hotkeys), an `info` scene, and a `null_scene` placeholder. Two of the demand-loaded Radium scenes (`cb8a8ab3…` under auto and nested under `bc0792d8…`) are referenced right next to this list — they are the **Radium overlays bound to the `info` Godot scene**.
+
+### 34.2: The `bc0792d8…` parent — attract/system/setup package
+
+The `bc0792d8dc81e8aa30b987246a5ce97c40cd6833` directory name appears **8 times** in the binary, in contexts clearly identifying it as the **platform/attract bundle**:
+
+| BN VA | Nearby strings | Role |
+|---|---|---|
+| `0x3a0cf78` / `0x3a0cfd8` | Connectivity/Login/LoginTopAA, Icons/Coin/Coin%04d, LoadingDots, AchievementVerified, JUKEBOX_LOOP{1..6} | Service S attract UI + jukebox |
+| `0x3a0d788` | Grand Champion Reset, High Scores Reset, Reset Audits, Reset Volumes, INPUT=%s/GROUND=%s | Service-menu reset confirmations |
+| `0x3a0dea8` | wpa_supplicant, udhcpc.pid, MAC-address format, score_average, player_scores | Network + score tracking |
+| `0x3a0e040` | NetInterlockSwitchOverlay, "Game Code v%d.%d.%d Is Out Of Date", "Update To v%d.%d.%d Or Newer", sternpinball.com | Out-of-date warning screen |
+| `0x3a14ef8` / `0x3a14f80` | spike3_logo_layer, System/Spike3_Boot/Spike3_logo, Version, ProgressBar, NoProgressBar, NetPressStartOverlay | Boot + logo + progress bar |
+| `0x3a17c28` | current/peak/avg coil stats, "NODE %2d", part/serial numbers, "# DIAGNOSTICS", ReplayFourLevels | Node diagnostics + replay info |
+
+So `bc0792d8…` is the **single compound scene-group** that bundles everything a pinball machine shows when it's NOT playing a game: boot progress, credits, attract videos, Service S login/icons/jukebox, update warnings, service-menu confirmations, network status, node diagnostics, replay levels.
+
+### 34.3: Full scene classification table
+
+**Auto-loaded (21) — always resident in memory:**
+
+| # | SHA-1 prefix | Size | Frame | Purpose (confidence) |
+|---|---|---:|---|---|
+| 1 | `18dad27e…` | 81 MB | 1920×1080 | **Main HUD frame** (Pokeball counter, NetScoreFrame, DoubleScoring overlay) |
+| 2 | `4d963cfa…` | 1.6 MB | 1920×1080 | End-of-ball "Total =" overlay |
+| 3 | `5d8400b9…` | 2.7 MB | 1920×1080 | Team overlay panel (slide-in) |
+| 4 | `60ed7e50…` | 21 KB | 1920×1080 @12fps | **Master in-game video dictionary** — 220+ named H.265 video buffers (PK_BGPattern_*, PK_Bulbasaur*_Award*, PK_Pikachu*_* mode videos, PK_TeamRocket*, PK_Match_00..90, PK_Tilt, PK_Replay, PK_BallSave, PK_SkillShot, etc.) |
+| 5 | `6a22f74b…` | 4.7 MB | 1360×768 | MODE NAME TOTAL (9 TextValues for mode-complete totals) |
+| 6 | `6b877640…` | 2.3 MB | 1360×768 | MODE TITLE banner |
+| 7 | `6cd5668f…` | 85 B | 1360×768 | Empty stub — probably the "null_scene" placeholder from the Godot list |
+| 8 | `7949bb14…` | 4.7 MB | 1360×768 | AWARD TITLE + TextValue1 |
+| 9 | `84907e57…` | 2.4 MB | 1360×768 | 9-line dev/test panel ("MON LE DEV", "Feb 12, 2026", "pokemon_le" nearby) |
+| 10 | `856d8afd…` | 970 KB | 1920×1080 | Score/timer text overlay (Stern_Impact, Timer_BG_Instance) |
+| 11 | `97cc9ed7…` | 18 MB | 1920×1080 | Alt main HUD layer (Bitmap+Sprite; DoubleScoring + PokeballCounter) |
+| 12 | `9d578751…` | 4 MB | 1920×1080 | Inactive player / multiplayer overlay ("Inactive Player", LightningIcon, WaterIcon) |
+| 13 | `a7786498…` | 4.9 MB | 1920×1080 | Multiplayer team/mode overlay ("LINE 1"; TeamRocket + SkillShot refs nearby) |
+| 14 | `aa681fbf…` | 134 KB | 1360×768 | DANGER 2-line popup (Match screens 00-70 nearby) |
+| 15 | `b466d6b7…` | 561 KB | **454×256** | **Small-display scene** — Pokeballs_Textbox nearby; this is the third LCD surface (likely a speaker panel or lockbar LCD) |
+| 16 | `c0f85d66…` | 2.4 MB | 1360×768 | AWARD VALUE (sister of #8; 0 direct xrefs — loaded via parent) |
+| 17 | `c6e8a05a…` | 8.3 MB | 1920×1080 | Score formatting w/ Text_Score element ("10-K" shorthand) |
+| 18 | `cab00277…` | 173 KB | 1360×768 | Debug-line overlay ("DEBUG LINE", Stern_FranklinGothDemiIt) |
+| 19 | `cac32730…` | 11 MB | 1920×1080 | Squirtle-mode-specific layer ("Squirtle 02" text, BallText) |
+| 20 | `cbe7806d…` | 4.7 MB | 1360×768 | Service-menu mode title ("Meowth Balloon Test", "Press Enter to Test", "Poke Ball Mechanism" nearby) |
+| 21 | `45a4e8c6…` (in `bc0792d8…/`) | 1.6 KB | 1360×768 @12fps | **Attract video dictionary** — ATTRACT_LOOP1..3 + _BW variants, ATTRACT_LOOP_SERVICE_S, JUKEBOX_LOOP1..6, Pattern. `video.in_attract_videos` Character |
+
+**Demand-loaded (15) — loaded on use:**
+
+| # | SHA-1 prefix | Size | Frame | Purpose (confidence) |
+|---|---|---:|---|---|
+| 22 | `2533b0a1…` | 2.4 MB | 1360×768 | AWARD TITLE (variant of #8 for demand mode) |
+| 23 | `394c4a03…` | 8.3 MB | 1920×1080 | **Instant Info** screen (107 chars; "Title/Line1/Line2"; Magikarp Topper Tests + GameScoresInfoLine* nearby) |
+| 24 | `3fdc91b3…` | 139 KB | **800×480** | Small-screen "LINE 1" — matches `SternLogo_800x480.png` dims; probably boot-splash Radium wrapper (0 direct xrefs) |
+| 25 | `cb8a8ab3…` (top-level) | 6.1 MB | 1920×1080 @24fps | **Info-scene overlay** (`res://scenes/info.tscn`; timer_text="15"; 15s countdown timer) |
+| 26 | `036fe928…` (in `bc0792d8…/`) | 512 KB | 1360×768 @24fps | **Boot screen with ProgressBar** ("spike3_logo_layer", "System/Spike3_Boot/Spike3_logo", Version, ProgressBar, GAME NAME) |
+| 27 | `0d349f5f…` (in `bc0792d8…/`) | 852 KB | 1360×768 @60fps | Credits display ("Credits 50"; 0 direct xrefs — loaded via parent) |
+| 28 | `1e3687a3…` (in `bc0792d8…/`) | 928 KB | 1360×768 | Service S overlay (Checkmark/ScanQR/Stopwatch/AchievementVerified icons; JUKEBOX_LOOP1 nearby) |
+| 29 | `417f7495…` (in `bc0792d8…/`) | 342 KB | 1360×768 @60fps | "www.sternpinball.com" marketing screen (0 direct xrefs) |
+| 30 | `74d01d82…` (in `bc0792d8…/`) | 512 KB | 1360×768 @24fps | Boot variant (GAME NAME + ProgressBar, CBOR/msgpack decoder strings nearby — likely the resource-bundle decoder's init screen) |
+| 31 | `7b15d22d…` (in `bc0792d8…/`) | 2.3 MB | 1360×768 @24fps | Network/score timer (wpa_supplicant, udhcpc.pid, score_average nearby) |
+| 32 | `a4e06cdd…` (in `bc0792d8…/`) | 272 KB | 1360×768 @24fps | **Out-of-date / update-required screen** ("Game Code Is Out Of Date", "Update To vX.Y.Z Or Newer", "Available at sternpinball.com", STERN_RussoOne font) |
+| 33 | `cb8a8ab3…` (in `bc0792d8…/`) | 2.5 MB | 1360×768 @24fps | Info scene for attract variant (same SHA as #25, different wrapper) |
+| 34 | `d1a2f117…` (in `bc0792d8…/`) | 527 KB | 1360×768 | Shape-only scene (0 xrefs; probably an animation mask or transition frame) |
+| 35 | `f1e5baf5…` (in `bc0792d8…/`) | 271 KB | 1360×768 @60fps | **System-settings warnings** ("CLOCK NOT SET", Grand Champion Reset, Reset Audits, Reset Volumes) |
+| 36 | `ffa461e7…` (in `bc0792d8…/`) | 803 KB | 1360×768 @60fps | **Node diagnostics + replay levels** (ReplayLevel1Text, "999,999,999,999", NODE #X version/part/serial, "# DIAGNOSTICS") |
+
+### 34.4: What the 454×256 and 800×480 scenes probably are
+
+- **`b466d6b7…` at 454×256** (auto-loaded): Only 3 chars (Bitmap + Sprite), nearby strings mention `Textboxes.Pokeballs.Textbox_Name` and `Pokedex-EOR-Done`. Likely the **speaker-panel / lockbar mini-LCD** showing the pokeball counter. 454×256 is an unusual size that suggests a secondary custom panel rather than the main LCD or DMD.
+- **`3fdc91b3…` at 800×480** (demand-loaded, 0 xrefs): Frame size matches exactly the `SternLogo_800x480.png` boot image. Probably wraps the Stern boot logo as a Radium scene for compositing onto a small/medium display. Zero direct xrefs is consistent with a "loaded once at very early boot and then discarded" usage pattern.
+
+### 34.5: Scenes with zero SHA-1 xrefs (5)
+
+`c0f85d66…`, `3fdc91b3…`, `0d349f5f…`, `417f7495…`, `d1a2f117…`.
+
+All 5 are **either nested under `bc0792d8…` (4 of them) or match an obvious sibling-load pattern** (AWARD VALUE loaded alongside AWARD TITLE):
+
+- 4 of 5 are in the `bc0792d8…` package. The game loads the parent, and the parent scene's own bytecode (or a directory-listing walk) enumerates the children.
+- `c0f85d66…` (AWARD VALUE) is almost certainly loaded in tandem with `7949bb14…` (AWARD TITLE) by a common wrapper.
+
+No "dead" scenes in our data — the SHA-1-xref-zero set has a benign explanation. (Binary-encoded SHA-1 lookups would confirm this but aren't load-bearing right now.)
+
+### 34.6: Fonts inventory (across all scenes)
+
+Distinct FontName values observed in the `Font` objects:
+
+- `Stern_Impact` — dominant for score/HUD text (Scenes 2, 10, 11, 12, 14, 17, 19) — Stern's branded impact-style face.
+- `Stern_GoldenSmile` — used for MODE/AWARD titles and panels (5, 6, 7, 8, 9, 13, 16, 20, 21, 22, 23, 24) — game-mode display font.
+- `Stern_FranklinGothDemiIt` — debug overlay (18).
+- `STERN_RussoOne` — update-required screen (32).
+- `HelveticaNeueBlack` — demand/system scenes (27, 29, 31, 33, 35, 36) — generic system face.
+- `Bitstream Vera Sans` — boot/progress scenes (26, 28, 30) — early-boot fallback before branded fonts are ready.
+
+The fonts in `assets/nuk/fonts/` (Hack-Regular, Stern_FjallaOne, Stern_WorkSans) are **disjoint** from these Radium fonts — confirms Radium and Nuklear draw text through different font pipelines, as expected (different render backends for different display surfaces).
+
+### 34.7: Takeaways and follow-ups
+
+- The game has **~4 display surfaces** touched by Radium scenes: **1920×1080** (backbox HDMI — main gameplay), **1360×768** (playfield/card LCD — modes/awards/system screens), **800×480** (boot-splash-sized display), **454×256** (speaker-panel/lockbar mini LCD). The DMD at 1024×256 captured by the shim may be yet another surface, or the 454×256 panel scaled up. BN dig on `ManualGodotScene` ctor + the display-target argument would resolve which scene drives which surface.
+- The Godot scene side is clean: `discover`, `capture_battle`, `pokemon_battle`, `info`, `null_scene`. These map to the **gameplay modes** visible in the previs project (Ctrl+D, Ctrl+C, Ctrl+B).
+- The Radium side handles **overlays, HUDs, attract, system, and boot** — it's the "frame around the Godot game" in all directions (score HUD over the top, boot/attract/system below).
+- Next concrete BN tasks (parked for future session):
+  1. Find the function that maps scene-SHA-1 → display surface. Near the BN VA `0x3a0d001` (string: `bc0792d8…/1e3687a305fa…`) we can read assembly and back-track.
+  2. Open `ManualGodotScene` ctor / methods to see how a Radium scene wraps as a Godot Node and how dt advances.
+  3. Reconstruct the full scene-event graph — which gameplay mode loads which Radium overlay, when. Binding clues: the `PokeballCounter01_Instance` and `NetScoreFrameOverlay` names show up in rodata alongside the HUD scene SHA-1s, which means the game code binds to those by name at runtime.
+- The analysis script (`/tmp/radium_xref/analyze.py`) is reusable — if the user wants a persistent copy, it can be moved into the repo (`_extraction/tools/` or similar).
+
+## Step 35: Binding index — which function binds which Radium scene, via rodata clustering (2026-04-19)
+
+Goal: identify, per Radium scene, the **C++ function in the game binary** that loads it and walks its element tree. The technique is binding-path clustering:
+
+- When a C++ function calls `scene.get_node("A.B.C")` etc., the compiler emits the literal string `"A.B.C"` into rodata near the function's own rodata (typically adjacent to the function's local string constants).
+- Functions that bind many elements of a scene produce a **cluster of PascalCase-dotted strings** at adjacent rodata offsets.
+- Scene SHA-1 strings sit in rodata too — usually right next to the binding cluster that owns that scene, because the same function loads the scene and then walks it.
+
+So: cluster the binary's rodata "A.B.C" strings by offset proximity; locate the nearest scene SHA-1(s) to each cluster; output is a function⇄scene⇄element-vocabulary graph.
+
+### 35.1: Method
+
+Scripts preserved at `games/pokemon_le/_extraction/tools/`:
+
+- `radium_scene_xref.py` — per-scene binary-occurrence analysis (Step 34).
+- `radium_bindings.py` — builds a binding index from all 407 diagnostic scene element-names (Step 35).
+- `radium_rodata_clusters.py` — finds dotted-path string clusters by offset proximity (≥3 strings, gap ≤ 400 bytes).
+- `radium_mode_xref.py` — exploratory pass for `res://scenes/*.tscn` callsites (proved they're all in one static scene-registry table, so not distinguishing).
+
+Key finding: the four `res://scenes/{info,discover,capture_battle,pokemon_battle}.tscn` strings are in ONE rodata table at BN VA `0x3a07c68…0x3a07d20` — a static **scene-registry table** the game uses for mode dispatch. They do NOT individually cluster with different HUD vocabularies. So mode→overlay mapping is NOT "direct callsite" — the binding is dynamic based on which registry entry is active.
+
+### 35.2: The 6 Radium binding clusters (filtered from 20 total — the other 14 are Godot engine internals)
+
+| # | BN VA range | #paths | Dominant prefixes | Adjacent scene SHA-1(s) (offset) | Inferred purpose |
+|---|---|---:|---|---|---|
+| **1** | `0x3a0aa50–0x3a0bf68` | **75** | `Team_Overlay_Instance`, `Player{1-4}_Instance`, `Match_Instance`, `Panel_{Left,Right,Bottom}_Instance`, `BallAndCredits_Instance` | **18dad27e** (56672296 — inside cluster), **97cc9ed7** (56672232 — inside), **9d578751** (56667352 — inside), **cac32730** (56666456 — inside), **c6e8a05a** (56666504 — inside), **856d8afd** (56666632 — inside), **5d8400b9** (56667080 — inside), **a7786498** (56666032 — inside), **cab00277** (56666400 — inside) | **Main-gameplay HUD binding function**: 1920×1080 backbox overlays — per-player active/inactive scores for 1-4 players, Match digits, Team Overlay panel, Panel_{Left,Right,Bottom} sliding title boards, BallAndCredits, DEBUG overlay, Squirtle mode layer, Score formatting. Binds ALL these HUD scenes in one function. |
+| **2** | `0x3a05e80–0x3a06950` | **40** | `TeamScoresInstance` (36), `CreditsAndPricing` (2), `CustomMessageInstance` (1) | **394c4a03** (56647232 — at cluster start) | **Instant Info binding function**: co-op team-score display (GC + HS1..HS4 frames × Name1..Name4 + Score/PlayerId), plus credits/pricing info, plus "Custom Message" admin overlay. Matches scene `394c4a03` (Instant Info, 107 chars). |
+| **3** | `0x3a06f18–0x3a073c8` | **28** | `Text` (10 — `.TextTitle`, `.TextValue0..8`), `Textboxes.{Pokeballs,Berries,PokemonCaught}` (13 — `.Textbox_{Count,Score,Name}`), `grand_champion` (3 — `.PageTitle`, `.PlayerId`, `.PlayerScore`), `CreditsAddCredits` | **6cd5668f** (56651968 — inside), **6a22f74b** (56652224 — inside), **6b877640** (56652176 — inside), **7949bb14** (56651896 — inside), **b466d6b7** (56653056 — at tail) | **End-of-mode / results / award binding function**: walks MODE TITLE + MODE NAME TOTAL + AWARD TITLE + AWARD VALUE + end-of-ball totals, drives Textbox widgets for PokemonCaught / Berries / Pokeballs on the **454×256 mini-LCD** (`b466d6b7`), plus grand_champion entry. Also binds CreditsAddCredits for the "Add Credits" dialog. |
+| **7** | `0x3a17d30–0x3a17dc8` | 5 | `ReplayFourLevels` only | **ffa461e7** (56720465 — just before) | **Replay-levels display binding**: four replay thresholds + ReplayAtText. Matches scene `ffa461e7` (Node diag + replay levels). |
+| **12** | `0x3a15ae0–0x3a15b10` | 4 | `icon` only (`.name`, `.file_name`, `.icon_url`, `.file_checksum`) | — | **Icon metadata binding**: probably Service S avatar/icon management — downloads remote icons with checksums. Independent of Radium scenes per se. |
+| **15** | `0x3a07df0–0x3a07ee0` | 3 | `LettersPalette.cursor`, `LettersPalette.LetterPaletteLetters.LetterPaletteText`, `timer_text.timer_text` | **cb8a8ab3** (56655280 — just before) | **Info scene binding**: the LettersPalette high-score initial-entry widget + 15-sec countdown timer. Matches scene `cb8a8ab3` (info.tscn overlay). |
+
+The remaining 14 clusters in the binary's dotted-path universe are all **Godot engine internals**: shader uniforms (`scene_data.*`, `canvas_data.*`, `params.*`, `world.xyz`, `FRAME.*`, `PARTICLE.*`), Vulkan pipeline state (`p_depth_stencil_state.*`, `p_rasterization_state.*`, `p_blend_state.*`, `p_state.*`, `p_view.swizzle_*`), Godot's MacOS-keymap input actions (`ui_text_*.macos`), Godot asset-manifest strings (`icon.{png,svg}`, `logo.{png,svg}`, `godot.{editor,properties,documentation}`), remote/marketing URLs (`google.com`, `api.sternpinball.io`, `iop.spidevx.com`, `iop.strndev.com`), Texture2d source-file strings (logger identifiers), and shader outputs (`COLOR.rgb`, `LIGHT.rgb`, `SHADOW_MODULATE.rgb`). None of these touch Radium scene elements.
+
+### 35.3: Implications for mode→overlay mapping
+
+The clusters tell us **which C++ binding function covers which Radium scenes**, but they do NOT directly map to which **gameplay mode** (discover/capture/battle/attract) activates them. Reasoning about mode→overlay:
+
+- **All 9 HUD scenes in Cluster 1 share a single binding function**. This is the "main HUD" — used by ALL gameplay modes (discover, capture, battle). Mode-specific content comes via the video dictionary (`60ed7e50`, 220+ named loops) and dynamically-swapped scene layers per mode (e.g., `cac32730` = Squirtle-mode-specific layer).
+- **Instant Info (Cluster 2 / scene 394c4a03)** is a mode-agnostic overlay — `res://scenes/info.tscn` loadable from any gameplay mode. The binding function pulls team scores, credits/pricing, and admin custom messages.
+- **End-of-mode panels (Cluster 3)** are driven by a single binding that walks multiple scenes in sequence during the award/total sequence. The `Textboxes.Pokeballs|Berries|PokemonCaught` paths indicate these are pinball-specific collection widgets (caught Pokémon counter, berries counter, pokeballs counter) — likely shown on the 454×256 mini-LCD (speaker panel or lockbar).
+- **Info scene overlay (Cluster 15 / scene cb8a8ab3)**: LettersPalette indicates Stern's traditional Flash-era initial-entry screen ("enter your initials"). Only appears after high-score achievement.
+- **Replay display (Cluster 7 / scene ffa461e7)** is the `ReplayAt / ReplayLevel1-4` overlay — shown after a game ends to display the player's replay thresholds.
+
+### 35.4: What each gameplay mode touches (inferred)
+
+| Mode | Godot scene | Radium overlays bound (bindings cluster) |
+|---|---|---|
+| attract / boot / idle | (none — Godot idle) | `bc0792d8…` package (11 scenes: boot/credits/jukebox/Service S/update/reset/diag/replay), `45a4e8c6` attract video dict, `60ed7e50` in-game video dict (kept loaded) |
+| **discover** | `discover.tscn` | Main HUD Cluster 1 (9 HUD scenes), `60ed7e50` video dict, end-of-mode Cluster 3 scenes on level completion |
+| **capture** | `capture_battle.tscn` | Same Main HUD Cluster 1, different video loops from `60ed7e50`, different mode-specific overlay layer |
+| **battle** | `pokemon_battle.tscn` | Same Main HUD Cluster 1, `cac32730` Squirtle-specific layer possibly, `60ed7e50` battle-videos |
+| info overlay | `info.tscn` | `cb8a8ab3` Info scene + Cluster 15 LettersPalette (for high-score initial entry) |
+| end-of-game | — | Cluster 3 end-of-mode panels + `ffa461e7` replay display + `cb8a8ab3` initial entry (if achieved) |
+| service menu | — | `f1e5baf5` (reset warnings), `a4e06cdd` (out-of-date), `cab00277` (DEBUG), `ffa461e7` (diag) |
+
+### 35.5: Open threads for BN-assisted follow-up (deferred)
+
+1. **Identify the binding functions by entry point**. Each cluster's rodata strings are loaded by `adrp + add` from within one or a small number of functions. Disassembling `.text` around the function-prologue closest to each cluster's first string gives the binding function's entry-point VA. With BN we could confirm the function signatures (e.g., `bind_main_hud(Scene& s)`, `bind_endofmode_panels(Scene& s)`, `bind_info_overlay(Scene& s, ...)`).
+2. **Find the mode-dispatch table entries** that call each binding function. The scene-registry at BN VA `0x3a07c68…0x3a07d20` (`null_scene`/`discover_scene`/`capture_scene`/`battle_scene`/`info.tscn`) probably has callback pointers immediately adjacent, pointing at the per-mode initializer functions.
+3. **Map the 220+ `PK_*` video names in `60ed7e50`** (master in-game video dictionary) to per-mode subsets. The game code likely has per-mode `const char*[] mode_videos = {"PK_Bulbasaur1_Start", "PK_Bulbasaur1_Award1", ...}` arrays — clustering those would identify which characters/modes are in each script.
+
+### 35.6: Scripts preserved
+
+Moved to the repo so future sessions can re-run:
+
+```
+games/pokemon_le/_extraction/tools/
+├── radium_scene_xref.py          # per-scene content + SHA-1 xref analysis (Step 34)
+├── radium_bindings.py            # all-scene element-name → binary binding index (Step 35)
+├── radium_rodata_clusters.py     # dotted-path proximity clustering (Step 35)
+└── radium_mode_xref.py           # res://scenes/*.tscn callsite dump (exploratory)
+```
+
+### 35.7: Verified facts to graduate to PROTOCOL
+
+- 6 Radium binding clusters in the game binary (1 / 2 / 3 / 7 / 12 / 15), each corresponding to a distinct C++ binding function.
+- Binding function #1 ("Main HUD") owns 9 of the 1920×1080 HUD scenes simultaneously.
+- Binding function #3 ("End-of-mode") owns a run of 1360×768 panels + the 454×256 Pokeball textbox scene.
+- The 14 non-Radium clusters in the binary's dotted-path universe are all Godot engine internals.
+
+## Step 36: reference-player-v2.py — dt-paced playback + Pokemon attract driver + binding API stub (2026-04-19)
+
+Goal: get Reference tool A's player playing Pokémon Radium scenes at the correct speed and with proper clip sequencing — and design the API surface for a future "drive from Godot" bridge.
+
+### 36.1: BN answers — integrated
+
+**Ask 1 (frame pacing)** resolved the `FIXME: Use dt?` in Researcher A's player. The game's `DisplayRenderer` (sub_bb76e0 @ 0xbb76e0) is **event-driven (condition variable) + vsync-locked** (via `page_flip_and_wait`): one step per vsync, no `clock_gettime` in the loop, no dt computation. So in our player, pyglet's wall-clock `dt` is a correct proxy — at 60 Hz vsync with a 30 fps scene we advance 0.5 frames per tick, matching the game's "one step per vsync with scene fps determining advance rate" semantics.
+
+**Ask 2 (attract sequencer)** gave us `sub_aded20` @ 0xaded20: a pure modulo-6 state machine over two parallel 6-entry arrays:
+
+- **Color** (`data_476b350`): `ATTRACT_LOOP1`, `ATTRACT_LOOP_SERVICE_S`, `ATTRACT_LOOP2`, `ATTRACT_LOOP_SERVICE_S`, `ATTRACT_LOOP3`, `ATTRACT_LOOP_SERVICE_S` — indices 0..5, Service S entries at odd indices.
+- **BW** (`data_476b2f0`): same pattern with `_BW` suffix on each name.
+
+Current index stored at BSS `data_48c52b8`. Wrappers `sub_adf470..sub_adf61c` drive `sub_aded20` from external triggers (video-playback-done callbacks). When Service S is inactive, a `while service_s_flag[idx] == 0: idx = (idx+1) % 6` loop skips Service S entries. The separate jukebox path (`sub_9ac0e0` @ 0x9ac0e0, array `data_462eeb0`) is for `JUKEBOX_LOOP1..6` when Service S is active; it's a distinct playback mode, NOT interleaved into the modulo-6 cycle.
+
+**Ask 3 (ManualGodotScene)** gave us the binding API surface. The vtable at `0x4630230` is minimal (3 slots — deleter family + one ManualGodotScene-specific override at `sub_b2be40`), but the **extended function-pointer table** immediately following it at `0x4630240..0x4630340` is the real API — ~15 setters with distinct parameter counts:
+
+| Game addr | Param count | Our best guess |
+|---|---|---|
+| 0xb2b7b0 | 2 | `get_element(path)` / `get_node(path)` |
+| 0xb2b850 | 0 | (no-arg reset?) |
+| 0xb2b8a0 | 2 | `set_text(path, value)` |
+| 0xb2b900 | 6 | multi-param setter (transform+color?) |
+| 0xb2b920 | 1 (likely 2) | `set_visible(path, bool)` |
+| 0xb2b960 | 4 | generic property setter |
+| 0xb2b990 | 15 | `set_clip(path, name, ...)` — many-arg video setter |
+| 0xb2bab0 | 1 | set flag |
+| 0xb2ba90 | 9 | `set_transform(path, mat4)` |
+| 0xb2bb00 | 2 | `set_color(path, rgba)` |
+| 0xb2bb40 | 4 | `set_rect(path, l,t,r,b)` |
+| 0xb2bb70 | 1 | `set_active(bool)` |
+| 0xb2bb90 | ? | set state |
+
+Constructor `sub_b25fc8` is called from `load_scene_assets` (0xb321d0) at 0xb32370/0xb32388, meaning scene instantiation happens during asset load — not during rendering. Per-frame tick is NOT on this vtable; the class inherits Godot's `Node::_process(delta)` for animation advancement, called by Godot's internal scene-tree traversal.
+
+### 36.2: Reference renderer experiment — what changed
+
+The experiment added elapsed-time-based playback, an attract-sequence driver
+and a small state-binding interface to Reference tool A. A separate modified
+copy was kept alongside the original. Syntax validation passed; visual testing
+was still pending.
+
+> [Redacted: source-level modifications to the external renderer, its internal
+> class/method layout, and service-specific playback controls. The observation
+> and test status are retained; this is not presented as standalone Kiki code.]
+
+### 36.3: How to test the speed fix
+
+```
+cd [REFERENCE_TOOL_A]/
+python3 reference-player-v2.py --pokemon-attract \
+    /mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le/assets/lcd/auto_loaded/bc0792d8dc81e8aa30b987246a5ce97c40cd6833/45a4e8c6251510e3f7b11f8b21f227e1fa49f331/scene.radium.json
+```
+
+Expected: attract video plays at **native speed** (instead of 2× too fast), cycles `ATTRACT_LOOP1 → ATTRACT_LOOP2 → ATTRACT_LOOP3 → wrap`, skipping Service S entries because `--Service S-active` wasn't passed. Add `--Service S-active` to see the Service S clip interleave; add `--bw` for the monochrome sequence.
+
+Other scenes (e.g. the main HUD `18dad27e…`) also benefit from the dt fix but have no driver yet — they'll play the decoded keyframes at the correct rate, but without game-state binding they'll mostly show default text values.
+
+### 36.4: Binding interface — remaining limitations
+
+Transform changes did not reach the renderer, color changes were limited, and
+there was no live data source. A state-binding surface by itself was not enough
+to connect gameplay to presentation.
+
+> [Redacted: external renderer member names and implementation instructions.]
+
+### 36.5: Proposed "wrap Godot scenes" architecture (sketch, for later)
+
+When we decide to pursue the long-term wrap:
+
+1. **Godot side** runs with game logic only (no rendering, or headless export). Publishes state to a well-known IPC: a JSON file written at 10 Hz, or a UDP broadcast, or a TCP socket. Simplest: a single JSON file in `/tmp/radium_state.json` containing `{ "PokeballCounter01_Instance.PokeballCounter.Score": "12,345,678", "Player1_Instance...": "..." , ... }`.
+2. **Player side** adds a background thread that polls/reads the state file, and applies each key → value pair via `RadiumBinding.set_text(key, value)` (or `set_visible`/`set_clip`/etc., with a type-tag prefix in the key if needed).
+3. **Scene driver**: small Python modules per gameplay mode (`pokemon_discover.py`, `pokemon_capture.py`, `pokemon_battle.py`) set up which Radium scenes to load and initialize scene-specific `setClip` / `play` state. Like the hardcoded `/deadpool_le/` / `/king_kong_pro/` blocks already in the original, but externalized.
+4. **Future extension**: instead of polling JSON, embed a tiny HTTP server in the player (or a gRPC-ish thing) that Godot can POST updates to directly. Same `RadiumBinding` surface, different transport.
+
+Deferred until the current fix is validated.
+
+### 36.6: What got lodged
+
+- v2 file: `[REFERENCE_TOOL_A]/reference-player-v2.py` — parses clean, 2230 lines, 7 inline `# v2:` edits + 3 new top-level constructs.
+- Original untouched: `[REFERENCE_TOOL_A]/reference-player.py` — 1900 lines, preserved as-is per user's "maintain history without git" request.
+- JOURNAL Step 36 (this entry) — records BN-derived facts + the v2 design.
+- PROTOCOL — to be updated with the three BN-proven facts (vsync-locked timing model, attract sequencer semantics, ManualGodotScene extended-ftable layout) after the v2 test run validates the dt fix actually works.
+
+## Step 37: First v2 test run — video-decoder gap + graceful fallback + docs (2026-04-19)
+
+### 37.1: What happened
+
+User ran `python3 reference-player-v2.py --pokemon-attract <path-to-attract-scene>`. The v2 driver installed correctly ("wired Video id=1 (mode=color, service_s_active=False)", "[v2] attract: state 0 → ATTRACT_LOOP1"), but pyglet's `.media.load` threw `DecodeException: No decoders available for this file type` on `scene.assets/2.asset/0.asset`.
+
+### 37.2: Diagnosis
+
+Three compounding facts:
+
+1. **Radium's inline video assets are QuickTime `.mov`** containers **without file extension** (verified by magic bytes `ftyp qt  ` at offset 4 of `2.asset/0.asset`). The files are literally named `scene.assets/<N>.asset/<M>.asset`.
+2. **Pyglet's codec registry picks by file extension**, so even if the decoder was available, it wouldn't be invoked. Renaming or symlinking to `.mov` would be a first step.
+3. **Pyglet 2.0.17's ffmpeg bridge is broken against ffmpeg ≥ 7** — the user's system has libavcodec.so.61 / libavformat.so.61 / ffmpeg 7.1.3, but pyglet's `libavutil.py` calls `avutil.av_get_default_channel_layout` which was removed in ffmpeg 6. `pyglet.media.have_ffmpeg()` returns `False`. Neither PyAV nor OpenCV is installed as alternative decoders.
+
+So on this system there is simply no Python video-decoding path available to pyglet right now. Short of upgrading pyglet (2.1 may fix) or installing PyAV and writing a custom backend, video frames won't render.
+
+### 37.3: v2 fix applied
+
+Made `Video.setClip` non-fatal:
+
+- On first `DecodeException`, tries symlinking to `/tmp/radium_v2_XXXX.mov` so pyglet's extension-based decoder picker at least attempts the video path.
+- If that also fails (as it does on this system — no working ffmpeg bridge), logs a one-shot clear message with a pointer to `README.v2.md → Video decoder setup` and sets `self._player = None`. Never raises.
+
+Made `PokemonAttractDriver` resilient to a missing player:
+
+- If the Video's `_player` is None after `setClip`, the driver falls back to a **timer-based auto-advance** (default 30 s per clip, user-tunable via `--attract-clip-duration N`). State-machine logging still fires on every transition.
+- If the Video has a player, the original `on_eos`-driven advancement is used.
+
+### 37.4: Documentation
+
+- **Created `[REFERENCE_TOOL_A]/README.v2.md`** (~12 KB). Covers: what v2 adds, setup (pyglet + numpy, convert_radium.sh), video-decoder gap + workaround, CLI flags, Pokemon-LE scene structure (auto_loaded/demand_loaded, content-addressed SHA-1 naming, compound `bc0792d8…` package with its nested scenes), recommended scenes to test with, troubleshooting, architecture for the future "wrap Godot" plan, and outstanding TODOs.
+- **Updated `_emulation/ASSETS.md`**:
+  - NUK=Nuklear identified; Nuklear font set specified; Radium per-scene embedded fonts catalogued.
+  - Full LCD Radium section rewritten: directory layout, scene format, 36-scene classification summary, playback tooling (radium.py + original player + v2 fork), runtime video-asset format (QuickTime .mov without extension + inline-in-scene.assets storage), attract-video buffer list with file sizes.
+
+### 37.5: What the user sees now
+
+```
+$ python3 reference-player-v2.py --pokemon-attract <attract-scene.radium.json>
+Collected all pointers
+Creating character 18
+Element 'VideoSurface' (Frame 0 / 1) {}
+[v2] PokemonAttractDriver: wired Video id=1 (mode=color, service_s_active=False)
+[v2] attract: state 0 → ATTRACT_LOOP1
+
+[v2] Video decoder unavailable — pyglet cannot decode the scene's .mov assets:
+    "No decoders available for this file type: /tmp/radium_v2_XXXX.mov"
+    Sequencer state transitions will still log (timer-advance), but no video will render.
+    See README.v2.md → 'Video decoder setup' to enable playback.
+
+[v2] attract: no video player — timer-advance in 30s
+  (30 seconds later)
+[v2] attract: state 2 → ATTRACT_LOOP2   (state 1 ATTRACT_LOOP_SERVICE_S was skipped because --Service S-active wasn't set)
+[v2] attract: no video player — timer-advance in 30s
+  …
+```
+
+Plus a black window (the attract scene is PURELY a Video object, so without video there's nothing to render).
+
+For a more visually interesting test, the README now recommends scenes with text/sprite content: main HUD (`18dad27e…`), mode title (`6b877640…`), award title (`7949bb14…`), instant info (`394c4a03…`), boot with progress bar (`036fe928…`), out-of-date warning (`a4e06cdd…`), etc. These render without needing video and let you verify the frame-pacing fix on their own animations.
+
+### 37.6: Unblocking video playback — future work
+
+To get actual attract-video rendering on this system, options in order of effort:
+
+1. **`pip install av`** + add a PyAV-based `Video` backend in v2 (new class that decodes frames via PyAV, uploads each as a pyglet texture). Medium effort, most reliable.
+2. **Downgrade system ffmpeg to 5.x** so pyglet's existing bridge works. Low effort for pyglet, but hostile to the rest of the system.
+3. **Wait for pyglet 2.1** which reportedly has ffmpeg 6+ compat. Zero effort but unknown timeline.
+
+Deferred until the user has a concrete need to see attract video — the timer-driven state machine is already proving the sequencer is correct.
+
+## Step 38: PyAV video backend + blob auto-heal (2026-04-19)
+
+User hit a new failure on the boot-progress scene (`036fe928…` under `bc0792d8…`): `FileNotFoundError: /tmp/blob_4d91043d18.bin`. And they installed PyAV (`pip install av`), so we can now do proper video playback.
+
+### 38.1: Why cached scene data disappeared
+
+The converted scene description referenced temporary files. A later run found
+those files missing after the temporary directory had been cleared.
+
+### 38.2: Cache regeneration
+
+The experiment checked for missing references and regenerated the temporary
+data before playback. This addressed stale derived data rather than a bad
+source asset.
+
+> [Redacted: external decoder internals and source-level integration details.]
+
+### 38.3: PyAV video backend landed
+
+New class `_V2PyAVPlayer` at module level in v2 — minimal drop-in for `pyglet.media.Player`:
+
+- `__init__(path)` — opens with `av.open(path)`, picks first video stream, caches `average_rate` as `fps`, primes with one decoded frame so `width`/`height` are known.
+- `update(dt)` — accumulates wall-clock time, advances the PyAV decoder iterator until `current_frame_idx` matches `int(elapsed * fps)`. If decoding raises `StopIteration`, sets `_eos=True` and fires `on_eos` callback. Skip-ahead on lag (no catch-up frame-by-frame).
+- `.texture` property — lazy upload: on first access per frame-index, converts the current `av.VideoFrame` to an `rgb24` numpy array (using PyAV's built-in `to_ndarray`), uploads to a cached GL texture via `glTexImage2D(GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, ...)`. Returns a `_TextureRef` object with `.id` matching the pyglet.media.Player.texture shape.
+- `.play()`, `.queue(source)` (no-op), `.delete()` for compatibility.
+
+New pipeline function `_v2_open_video(path)` tries strategies in order:
+1. **PyAV** — `av.open(path)` → `_V2PyAVPlayer`. Logs e.g. `[v2] PyAV opened 0.asset (853×480 @ 29.97 fps)`. Registered in `_v2_pyav_players` list.
+2. **pyglet.media.load** direct path, then via `/tmp/radium_v2_*.mov` symlink.
+3. **Graceful degrade** — log both failure modes once, return None. Driver falls back to timer-advance.
+
+`Video.setClip` simplified to a single call: `self._player = _v2_open_video(videoPath)`.
+
+`update(dt)` now also iterates `_v2_pyav_players`: calls `.update(dt)` on each active player, removes ones where `_eos` became true.
+
+### 38.4: Expected behavior now
+
+With PyAV installed (confirmed: user has `av 14.2.0`, pyglet 2.0.17, ffmpeg 7.1.3):
+
+- Running the attract scene should open a PyAV player per clip transition, decode frames at real-time, upload as textures, and show video. Log will look like:
+  ```
+  [v2] PokemonAttractDriver: wired Video id=1 (mode=color, service_s_active=False)
+  [v2] attract: state 0 → ATTRACT_LOOP1
+  [v2] PyAV opened 0.asset (853×480 @ 29.97 fps)
+  [EOS after ~30s] [v2] attract: state 2 → ATTRACT_LOOP2
+  [v2] PyAV opened 2.asset (853×480 @ 29.97 fps)
+  ...
+  ```
+- The boot scene `036fe928…` (non-video, sprite+text+progressbar) should no longer crash on missing blobs — the preflight regenerates them.
+- Any other scene whose .json references `/tmp/blob_*.bin` files auto-heals on first open.
+
+### 38.5: Limitations (known, documented in README.v2.md)
+
+- **No audio playback.** `_V2PyAVPlayer` decodes the video stream only. PyAV has full audio-decode support but we'd need to feed samples into pyglet's audio queue — deferred.
+- **Texture upload on GL thread.** Decoder runs in pyglet's clock callback (same thread as on_draw, fine), but if someone refactors to background decoding later, the upload path will need `glFlush`/context sharing.
+- **No frame rate sync with refresh.** We decode when wall-clock demands; if the window is sub-60Hz, frames may be dropped. `skip_ahead` in `update(dt)` handles this by advancing the decoder iterator without uploading intermediate frames.
+
+### 38.6: What got lodged
+
+- `[REFERENCE_TOOL_A]/reference-player-v2.py` — up to 2535 lines (2230 → 2535; added `_v2_ensure_blobs_exist`, `_V2PyAVPlayer`, `_v2_open_video`, and plumbed through `update(dt)`).
+- `[REFERENCE_TOOL_A]/README.v2.md` — Video decoder section rewritten; PyAV promoted from TODO to "primary recommended path".
+- This journal entry.
+
+## Step 39: Static-frame freeze — fixes the "5× too fast" state-oscillation (2026-04-19)
+
+User reported that even after the dt fix, "some scenes still cycle their assets way too fast" with a good intuition: "maybe when they're used properly you're supposed to instantiate them with one of the assets and frame the game that way."
+
+### 39.1: Root cause
+
+`Sprite.__init__` auto-runs `self.play(1, data['FrameCount'], loop=True)` — so every sprite loops its entire timeline by default. But **Pokemon scenes are mostly state-based, not animated**. The boot scene `036fe928…` is the clearest example:
+
+- `FrameRate=24, FrameCount=2, FrameLabels={NoProgressBar: 1, ProgressBar: 2}` — two discrete STATES, not a 2-frame animation.
+- Nested sprites inside it have `FrameCount=101` — a progress-bar widget with 101 increments (0–100%), not a 101-frame loop.
+
+The default "loop everything forever" then oscillates between `NoProgressBar` and `ProgressBar` states 12× per second, while nested progress-bar sprites cycle through all 101 fill levels in ~4 seconds. Visual chaos that looks like "assets cycling 5× too fast".
+
+The game instantiates the scene, picks one state (e.g. `ProgressBar`), and sets the nested progress-bar's frame to the current completion percentage. Nothing loops.
+
+### 39.2: Fix — global static-frame override
+
+Added `_v2_static_frame = [None]` (list-wrapped for mutability from nested-class methods). When non-None:
+
+- `_Playable._updatePlayable` returns early — `self._frame` doesn't advance.
+- `_Playable._getFrame` returns `_v2_static_frame[0]` clamped to each Playable's valid `[_startFrame, _startFrame + _frameCount - 1]` range.
+
+Every sprite in the scene tree freezes on frame N (or the nearest valid frame in its range). For the boot scene, `--static-frame 2` shows the `ProgressBar` state with the nested widget snapped to frame 2 of its 101-frame range (2% fill). `--static-frame 50` snaps it to 50% fill. `--static-frame 1` shows the `NoProgressBar` state.
+
+### 39.3: CLI + scene summary
+
+Two new flags:
+
+- `--static-frame N` — freeze every sprite on frame N.
+- `--static-label NAME` — resolves NAME against root Sprite's FrameLabels at scene-load time. For the boot scene, `--static-label ProgressBar` is equivalent to `--static-frame 2`.
+
+New `_v2_print_scene_summary()` runs per-scene after `RadiumScene()` constructs and prints the scene's timing knobs so users know what to try:
+
+```
+[v2] scene: 036fe9286978d41e4df740cd9ddb9a998e4afc69
+     FrameSize: 1360×768   FrameRate: 24.0   root FrameCount: 2
+     FrameLabels: NoProgressBar=1, ProgressBar=2
+```
+
+When `--static-frame` is active, it's echoed too.
+
+### 39.4: play.py TUI — inline state control
+
+`/mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le/assets/lcd/play.py` gained:
+
+| Command | Effect |
+|---|---|
+| `f N` | set `--static-frame N` for subsequent launches |
+| `l NAME` | set `--static-label NAME` (resolves per-scene) |
+| `f off` | clear static-frame/label (back to looping) |
+| `info N` | print scene N's FrameRate / FrameCount / FrameLabels without launching |
+
+Typical workflow for exploring a stateful scene:
+
+```
+  info 20                    (shows FrameLabels={NoProgressBar:1, ProgressBar:2})
+  l ProgressBar              (set label)
+  20                         (launch with that label)
+```
+
+### 39.5: Limits
+
+- `--static-frame` freezes ALL sprites globally to the same frame. For scenes with different nested-sprite timelines that want different frames per sprite (e.g. "main sprite at state 1, progress bar at 50%"), this needs per-element control — deferred until we have a concrete scene where global freeze is insufficient.
+- Does NOT help scenes that genuinely need animation (e.g. loading-spinner loops). For those, the `--static-frame` flag just shouldn't be used.
+- Does NOT replace scene drivers. For scenes with orchestrated animation (Kong intro, attract sequencer), a driver is still the right tool. Static-frame is for one-shot visual inspection.
+
+### 39.6: Reminder of the mental model
+
+Radium scenes are **closer to Flash MovieClip templates** than standalone animations. The game:
+
+1. Loads a scene.
+2. Binds data to specific elements by name (e.g. `PokeballCounter01_Instance.PokeballCounter.Score.set_text("12,345,678")`).
+3. Picks a state/frame (e.g. `play(1, 1, False)` to hold on frame 1, or `play("label_a", "label_b", False)` to run a specific segment).
+4. Optionally runs driver code on gameplay events (e.g. advance frame on score update, trigger animation on ball lock).
+
+Our player now supports (2) via `RadiumBinding`, (3) via `--static-frame` / `--static-label`, and (4) per-scene drivers like `PokemonAttractDriver`. Still missing: per-element frame control and the IPC layer for (2) from a Godot process. Both deferred to follow-up sessions.
+

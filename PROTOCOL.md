@@ -145,33 +145,6 @@ Paths intercepted by `_emulation/spi_shim.c`:
 
 Verified by Step 24 run: game completes full bridge → DRM resource enumeration → Radium compiles **12** shader programs (24 shader objects, 12 vertex `type=0x8b31` + 12 fragment `type=0x8b30` — refining prior "11 programs" count) → SternLogo PNG uploaded as 1920×1080 RGBA → 16 additional RGBA textures uploaded at 1024×{64,128,256,512} → DMD `gbm_bo_map`/`gbm_bo_unmap` path executes and produces one 1024×256 BGRA frame on disk → process aborts on ALSA assertion (new blocker, not a GL problem). The prior Step-22 SEGV at `NULL+0x48` is refuted by this run and by design — `gbm_bo_map` is now hooked.
 
-**Audio subsystem** (Step 25). Game links against `libasound.so.2` and imports 18 playback-side symbols only — no capture, no sequencer, no mixer. Full list from `nm -D --undefined-only`:
-
-```
-snd_pcm_open, snd_pcm_close, snd_pcm_prepare, snd_pcm_drain, snd_pcm_nonblock,
-snd_pcm_writei,
-snd_pcm_hw_params, snd_pcm_hw_params_any, snd_pcm_hw_params_sizeof,
-snd_pcm_hw_params_set_{access,format,channels,rate,rate_near,buffer_size,period_size},
-snd_pcm_hw_params_get_{channels,rate}
-```
-
-Failure mode under QEMU user-mode (no `/dev/snd/*`): game calls `snd_pcm_open` which returns a nonzero error, ignores the return code, then calls `snd_pcm_prepare` with the uninitialized PCM pointer. Glibc's `snd_pcm_prepare` asserts `pcm != NULL` at `pcm.c:1239` and aborts. Verified by direct observation in the Step 25 run.
-
-**Shim hooks (Step 26/27).** All 18 symbols stubbed in `spi_shim.c`. Fake-success pattern: `snd_pcm_open` returns a `calloc(256)` scratch handle with return 0; `hw_params` setters/getters no-op success; rate-near writes 44100 to `*val`; `get_rate`/`get_channels` return 44100 / 2. `snd_pcm_writei` paces with `usleep(size * 1e6 / 44100)` (46.4 ms per 2048-frame buffer) and appends the raw S16_LE interleaved stereo buffer to `_emulation/audio/stream.s16le`, flushing every 64 writes. Verified by Step 27 run: 11.7 MB / 66.4 s of real-time audio captured in a single run, audio thread did NOT spin (CPU usage stayed bounded), game progressed into scene-loader territory.
-
-BN-confirmed audio init details (used by the stub): `alsa_pcm_init` @ `0xce61e0` checks `snd_pcm_open`'s return at `0xce6270` (tbnz bit 31 → error-7 path); `alsa_audio_thread` @ `0xce5f68` is a tight writei loop with no intrinsic usleep.
-
-**Syscalls requiring libc-level hooks** (glibc bypasses our `ioctl` / `faccessat` wrappers via INLINE_SYSCALL):
-
-- `access`, `stat`, `lstat`, `__xstat*`, `__lxstat*`, `fstatat`, `__fxstatat*` — path remapping via `SPIKE3_SYSROOT`
-- `tcsetattr`, `tcgetattr`, `tcflush`, `tcflow`, `tcdrain`, `tcsendbreak` — termios on the fake UART
-
-**`system()` hook** blocks any command containing `openocd` or `/games/spike3/`, returning 0 so the game thinks RP2040 flashing succeeded.
-
-**`pthread_create` hook** forces `PTHREAD_INHERIT_SCHED` on any attr that specified `PTHREAD_EXPLICIT_SCHED`. Reason: ulimit -r is 0 on WSL users, so `sched_setscheduler(SCHED_RR)` fails with EPERM during glibc's internal pthread setup, causing the child thread to exit without running its entry. Forcing inherit-sched skips that failing call path (glibc uses `INTERNAL_SYSCALL_CALL` for the internal `sched_setscheduler`, so a direct LD_PRELOAD on `sched_setscheduler` wouldn't fire). Verified by Step 20.4 / 20.5: `sub_a78bc0` now exits its 480-iter × 250 ms poll on `data_4882108` because the dispatch-thread init (`sub_a6ce20`) actually runs and sets the flag.
-
----
-
 ## Run command
 
 ```bash
