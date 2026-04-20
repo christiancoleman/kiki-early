@@ -2887,3 +2887,404 @@ Radium scenes are **closer to Flash MovieClip templates** than standalone animat
 
 Our player now supports (2) via `RadiumBinding`, (3) via `--static-frame` / `--static-label`, and (4) per-scene drivers like `PokemonAttractDriver`. Still missing: per-element frame control and the IPC layer for (2) from a Godot process. Both deferred to follow-up sessions.
 
+
+## Step 40: Video actually renders — chased `no-player` to a ptrs-duplicate + shipped `--play-clip` (2026-04-19)
+
+Previous step's attract run showed PyAV successfully opening H.264 streams and `PokemonAttractDriver` cycling its state machine, but the window stayed a solid black rectangle — no actual video pixels reached the texture. This step traces that end-to-end and lands a generic clip-player on top.
+
+### 40.1 Diagnostic pass — fix the silently-wrong things first
+
+User reported the on-screen "Time: 0.00" debug overlay never moved. That was a false cue: the overlay at `reference-player-v2.py` line 2602 was hardcoded `"Time: %.2f / %.2f [s]" % (0.0, animationDuration)` instead of using `time_`. Fixed to use `time_` so a static timer now means "update loop is actually dead" rather than "hardcoded zero".
+
+Instrumented `_V2PyAVPlayer.__init__`:
+
+- Record `self._codec_name` from `self._stream.codec_context.name` (spots H.264 vs. HEVC etc.).
+- After priming first frame, record `self._pix_fmt` from `frame.format.name`.
+- If prime-frame extraction failed (`_width == 0`), raise `RuntimeError(f"PyAV opened … (codec=…) but got no frames")` so the outer `_v2_open_video` `except Exception` falls through to pyglet instead of silently returning a dead player.
+
+The "PyAV opened" log now prints `codec=…, pix_fmt=…` so we can distinguish codec-decode failures from pipeline-wiring bugs at a glance.
+
+Instrumented `Video._render` with one-shot-per-state-transition logging:
+
+| Reported state | Meaning |
+|---|---|
+| `no-player` | `self._player is None` — nobody called `setClip()` or setClip's `_v2_open_video` returned None |
+| `no-texture` | Player exists but its `.texture` property returns None (decoder eof or upload failed) |
+| `texture#N` | Player's uploaded GL texture id (happy path) |
+
+State machine is `hasattr(self, '_v2_logged_state')`-initialized and only logs on transitions, so busy render loops don't spam.
+
+### 40.2 ffmpeg probe — codec was mis-remembered
+
+Before chasing code paths we had the user run `ffmpeg -hide_banner -i …/2.asset/0.asset -frames:v 1 -f null -`. Output:
+
+```
+Stream #0:0[0x1](eng): Video: h264 (Constrained Baseline) (avc1 / 0x31637661),
+    yuv420p(progressive), 1360x768, 1420 kb/s, 30 fps, 30 tbr, 15360 tbn (default)
+```
+
+**The Radium `.asset` files are H.264, not H.265.** The Godot battle-backdrop videos leaked in Step 27 stderr (`res://gfx/bknd/*/…_h265.mp4`) are a DIFFERENT, Godot-side asset class — those are plausibly H.265. The 15 attract clips and 214 in-game clips inside `scene.assets/` are H.264 baseline at 1360×768@30fps, ~17 s each. This settles an assumption that had been floating since Step 28 without being verified.
+
+### 40.3 The smoking gun — `Video._render → no-player`
+
+With instrumentation on, attract run logged:
+
+```
+[v2] PokemonAttractDriver: wired Video id=1 (mode=color, service_s_active=False)
+[v2] attract: state 0 → ATTRACT_LOOP1
+[v2] PyAV opened 0.asset (1360×768 @ 30.00 fps, codec=h264, pix_fmt=yuv420p)
+[v2] Video._render 'video.in_attract_videos' (1360×768) → no-player
+```
+
+Driver wires Video id=1, PyAV opens fine — but render sees no player. Two Video instances.
+
+Added a second round of instrumentation: `Video.__init__` prints every construction with `_id` and Buffer keys, and `_characterToObject` prints cache-hits vs. creates for Video type. Re-ran:
+
+```
+[v2] _characterToObject CREATE Video id=18 (cache had keys: [])
+Creating character 18
+[v2] Video.__init__ id=18 name='video.in_attract_videos' buffer_keys=['ATTRACT_LOOP1', …]
+…
+[v2] Video.__init__ id=1 name='video.in_attract_videos' buffer_keys=['ATTRACT_LOOP1', …]
+[v2] PokemonAttractDriver: wired Video id=1
+…
+[v2] _characterToObject cache-hit Video id=18 player=no  ← render path
+```
+
+Confirmed: **the scene's `ptrs` table contains two distinct entries with the same `Character.Name='video.in_attract_videos'` and the same Buffer keys** — ids 1 and 18. `dumpChildren` (runs during scene load, before the driver) walks via keyframes and materializes id=18 into `scene.objs`. Driver's `_v2_find_video_char_by_name` iterates `radiumScene.ptrs.items()` and returns the first match (id=1), constructs a fresh Video at id=1, overwrites `scene.objs[1]` (empty slot) — but the render walk's `_characterToObject` looks up `character['_id']` which is 18, finds the stale `dumpChildren`-era Video with `_player=None`, and calls its `_render`.
+
+### 40.4: Reuse the already-materialized video object
+
+The probe had selected a duplicate object instead of the one participating in
+rendering. Reusing the active object resolved the mismatch between successful
+decode and absent playback.
+
+> [Redacted: external renderer object-layout details and implementation code.]
+
+### 40.5 GenericClipDriver + `--play-clip` flag
+
+Attract was only step one — scene 18 (`60ed7e50…`) is the master in-game video dictionary with 214 `PK_*` clips (mode awards, pokéball states, match digits, ball-save, skill-shot tiers, tilt, replay, per-mode LoopingBGs, etc.). No modulo-6 sequencer applies; each clip is a per-event animation the game triggers on specific gameplay moments.
+
+Added `GenericClipDriver` (in `reference-player-v2.py`, right after `PokemonAttractDriver`):
+
+- Takes `scene` + `clip_name`.
+- Looks for a Video in `scene.objs` whose Buffer contains `clip_name` (same scene.objs-first pattern as the attract fix).
+- Fallback: iterate `scene.ptrs` and materialize on miss.
+- Calls `setClip(clip_name)`. On PyAV EOS (`on_eos` callback), calls `setClip(clip_name)` again to loop.
+- If the clip isn't in any scene Video's Buffer, prints `[v2] --play-clip 'X' not found in any scene Video buffer (available: …)` with the full list of names the scene does have — so the error tells the user what they could have typed.
+
+New CLI flag `--play-clip NAME`. Wired into scene-load to take precedence over `--pokemon-attract` if both are set — "user explicitly said play this clip" beats "run the attract sequencer".
+
+### 40.6 Clip catalog — `_emulation/VIDEO_CLIPS.md`
+
+Wrote a scanner that walks every `scene.radium.json` under `assets/lcd/`, finds each `ptr_wrapper → data` dict that has both a `Character.Name` and a `Buffer` dict, and collects Buffer keys. Result:
+
+- **2 scenes** carry Videos:
+  - `auto_loaded/bc0792d8…/45a4e8c6…` — `video.in_attract_videos` — **15 clips** (ATTRACT_LOOP1..3 + `_BW` + `_SERVICE_S` + `_SERVICE_S_BW` + JUKEBOX_LOOP1..6 + Pattern).
+  - `auto_loaded/60ed7e50…` — `video.in_game_videos` — **214 clips**.
+- Both video dicts appear in ptrs TWICE per scene (the duplicate-ptrs quirk we just fixed around).
+
+Catalog saved to `_emulation/VIDEO_CLIPS.md` grouped by mode:
+
+- Ball / pinball state: `PK_BallSave_{01,02}`, `PK_Pokeball_{10..100}pct`, `PK_Pokeball_Drop_{01..10}`, `PK_EB_{ExtraBall,ExtraBallLit,ShootAgain}`, `PK_Replay`, `PK_Tilt`, `PK_TiltWarning`, `PK_SkillShot_Award{1..3}`.
+- Character select: `PK_CharacterSelectBG_{Bulba,Charm,Pika,Squirtle}`.
+- Background patterns: `PK_BG_WorldMap_LoopingBG_01`, `PK_WorldMap_LoopingBG_01`, `PK_BGPattern_{Electric,Fire,Grass,Normal,Water,PokeBall{Black,Blue,Grey,Red}}`, `PK_{Electric,Fire,Grass,Normal,Water}Patterns`.
+- Mode: Bulbasaur 1/2, Charmander 1/2, Charmander Spinner, Squirtle 1/2 — each has `_Start` + `_LoopingBG` + `_Award{1,2,3}` + `_Total` (with small variants).
+- Mode: Magikarp (fishing + multiball + spelling + evolves + total).
+- Mode: Pikachu vs. {Charizard, Gyarados, Lucario, Mimikyu, Raichu, Magikarp} — per-opponent award tiers, LoopingBGs, Start, Total. Note `PK_PikachuVSMagikarp_*` uses capital VS (inconsistent with the rest — preserved verbatim in catalog).
+- Mode: Eevee evolutions — `PK_Eevee{Espeon,Flareon,Glaceon,Jolteon,Leafeon,Sylveon,Umbreon,Vaporeon}_Award{NN}` (all 8 Eeveelutions).
+- Mode: Team Rocket Multiball 1/2/3 + the three `*Advance` phases, plus Meowth attacks on Multiball 3.
+- Match / end-of-ball: `PK_Match_{00,10,…,90}` (decimal digit endings).
+- Misc: `PK_Psyduck_Award1`.
+
+### 40.7 play.py TUI — `c NAME` and `clips N`
+
+Added two commands to the interactive menu:
+
+| Command | Effect |
+|---|---|
+| `c NAME` | Set `--play-clip NAME` for subsequent launches. Echoes `[play-clip set to 'NAME']`. |
+| `c off` | Clear `--play-clip`. |
+| `clips N` | Read scene N's `scene.radium.json`, walk for Video-shaped dicts, print their Character.Name and Buffer keys. Pure-Python read, no player launch. |
+
+A new `scene_clips(scene_path)` helper mirrors `scene_labels(scene_path)` (Step 39) — same ptr_wrapper walker, collects `{Character.Name: sorted-set-of-buffer-keys}`. Merges duplicates under one key (the same Radium duplicate-ptrs quirk).
+
+Footer now mentions: "See _emulation/VIDEO_CLIPS.md for the full 229-entry clip catalog".
+
+### 40.8 What this unblocks and what remains
+
+Unblocked:
+
+- **Any Video-bearing scene is now previewable in full motion**. Pick any of the 229 clip names and see it loop. Before this step, only the attract scene had bespoke driver code and even it wasn't actually rendering.
+- **The Radium "scene → Video → setClip(name) → texture → GL draw" pipeline is end-to-end verified**. Our previously-stubbed `RadiumBinding.set_clip` method corresponds exactly to this flow — we now have a working demo of how a Godot driver would drive a Radium Video at runtime.
+
+Still missing (punch-list for future sessions):
+
+- **Audio from the video tracks**. `_V2PyAVPlayer` decodes the video stream only. PyAV can decode the audio stream in parallel — would need a pyglet audio queue (or direct ALSA/SDL2) fed with the samples. This is the main ask for next session.
+- **Non-Radium video paths**. The 8 Godot battle-backdrop `.../_h265.mp4` files (Step 27 stderr leak) live under `res://gfx/bknd/...` and are loaded via Godot's resource loader, not the Radium Video path. Separate decoder surface from `scene.assets/`-style `.mov`s.
+- **Driver per non-attract mode**. GenericClipDriver is adequate for inspection but a real Main HUD driver would need to drive 9 scenes + ~75 element paths from cluster 1, not just play a video loop.
+- **The JSON-over-IPC bridge** from a Godot process — stubbed in `RadiumBinding` but no consumer yet. Once audio lands, this is the next thing that would make the player drivable as a real front-end.
+
+## Step 41: Sound-event mapping — `sub_8d3460` registers 25 strings; hashmap path found, token→asset_id gap remains (2026-04-19)
+
+Goal: map 231 extracted PCM WAVs + 303 `_tf2_w4` candidates to `SE_PK_*` sound IDs in the previs `spike_game_sound_ids.gd` autoload (~750 constants) so standalone Godot previs plays the right SFX from `res://sfx/<SOUND_ID>.wav`.
+
+### 41.1: Memory correction — music is NOT encrypted
+
+Prior memory `project_audio_next.md` said "largest tf2_w4 blobs show near-uniform entropy, likely encrypted." **Refuted.** User identified three `tf2_w4.bin` files as clean stereo S16_LE PCM at 44.1 kHz:
+
+| File | asset ID | Duration |
+|---|---|---:|
+| `asset_0050_id20020446_tf2_w4.bin` | `0x20020446` | 67.76 s |
+| `asset_0625_id00020446_tf2_w4.bin` | `0x00020446` | 139.06 s |
+| `asset_1089_id00020046_tf2_w4.bin` | `0x00020046` | 81.10 s |
+
+The `_extraction/README.md` classification "bit-6 set on id_encoded → 4-byte/element, non-audio" collides with stereo S16_LE PCM (2 ch × 2 B = 4 B/frame). 303 `image.bin` assets were classified `_tf2_w4` and given `.bin` extension — but many of them *are* audio that got the wrong filename convention. Each /tmp candidate WAV is exactly 78 bytes larger than its `_extraction/assets/*.bin` source (the ffmpeg RIFF/fmt/LIST-INFO header).
+
+### 41.2: Batch-converted the remaining 300 candidates
+
+Wrote 303 files to `_extraction/wav_candidates/` (487 MB) via `ffmpeg -f s16le -ar 44100 -ac 2` — header-stamp only, no re-encoding. Index at `_extraction/wav_candidates/CANDIDATES.md` bucketed by duration: **35 long (>30 s)** music candidates, **44 medium (5–30 s)** SFX/VO candidates, **224 short (<5 s)** mostly texture data playing as white noise.
+
+Cross-referenced all 303 against `/tmp/blob_<sha256[:10]>.*` (Reference tool A's inline scene-data cache): zero overlap. The two stores are content-disjoint — blobs come from Radium `scene.radium` inlines, tf2_w4 bins come from `image.bin` asset-registry records.
+
+### 41.3: Sidekick round 1 — 6 questions, winning lead at Q5
+
+Six-question prompt covering SE_PK_ string xrefs, hash-table search, Pokémon-cry table, ALSA backward trace, Stern audio classes, music ID patterns.
+
+- **Q1**: 24 `SE_PK_FX_*` strings registered at runtime into `std::unordered_map<std::string, uint16_t>` at `data_48c56d0`. Tokens 0x6b–0x71 and 0xba–0xcb. **Tokens are not asset IDs.**
+- **Q2**: Hash = `std::_Hash_bytes` with seed `0xc70f6907` (standard `std::hash<std::string>`). Only 24 strings in the binary.
+- **Q3/Q6**: No Pokémon-cry flat array, no music-ID compiled constants. Both scene-embedded / runtime-resolved.
+- **Q4**: Audio thread `sub_cd2590` is a channel-mixer — no event-name routing at that level.
+- **Q5** (winning): Found mangled symbol `_ZN16GodotSpikeBridge14register_soundERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEtiEUlRK5ArrayE_`. Itanium `t` = `unsigned short` — the 2nd arg is **uint16_t** (a token), not uint32_t (Sidekick's summary was loose). Matches Q1's token values.
+
+### 41.4: Binary is fully stripped
+
+`nm -D game | grep -i spikebridge` → 0 hits. `nm game | grep -i spikebridge` → 0 hits. Both dynamic and static symbol tables are empty for game-internal methods. The only textual reference to register_sound is in RTTI strings. Standard LD_PRELOAD can't hook internal C++ methods by name — inline binary patching of the function prologue would be required.
+
+### 41.5: Path-find from lambda typeinfo → registration function
+
+Chain from the typeinfo to the actual registration function:
+
+1. **Lambda typeinfo** at BN VA `0x46bb1f8` (a `__class_type_info`) — its `__type_name` field points to rodata string `ZN16GodotSpikeBridge…` at BN VA `0x3bc8f08`.
+2. **libstdc++ std::function manager** `sub_b086b4` at file offset `0xb086b4` — references the typeinfo in op 0. Manager pattern: `op 0 = __get_type_info` writes typeinfo to `*arg1`; `op 1 = __get_functor_ptr` writes `arg2`; `op 2 = __clone_functor` writes `*arg2`. Stateless-lambda variant (no op 3 destroy body because the closure has no captures). This is the `_Base_manager` generated by libstdc++ whenever a `std::function<void(Array const&)>` wraps the specific lambda — it's referenced from every `std::function` instance that wraps that lambda.
+3. **Registration function** `sub_8d3460` at file offset `0x8d3460` — located via xrefs from the manager + Sidekick. Bulk-inserts 25 sound-event strings into `data_48c56d0` at C++ static init.
+
+### 41.6: The 25-entry token table
+
+Each call at init:
+
+```
+sub_b094c0(&data_48c56d0, &"SE_PK_FX_...", token, 0xffffffff)
+```
+
+`sub_b094c0` is the hashmap-insertion helper → mutex guard (`sub_b09370`) → `sub_b09850` (hash + collision resolution). Tokens (ranges contiguous):
+
+- `SE_PK_FX_EOB_POKEDEX_*` — 7 entries, tokens `0x6b`–`0x71`
+- `SE_PK_FX_ATTACK_TYPE_*` — 18 entries, tokens `0xba`–`0xcb`
+
+Full table: `PROTOCOL.md → Sound event registration`.
+
+### 41.7: The dispatch gap
+
+GDScript pattern (from `pokemon_battle_previs/` and presumably the real build's `main.pck`):
+
+```
+Spike.play_sound(SpikeSoundIds.SE_PK_FX_EOB_POKEDEX_PAGE_TURN)
+```
+
+String goes across the bridge, C++ looks up the hashmap → gets token 0x6b → resolves to asset_id (via an unidentified second step) → plays.
+
+**But only 25 strings are in the hashmap.** The other ~725 `SE_PK_*` names from the autoload (VO, TUNE, MX, BONUS, THEME, and several FX families outside attack-type / EOB-pokedex) aren't registered. Real hardware clearly plays music and VO — so a second dispatch path must exist. Plausible routes:
+
+- Sister C++ method like `play_music(name)` / `play_voice(name)` with its own hashmap.
+- Name-prefix-based dispatch (inspect the first 5 chars of the name to branch).
+- Godot's native `AudioStreamPlayer` loading music from `res://` — but `main.pck_extracted/` has no `audio/` folder, so if Godot plays it, the streams must come via a C++ loader reading image.bin.
+
+All three are untested.
+
+### 41.8: Open for next session
+
+1. **Token → asset_id step.** The 25-entry map resolves name → token but not token → asset_id. Look for a `uint32_t token_to_asset[256]` array (indexed by 0x6b, 0xba, etc.) or a second hashmap, called from whatever responds to `Spike.play_sound(...)` after the name lookup.
+2. **725-name dispatch.** Find sister methods to `register_sound` and any name-based routing. Likely candidate is another function near `sub_8d3460` that registers the larger set, OR a play-side function that tries multiple hashmaps.
+3. **Manual triage of the 35 long tf2_w4 candidates.** User audition: the 35 files >30 s in `wav_candidates/` are likely music (themes, tunes, main-play loops). Easy win against the short SE_PK_THEME / MX / TUNE / BONUS lists.
+
+### 41.9: Artifacts this session
+
+- `_extraction/wav_candidates/` — 303 new WAVs (487 MB) + `CANDIDATES.md` index.
+- `PROTOCOL.md → Sound event registration` — 25-entry token table with BN VAs.
+- `ASSETS.md → Audio` — new row for tf2_w4 candidates + Sound-event registration subsection.
+- `memory/project_audio_next.md` — music-encryption hypothesis rolled back; state reflects 41.1–41.8.
+
+## Step 42: Full pipeline traced — token→asset_id is runtime-only; static extraction dead (2026-04-19)
+
+Final Sidekick round on audio. User flagged BN budget exhausted after this one. Result closes the question: the token → asset_id step is **intentionally** not in compiled code.
+
+### 42.1: Five-stage resolution pipeline
+
+| Stage | Function | Effect |
+|---|---|---|
+| 1. String registration (static init) | `sub_8d3460` | Inserts 25 `SE_PK_FX_*` strings → uint16_t tokens into hashmap at `data_48c56d0` (documented Step 41) |
+| 2. Name lookup | `sub_b09660` | `std::_Hash_bytes` seed `0xc70f6907`; returns hash node with token at offset `+0x28` |
+| 3. **Token → asset_id** | NOT IN COMPILED CODE | Populated at runtime from scene bytecodes (image-sc*.bin / image.bin scene 0) via `load_scene_assets` (0xb321d0) — the type-0x0b records registering into `g_asset_registry` |
+| 4. Asset registry lookup | `asset_registry_find` over `g_asset_registry` at `data_48ca4d0` | Encoded asset_id → `{file_offset, size, type}` |
+| 5. Mmap resolve | `get_asset_ptr_by_packed_id` → `image_mapped_base_plus_offset` | File offset → absolute pointer inside mmap'd `image.bin` |
+
+### 42.2: Why static analysis fails (Sidekick quote)
+
+> "This separation allows content updates without binary recompilation — a regulatory compliance requirement for gaming machines."
+
+Practical consequences:
+- No `uint32_t token_to_asset[]` array exists to dump.
+- Token constants (0x6b, 0xba, …) **never** appear in asset-ID construction paths.
+- Same `SE_PK_*` name can bind different asset_ids in different scenes (mode-specific variants).
+- Full mapping only exists in memory after scenes load.
+
+### 42.3: Dead options after this finding
+
+- **Static dump**: not available (no table).
+- **Hook register_sound / sub_b09660**: gets us the 25 static names → tokens, nothing more.
+- **Any further BN trace** on this subject: out of budget.
+
+### 42.4: Still-viable paths
+
+- **(A) Runtime capture under emulation.** Get past Step 31's PopupMenu TLS SEGV, then hook `asset_registry_find` (file offset `0x8ca4d0` neighborhood) to log (packed_asset_id, file_offset, size) tuples as scenes load, and hook `sub_b09660` to correlate names → tokens. Gated on resolving the Godot-TLS crash that's been parked since Step 31. High eng cost.
+- **(B) CM4 hardware memory dump.** User owns CM4 + Pi carrier (per memory `hardware_inventory.md`). Boot real filesystem on CM4 (no 48V needed), attach gdb/perf to running game, dump `g_asset_registry` once scenes have loaded. One-shot capture. Low eng cost, moderate logistics.
+- **(C) Manual triage.** Audition 231 + 303 WAV candidates against the ~750 `SE_PK_*` names; tag what we recognize. Zero eng cost, high user time cost. Can be accelerated with a small play/tag TUI.
+
+### 42.5: Decision — pivoting to (C)
+
+BN exhausted means (A) is gated behind the Step-31 TLS investigation, which is a different work track. (B) depends on when CM4 setup lands. (C) can start immediately and produces usable results per hour of listening.
+
+Going with (C). Starting points:
+- **3 confirmed music tracks** (67 / 139 / 81 s) → slot into 3 of the `SE_PK_THEME_*` / `SE_PK_MX_*` constants by audition.
+- **6 user-labeled Pokémon cries** (PIKACHU/ODDISH/PSYDUCK/MUDKIP/ONIX/DIGLETT) → map directly to `SE_PK_VO_POKEDEX_####` by Pokédex number.
+- **35 long `wav_candidates`** (>30 s) → audition against TUNE / THEME / BONUS / MX names.
+- **44 medium** (5–30 s) → longer VO and FX.
+- **Skip 224 shorts** — mostly RGBA-as-PCM noise.
+
+### 42.6: Artifacts
+
+- This JOURNAL entry.
+- `PROTOCOL.md → Sound event registration` — extended with stages 3–5 + rationale.
+- `memory/project_audio_next.md` — updated with final state: static path dead; triage is now the official plan.
+
+## Step 43: Standalone extractor built — image.bin section 7 is all we need (2026-04-20)
+
+Pivoted the mapping problem into a *generic extraction* problem after Step 42 closed the SE_PK_* → asset_id avenue. User's architectural ask: a **standalone** extractor that operates on `(game binary, image.bin)` alone, modeled on Pinball Browser — no runtime emulation, no shim dependency. Deliverable: `games/pokemon_le/_extraction/tools/spike_extract/`.
+
+### 43.1: Walked the `g_asset_registry` hashmap at runtime
+
+Extended the shim's `SIGSEGV`+`SIGBUS` handler to parse the `std::_Hashtable` struct at `data_48ca4d0` and walk the `_M_nxt` linked list, dumping each node's raw bytes to `_emulation/asset_registry.bin`.
+
+Hurdles resolved along the way (all documented here for future QEMU memory-dump work):
+
+- **`/proc/self/mem` is host-view, not guest-view.** `pread()` to read guest VAs fails with `EIO`. Switched to direct `memcpy` — under QEMU user-mode the shim runs as guest code (aarch64 via TCG), so direct pointer access hits QEMU's address translation.
+- **Game binary is rebased by QEMU ASLR.** Dladdr-from-backtrace gives the runtime base. Trap: `strstr(dli_fname, "/game")` also matches the shim's path (`.../games/pokemon_le/_emulation/spi_shim.so`) because "games" is plural. Filter with `&& !strstr(dli_fname, ".so")` to avoid false match on shim frames.
+- **Binary fully stripped** — neither `nm -D` nor static symbols expose internal C++ methods. Inline binary-patching of the function prologue would be needed to hook by address. Not required for this dump (we're reading globals, not hooking functions).
+- **SIGTERM intercepted by QEMU, not forwarded to guest.** `timeout --signal=TERM` produces an empty log. Rely on the natural Step-31 `PopupMenu` SEGV instead, which fires ~55–66 s in.
+
+Final shim dump captures **2452 nodes × 128 bytes** = 314 KB to `asset_registry.bin`. Nodes are actually ~48 bytes; the extra padding in each 128-byte slot includes adjacent heap memory (harmless, parser only reads the first 48 bytes).
+
+### 43.2: `_Hashtable` struct decoded
+
+Header at `game_base + 0x44ca4d0`:
+
+```
+_M_buckets       = heap ptr (0x7?????02fc80 typical)
+_M_bucket_count  = 5087  (prime > 2452)
+_M_before_begin._M_nxt = heap ptr to first node
+_M_element_count = 2452  (matches image.bin section-7 record count)
+_M_max_load_factor = 1.0
+_M_next_resize   = 5087
+```
+
+Node key is the `uint64_t` at offset `+0x08`. **Verified:** 2452 unique keys across all nodes.
+
+### 43.3: Registry keys match image.bin section 7 exactly
+
+Parsed image.bin section 7 (24-byte records at file offset `0x42F23E06`) with the documented format from `_extraction/README.md`:
+
+```
+bytes 0-7:   uint64 file_offset
+bytes 8-15:  uint64 (flags<<32 | asset_id_low)     ← the composite key
+bytes 16-23: uint64 (hash<<32 | size_elements)
+```
+
+Cross-reference result:
+
+```
+registry keys:         2452
+image.bin encoded_ids: 2452
+intersection:          2452
+reg-only:              0
+img-only:              0
+perfect_match:         True
+```
+
+**The runtime registry is a cached index of section-7 data — nothing more.** Static extraction from `image.bin` alone is sufficient; the shim's dump becomes validation-only.
+
+### 43.4: Standalone extractor `spike_extract/`
+
+New tool at `games/pokemon_le/_extraction/tools/spike_extract/`:
+
+```
+spike_extract/
+├── __init__.py           # package header
+├── __main__.py           # CLI: python -m spike_extract --image image.bin [--registry X] [--out dir]
+├── image_bin.py          # Section-7 parser → AssetRecord dataclass
+├── registry_dump.py      # Reads _emulation/asset_registry.bin (optional validation)
+└── README.md             # Usage + format docs
+```
+
+Usage:
+
+```
+# Pure static extraction — no shim needed
+python -m spike_extract --image games/pokemon_le/image.bin --out out/
+
+# With validation against runtime dump
+python -m spike_extract --image image.bin --registry asset_registry.bin --out out/
+```
+
+Validation run confirmed 2452/2452 match with the runtime registry.
+
+### 43.4b: Classifier refined + full extraction
+
+Initial histogram had a 268-record `data_4byte` bucket labelled "non-audio 4-byte data". Inspecting the first 16 bytes of those records revealed small signed int16 deltas clustered near zero — the textbook shape of low-amplitude stereo PCM sample pairs. One of the 3 known music tracks (asset 1089, id `0x00020046`) was sitting in `data_4byte` because its id_low doesn't have bit 10 set — my "music" heuristic was too narrow.
+
+Discovered pattern: **all 347 4-byte-element records in Pokémon LE 0.81 have bit 17 (`0x20000`) set in `id_low`**. This is the stereo-audio marker. Rewrote the classifier to:
+
+- Stereo audio (any): `elem == 4 AND (id_low & 0x20000) AND (id_low & 0x40)`
+- Split into music vs SFX by computed duration (≥30 s → music) since there's no reliable static discriminator.
+
+Cleaned up folder creation to be lazy — empty categories produce no folder.
+
+Final full-extraction histogram:
+
+| Category | Count | Size |
+|---|---:|---:|
+| `audio_mono` | 2105 | 566 MB |
+| `audio_stereo_sfx` | 312 | 180 MB |
+| `audio_stereo_music` | 35 | 331 MB |
+
+All 3 known music tracks classified correctly. MUDKIP cry byte-exact with legacy `_extraction/wav/` (mod WAV header). `data_4byte` bucket eliminated. `audio_mono` is still coarse (2105 > 230 true-mono baseline), but the stereo-audio pool is clean.
+
+Output: `_extraction/spike_extract_out/` (1.1 GB, 2452 WAV files + `index.csv`).
+
+### 43.5: Portability
+
+The section-7 format is stable across Stern's Spike 3 codebase. Parser should work on any `image.bin` from any Spike 3 game (Jurassic Park Pro, Stranger Things, etc.). Per-game tuning is only the classification heuristic — different games may use different `flags` encodings and the 64 `asset_id_low` category codes may shift. The file-structure parser is universal.
+
+Future: accept `--registry-va 0x48ca4d0` as CLI flag (default for Pokémon LE 0.81) for scanning other builds' game binaries; extend `image_bin.py` to handle `image-sc*.bin` scene-specific subfiles via the RB-tree-of-mmaps pattern documented in `load_image_bin_file` at BN `0xc47210` (decomp captured in Step 43 session notes).
+
+### 43.6: What the shim's role is now
+
+The shim stays in the repo as the emulation-investigation tool (Steps 14–42). Its new `shim_dump_sound_globals` routine is preserved as a **reference-capture mechanism** for validating future Spike 3 image.bin parsers. For routine extraction, no shim, no QEMU — just `python -m spike_extract --image image.bin`.
+
+### 43.7: Artifacts
+
+- `games/pokemon_le/_extraction/tools/spike_extract/` — the tool.
+- `games/pokemon_le/_emulation/asset_registry.bin` — reference registry dump (314 KB; regenerate by running the shim with the current `spi_shim.c`).
+- `games/pokemon_le/_emulation/spi_shim.c` — SIGSEGV handler now includes hashmap struct parse + linked-list walk + file-based dump.
+- PROTOCOL.md — new `g_asset_registry` section with the verified struct layout and validation record.
+

@@ -145,6 +145,127 @@ Paths intercepted by `_emulation/spi_shim.c`:
 
 Verified by Step 24 run: game completes full bridge → DRM resource enumeration → Radium compiles **12** shader programs (24 shader objects, 12 vertex `type=0x8b31` + 12 fragment `type=0x8b30` — refining prior "11 programs" count) → SternLogo PNG uploaded as 1920×1080 RGBA → 16 additional RGBA textures uploaded at 1024×{64,128,256,512} → DMD `gbm_bo_map`/`gbm_bo_unmap` path executes and produces one 1024×256 BGRA frame on disk → process aborts on ALSA assertion (new blocker, not a GL problem). The prior Step-22 SEGV at `NULL+0x48` is refuted by this run and by design — `gbm_bo_map` is now hooked.
 
+## Sound event registration — verified (Step 41)
+
+**Function:** `sub_8d3460` at BN VA `0x8d3460` / file offset `0x8d3460`. Called during C++ static init before GDScript runs.
+
+**Effect:** Populates `std::unordered_map<std::string, uint16_t>` at `data_48c56d0` (BN VA `0x48c56d0`) with **25 sound-event name → token entries**. Each registration:
+
+```
+sub_b094c0(&data_48c56d0, &"SE_PK_FX_...", token, 0xffffffff)
+```
+
+Insertion helper `sub_b094c0` → mutex-guarded (`sub_b09370`) → hash via `sub_b09850` using `std::_Hash_bytes` with seed `0xc70f6907` (= `std::hash<std::string>`).
+
+**Token namespace** (contiguous ranges):
+
+| Token range | Count | Name prefix |
+|---|---:|---|
+| `0x6b–0x71` | 7 | `SE_PK_FX_EOB_POKEDEX_*` |
+| `0xba–0xcb` | 18 | `SE_PK_FX_ATTACK_TYPE_*` |
+
+**Full 25-entry table:**
+
+| Token | Name |
+|---:|---|
+| `0x6b` | `SE_PK_FX_EOB_POKEDEX_PAGE_TURN` |
+| `0x6c` | `SE_PK_FX_EOB_POKEDEX_POKEMON_CAUGHT_LARGE_SCREEN` |
+| `0x6d` | `SE_PK_FX_EOB_POKEDEX_POKEMON_CAUGHT_SMALL_SCREEN` |
+| `0x6e` | `SE_PK_FX_EOB_POKEDEX_RESULTS` |
+| `0x6f` | `SE_PK_FX_EOB_POKEDEX_SCREEN_DOWN` |
+| `0x70` | `SE_PK_FX_EOB_POKEDEX_SCREEN_UP` |
+| `0x71` | `SE_PK_FX_EOB_POKEDEX_BACKGROUND` |
+| `0xba` | `SE_PK_FX_ATTACK_TYPE_BUG` |
+| `0xbb` | `SE_PK_FX_ATTACK_TYPE_DARK` |
+| `0xbc` | `SE_PK_FX_ATTACK_TYPE_DRAGON` |
+| `0xbd` | `SE_PK_FX_ATTACK_TYPE_ELECTRIC` |
+| `0xbe` | `SE_PK_FX_ATTACK_TYPE_FAIRY` |
+| `0xbf` | `SE_PK_FX_ATTACK_TYPE_FIGHTING` |
+| `0xc0` | `SE_PK_FX_ATTACK_TYPE_FIRE` |
+| `0xc1` | `SE_PK_FX_ATTACK_TYPE_FLYING` |
+| `0xc2` | `SE_PK_FX_ATTACK_TYPE_GHOST` |
+| `0xc3` | `SE_PK_FX_ATTACK_TYPE_GRASS` |
+| `0xc4` | `SE_PK_FX_ATTACK_TYPE_GROUND` |
+| `0xc5` | `SE_PK_FX_ATTACK_TYPE_ICE` |
+| `0xc6` | `SE_PK_FX_ATTACK_TYPE_NORMAL` |
+| `0xc7` | `SE_PK_FX_ATTACK_TYPE_POISON` |
+| `0xc8` | `SE_PK_FX_ATTACK_TYPE_PSYCHIC` |
+| `0xc9` | `SE_PK_FX_ATTACK_TYPE_ROCK` |
+| `0xca` | `SE_PK_FX_ATTACK_TYPE_STEEL` |
+| `0xcb` | `SE_PK_FX_ATTACK_TYPE_WATER` |
+
+**Signature** (Itanium mangled `_ZN16GodotSpikeBridge14register_soundERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEtiE…`):
+
+- 1st: `std::string const&` (name)
+- 2nd: **`uint16_t`** (token) — `t` = unsigned short, **not** uint32_t
+- 3rd: `int` (flags — always `0xffffffff` at observed registration sites)
+
+The Godot bridge exposes this method to GDScript via a `std::function<void(Array const&)>` adapter lambda (typeinfo at BN VA `0x46bb1f8`, libstdc++ manager at `sub_b086b4`). The lambda unpacks an `Array` from GDScript and calls into `register_sound` with typed arguments.
+
+**GDScript call pattern:** `Spike.play_sound(SpikeSoundIds.SE_PK_FX_<NAME>)` — passes the string; the C++ bridge looks it up in the hashmap to resolve to a token.
+
+**What's NOT in the hashmap:** ~725 other `SE_PK_*` strings from the previs `spike_game_sound_ids.gd` autoload (VO, TUNE, MX, BONUS, THEME, and several FX families beyond attack-type / EOB-pokedex). Their dispatch path is not located statically — see 5-stage pipeline below.
+
+**Full 5-stage resolution pipeline** (added Step 42):
+
+| Stage | Function | Effect |
+|---|---|---|
+| 1 | `sub_8d3460` (static init) | Name string → uint16_t token, into hashmap at `data_48c56d0` (25 entries only) |
+| 2 | `sub_b09660` | Name lookup in the hashmap; returns hash node with token at offset `+0x28` |
+| 3 | **NONE — runtime only** | Token → asset_id: **not in compiled code**. Populated from scene bytecodes (type-0x0b records) by `load_scene_assets` at `0xb321d0` when each scene loads. Per-scene variants possible. |
+| 4 | `asset_registry_find` over `g_asset_registry` at `data_48ca4d0` | Encoded asset_id → `{file_offset, size, type}` |
+| 5 | `get_asset_ptr_by_packed_id` → `image_mapped_base_plus_offset` | File offset → absolute pointer inside mmap'd `image.bin` |
+
+**Why static extraction fails** (Sidekick, Step 42): "This separation allows content updates without binary recompilation — a regulatory compliance requirement for gaming machines." No `uint32_t token_to_asset[]` array exists; token constants never appear in asset-ID construction paths. Same `SE_PK_*` can map to different asset_ids across scenes.
+
+**Implication**: to obtain the full name → asset_id mapping, either (a) runtime-capture under emulation by hooking `asset_registry_find` / `sub_b09660` after `load_scene_assets` has run for every scene, or (b) dump `g_asset_registry` from a running game on real hardware (CM4). Both are deferred as of Step 42.
+
+Verified by: JOURNAL Step 41 (stages 1–2) and Step 42 (stages 3–5, architectural rationale).
+
+---
+
+## g_asset_registry — `std::unordered_map` layout verified (Step 43)
+
+**Location:** BN VA `0x48ca4d0` → ELF VA `0x44ca4d0` → runtime VA `game_base + 0x44ca4d0` (QEMU ASLR-dependent game_base resolved via `dladdr(frames[i])` on any backtrace frame whose `dli_fname` ends with `/game` and is NOT a `.so`).
+
+**Struct** (libstdc++ `std::_Hashtable`, 56 bytes, populated by `load_scene_assets` during C++ static init):
+
+| Offset | Type | Field | Pokémon LE 0.81 value |
+|---|---|---|---|
+| +0x00 | `uintptr_t` | `_M_buckets` | heap ptr (bucket array) |
+| +0x08 | `uint64_t` | `_M_bucket_count` | 5087 (prime for 2452 elements) |
+| +0x10 | `uintptr_t` | `_M_before_begin._M_nxt` | heap ptr (first node in chain) |
+| +0x18 | `uint64_t` | `_M_element_count` | **2452** (= image.bin section-7 record count) |
+| +0x20 | `float` | `_M_max_load_factor` | 1.0 |
+| +0x28 | `uint64_t` | `_M_next_resize` | 5087 |
+| +0x30 | `uintptr_t` | `_M_single_bucket` | NULL |
+
+**Node layout** (libstdc++ `_Hash_node<pair<const uint64_t, AssetRecord>, true>`):
+
+| Offset | Type | Field |
+|---|---|---|
+| +0x00 | `uintptr_t` | `_M_nxt` — next node in bucket chain |
+| +0x08 | `uint64_t` | **key** = `(flags << 32) \| asset_id_low` — matches image.bin section-7 bytes 8–15 |
+| +0x10 | `uint64_t` | `_M_hash_code` (cached) OR first value field |
+| +0x18..+0x2f | *varies* | `AssetRecord` value fields (exact layout TBD) |
+
+Across all 2452 nodes: **unique key count = 2452** (confirmed via shim dump). U32-at-+0x08 has only 64 unique values (the `asset_id_low` category codes); u32-at-+0x0c has 256 unique values (the `flags` field).
+
+**Cross-reference with image.bin section 7 (Step 43 verification):** the 2452 u64 keys from the runtime registry intersect **exactly** with the 2452 `(flags << 32) | asset_id_low` composite values parsed from image.bin section-7 records. Intersection = 2452, `reg-only` = 0, `img-only` = 0. This proves the registry is a runtime-populated cache of section-7 data and nothing more — **static extraction from image.bin alone is sufficient**.
+
+**Implication for extraction:** a standalone tool (`_extraction/tools/spike_extract/`) parses image.bin section 7 and extracts every asset without needing the game binary or emulator. The shim's `asset_registry.bin` dump serves only as validation.
+
+**Discovery path** (followed without additional Binary Ninja budget):
+1. Lambda typeinfo at BN VA `0x46bb1f8` → rodata string at `0x3bc8f08`.
+2. libstdc++ `std::function` manager `sub_b086b4` at file offset `0xb086b4` (stateless-lambda variant: op 0 = get_type_info, op 1 = get_functor_ptr, op 2 = clone_functor).
+3. Xrefs to the manager → `sub_8d3460` at file offset `0x8d3460` (25-string sound-event registration, documented above).
+4. Shim memory dump (`_emulation/spi_shim.c` → `shim_dump_sound_globals`) reads the `_Hashtable` struct + walks `_M_nxt` chain → `_emulation/asset_registry.bin` binary dump (format documented in `_extraction/tools/spike_extract/registry_dump.py`).
+5. Parser matches 2452/2452 against image.bin section 7 → registry is a cache, not a source of new info.
+
+Verified by: JOURNAL Step 43.
+
+---
+
 ## Run command
 
 ```bash

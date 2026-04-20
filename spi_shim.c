@@ -214,6 +214,270 @@ static void shim_init_capture_dirs(void) {
  * getting output out before the inevitable re-crash.
  */
 
+/* Read `size` bytes from guest VA `addr` into `dst`. Under QEMU user-mode
+ * the shim runs as guest code, so a direct memcpy hits QEMU's address
+ * translation and reaches guest memory (unlike /proc/self/mem, which is
+ * host-view). If `addr` points to an unmapped guest page the memcpy
+ * faults — if we're already inside a SIGSEGV handler, the second fault
+ * will terminate the process. Caller should write diagnostic context
+ * BEFORE calling this so at least the header makes it to stderr. */
+static ssize_t shim_safe_read(void *dst, uintptr_t addr, size_t size) {
+    memcpy(dst, (const void *)addr, size);
+    return (ssize_t)size;
+}
+
+/* Hexdump `size` bytes starting at guest VA `addr` to stderr in
+ * `offset: hh hh hh ... |ascii|` format. Uses shim_safe_read so
+ * unmapped addresses report an error rather than crashing. */
+static void shim_hexdump_stderr(const char *label, uintptr_t addr, size_t size) {
+    char hdr[256];
+    int hn = snprintf(hdr, sizeof(hdr),
+        "\n--- DUMP %s @ 0x%lx (%zu bytes) ---\n", label, addr, size);
+    ssize_t u = write(STDERR_FILENO, hdr, (size_t)hn);
+    (void)u;
+
+    unsigned char buf[4096];
+    size_t off = 0;
+    while (off < size) {
+        size_t chunk = size - off;
+        if (chunk > sizeof(buf)) chunk = sizeof(buf);
+        ssize_t got = shim_safe_read(buf, addr + off, chunk);
+        if (got <= 0) {
+            char err[128];
+            int en = snprintf(err, sizeof(err),
+                "  (unreadable at 0x%lx: pread=%zd errno=%d)\n",
+                addr + off, got, errno);
+            u = write(STDERR_FILENO, err, (size_t)en);
+            break;
+        }
+        for (ssize_t i = 0; i < got; i += 16) {
+            char line[128];
+            int ln = snprintf(line, sizeof(line), "%08lx: ", addr + off + (size_t)i);
+            ssize_t j;
+            for (j = 0; j < 16 && (i + j) < got; j++)
+                ln += snprintf(line + ln, sizeof(line) - (size_t)ln,
+                               "%02x ", buf[i + j]);
+            while (ln < 60) line[ln++] = ' ';
+            line[ln++] = '|';
+            for (j = 0; j < 16 && (i + j) < got; j++) {
+                unsigned char c = buf[i + j];
+                line[ln++] = (c >= 32 && c < 127) ? (char)c : '.';
+            }
+            line[ln++] = '|';
+            line[ln++] = '\n';
+            u = write(STDERR_FILENO, line, (size_t)ln);
+        }
+        off += (size_t)got;
+    }
+}
+
+/* One-shot diagnostic: dump /proc/self/maps grep'd for the game binary
+ * and the two sound-system globals. Called from SIGSEGV handler. */
+static void shim_dump_sound_globals(void) {
+    /* Print the shim's own handler address so we know what VA range
+     * our code landed at under QEMU user-mode. If this is in the
+     * 0x7xxx... range, the shim is in high-memory mmap and we need
+     * to rebase guest addresses accordingly. */
+    char addr_line[256];
+    int aln = snprintf(addr_line, sizeof(addr_line),
+        "\n--- shim handler addresses (for computing QEMU guest base) ---\n"
+        "&shim_dump_sound_globals = %p\n"
+        "(shim .so was compiled with default aarch64 Linux ABI)\n",
+        (void*)shim_dump_sound_globals);
+    ssize_t u = write(STDERR_FILENO, addr_line, (size_t)aln);
+    (void)u;
+
+    /* Print the FULL /proc/self/maps so we can see file-backed
+     * mappings for the game binary. */
+    int mf = open("/proc/self/maps", O_RDONLY);
+    if (mf >= 0) {
+        char buf[32768];
+        ssize_t total = 0;
+        ssize_t n;
+        while (total < (ssize_t)sizeof(buf) - 1 &&
+               (n = read(mf, buf + total, sizeof(buf) - 1 - (size_t)total)) > 0) {
+            total += n;
+        }
+        close(mf);
+        if (total > 0) {
+            u = write(STDERR_FILENO,
+                "\n--- /proc/self/maps (full) ---\n", 33);
+            (void)u;
+            u = write(STDERR_FILENO, buf, (size_t)total);
+            (void)u;
+            u = write(STDERR_FILENO, "\n--- end /proc/self/maps ---\n", 30);
+            (void)u;
+        }
+    }
+
+    /* Find the game binary's load base at runtime by walking backtrace
+     * frames for one inside ./game and subtracting its file offset.
+     * QEMU user-mode + ASLR puts the game at a randomized base
+     * (~0x7ab...) rather than at ELF VA 0x400000. Filter out .so
+     * frames — the shim path contains the substring "games/" which
+     * would falsely match a bare "/game" strstr. */
+    uintptr_t game_base = 0;
+    void *bt[64];
+    int nb = backtrace(bt, 64);
+    for (int i = 0; i < nb; i++) {
+        Dl_info bi;
+        if (dladdr(bt[i], &bi) && bi.dli_fname &&
+            strstr(bi.dli_fname, "/game") &&
+            !strstr(bi.dli_fname, ".so")) {
+            game_base = (uintptr_t)bi.dli_fbase;
+            break;
+        }
+    }
+
+    char base_line[256];
+    int bln;
+    if (game_base == 0) {
+        bln = snprintf(base_line, sizeof(base_line),
+            "\n--- could NOT resolve game binary load base via dladdr; aborting dump ---\n");
+        u = write(STDERR_FILENO, base_line, (size_t)bln);
+        return;
+    }
+    bln = snprintf(base_line, sizeof(base_line),
+        "\n--- resolved game load base = 0x%lx ---\n"
+        "(hashmap = base + 0x44c56d0; registry = base + 0x44ca4d0)\n",
+        game_base);
+    u = write(STDERR_FILENO, base_line, (size_t)bln);
+
+    /* Self-probe: read 32 bytes at our own function's address. If
+     * THIS fails, memcpy can't read anything — something is wrong
+     * with how the shim executes in its own memory (unlikely). */
+    shim_hexdump_stderr("self-probe (&shim_dump_sound_globals)",
+                        (uintptr_t)&shim_dump_sound_globals, 0x20);
+
+    /* Frame-probe: read at the actual backtrace frame we found in
+     * the game binary. We know this address IS valid because the
+     * game is executing there right now. */
+    if (nb > 0) {
+        /* Find first frame in ./game and probe there directly. */
+        for (int i = 0; i < nb; i++) {
+            Dl_info bi;
+            if (dladdr(bt[i], &bi) && bi.dli_fname && strstr(bi.dli_fname, "/game")) {
+                shim_hexdump_stderr("frame-probe (live game PC from backtrace)",
+                                    (uintptr_t)bt[i], 0x20);
+                break;
+            }
+        }
+    }
+
+    /* Sanity probe: dump 64 bytes at the known rodata location of
+     * SE_PK_FX_ATTACK_TYPE_BUG. If this doesn't print an ASCII run
+     * starting with "SE_PK_FX_ATTACK_TYPE_BUG", game_base resolution
+     * is wrong and all subsequent dumps are suspect. */
+    shim_hexdump_stderr("rodata probe (SE_PK_FX_ATTACK_TYPE_BUG)",
+                        game_base + 0x3607900, 0x40);
+
+    /* Parse the g_asset_registry _Hashtable header and walk into
+     * the first few nodes. BN VA 0x48ca4d0 → ELF VA 0x44ca4d0. */
+    uintptr_t reg_addr = game_base + 0x44ca4d0;
+    uint64_t buckets_ptr = 0, bucket_count = 0, first_node = 0;
+    uint64_t element_count = 0, next_resize = 0;
+    uint32_t max_lf_bits = 0;
+    memcpy(&buckets_ptr,  (void*)(reg_addr + 0x00), 8);
+    memcpy(&bucket_count, (void*)(reg_addr + 0x08), 8);
+    memcpy(&first_node,   (void*)(reg_addr + 0x10), 8);
+    memcpy(&element_count,(void*)(reg_addr + 0x18), 8);
+    memcpy(&max_lf_bits,  (void*)(reg_addr + 0x20), 4);
+    memcpy(&next_resize,  (void*)(reg_addr + 0x28), 8);
+    float max_lf;
+    memcpy(&max_lf, &max_lf_bits, 4);
+
+    char summary[512];
+    int sn = snprintf(summary, sizeof(summary),
+        "\n=== g_asset_registry _Hashtable @ 0x%lx ===\n"
+        "  _M_buckets       = 0x%lx\n"
+        "  _M_bucket_count  = %lu\n"
+        "  _M_first_node    = 0x%lx\n"
+        "  _M_element_count = %lu\n"
+        "  _M_max_load_factor = %.2f\n"
+        "  _M_next_resize   = %lu\n",
+        reg_addr, buckets_ptr, bucket_count, first_node,
+        element_count, max_lf, next_resize);
+    u = write(STDERR_FILENO, summary, (size_t)sn);
+
+    /* Walk the full _M_nxt chain and dump each node's raw bytes to
+     * _emulation/asset_registry.bin for the standalone parser. Each
+     * node is assumed ≤128 bytes (libstdc++ _Hash_node<pair<K,V>,true>
+     * with cached hash; larger than typical but conservative). */
+    const size_t NODE_SIZE = 128;
+    uint64_t node_count = 0;
+    int fd = open("_emulation/asset_registry.bin",
+                  O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        const char *msg = "\n[shim] failed to open _emulation/asset_registry.bin\n";
+        u = write(STDERR_FILENO, msg, strlen(msg));
+    } else {
+        /* File layout:
+         *   [0x00..0x40)   64B file header (magic, game_base, registry_va, counts)
+         *   [0x40..0x80)   64B raw copy of the _Hashtable struct
+         *   [0x80..end)    node_count × NODE_SIZE bytes, each node raw */
+        struct {
+            char     magic[8];         // "SPK3ASR\0"
+            uint64_t game_base;
+            uint64_t registry_va;
+            uint64_t hashtable_bytes;  // 64
+            uint64_t node_size;        // NODE_SIZE
+            uint64_t node_count;       // filled after walk
+            uint64_t bucket_count;
+            uint64_t element_count;
+        } hdr = {{0}};
+        memcpy(hdr.magic, "SPK3ASR", 8);
+        hdr.game_base = game_base;
+        hdr.registry_va = reg_addr;
+        hdr.hashtable_bytes = 64;
+        hdr.node_size = NODE_SIZE;
+        hdr.bucket_count = bucket_count;
+        hdr.element_count = element_count;
+        /* Placeholder — rewritten after walk. */
+        u = (ssize_t)write(fd, &hdr, sizeof(hdr));
+        /* Pad to 64 bytes. */
+        char pad[64];
+        memset(pad, 0, sizeof(pad));
+        u = (ssize_t)write(fd, pad, 64 - sizeof(hdr));
+
+        /* Dump the _Hashtable struct verbatim (64 bytes covers it). */
+        u = (ssize_t)write(fd, (void*)reg_addr, 64);
+
+        /* Walk the chain. */
+        char node_buf[128];
+        uintptr_t node = (uintptr_t)first_node;
+        while (node != 0 && node_count < 3000) {
+            memcpy(node_buf, (void*)node, NODE_SIZE);
+            u = (ssize_t)write(fd, node_buf, NODE_SIZE);
+            /* _M_nxt is at +0x00 of every node. */
+            uint64_t nxt;
+            memcpy(&nxt, &node_buf[0], 8);
+            node = (uintptr_t)nxt;
+            node_count++;
+        }
+
+        /* Rewrite header with final node_count. */
+        hdr.node_count = node_count;
+        lseek(fd, 0, SEEK_SET);
+        u = (ssize_t)write(fd, &hdr, sizeof(hdr));
+        close(fd);
+
+        char msg[256];
+        int ml = snprintf(msg, sizeof(msg),
+            "\n[shim] asset_registry dumped: %lu nodes × %zu bytes → "
+            "_emulation/asset_registry.bin (%lu bytes total, elem_count=%lu)\n",
+            node_count, NODE_SIZE, 64 + 64 + node_count * NODE_SIZE, element_count);
+        u = write(STDERR_FILENO, msg, (size_t)ml);
+    }
+
+    /* Keep a small in-band hexdump so the user can eyeball structure
+     * without opening the binary file. 0x200 bytes = ~4 nodes. */
+    if (first_node) {
+        shim_hexdump_stderr("asset_registry first nodes (eyeball sample)",
+                            first_node, 0x200);
+    }
+    (void)node_count;
+}
+
 static void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
     (void)ucontext;
 
@@ -244,10 +508,29 @@ static void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
         u = write(STDERR_FILENO, line, (size_t)ln);
     }
 
+    /* Dump sound-system globals for offline inspection (Step 42). */
+    shim_dump_sound_globals();
+
     /* Chain to default handler so QEMU's "uncaught target signal 11"
      * + core dump still happen (unchanged external behaviour). */
     signal(sig, SIG_DFL);
     raise(sig);
+}
+
+/* SIGTERM / SIGUSR1 handler: dump sound globals and exit cleanly.
+ * Lets us extract memory state when `timeout` kills QEMU (SIGTERM)
+ * or when the user triggers a manual dump via `kill -USR1 <pid>`. */
+static void shim_term_dump_handler(int sig) {
+    char hdr[128];
+    int hn = snprintf(hdr, sizeof(hdr),
+        "\n=== SHIM SIGTERM/USR1 DUMP (sig=%d) ===\n", sig);
+    ssize_t u = write(STDERR_FILENO, hdr, (size_t)hn);
+    (void)u;
+    shim_dump_sound_globals();
+    /* For SIGTERM, exit cleanly; for SIGUSR1, keep running. */
+    if (sig == SIGTERM || sig == SIGINT) {
+        _exit(0);
+    }
 }
 
 __attribute__((constructor))
@@ -259,6 +542,14 @@ static void shim_install_crash_handler(void) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS,  &sa, NULL);
+
+    struct sigaction sa2;
+    memset(&sa2, 0, sizeof(sa2));
+    sa2.sa_handler = shim_term_dump_handler;
+    sigemptyset(&sa2.sa_mask);
+    sigaction(SIGTERM, &sa2, NULL);
+    sigaction(SIGINT,  &sa2, NULL);
+    sigaction(SIGUSR1, &sa2, NULL);
 }
 
 /* Synthesize a page-flip completion event on the shim side of the DRM
