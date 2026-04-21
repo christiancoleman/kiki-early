@@ -144,6 +144,20 @@ static uint32_t drm_next_fb_id = 100;
 /* DRM is a real socketpair (same pattern as UART) so the game's select() +
  * drmHandleEvent loop can drive forward on synthesized page-flip events. */
 
+/* ---- V4L2 stub fds (Step 46) ----
+ * libavcodec's v4l2_request HEVC decoder respects LIBVA_V4L2_REQUEST_MEDIA_PATH
+ * and LIBVA_V4L2_REQUEST_VIDEO_PATH env vars. We set both at run time to
+ * these sentinel paths and intercept the open — no /dev/media0 on the host
+ * means we must provide our own fake device.
+ */
+#define FAKE_V4L2_MEDIA_PATH  "/dev/shim-v4l2-media"
+#define FAKE_V4L2_VIDEO_PATH  "/dev/shim-v4l2-video"
+#define FAKE_FD_V4L2_MEDIA    1021
+#define FAKE_FD_V4L2_VIDEO    1020
+static int v4l2_media_active = 0;
+static int v4l2_video_active = 0;
+static uint32_t v4l2_ioctl_count = 0;
+
 /* ---- Device state ---- */
 
 static int spi_active = 0;
@@ -194,6 +208,10 @@ static void shim_init_capture_dirs(void) {
     mkdir("_emulation/shaders",   0755);
     mkdir("_emulation/textures",  0755);
     mkdir("_emulation/audio",     0755);
+    /* Step 45 — Godot tries to cache compiled shaders here and logs an
+     * ERROR when it can't create /tmp/cache. Host-visible path (/tmp is
+     * excluded from remap_path), so this mkdir works directly. */
+    mkdir("/tmp/cache",           0755);
 }
 
 /* ---- SIGSEGV/SIGBUS backtrace handler ----
@@ -478,6 +496,312 @@ static void shim_dump_sound_globals(void) {
     (void)node_count;
 }
 
+/* ---- cmode dump (Step 50) ----
+ *
+ * _INIT_74 registers 42 crule::cmode_* objects at fixed BN VA addresses.
+ * Struct layout (verified from sub_90d840 decomp):
+ *   +0x00  vtable ptr
+ *   +0x08  mode_id          (uint32)
+ *   +0x10  arg5 behaviour   (uint32)
+ *   +0x18  const 0x700
+ *   +0x30  type_flags       (uint32)
+ *   +0x58  scene_data ptr   (from get_scene_data_by_id(scene_id))
+ *   +0xb0  timer_obj ptr
+ *   +0x308 init_flag        (int — changes from 0 when mode activates)
+ *
+ * BN VA → runtime address = game_base + (bn_va - 0x400000).
+ *
+ * For 42 slots, dump (mode_id, type_flags, scene_ptr, init_flag) to give
+ * us a live snapshot of the game's mode state. If static init ran
+ * successfully these will all have the expected mode_id / type_flags
+ * values matching MODE_TABLE.md. If any init_flag is non-zero, that mode
+ * has transitioned from static-registration to "activated" state.
+ */
+
+struct shim_cmode_entry {
+    uintptr_t bn_va;        /* BN-reported .bss address */
+    uint32_t  expected_mode_id;
+    uint32_t  expected_type_flags;
+    const char *name_hint;
+};
+
+static const struct shim_cmode_entry shim_cmode_table[] = {
+    /* Simple/base modes (type_flags=0x01) — 20 entries */
+    { 0x4856ae0, 0x00, 0x01, "base_00" },
+    { 0x4856be0, 0x01, 0x01, "base_01" },
+    { 0x4856ce0, 0x02, 0x01, "base_02" },
+    { 0x4856df0, 0x03, 0x01, "base_03" },
+    { 0x4856f38, 0x04, 0x01, "base_04" },
+    { 0x4856fb8, 0x05, 0x01, "base_05" },
+    { 0x4857020, 0x06, 0x01, "base_06" },
+    { 0x48570c0, 0x08, 0x01, "base_08" },
+    { 0x48571a0, 0x07, 0x01, "base_07" },
+    { 0x4857288, 0x0b, 0x01, "base_0b" },
+    { 0x4857320, 0x0a, 0x01, "base_0a" },
+    { 0x48573d0, 0x0c, 0x01, "base_0c" },
+    { 0x4857448, 0x1f, 0x01, "base_1f" },
+    { 0x48574b8, 0x0d, 0x01, "base_0d" },
+    { 0x4857548, 0x0e, 0x01, "base_0e" },
+    { 0x4857608, 0x10, 0x01, "base_10" },
+    { 0x48576f8, 0x0f, 0x01, "base_0f" },
+    { 0x4857760, 0x11, 0x01, "base_11" },
+    { 0x48577d0, 0x1e, 0x01, "base_1e" },
+    { 0x4857950, 0x12, 0x01, "base_12" },
+    /* type_flags=0x08 utility modes */
+    { 0x48579d0, 0x25, 0x08, "util_25" },
+    { 0x4858360, 0x24, 0x08, "util_24" },
+    { 0x4859288, 0x1c, 0x08, "util_1c" },
+    /* Battle environment modes (type_flags=0x48) */
+    { 0x4857aa0, 0x20, 0x48, "battle_mountain" },
+    { 0x4857cd0, 0x21, 0x48, "battle_forest" },
+    { 0x4857f00, 0x22, 0x48, "battle_desert" },
+    { 0x4858130, 0x23, 0x48, "battle_coast" },
+    /* Pokemon story modes (type_flags=0x28) */
+    { 0x4858480, 0x13, 0x28, "story_bulbasaur_1" },
+    { 0x48585e0, 0x14, 0x28, "story_bulbasaur_2" },
+    { 0x48586b8, 0x15, 0x28, "story_charmander_1" },  /* CONFIRMED */
+    { 0x48587f8, 0x16, 0x28, "story_charmander_2" },
+    { 0x4858900, 0x19, 0x28, "story_squirtle_1" },
+    { 0x4858a50, 0x1a, 0x28, "story_squirtle_2" },
+    /* Pikachu modes (type_flags=0x24) */
+    { 0x4858df0, 0x17, 0x24, "pikachu_1" },
+    { 0x4858f90, 0x18, 0x24, "pikachu_2" },
+    /* Multiball family (type_flags=0x04) */
+    { 0x4858b28, 0x09, 0x04, "mb_09" },
+    { 0x4858c80, 0x26, 0x04, "mb_26" },
+    { 0x4858d38, 0x27, 0x04, "mb_27" },
+    /* Multiball / wizard (type_flags=0x84) */
+    { 0x48590a0, 0x28, 0x84, "rocket_mb_1" },
+    { 0x4859160, 0x1b, 0x84, "rocket_mb_2" },
+    { 0x4859368, 0x1d, 0x84, "rocket_mb_3" },
+    { 0x4859438, 0x29, 0x84, "rocket_wizard" },
+};
+
+/* Resolve the game binary's load base via backtrace + dladdr.
+ * Mirrors the logic in shim_dump_sound_globals. Returns 0 on failure. */
+static uintptr_t shim_resolve_game_base(void) {
+    void *bt[64];
+    int nb = backtrace(bt, 64);
+    for (int i = 0; i < nb; i++) {
+        Dl_info bi;
+        if (dladdr(bt[i], &bi) && bi.dli_fname &&
+            strstr(bi.dli_fname, "/game") &&
+            !strstr(bi.dli_fname, ".so")) {
+            return (uintptr_t)bi.dli_fbase;
+        }
+    }
+    return 0;
+}
+
+static void shim_dump_cmodes(void) {
+    uintptr_t game_base = shim_resolve_game_base();
+    if (game_base == 0) {
+        const char *m = "\n--- cmode dump: game_base not resolved, skipping ---\n";
+        ssize_t u = write(STDERR_FILENO, m, strlen(m));
+        (void)u;
+        return;
+    }
+
+    const char *hdr = "\n--- cmode state dump (42 entries from _INIT_74) ---\n"
+                      "slot  bn_va        rt_va            mode_id  type_flags  "
+                      "scene_ptr        init_flag  name\n";
+    ssize_t u = write(STDERR_FILENO, hdr, strlen(hdr));
+    (void)u;
+
+    size_t N = sizeof(shim_cmode_table) / sizeof(shim_cmode_table[0]);
+    int ok_count = 0, mismatch_count = 0, activated_count = 0;
+
+    for (size_t i = 0; i < N; i++) {
+        const struct shim_cmode_entry *e = &shim_cmode_table[i];
+        uintptr_t rt_va = game_base + (e->bn_va - 0x400000);
+
+        uint32_t mode_id = 0, type_flags = 0, init_flag = 0;
+        uintptr_t scene_ptr = 0;
+
+        /* Direct memcpy — under QEMU user-mode the shim runs as guest code,
+         * so accessing guest VAs works (same as asset_registry dump). */
+        memcpy(&mode_id,     (void*)(rt_va + 0x08), 4);
+        memcpy(&type_flags,  (void*)(rt_va + 0x0c), 4);   /* CORRECTED from +0x30 */
+        memcpy(&scene_ptr,   (void*)(rt_va + 0x58), 8);
+        memcpy(&init_flag,   (void*)(rt_va + 0x308), 4);
+
+        int ok = (mode_id == e->expected_mode_id &&
+                  type_flags == e->expected_type_flags);
+        if (ok) ok_count++; else mismatch_count++;
+        if (init_flag != 0) activated_count++;
+
+        char line[256];
+        int ln = snprintf(line, sizeof(line),
+            "%4zu  0x%08lx   0x%012lx   0x%02x      0x%02x        "
+            "0x%012lx   0x%08x  %s%s\n",
+            i, e->bn_va, (unsigned long)rt_va,
+            mode_id, type_flags,
+            (unsigned long)scene_ptr, init_flag,
+            e->name_hint,
+            ok ? "" : "  [MISMATCH]");
+        u = write(STDERR_FILENO, line, (size_t)ln);
+        (void)u;
+    }
+
+    char tail[256];
+    int tl = snprintf(tail, sizeof(tail),
+        "\n--- cmode dump summary: %d/%zu mode_id+type_flags matched, "
+        "%d activated (init_flag != 0), %d mismatches ---\n"
+        "(type_flags mismatches are expected — we haven't pinned the offset yet; "
+        "see hexdump below)\n",
+        ok_count, N, activated_count, mismatch_count);
+    u = write(STDERR_FILENO, tail, (size_t)tl);
+    (void)u;
+
+    /* Dereference scene_data_ptr for a few representative cmodes and
+     * hexdump the target memory. If scene_data contains a SHA-1 (Radium
+     * scene identifier) or a pointer to one, we'll see it as ASCII hex
+     * text in the dump. Three cmodes chosen:
+     *   - base_00 (mode 0x00, scene_id 0x29) — shared attract scene
+     *   - story_charmander_1 (mode 0x15, scene_id 0x1a) — known Radium
+     *     scene SHA-1 "7949bb14a9a21abf5e2885a01eb5ed4f9c3a8eca"
+     *   - battle_mountain (mode 0x20, scene_id 0x14) — distinct */
+    uintptr_t scene_ptrs[3];
+    memcpy(&scene_ptrs[0], (void*)(game_base + (0x4856ae0 - 0x400000) + 0x58), 8);
+    memcpy(&scene_ptrs[1], (void*)(game_base + (0x48586b8 - 0x400000) + 0x58), 8);
+    memcpy(&scene_ptrs[2], (void*)(game_base + (0x4857aa0 - 0x400000) + 0x58), 8);
+
+    if (scene_ptrs[0]) shim_hexdump_stderr(
+        "scene_data for base_00 (scene_id 0x29, shared attract)",
+        scene_ptrs[0], 0x80);
+    if (scene_ptrs[1]) shim_hexdump_stderr(
+        "scene_data for story_charmander_1 (scene_id 0x1a, SHA-1 7949bb14...)",
+        scene_ptrs[1], 0x80);
+    if (scene_ptrs[2]) shim_hexdump_stderr(
+        "scene_data for battle_mountain (scene_id 0x14)",
+        scene_ptrs[2], 0x80);
+}
+
+/* ---- Step 51: dispatch table dump ----
+ *
+ * From BN analysis (user-provided):
+ *   data_4767b30 = cmode pointer registry (42 entries × 8 bytes = 336 bytes)
+ *     Iterated by sub_950d60 (event handler) + sub_94f140 (update callback)
+ *   data_485ea80 = event dispatch linked-list heads (207 slots × 8 bytes = 1656 bytes)
+ *     206 event types, slot [event_id] -> head of callback linked list
+ *   data_48c52c0 = update-type linked-list heads (5 slots × 8 bytes = 40 bytes)
+ *   data_480eab0 = scene_data lookup table (40 entries × 0x1a0 = 16640 bytes)
+ *
+ * Dump: (a) the 42 cmode registry pointers and verify they match the .bss
+ * addresses we already expect. (b) which event slots have handlers — a
+ * histogram of "# events with ≥1 handler registered".
+ */
+static void shim_dump_dispatch_tables(void) {
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        const char *m = "\n--- dispatch tables: game_base unresolved, skipping ---\n";
+        ssize_t u = write(STDERR_FILENO, m, strlen(m)); (void)u;
+        return;
+    }
+
+    /* --- cmode registry at data_4767b30 --- */
+    uintptr_t reg_rt = game_base + (0x4767b30 - 0x400000);
+    uintptr_t reg_end_rt = game_base + (0x4767c80 - 0x400000);
+    size_t reg_entries = (reg_end_rt - reg_rt) / 8;
+
+    char hdr[256];
+    int hn = snprintf(hdr, sizeof(hdr),
+        "\n--- cmode registry @ data_4767b30 (runtime 0x%lx, %zu entries) ---\n"
+        " idx  registry_ptr_value   expected_bss     match?\n",
+        reg_rt, reg_entries);
+    ssize_t u = write(STDERR_FILENO, hdr, (size_t)hn); (void)u;
+
+    /* Expected cmode BSS addresses from _INIT_74, in the ORDER we think
+     * they're registered into data_4767b30. This is a guess — the actual
+     * order may differ. If the guess is wrong, the "match?" column flags
+     * it and we learn what the real order is from the registry itself. */
+    static const uintptr_t expected_order[] = {
+        0x4856ae0, 0x4856be0, 0x4856ce0, 0x4856df0, 0x4856f38, 0x4856fb8,
+        0x4857020, 0x48571a0, 0x48570c0, 0x4857288, 0x4857320, 0x48573d0,
+        0x4857448, 0x48574b8, 0x4857548, 0x4857608, 0x48576f8, 0x4857760,
+        0x48577d0, 0x4857950, 0x48579d0, 0x4857aa0, 0x4857cd0, 0x4857f00,
+        0x4858130, 0x4858360, 0x4858480, 0x48585e0, 0x48586b8, 0x48587f8,
+        0x4858900, 0x4858a50, 0x4858b28, 0x4858c80, 0x4858d38, 0x4858df0,
+        0x4858f90, 0x48590a0, 0x4859160, 0x4859288, 0x4859368, 0x4859438,
+    };
+    size_t N_expected = sizeof(expected_order) / sizeof(expected_order[0]);
+
+    int matched = 0;
+    for (size_t i = 0; i < reg_entries && i < 64; i++) {
+        uintptr_t entry = 0;
+        memcpy(&entry, (void*)(reg_rt + i * 8), 8);
+        /* Unmap runtime→BN VA: subtract game_base, add 0x400000 */
+        uintptr_t entry_bn = entry - game_base + 0x400000;
+        uintptr_t expected_bn = (i < N_expected) ? expected_order[i] : 0;
+        int mismatch = (expected_bn == 0 || entry_bn != expected_bn);
+        if (!mismatch) matched++;
+
+        char line[200];
+        int ln = snprintf(line, sizeof(line),
+            " %3zu  0x%014lx  0x%08lx  %s\n",
+            i, (unsigned long)entry, (unsigned long)expected_bn,
+            mismatch ? "[differs]" : "ok");
+        u = write(STDERR_FILENO, line, (size_t)ln); (void)u;
+    }
+    char sum[128];
+    int sl = snprintf(sum, sizeof(sum),
+        "  cmode registry: %d/%zu matched expected .bss ordering\n",
+        matched, reg_entries);
+    u = write(STDERR_FILENO, sum, (size_t)sl); (void)u;
+
+    /* --- event handler histogram at data_485ea80 (207 slots) --- */
+    uintptr_t evt_base = game_base + (0x485ea80 - 0x400000);
+    int populated = 0;
+    int total_handlers = 0;
+    char evt_detail[16384] = "\n--- event dispatch @ data_485ea80 (207 slots; non-empty shown) ---\n";
+    size_t evt_off = strlen(evt_detail);
+    for (int ev = 0; ev <= 0xce; ev++) {
+        uintptr_t head = 0;
+        memcpy(&head, (void*)(evt_base + ev * 8), 8);
+        if (!head) continue;
+        populated++;
+        /* Count chain length by following a 'next' pointer at offset +0x10
+         * (guessed from sub_9c11d0's linked-list insertion pattern). */
+        int chain = 0;
+        uintptr_t cur = head;
+        for (int step = 0; step < 32 && cur; step++) {
+            chain++;
+            total_handlers++;
+            uintptr_t next = 0;
+            memcpy(&next, (void*)(cur + 0x10), 8);
+            cur = next;
+        }
+        size_t space_left = sizeof(evt_detail) - evt_off;
+        if (space_left > 128) {
+            int added = snprintf(evt_detail + evt_off, space_left,
+                "  event 0x%02x: head=0x%lx  chain_len=%d\n",
+                ev, (unsigned long)head, chain);
+            evt_off += (size_t)added;
+        }
+    }
+    u = write(STDERR_FILENO, evt_detail, evt_off); (void)u;
+    char esum[128];
+    int esl = snprintf(esum, sizeof(esum),
+        "  event registry summary: %d/207 slots populated, %d total handlers\n",
+        populated, total_handlers);
+    u = write(STDERR_FILENO, esum, (size_t)esl); (void)u;
+
+    /* --- update-type dispatch at data_48c52c0 (5 slots) --- */
+    uintptr_t upd_base = game_base + (0x48c52c0 - 0x400000);
+    char upd_hdr[128];
+    int uhl = snprintf(upd_hdr, sizeof(upd_hdr),
+        "\n--- update-type dispatch @ data_48c52c0 (5 slots) ---\n");
+    u = write(STDERR_FILENO, upd_hdr, (size_t)uhl); (void)u;
+    for (int ut = 0; ut < 5; ut++) {
+        uintptr_t head = 0;
+        memcpy(&head, (void*)(upd_base + ut * 8), 8);
+        char line[128];
+        int lnn = snprintf(line, sizeof(line),
+            "  update_type %d: head=0x%lx\n", ut, (unsigned long)head);
+        u = write(STDERR_FILENO, line, (size_t)lnn); (void)u;
+    }
+}
+
 static void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
     (void)ucontext;
 
@@ -511,6 +835,12 @@ static void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
     /* Dump sound-system globals for offline inspection (Step 42). */
     shim_dump_sound_globals();
 
+    /* Dump the 42 cmode objects from _INIT_74 (Step 50). */
+    shim_dump_cmodes();
+
+    /* Dump dispatch tables: cmode registry, event handlers, update types (Step 51). */
+    shim_dump_dispatch_tables();
+
     /* Chain to default handler so QEMU's "uncaught target signal 11"
      * + core dump still happen (unchanged external behaviour). */
     signal(sig, SIG_DFL);
@@ -527,6 +857,8 @@ static void shim_term_dump_handler(int sig) {
     ssize_t u = write(STDERR_FILENO, hdr, (size_t)hn);
     (void)u;
     shim_dump_sound_globals();
+    shim_dump_cmodes();
+    shim_dump_dispatch_tables();
     /* For SIGTERM, exit cleanly; for SIGUSR1, keep running. */
     if (sig == SIGTERM || sig == SIGINT) {
         _exit(0);
@@ -631,6 +963,18 @@ static int intercept_device(const char *pathname) {
                  pathname, drm_game_fd, drm_shim_fd);
         return drm_game_fd;
     }
+    if (strcmp(pathname, FAKE_V4L2_MEDIA_PATH) == 0) {
+        v4l2_media_active = 1;
+        SHIM_LOG("OPEN %s -> fake fd %d (V4L2 media controller — probe logging)",
+                 pathname, FAKE_FD_V4L2_MEDIA);
+        return FAKE_FD_V4L2_MEDIA;
+    }
+    if (strcmp(pathname, FAKE_V4L2_VIDEO_PATH) == 0) {
+        v4l2_video_active = 1;
+        SHIM_LOG("OPEN %s -> fake fd %d (V4L2 video device — probe logging)",
+                 pathname, FAKE_FD_V4L2_VIDEO);
+        return FAKE_FD_V4L2_VIDEO;
+    }
     if (strcmp(pathname, "/dev/ttyAMA5") == 0 ||
         strcmp(pathname, "/dev/ttyAMA2") == 0) {
         if (uart_game_fd < 0) {
@@ -660,7 +1004,14 @@ static int is_fake_fd(int fd) {
      * that need to check for "any intercepted device" should call both
      * this and uart_game_fd / drm_game_fd explicitly. */
     return (fd == FAKE_FD_SPI && spi_active) ||
-           (fd == FAKE_FD_I2C && i2c_active);
+           (fd == FAKE_FD_I2C && i2c_active) ||
+           (fd == FAKE_FD_V4L2_MEDIA && v4l2_media_active) ||
+           (fd == FAKE_FD_V4L2_VIDEO && v4l2_video_active);
+}
+
+static int is_v4l2_fd(int fd) {
+    return (fd == FAKE_FD_V4L2_MEDIA && v4l2_media_active) ||
+           (fd == FAKE_FD_V4L2_VIDEO && v4l2_video_active);
 }
 
 static int is_uart_fd(int fd) {
@@ -2261,6 +2612,16 @@ int close(int fd) {
         i2c_active = 0;
         return 0;
     }
+    if (fd == FAKE_FD_V4L2_MEDIA && v4l2_media_active) {
+        SHIM_LOG("CLOSE V4L2 media (fd %d) after %u ioctls", fd, v4l2_ioctl_count);
+        v4l2_media_active = 0;
+        return 0;
+    }
+    if (fd == FAKE_FD_V4L2_VIDEO && v4l2_video_active) {
+        SHIM_LOG("CLOSE V4L2 video (fd %d)", fd);
+        v4l2_video_active = 0;
+        return 0;
+    }
     if (is_uart_fd(fd)) {
         SHIM_LOG("CLOSE UART (game=%d shim=%d) after %u reads, %u writes",
                  uart_game_fd, uart_shim_fd, uart_read_count, uart_write_count);
@@ -2640,6 +3001,26 @@ static void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
                  cmd27_count, status, id);
         return;
     }
+    /* Step 45: cmd 0x25 / 0x41 silent-ACK reverted.
+     *
+     * ATTEMPTED: zero-payload ACK for both. Unblocked the send-side channel
+     * wait, but progress REGRESSED — the crashing run reached Godot init +
+     * Radium + pokemon_battle_scene + texture 400 before SEGV. With ACKs
+     * enabled, the game never reached Godot at all in 90 s (stdout stopped
+     * at the /data/ mkdir errors; no Godot Engine banner; texture/shader
+     * counts unchanged from pre-init steady state).
+     *
+     * Interpretation: the previous timeout path WAS the progress path. Game
+     * sends cmd 0x41, waits 1000 ms, times out, logs "Connection timed out",
+     * falls back to default/null state, proceeds to Godot. Our fast zero-
+     * payload ACK arrives before the timeout fires; game interprets "ACK
+     * without the expected status payload" as "keep polling", and spins.
+     *
+     * cmd 0x41 dispatches to dedicated handler 0x915f88 (PROTOCOL.md) with
+     * payload contract unknown. Resolving it properly needs a BN dig we
+     * don't want to spend budget on today. For now: let the timeout fire,
+     * memcpy NULL-guard catches the downstream PopupMenu SEGV.
+     */
     default:
         SHIM_LOG("bridge: no synthetic response for cmd 0x%02x", cmd);
         return;
@@ -3021,6 +3402,32 @@ int ioctl(int fd, unsigned long request, ...) {
         }
     }
 
+    /* ---- V4L2 media controller + video device ioctls (Step 46 probe) ----
+     *
+     * First-pass probe: log every ioctl request number with arg pointer,
+     * return -1 with errno=ENOTTY. This tells libavcodec "this device does
+     * not support this ioctl" (the canonical response for an unsupported
+     * command) and should produce a deterministic error trail we can follow.
+     *
+     * ioctl request numbers follow the standard _IOR/_IOWR encoding:
+     *   bits [0..7]   = command nr
+     *   bits [8..15]  = magic letter ('V' = 0x56 for V4L2, '|' = 0x7c for MC)
+     *   bits [16..29] = arg size in bytes
+     *   bits [30..31] = direction (_IOC_READ=2, _IOC_WRITE=1)
+     * We print all four fields so we can decode without a header. */
+    if (is_v4l2_fd(fd)) {
+        v4l2_ioctl_count++;
+        unsigned long type = (request >> 8) & 0xff;
+        unsigned long nr   = request & 0xff;
+        unsigned long size = (request >> 16) & 0x3fff;
+        unsigned long dir  = (request >> 30) & 0x3;
+        const char *dev = (fd == FAKE_FD_V4L2_MEDIA) ? "media" : "video";
+        SHIM_LOG("V4L2 %s ioctl #%u: req=0x%lx dir=%lu type='%c' nr=0x%02lx size=%lu arg=%p  -> ENOTTY",
+                 dev, v4l2_ioctl_count, request, dir, (char)type, nr, size, arg);
+        errno = 25;  /* ENOTTY = inappropriate ioctl for device */
+        return -1;
+    }
+
     /* ---- I2C ioctls ---- */
     if (fd == FAKE_FD_I2C) {
         i2c_ioctl_count++;
@@ -3048,4 +3455,348 @@ int ioctl(int fd, unsigned long request, ...) {
     }
 
     return 0;
+}
+
+/* ---- memcpy NULL-guard (Step 45) ----
+ *
+ * Godot's error-logger path on the custom Stern/Radium DisplayRenderer
+ * thread hits vformat()/memcpy(src=NULL, …) because Godot TLS singletons
+ * (StringName pool, memory arena, OS::get_singleton) are unregistered on
+ * that thread. The resulting NULL dereference inside aarch64 __memcpy_aarch64
+ * (cpyfp) has been the Step-31 blocker since 2026-04-19.
+ *
+ * This override: when either pointer is NULL, silently no-op instead of
+ * faulting. Real memcpy goes through dlsym(RTLD_NEXT, "memcpy") so hot-path
+ * copies retain libc's SIMD-optimised implementation.
+ *
+ * Safety:
+ *   - Thread-local `in_memcpy` guard breaks any recursion (e.g. if SHIM_LOG's
+ *     internal printf happens to call back into memcpy).
+ *   - Byte-copy fallback if dlsym hasn't resolved yet (early ctor) or fails.
+ *   - SHIM_LOG is called inside the non-null path; that's fine because we've
+ *     already guarded the in_memcpy recursion flag.
+ *   - Counts are atomics so concurrent threads don't corrupt the tally.
+ */
+static volatile unsigned long shim_memcpy_null_count = 0;
+static void *(*real_memcpy)(void *, const void *, size_t) = NULL;
+
+void *memcpy(void *dst, const void *src, size_t n) {
+    static __thread int in_memcpy = 0;
+
+    if (!dst || !src) {
+        unsigned long n_hit = __atomic_add_fetch(&shim_memcpy_null_count, 1,
+                                                  __ATOMIC_RELAXED);
+        /* Log first 8, then every 1000th — avoids flooding if this fires
+         * per-frame. Log OUTSIDE the in_memcpy recursion guard is fine
+         * because we're returning before any real work. */
+        if (n_hit <= 8 || (n_hit % 1000) == 0) {
+            if (!in_memcpy) {
+                in_memcpy = 1;
+                SHIM_LOG("memcpy NULL-guard #%lu: dst=%p src=%p n=%zu",
+                         n_hit, dst, src, n);
+                in_memcpy = 0;
+            }
+        }
+        return dst;
+    }
+
+    if (in_memcpy) {
+        /* Recursion break — copy byte-by-byte. Used if dlsym indirectly
+         * re-enters memcpy during its own resolution path. */
+        unsigned char *d = dst;
+        const unsigned char *s = src;
+        for (size_t i = 0; i < n; i++) d[i] = s[i];
+        return dst;
+    }
+
+    in_memcpy = 1;
+    if (!real_memcpy) {
+        real_memcpy = dlsym(RTLD_NEXT, "memcpy");
+    }
+    void *ret;
+    if (real_memcpy) {
+        ret = real_memcpy(dst, src, n);
+    } else {
+        unsigned char *d = dst;
+        const unsigned char *s = src;
+        for (size_t i = 0; i < n; i++) d[i] = s[i];
+        ret = dst;
+    }
+    in_memcpy = 0;
+    return ret;
+}
+
+/* ---- libavcodec HW-accel bypass (Step 47) ----
+ *
+ * The game's spi_video_player uses libavcodec to decode HEVC. Its init
+ * sequence (per `nm -D --undefined-only game`) calls:
+ *   avcodec_find_decoder_by_name  → looks up the decoder
+ *   avcodec_get_hw_config         → probes HW configs
+ *   av_hwdevice_ctx_create        → creates a DRM/V4L2 device context
+ *   avcodec_open2                 → opens the codec
+ *
+ * On Spike 3 hardware this resolves to "hevc_v4l2request" + drm_prime.
+ * Under QEMU user-mode we have no real V4L2 HEVC decoder, so hwaccel init
+ * fails (Step 46) and `Error parsing NAL unit #0` follows — the game's
+ * render path doesn't get usable frames. Rather than emulate V4L2 fully,
+ * we intercept here and force the plain software HEVC decoder:
+ *
+ *   - avcodec_find_decoder_by_name("hevc_v4l2request") → delegate to "hevc"
+ *   - avcodec_get_hw_config(codec, idx) → always NULL  (no HW configs)
+ *   - av_hwdevice_ctx_create(..., DRM, …) → AVERROR(ENOSYS)
+ *
+ * If the game's video module has a SW fallback path, it'll now take it and
+ * libavcodec's software HEVC decoder produces frames into an AVFrame the
+ * game uploads as a GL texture. No dummy frames needed — real decode.
+ *
+ * Risk: if the game hard-codes hwaccel (no fallback) these hooks don't
+ * produce video, but they at least make the failure deterministic. We'll
+ * see in the next run.
+ */
+
+typedef const void *(*real_avcodec_find_decoder_by_name_t)(const char *name);
+typedef const void *(*real_avcodec_get_hw_config_t)(const void *codec, int index);
+typedef int (*real_av_hwdevice_ctx_create_t)(void **device_ctx, int type,
+                                              const char *device, void *opts, int flags);
+typedef int (*real_avcodec_send_packet_t)(void *avctx, const void *pkt);
+typedef int (*real_avcodec_receive_frame_t)(void *avctx, void *frame);
+
+static real_avcodec_find_decoder_by_name_t real_avcodec_find_decoder_by_name = NULL;
+static real_avcodec_get_hw_config_t real_avcodec_get_hw_config = NULL;
+static real_av_hwdevice_ctx_create_t real_av_hwdevice_ctx_create = NULL;
+static real_avcodec_send_packet_t real_avcodec_send_packet = NULL;
+static real_avcodec_receive_frame_t real_avcodec_receive_frame = NULL;
+
+static unsigned int av_send_count = 0;
+static unsigned int av_recv_count = 0;
+static unsigned int av_recv_err_count = 0;
+static unsigned int av_recv_ok_count = 0;
+
+/* Helper — resolve via dlvsym so versioned symbols work.
+ * The game imports avcodec_find_decoder_by_name@LIBAVCODEC_59 etc.; plain
+ * dlsym(RTLD_NEXT, ...) can miss versioned symbols in some ld configs, so we
+ * try both. Also try dlopen(libavcodec.so.59) as a last resort. */
+static void *shim_resolve_libav(const char *sym, const char *version) {
+    void *p = dlvsym(RTLD_NEXT, sym, version);
+    if (p) return p;
+    p = dlsym(RTLD_NEXT, sym);
+    if (p) return p;
+    /* Try explicit lib handle */
+    static void *h_avcodec = NULL, *h_avutil = NULL;
+    void **h = NULL;
+    if (strstr(sym, "avcodec_")) h = &h_avcodec;
+    else if (strstr(sym, "av_hwdevice_") || strstr(sym, "av_frame_")) h = &h_avutil;
+    if (h) {
+        if (!*h) {
+            *h = dlopen(strstr(sym, "avcodec_") ? "libavcodec.so.59" : "libavutil.so.57",
+                        RTLD_LAZY | RTLD_NOLOAD);
+        }
+        if (*h) p = dlsym(*h, sym);
+    }
+    return p;
+}
+
+const void *avcodec_find_decoder_by_name(const char *name) {
+    SHIM_LOG("avcodec_find_decoder_by_name HOOK ENTERED: name='%s'",
+             name ? name : "(null)");
+    if (!real_avcodec_find_decoder_by_name) {
+        real_avcodec_find_decoder_by_name =
+            (real_avcodec_find_decoder_by_name_t)shim_resolve_libav(
+                "avcodec_find_decoder_by_name", "LIBAVCODEC_59");
+        SHIM_LOG("  dlvsym resolved real_avcodec_find_decoder_by_name = %p",
+                 (void *)real_avcodec_find_decoder_by_name);
+    }
+    if (!real_avcodec_find_decoder_by_name) return NULL;
+    /* Passthrough — do NOT fallback to SW. The game hardcodes HW decode and
+     * asserts(hw_decoder) at SpiVideoStreamDecoderBase.cpp:1830 if we
+     * return NULL. Let the real HW decoder through; we'll intervene later
+     * in the pipeline. */
+    const void *ret = real_avcodec_find_decoder_by_name(name);
+    SHIM_LOG("  -> %p (name='%s')", ret, name ? name : "(null)");
+    return ret;
+}
+
+/* Get_hw_config, hwdevice_ctx_create, send_packet, receive_frame — all
+ * REVERTED to passthrough for now. First goal is to confirm the hook itself
+ * fires and we can see the call pattern. Once we see avcodec_find_decoder's
+ * name, avcodec_open2's return, and the codec ptr flow, we can design the
+ * intervention. */
+const void *avcodec_get_hw_config(const void *codec, int index) {
+    if (!real_avcodec_get_hw_config) {
+        real_avcodec_get_hw_config =
+            (real_avcodec_get_hw_config_t)shim_resolve_libav(
+                "avcodec_get_hw_config", "LIBAVCODEC_59");
+    }
+    if (!real_avcodec_get_hw_config) return NULL;
+    const void *ret = real_avcodec_get_hw_config(codec, index);
+    if (index < 4) {
+        SHIM_LOG("avcodec_get_hw_config(codec=%p, index=%d) -> %p (passthrough)",
+                 codec, index, ret);
+    }
+    return ret;
+}
+
+int av_hwdevice_ctx_create(void **device_ctx, int type, const char *device,
+                            void *opts, int flags) {
+    if (!real_av_hwdevice_ctx_create) {
+        real_av_hwdevice_ctx_create =
+            (real_av_hwdevice_ctx_create_t)shim_resolve_libav(
+                "av_hwdevice_ctx_create", "LIBAVUTIL_57");
+    }
+    if (!real_av_hwdevice_ctx_create) {
+        SHIM_LOG("av_hwdevice_ctx_create: no real symbol, returning ENOSYS");
+        if (device_ctx) *device_ctx = NULL;
+        return -38;
+    }
+    int ret = real_av_hwdevice_ctx_create(device_ctx, type, device, opts, flags);
+    SHIM_LOG("av_hwdevice_ctx_create(type=%d, device=%s, flags=%d) -> %d (passthrough)",
+             type, device ? device : "(null)", flags, ret);
+    return ret;
+}
+
+/* ---- Dummy-frame injection (Step 47b) ----
+ *
+ * DRM-based HW decode is being set up successfully (av_hwdevice_ctx_create
+ * returned 0 for AV_HWDEVICE_TYPE_DRM=8), packets are being sent to the
+ * codec, but receive_frame always returns EAGAIN (-11) — no real frames
+ * because our DRM socketpair doesn't actually decode. Inject a dummy
+ * NV12 1920×1080 all-black frame so the game's video renderer gets SOMETHING.
+ *
+ * AVFrame field offsets (libavutil 57 / ffmpeg 5.1, stable):
+ *   width:   104   int
+ *   height:  108   int
+ *   format:  116   int  (AV_PIX_FMT_NV12 = 23)
+ *
+ * We let libavutil helpers (av_frame_alloc, av_frame_get_buffer, av_frame_ref,
+ * av_frame_unref) do allocation. The only direct field pokes are the three
+ * ints above.
+ */
+#define DUMMY_FRAME_W      1920
+#define DUMMY_FRAME_H      1080
+#define AV_PIX_FMT_NV12    23
+#define AVFRAME_OFF_WIDTH  104
+#define AVFRAME_OFF_HEIGHT 108
+#define AVFRAME_OFF_FORMAT 116
+#define AVFRAME_OFF_PTS    136   /* int64_t  — ffmpeg 5.1 stable layout */
+#define AVFRAME_OFF_PKTDTS 144   /* int64_t  — ffmpeg 5.1 stable layout */
+
+typedef void *(*real_av_frame_alloc_t)(void);
+typedef int  (*real_av_frame_get_buffer_t)(void *frame, int align);
+typedef int  (*real_av_frame_ref_t)(void *dst, const void *src);
+typedef void (*real_av_frame_unref_t)(void *frame);
+
+static void *shim_dummy_frame = NULL;
+static int shim_dummy_frame_inited = 0;
+
+static void shim_init_dummy_frame(void) {
+    if (shim_dummy_frame_inited) return;
+    shim_dummy_frame_inited = 1;  /* flag now, regardless of success */
+
+    real_av_frame_alloc_t      alloc    = shim_resolve_libav("av_frame_alloc", "LIBAVUTIL_57");
+    real_av_frame_get_buffer_t getbuf   = shim_resolve_libav("av_frame_get_buffer", "LIBAVUTIL_57");
+
+    if (!alloc || !getbuf) {
+        SHIM_LOG("shim_init_dummy_frame: couldn't resolve libavutil helpers (alloc=%p getbuf=%p)",
+                 (void *)alloc, (void *)getbuf);
+        return;
+    }
+
+    void *f = alloc();
+    if (!f) {
+        SHIM_LOG("shim_init_dummy_frame: av_frame_alloc returned NULL");
+        return;
+    }
+
+    *(int *)((char *)f + AVFRAME_OFF_WIDTH)  = DUMMY_FRAME_W;
+    *(int *)((char *)f + AVFRAME_OFF_HEIGHT) = DUMMY_FRAME_H;
+    *(int *)((char *)f + AVFRAME_OFF_FORMAT) = AV_PIX_FMT_NV12;
+
+    int gb_ret = getbuf(f, 32);
+    if (gb_ret < 0) {
+        SHIM_LOG("shim_init_dummy_frame: av_frame_get_buffer returned %d", gb_ret);
+        return;
+    }
+
+    /* Zero-fill Y plane to 0x10 (studio black luma), UV plane to 0x80
+     * (neutral chroma). data/linesize are at known offsets 0/64. */
+    uint8_t **data = (uint8_t **)f;
+    int *linesize  = (int *)((char *)f + 64);
+    if (data[0]) memset(data[0], 0x10, (size_t)linesize[0] * DUMMY_FRAME_H);
+    if (data[1]) memset(data[1], 0x80, (size_t)linesize[1] * (DUMMY_FRAME_H / 2));
+
+    shim_dummy_frame = f;
+    SHIM_LOG("shim_init_dummy_frame OK: frame=%p data[0]=%p linesize[0]=%d",
+             f, data[0], linesize[0]);
+}
+
+/* State: number of pending frames to deliver. send_packet accepts → +1. */
+static int shim_pending_dummies = 0;
+
+int avcodec_send_packet(void *avctx, const void *pkt) {
+    if (!real_avcodec_send_packet)
+        real_avcodec_send_packet =
+            (real_avcodec_send_packet_t)shim_resolve_libav("avcodec_send_packet", "LIBAVCODEC_59");
+    if (!real_avcodec_send_packet) return -38;
+
+    int ret = real_avcodec_send_packet(avctx, pkt);
+    av_send_count++;
+    if (ret == 0) shim_pending_dummies++;   /* packet accepted → frame coming */
+    if (av_send_count <= 8 || (av_send_count % 500) == 0) {
+        SHIM_LOG("avcodec_send_packet #%u (ctx=%p, pkt=%p) -> %d  pending=%d",
+                 av_send_count, avctx, pkt, ret, shim_pending_dummies);
+    }
+    return ret;
+}
+
+int avcodec_receive_frame(void *avctx, void *frame) {
+    if (!real_avcodec_receive_frame)
+        real_avcodec_receive_frame =
+            (real_avcodec_receive_frame_t)shim_resolve_libav("avcodec_receive_frame", "LIBAVCODEC_59");
+    if (!real_avcodec_receive_frame) return -38;
+
+    int ret = real_avcodec_receive_frame(avctx, frame);
+    av_recv_count++;
+    if (ret == 0) av_recv_ok_count++; else av_recv_err_count++;
+
+    /* Real decode returned EAGAIN AND we have a pending packet — inject
+     * a dummy frame instead of propagating EAGAIN. */
+    if (ret == -11 /* EAGAIN */ && shim_pending_dummies > 0) {
+        shim_init_dummy_frame();
+        if (shim_dummy_frame) {
+            real_av_frame_ref_t   aref   = shim_resolve_libav("av_frame_ref",   "LIBAVUTIL_57");
+            real_av_frame_unref_t aunref = shim_resolve_libav("av_frame_unref", "LIBAVUTIL_57");
+            if (aref && aunref) {
+                aunref(frame);
+                int rref = aref(frame, shim_dummy_frame);
+                if (rref == 0) {
+                    /* Stamp a valid monotonic PTS. The game asserts
+                     * `frame->pts != AV_NOPTS_VALUE` at
+                     * SpiVideoStreamDecoderBase.cpp:1490. A counter in the
+                     * codec's native timebase would be ideal; we don't know
+                     * it, so we just increment by 3000 per frame (=1/30 s in
+                     * a 1/90000 timebase, the H.264/H.265 default). */
+                    static int64_t next_pts = 0;
+                    int64_t pts_val = next_pts;
+                    next_pts += 3000;
+                    *(int64_t *)((char *)frame + AVFRAME_OFF_PTS)    = pts_val;
+                    *(int64_t *)((char *)frame + AVFRAME_OFF_PKTDTS) = pts_val;
+                    shim_pending_dummies--;
+                    av_recv_ok_count++;
+                    av_recv_err_count--;
+                    if (av_recv_count <= 8 || (av_recv_count % 500) == 0) {
+                        SHIM_LOG("avcodec_receive_frame #%u -> INJECTED dummy NV12 %dx%d pts=%lld (remaining=%d)",
+                                 av_recv_count, DUMMY_FRAME_W, DUMMY_FRAME_H,
+                                 (long long)pts_val, shim_pending_dummies);
+                    }
+                    return 0;
+                }
+            }
+        }
+    }
+
+    if (av_recv_count <= 8 || (av_recv_count % 500) == 0) {
+        SHIM_LOG("avcodec_receive_frame #%u (ctx=%p, frame=%p) -> %d  (ok=%u err=%u)",
+                 av_recv_count, avctx, frame, ret, av_recv_ok_count, av_recv_err_count);
+    }
+    return ret;
 }

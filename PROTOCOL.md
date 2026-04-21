@@ -266,6 +266,81 @@ Verified by: JOURNAL Step 43.
 
 ---
 
+## image.bin section 5 — per-asset bytecode descriptor table (verified Step 44)
+
+**Scope correction vs. earlier assumption.** Section 5 is NOT a scene → asset list. It is a per-asset descriptor table: one bytecode program per asset, describing how to load/render that single asset. 12,568 uint64-slot table grouped in 5-tuples (language variants) → 2,492 unique bytecode offsets in the bulk region `[0x42EEEB3C, 0x42F23E06)`.
+
+Across all 2,492 bulk bytecodes, 2,414 contain exactly one type-`0x0b` "asset reference" record (the remaining ~78 are meta-descriptors without direct asset references). Correct decoder behavior: bound each walk by the next unique section-5 offset (not by tag 0x00 alone).
+
+**Tag frequency per typical bytecode** (eos-terminated):
+
+| Tag | Size | Count across all bulk bytecodes | Typical role |
+|---:|---:|---:|---|
+| `0x05` | 6 | 2,496 | Header — byte 2 is 256-distinct (matches section-7 flag count) |
+| `0x02` | 2 | 2,577 | Short reference |
+| `0x0b` | 10 | 2,414 | **Asset reference** — carries asset_id_low in payload |
+| `0x09` | 15 | 4,483 | Animation/transform data |
+| `0x04` | 2 | 108 | Short reference (secondary variant) |
+
+### Type-0x0b asset reference payload layout (10 bytes)
+
+| Byte | Distinct values (across 2414 records) | Meaning |
+|---:|---:|---|
+| 0-2 | always `0x00` | padding |
+| 3 | 16 | `asset_id_low` bits 0-7 |
+| 4 | `{0x00, 0x04}` | `asset_id_low` bits 8-15 |
+| 5 | `{0x00, 0x02}` | `asset_id_low` bits 16-23 (bit 17 is the stereo-audio marker) |
+| 6 | `{0x00, 0x20}` | `asset_id_low` bits 24-31 (bit 29) |
+| 7 | `{0x00, 0x02}` | partial flag bit (word bit 1) |
+| 8 | always `0x00` | padding |
+| 9 | 8 values | partial flag bits (word bits 20-22 after `<< 16`) |
+
+**Verified:** u32 LE read at payload offset +3 is a valid `asset_id_low` for every one of the 2,414 records (100% match against the 64 distinct id_lows in section 7).
+
+**Not fully verified:** the 32-bit `flags` word of the section-7 composite key (`(flags << 32) | id_low`). Bytes 7 & 9 of 0x0b alone encode at most 16 combinations but section 7 has 256 distinct flag values. The likely missing source is byte 2 of the preceding type-`0x05` header (which has 256 distinct values across all 2,496 `0x05` records — matching the section-7 flag cardinality exactly), but we don't yet have a formula that joins them to 100% resolution. Best static brute-force: `flags = (H[0] << 24) | P[7] | (P[9] << 16)` yields 660/2414 matches. See JOURNAL Step 44.4.
+
+Practical implication: to produce a complete `(asset_id_low, flags)` extract statically from image.bin alone, either finish the 0x05-byte-2 decoding work or capture at runtime. For partial extraction (asset_id_low only), this is sufficient.
+
+---
+
+## image.bin section 2 — playfield/mode grid records (verified Step 44)
+
+Section 2 @ 0x189b8, length 0x2E28 (11,816 bytes), is a table of 1,477 uint64 pointers into section 0 (and adjacent regions). Pointers step by variable deltas (408 most common; then 40, 64, 48, 56, 88). Each pointer targets a variable-size **grid record**.
+
+First 12 records (and most `delta == 408` records) are identical-shaped:
+
+```
++0x00  uint32 LE  record_id (sequential 1, 2, 3, ...)
++0x04  uint32 LE  flag/variant (alternating 0 / 2)
++0x08  uint16 LE  width  (17)
++0x0a  uint16 LE  height (23)
++0x0c  uint8[5]   padding
++0x11  uint8[391] grid cells (17 × 23, values are small enums: 0x00, 0x03, 0x0f, …)
++0x188 total size 408
+```
+
+Later records (delta != 408) likely have different grid dimensions.
+
+**Not a scene → asset mapping.** Zero of the section-2 uint32 values match any `asset_id_low` from section 7, and zero uint64 values match any section-5 offset. The README's label "numbered grid data" is literal — these records hold numbered grid patterns, most plausibly playfield lamp/target/insert state tables used by the gameplay logic per mode or per animation frame.
+
+Verified by: JOURNAL Step 44.1.
+
+---
+
+## `scene_config_table.c` in _extraction/ is the Spike 3 service menu, NOT the 885 gameplay scenes (noted Step 44)
+
+The 1,254-line `scene_config_table.c` export covers VA 0x48071d0 onward, which holds the Spike 3 **service/test/adjustments menu tree** (Active Switch Test, Game Adjustments, Pikachu Tests and Calibration, Exit the test menu, etc., plus a handful of audio-test items: "MUSIC: MAINPLAY", "SOUND: SUPER SKILL SHOT", "SPEECH: 'SQUIRTLE'").
+
+Each entry is a `{function_ptr, label_string, u16_index, u16_parent_id}` quadruple. This is the menu structure Nuklear walks when the operator enters test mode.
+
+The real `scene_config_table` lives at VA 0x47fcf10 (CLAUDE.md's claim), 41,664 bytes earlier. It is either BSS (populated at runtime by an unidentified setup function) or static data not yet exported from the `.bndb`. Closing the 885 scene → asset_id mapping requires either re-exporting that region or capturing it at runtime.
+
+File should be renamed to `service_menu_table.c` for clarity.
+
+Verified by: JOURNAL Step 44.5.
+
+---
+
 ## Run command
 
 ```bash
@@ -284,6 +359,16 @@ cd /mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le/_emulation && \
 ```
 
 (`-lpthread` needed since the `pthread_create` override in the shim calls `pthread_attr_getinheritsched` / `pthread_attr_setinheritsched`.)
+
+---
+
+## Bridge-command timeouts as progress signal (verified Step 45)
+
+Some bridge commands **require** the 1000 ms channel timeout to fire — the timeout IS the state-machine transition, not the failure mode. If we synthesize an early ACK, the game interprets our ACK as "response received but no status payload" and keeps polling forever.
+
+Confirmed for cmd **0x41** (handler at BN VA `0x915f88`): replacing the default "no synthetic response" branch with a zero-payload ACK sent progress BACKWARD — the game stopped reaching Godot init entirely (run `_emulation/run_step45_fix1.stderr`). Reverting to the timeout path restored progress past the Step-31 PopupMenu SEGV and reached four Godot scenes (run `_emulation/run_step45_fix2.stderr`).
+
+Likely also applies to cmds **0x25, 0x12, 0x19** — all of them show up as `bridge message (cmd=XX, id=N) response failed 110: Connection timed out` in the game's own stdout, and the game continues after. Do not ACK them without first reversing their handler's expected response payload. Marker to look for in a fresh run: the game's stdout line `bridge message (cmd=NN, id=M) response failed 110: Connection timed out` is **expected**, not a bug, until proven otherwise.
 
 ---
 
