@@ -84,6 +84,71 @@ static const char *remap_path(const char *path) {
     return remapped_buf;
 }
 
+/* ---- SPIKE3_REAL_GL env gate (Step 56) ----
+ *
+ * When set (any non-empty value), the shim's EGL/GBM/GLES interceptors
+ * forward to the real library via dlsym(RTLD_NEXT, ...) instead of returning
+ * fake-success stubs. Let Mesa's real pipeline do the rendering.
+ *
+ * Unset (default): preserves the Step 54 behavior — every interceptor is a
+ * stub that returns plausible values, no Mesa ever runs. The bridge, switch,
+ * UART, DRM-socketpair, ALSA, pthread_create, memcpy NULL-guard, system()
+ * openocd block, /tmp/cache mkdir, shim_dump_* diagnostics all stay on
+ * regardless of this flag — they are orthogonal to rendering.
+ */
+static int spike3_real_gl_cached = -1;
+static int is_real_gl(void) {
+    if (__builtin_expect(spike3_real_gl_cached == -1, 0)) {
+        const char *v = getenv("SPIKE3_REAL_GL");
+        spike3_real_gl_cached = (v && v[0]) ? 1 : 0;
+    }
+    return spike3_real_gl_cached;
+}
+
+/* FWD_RET(RET, FN, SIG, CALL) — return-typed forward.
+ * FWD_VOID(FN, SIG, CALL)     — void forward.
+ * Usage inside a stub body, as the first statement:
+ *   void glEnable(unsigned cap) {
+ *       FWD_VOID(glEnable, (unsigned), (cap));
+ *       ... existing stub body ...
+ *   }
+ * When SPIKE3_REAL_GL is unset, expands to a no-op and the stub runs.
+ * When set, resolves the real function once via dlsym(RTLD_NEXT, ...) and
+ * tail-calls it. Cached per-function in a static pointer. */
+#define FWD_RET(RET, FN, SIG, CALL) do {                                 \
+    if (__builtin_expect(is_real_gl(), 0)) {                             \
+        static RET (*_real)SIG = NULL;                                   \
+        if (!_real) _real = (RET (*)SIG)dlsym(RTLD_NEXT, #FN);           \
+        if (_real) return _real CALL;                                    \
+    }                                                                    \
+} while (0)
+#define FWD_VOID(FN, SIG, CALL) do {                                     \
+    if (__builtin_expect(is_real_gl(), 0)) {                             \
+        static void (*_real)SIG = NULL;                                  \
+        if (!_real) _real = (void (*)SIG)dlsym(RTLD_NEXT, #FN);          \
+        if (_real) { _real CALL; return; }                               \
+    }                                                                    \
+} while (0)
+/* Verbose variants — log "FWD <fn>" before the tail-call. Use only at
+ * low-frequency sites (EGL ~20 calls); never on GLES hot paths where the
+ * 10k-line/20s steady state would drown any diagnostic signal. */
+#define FWD_RET_V(RET, FN, SIG, CALL) do {                               \
+    if (__builtin_expect(is_real_gl(), 0)) {                             \
+        static RET (*_real)SIG = NULL;                                   \
+        if (!_real) _real = (RET (*)SIG)dlsym(RTLD_NEXT, #FN);           \
+        SHIM_LOG("FWD " #FN);                                            \
+        if (_real) return _real CALL;                                    \
+    }                                                                    \
+} while (0)
+#define FWD_VOID_V(FN, SIG, CALL) do {                                   \
+    if (__builtin_expect(is_real_gl(), 0)) {                             \
+        static void (*_real)SIG = NULL;                                  \
+        if (!_real) _real = (void (*)SIG)dlsym(RTLD_NEXT, #FN);          \
+        SHIM_LOG("FWD " #FN);                                            \
+        if (_real) { _real CALL; return; }                               \
+    }                                                                    \
+} while (0)
+
 /* ---- SPI ioctl definitions ---- */
 
 #define SPI_IOC_WR_MODE          0x40016b01
@@ -199,27 +264,21 @@ static real_ioctl_t real_ioctl = NULL;
 static real_read_t real_read = NULL;
 static real_write_t real_write = NULL;
 
-/* ---- Capture pipeline (Step 23.3) ----
+/* ---- Shim directory init ----
  *
- * Writes DMD frames, shader source, and texture bytes to _emulation/{dmd,
- * shaders,textures}/ as the game runs. Hooks that feed these live further
- * down in the file (gbm_bo_map/unmap, glShaderSource, glTex*Image2D,
- * glCompressedTexSubImage2D). The constructor creates the dirs up front.
+ * Audio capture (_emulation/audio/stream.s16le) is the only data-capture
+ * pipeline still in use — texture/shader/DMD capture was removed in Step 56
+ * (duplicative of _extraction/ asset extraction, and DMD doesn't exist on
+ * modern Spike 3 hardware).
+ *
+ * /tmp/cache exists because Godot logs an ERROR when it can't create it
+ * (Step 45); the mkdir here pre-empts that.
  */
 
 __attribute__((constructor))
-static void shim_init_capture_dirs(void) {
-    /* Paths are relative to the game's cwd, which is games/pokemon_le/ per
-     * the documented run command (see Step 23.3). mkdir returns EEXIST when
-     * rerunning, which we ignore. */
+static void shim_init_dirs(void) {
     mkdir("_emulation",           0755);
-    mkdir("_emulation/dmd",       0755);
-    mkdir("_emulation/shaders",   0755);
-    mkdir("_emulation/textures",  0755);
     mkdir("_emulation/audio",     0755);
-    /* Step 45 — Godot tries to cache compiled shaders here and logs an
-     * ERROR when it can't create /tmp/cache. Host-visible path (/tmp is
-     * excluded from remap_path), so this mkdir works directly. */
     mkdir("/tmp/cache",           0755);
 }
 
@@ -2246,6 +2305,53 @@ static void *alloc_fake_gbm_object(void) {
     return p;
 }
 
+/* Minimal per-BO side table: track dimensions so gbm_bo_get_width/height/
+ * stride/format return what the caller originally requested at create-time.
+ * DMD-specific machinery (is_dmd, mapped tracking, frame dump) removed in
+ * Step 56 — modern Spike 3 has no physical DMD. */
+#define GBM_BO_TABLE_SIZE   32
+
+struct gbm_bo_entry {
+    void    *bo;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint32_t stride;
+};
+
+static struct gbm_bo_entry gbm_bo_table[GBM_BO_TABLE_SIZE];
+static pthread_mutex_t gbm_bo_table_lock = PTHREAD_MUTEX_INITIALIZER;
+static void *gbm_bo_latest = NULL;
+
+static void gbm_bo_register(void *bo, uint32_t w, uint32_t h, uint32_t fmt) {
+    pthread_mutex_lock(&gbm_bo_table_lock);
+    for (int i = 0; i < GBM_BO_TABLE_SIZE; i++) {
+        if (!gbm_bo_table[i].bo) {
+            gbm_bo_table[i].bo     = bo;
+            gbm_bo_table[i].width  = w;
+            gbm_bo_table[i].height = h;
+            gbm_bo_table[i].format = fmt;
+            gbm_bo_table[i].stride = w * 4;   /* 32-bpp assumed */
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gbm_bo_table_lock);
+}
+
+static struct gbm_bo_entry *gbm_bo_lookup(void *bo) {
+    /* No lock needed for read-only lookup; entries are write-once post-create. */
+    for (int i = 0; i < GBM_BO_TABLE_SIZE; i++)
+        if (gbm_bo_table[i].bo == bo) return &gbm_bo_table[i];
+    return NULL;
+}
+
+static void gbm_bo_unregister(void *bo) {
+    pthread_mutex_lock(&gbm_bo_table_lock);
+    for (int i = 0; i < GBM_BO_TABLE_SIZE; i++)
+        if (gbm_bo_table[i].bo == bo) { memset(&gbm_bo_table[i], 0, sizeof(gbm_bo_table[i])); break; }
+    pthread_mutex_unlock(&gbm_bo_table_lock);
+}
+
 void *gbm_create_device(int fd) {
     if (!fake_gbm_device_mem) fake_gbm_device_mem = alloc_fake_gbm_object();
     SHIM_LOG("gbm_create_device(fd=%d) -> %p (%d-byte backing)",
@@ -2260,18 +2366,15 @@ void gbm_device_destroy(void *device) {
 }
 
 int gbm_device_get_fd(void *device) {
-    (void)device;
-    return gbm_drm_fd;
+    (void)device; return gbm_drm_fd;
 }
 
 const char *gbm_device_get_backend_name(void *device) {
-    (void)device;
-    return "stub";
+    (void)device; return "stub";
 }
 
 int gbm_device_is_format_supported(void *device, uint32_t format, uint32_t usage) {
-    (void)device; (void)format; (void)usage;
-    return 1;
+    (void)device; (void)format; (void)usage; return 1;
 }
 
 void *gbm_surface_create(void *gbm, uint32_t width, uint32_t height,
@@ -2279,8 +2382,7 @@ void *gbm_surface_create(void *gbm, uint32_t width, uint32_t height,
     if (!fake_gbm_surface_mem) fake_gbm_surface_mem = alloc_fake_gbm_object();
     SHIM_LOG("gbm_surface_create(%ux%u, fmt=0x%x, flags=0x%x) -> %p",
              width, height, format, flags, fake_gbm_surface_mem);
-    (void)gbm;
-    return fake_gbm_surface_mem;
+    (void)gbm; return fake_gbm_surface_mem;
 }
 
 void *gbm_surface_create_with_modifiers(void *gbm, uint32_t width, uint32_t height,
@@ -2297,89 +2399,13 @@ void gbm_surface_destroy(void *surface) {
     (void)surface;
 }
 
-/* Each BO needs its own backing so the game can distinguish them. Track
- * the most-recent one in a small LRU so gbm_surface_lock_front_buffer
- * can return a valid BO. */
-static void *gbm_bo_latest = NULL;
-
-/* ---- Per-BO side table ----
- *
- * Needed so gbm_bo_map can hand back the BO's real width/stride/backing
- * and so gbm_bo_unmap can flush the DMD backing to disk as a BGRA frame.
- * The game's `DMDEmulationScene` uses a 1024×256 ABGR8888 BO (see BN
- * analysis in _emulation/ASSETS.md); that pair of dimensions + format
- * uniquely identifies the DMD among the few BOs the game allocates. */
-
-#define GBM_BO_TABLE_SIZE   32
-#define GBM_FORMAT_ABGR8888 0x34324241u   /* 'AB24' — DMD format */
-
-struct gbm_bo_entry {
-    void    *bo;
-    uint32_t width;
-    uint32_t height;
-    uint32_t format;
-    uint32_t flags;
-    uint32_t stride;
-    void    *mapped;        /* allocated in gbm_bo_map, freed in gbm_bo_unmap */
-    int      is_dmd;
-};
-
-static struct gbm_bo_entry gbm_bo_table[GBM_BO_TABLE_SIZE];
-static pthread_mutex_t gbm_bo_table_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static struct gbm_bo_entry *gbm_bo_register(void *bo, uint32_t w, uint32_t h,
-                                            uint32_t fmt, uint32_t flags) {
-    pthread_mutex_lock(&gbm_bo_table_lock);
-    struct gbm_bo_entry *out = NULL;
-    for (int i = 0; i < GBM_BO_TABLE_SIZE; i++) {
-        if (!gbm_bo_table[i].bo) {
-            gbm_bo_table[i].bo      = bo;
-            gbm_bo_table[i].width   = w;
-            gbm_bo_table[i].height  = h;
-            gbm_bo_table[i].format  = fmt;
-            gbm_bo_table[i].flags   = flags;
-            gbm_bo_table[i].stride  = w * 4;   /* 32-bpp assumed */
-            gbm_bo_table[i].mapped  = NULL;
-            gbm_bo_table[i].is_dmd  = (w == 1024 && h == 256
-                                        && fmt == GBM_FORMAT_ABGR8888);
-            out = &gbm_bo_table[i];
-            break;
-        }
-    }
-    pthread_mutex_unlock(&gbm_bo_table_lock);
-    return out;
-}
-
-static struct gbm_bo_entry *gbm_bo_lookup(void *bo) {
-    pthread_mutex_lock(&gbm_bo_table_lock);
-    struct gbm_bo_entry *out = NULL;
-    for (int i = 0; i < GBM_BO_TABLE_SIZE; i++) {
-        if (gbm_bo_table[i].bo == bo) { out = &gbm_bo_table[i]; break; }
-    }
-    pthread_mutex_unlock(&gbm_bo_table_lock);
-    return out;
-}
-
-static void gbm_bo_unregister(void *bo) {
-    pthread_mutex_lock(&gbm_bo_table_lock);
-    for (int i = 0; i < GBM_BO_TABLE_SIZE; i++) {
-        if (gbm_bo_table[i].bo == bo) {
-            if (gbm_bo_table[i].mapped) free(gbm_bo_table[i].mapped);
-            memset(&gbm_bo_table[i], 0, sizeof(gbm_bo_table[i]));
-            break;
-        }
-    }
-    pthread_mutex_unlock(&gbm_bo_table_lock);
-}
-
 void *gbm_bo_create(void *gbm, uint32_t width, uint32_t height,
                     uint32_t format, uint32_t flags) {
     void *bo = alloc_fake_gbm_object();
     gbm_bo_latest = bo;
-    struct gbm_bo_entry *e = gbm_bo_register(bo, width, height, format, flags);
-    SHIM_LOG("gbm_bo_create(%ux%u, fmt=0x%x, flags=0x%x) -> %p%s",
-             width, height, format, flags, bo,
-             (e && e->is_dmd) ? " [DMD]" : "");
+    gbm_bo_register(bo, width, height, format);
+    SHIM_LOG("gbm_bo_create(%ux%u, fmt=0x%x, flags=0x%x) -> %p",
+             width, height, format, flags, bo);
     (void)gbm;
     return bo;
 }
@@ -2389,18 +2415,16 @@ void *gbm_bo_create_with_modifiers(void *gbm, uint32_t width, uint32_t height,
                                    unsigned int count) {
     void *bo = alloc_fake_gbm_object();
     gbm_bo_latest = bo;
-    struct gbm_bo_entry *e = gbm_bo_register(bo, width, height, format, 0);
-    SHIM_LOG("gbm_bo_create_with_modifiers(%ux%u) -> %p%s",
-             width, height, bo, (e && e->is_dmd) ? " [DMD]" : "");
+    gbm_bo_register(bo, width, height, format);
+    SHIM_LOG("gbm_bo_create_with_modifiers(%ux%u) -> %p", width, height, bo);
     (void)gbm; (void)modifiers; (void)count;
     return bo;
 }
 
-void gbm_bo_destroy(void *bo) { gbm_bo_unregister(bo); free(bo); }
+void gbm_bo_destroy(void *bo) {
+    gbm_bo_unregister(bo); free(bo);
+}
 
-/* Per-BO getters: consult the side table so each BO reports its real
- * dimensions/format (the DMD is 1024×256 ABGR8888, not the screen size).
- * Unknown BOs fall back to the screen defaults. */
 uint32_t gbm_bo_get_width(void *bo) {
     struct gbm_bo_entry *e = gbm_bo_lookup(bo);
     return e ? e->width : FAKE_MODE_HDISPLAY;
@@ -2417,111 +2441,51 @@ uint32_t gbm_bo_get_format(void *bo) {
     struct gbm_bo_entry *e = gbm_bo_lookup(bo);
     return e ? e->format : 0x34325258; /* XR24 */
 }
-uint64_t gbm_bo_get_modifier(void *bo) { (void)bo; return 0; /* LINEAR */ }
-int gbm_bo_get_fd(void *bo) { (void)bo; return -1; }
-uint32_t gbm_bo_get_handle_u(void *bo) { (void)bo; return 1; }
+uint64_t gbm_bo_get_modifier(void *bo) {
+    (void)bo; return 0; /* LINEAR */
+}
+int gbm_bo_get_fd(void *bo) {
+    (void)bo; return -1;
+}
+uint32_t gbm_bo_get_handle_u(void *bo) {
+    (void)bo; return 1;
+}
 
-/* ---- gbm_bo_map / gbm_bo_unmap ----
- *
- * The game's DMD upload path (create_gbm_bo_and_upload, BN VA 0xcffe80)
- * calls gbm_bo_map to get a writable pointer + stride, memcpys pixel rows
- * into it, then calls gbm_bo_unmap. We allocate `stride*height` zero-
- * initialized backing on first map and hand back (backing, stride). On
- * unmap of a DMD-sized BO we write the backing to _emulation/dmd/ and
- * free it.
- *
- * Libgbm signature:
- *   void *gbm_bo_map(bo, x, y, w, h, flags, *stride_out, **map_data_out)
- *   void  gbm_bo_unmap(bo, map_data)
- */
-
-static uint32_t dmd_frame_counter = 0;
-
+/* gbm_bo_map / gbm_bo_unmap: stub path hands back a per-call scratch buffer
+ * sized from the caller's requested (w,h). The caller memcpys into it and
+ * unmaps — we free and return. No state kept. */
 void *gbm_bo_map(void *bo, uint32_t x, uint32_t y,
                  uint32_t w, uint32_t h, uint32_t flags,
                  uint32_t *stride_out, void **map_data_out) {
-    (void)x; (void)y;
-    struct gbm_bo_entry *e = gbm_bo_lookup(bo);
-    if (!e) {
-        /* Unknown BO (created through a path we didn't track). Still hand
-         * back scratch of the asked-for region so the caller doesn't SEGV. */
-        size_t sz = (size_t)w * (size_t)h * 4;
-        void *scratch = calloc(1, sz ? sz : 16);
-        if (stride_out) *stride_out = w * 4;
-        if (map_data_out) *map_data_out = scratch;
-        SHIM_LOG("gbm_bo_map(%p, unknown BO, %ux%u) -> %p (scratch)",
-                 bo, w, h, scratch);
-        return scratch;
-    }
-    pthread_mutex_lock(&gbm_bo_table_lock);
-    if (!e->mapped) {
-        size_t sz = (size_t)e->stride * (size_t)e->height;
-        e->mapped = calloc(1, sz);
-    }
-    void *backing = e->mapped;
-    uint32_t stride = e->stride;
-    int is_dmd = e->is_dmd;
-    pthread_mutex_unlock(&gbm_bo_table_lock);
-    if (stride_out)   *stride_out = stride;
-    if (map_data_out) *map_data_out = backing;
-    static int map_log_budget = 6;
-    if (map_log_budget > 0) {
-        map_log_budget--;
-        SHIM_LOG("gbm_bo_map(%p, %ux%u, flags=0x%x) -> %p stride=%u%s",
-                 bo, w, h, flags, backing, stride, is_dmd ? " [DMD]" : "");
-    }
-    return backing;
+    (void)x; (void)y; (void)flags;
+    size_t sz = (size_t)w * (size_t)h * 4;
+    void *scratch = calloc(1, sz ? sz : 16);
+    if (stride_out)   *stride_out = w * 4;
+    if (map_data_out) *map_data_out = scratch;
+    (void)bo;
+    return scratch;
 }
 
 void gbm_bo_unmap(void *bo, void *map_data) {
-    struct gbm_bo_entry *e = gbm_bo_lookup(bo);
-    if (!e) {
-        /* Scratch path: just free and return. */
-        free(map_data);
-        return;
-    }
-    /* Dump DMD frames before freeing. */
-    if (e->is_dmd && e->mapped) {
-        uint32_t n = __atomic_fetch_add(&dmd_frame_counter, 1, __ATOMIC_SEQ_CST);
-        char path[128];
-        snprintf(path, sizeof(path), "_emulation/dmd/frame_%06u.bgra", n);
-        FILE *f = fopen(path, "wb");
-        if (f) {
-            size_t sz = (size_t)e->stride * (size_t)e->height;
-            fwrite(e->mapped, 1, sz, f);
-            fclose(f);
-            if (n < 8 || (n % 60) == 0) {
-                SHIM_LOG("DMD frame %u -> %s (%zu bytes)", n, path, sz);
-            }
-        } else {
-            SHIM_LOG("DMD frame %u: fopen %s failed: %s",
-                     n, path, strerror(errno));
-        }
-    }
-    pthread_mutex_lock(&gbm_bo_table_lock);
-    if (e->mapped) {
-        free(e->mapped);
-        e->mapped = NULL;
-    }
-    pthread_mutex_unlock(&gbm_bo_table_lock);
-    (void)map_data;
+    (void)bo;
+    free(map_data);
 }
 
-/* gbm_bo_get_handle returns a union; declaring it as returning uint32_t
- * by value works because union gbm_bo_handle is layout-compatible with a
- * single 64-bit integer. */
-uint64_t gbm_bo_get_handle(void *bo) { (void)bo; return 1; }
+uint64_t gbm_bo_get_handle(void *bo) {
+    (void)bo; return 1;
+}
 
 void *gbm_surface_lock_front_buffer(void *surface) {
     (void)surface;
-    /* Return the most recent BO; if none yet, allocate one. */
     if (!gbm_bo_latest) gbm_bo_latest = alloc_fake_gbm_object();
     return gbm_bo_latest;
 }
 void gbm_surface_release_buffer(void *surface, void *bo) {
     (void)surface; (void)bo;
 }
-int gbm_surface_has_free_buffers(void *surface) { (void)surface; return 1; }
+int gbm_surface_has_free_buffers(void *surface) {
+    (void)surface; return 1;
+}
 
 /* ---- Hooked: EGL ----
  * Once gbm_create_device returns our fake handle, mesa's libEGL would
@@ -2548,30 +2512,40 @@ int gbm_surface_has_free_buffers(void *surface) { (void)surface; return 1; }
 #define EGL_OPENGL_ES_API    0x30A0
 
 void *eglGetDisplay(void *native_display) {
+    FWD_RET_V(void*, eglGetDisplay, (void*), (native_display));
     SHIM_LOG("eglGetDisplay(%p) -> fake display", native_display);
     return FAKE_EGL_DISPLAY;
 }
 
 void *eglGetPlatformDisplay(unsigned platform, void *native_display, const intptr_t *attrib_list) {
+    FWD_RET_V(void*, eglGetPlatformDisplay, (unsigned, void*, const intptr_t*),
+            (platform, native_display, attrib_list));
     SHIM_LOG("eglGetPlatformDisplay(platform=0x%x, dpy=%p) -> fake", platform, native_display);
     (void)attrib_list; return FAKE_EGL_DISPLAY;
 }
 
 void *eglGetPlatformDisplayEXT(unsigned platform, void *native_display, const int *attrib_list) {
+    FWD_RET_V(void*, eglGetPlatformDisplayEXT, (unsigned, void*, const int*),
+            (platform, native_display, attrib_list));
     SHIM_LOG("eglGetPlatformDisplayEXT(platform=0x%x, dpy=%p) -> fake", platform, native_display);
     (void)attrib_list; return FAKE_EGL_DISPLAY;
 }
 
 unsigned eglInitialize(void *display, int *major, int *minor) {
+    FWD_RET_V(unsigned, eglInitialize, (void*, int*, int*), (display, major, minor));
     if (major) *major = 1;
     if (minor) *minor = 5;
     SHIM_LOG("eglInitialize(%p) -> 1.5", display);
     return EGL_TRUE;
 }
 
-unsigned eglTerminate(void *display) { (void)display; return EGL_TRUE; }
+unsigned eglTerminate(void *display) {
+    FWD_RET_V(unsigned, eglTerminate, (void*), (display));
+    (void)display; return EGL_TRUE;
+}
 
 const char *eglQueryString(void *display, int name) {
+    FWD_RET_V(const char*, eglQueryString, (void*, int), (display, name));
     (void)display;
     switch (name) {
     case 0x3053: return "1.5";                       /* EGL_VERSION */
@@ -2583,11 +2557,14 @@ const char *eglQueryString(void *display, int name) {
 }
 
 unsigned eglBindAPI(unsigned api) {
+    FWD_RET_V(unsigned, eglBindAPI, (unsigned), (api));
     SHIM_LOG("eglBindAPI(0x%x)", api);
     return EGL_TRUE;
 }
 
 unsigned eglGetConfigs(void *display, void **configs, int config_size, int *num_config) {
+    FWD_RET_V(unsigned, eglGetConfigs, (void*, void**, int, int*),
+            (display, configs, config_size, num_config));
     (void)display;
     if (num_config) *num_config = 1;
     if (configs && config_size >= 1) configs[0] = FAKE_EGL_CONFIG;
@@ -2596,6 +2573,8 @@ unsigned eglGetConfigs(void *display, void **configs, int config_size, int *num_
 
 unsigned eglChooseConfig(void *display, const int *attrib_list,
                          void **configs, int config_size, int *num_config) {
+    FWD_RET_V(unsigned, eglChooseConfig, (void*, const int*, void**, int, int*),
+            (display, attrib_list, configs, config_size, num_config));
     (void)display; (void)attrib_list;
     if (num_config) *num_config = 1;
     if (configs && config_size >= 1) configs[0] = FAKE_EGL_CONFIG;
@@ -2603,12 +2582,11 @@ unsigned eglChooseConfig(void *display, const int *attrib_list,
 }
 
 unsigned eglGetConfigAttrib(void *display, void *config, int attribute, int *value) {
+    FWD_RET_V(unsigned, eglGetConfigAttrib, (void*, void*, int, int*),
+            (display, config, attribute, value));
     (void)display; (void)config;
     if (!value) return EGL_FALSE;
-    /* EGL attribute constants from <EGL/egl.h>; my earlier guesses had
-     * RED_SIZE and NATIVE_VISUAL_ID on the wrong numbers, which made the
-     * game log "failed to find egl config for gbm format" because the
-     * returned visual id didn't match XR24. */
+    /* EGL attribute constants from <EGL/egl.h>. */
     switch (attribute) {
     case 0x3020: *value = 32; break;                 /* EGL_BUFFER_SIZE */
     case 0x3021: *value = 8;  break;                 /* EGL_ALPHA_SIZE */
@@ -2631,50 +2609,87 @@ unsigned eglGetConfigAttrib(void *display, void *config, int attribute, int *val
 
 void *eglCreateContext(void *display, void *config, void *share_context,
                        const int *attrib_list) {
+    FWD_RET_V(void*, eglCreateContext, (void*, void*, void*, const int*),
+            (display, config, share_context, attrib_list));
     SHIM_LOG("eglCreateContext -> fake context");
     (void)display; (void)config; (void)share_context; (void)attrib_list;
     return FAKE_EGL_CONTEXT;
 }
 
 unsigned eglDestroyContext(void *display, void *context) {
+    FWD_RET_V(unsigned, eglDestroyContext, (void*, void*), (display, context));
     (void)display; (void)context; return EGL_TRUE;
 }
 
 void *eglCreateWindowSurface(void *display, void *config, void *native_window,
                              const int *attrib_list) {
+    /* Step 56.2 — in real-GL mode, window surfaces don't work because our
+     * "native_window" is a fake GBM surface that Mesa's GBM platform cannot
+     * consume (no real DRM device). Redirect to a surfaceless pbuffer of
+     * screen size. Game sees an EGL surface and doesn't know the difference;
+     * Mesa gets something it can bind. */
+    if (is_real_gl()) {
+        static void *(*real_pbuf)(void*, void*, const int*) = NULL;
+        if (!real_pbuf) real_pbuf = (void*(*)(void*, void*, const int*))
+                                    dlsym(RTLD_NEXT, "eglCreatePbufferSurface");
+        if (real_pbuf) {
+            int pb_attrs[] = {
+                0x3057, FAKE_MODE_HDISPLAY,   /* EGL_WIDTH  */
+                0x3056, FAKE_MODE_VDISPLAY,   /* EGL_HEIGHT */
+                0x3038                         /* EGL_NONE   */
+            };
+            void *p = real_pbuf(display, config, pb_attrs);
+            SHIM_LOG("eglCreateWindowSurface(native=%p) -> pbuffer %p (redirected %dx%d)",
+                     native_window, p, FAKE_MODE_HDISPLAY, FAKE_MODE_VDISPLAY);
+            (void)attrib_list;
+            return p;
+        }
+        SHIM_LOG("eglCreateWindowSurface: no RTLD_NEXT eglCreatePbufferSurface; falling back to stub");
+    }
     SHIM_LOG("eglCreateWindowSurface(native=%p) -> fake surface", native_window);
     (void)display; (void)config; (void)attrib_list;
     return FAKE_EGL_SURFACE;
 }
 
 void *eglCreatePbufferSurface(void *display, void *config, const int *attrib_list) {
+    FWD_RET_V(void*, eglCreatePbufferSurface, (void*, void*, const int*),
+            (display, config, attrib_list));
     (void)display; (void)config; (void)attrib_list;
     return FAKE_EGL_SURFACE;
 }
 
 unsigned eglDestroySurface(void *display, void *surface) {
+    FWD_RET_V(unsigned, eglDestroySurface, (void*, void*), (display, surface));
     (void)display; (void)surface; return EGL_TRUE;
 }
 
 unsigned eglMakeCurrent(void *display, void *draw, void *read, void *context) {
+    FWD_RET_V(unsigned, eglMakeCurrent, (void*, void*, void*, void*),
+            (display, draw, read, context));
     SHIM_LOG("eglMakeCurrent(dpy=%p, draw=%p, read=%p, ctx=%p)",
              display, draw, read, context);
     return EGL_TRUE;
 }
 
 unsigned eglSwapBuffers(void *display, void *surface) {
+    FWD_RET_V(unsigned, eglSwapBuffers, (void*, void*), (display, surface));
     (void)display; (void)surface; return EGL_TRUE;
 }
 
 unsigned eglSwapInterval(void *display, int interval) {
+    FWD_RET_V(unsigned, eglSwapInterval, (void*, int), (display, interval));
     (void)display; (void)interval; return EGL_TRUE;
 }
 
 unsigned eglSurfaceAttrib(void *display, void *surface, int attribute, int value) {
+    FWD_RET_V(unsigned, eglSurfaceAttrib, (void*, void*, int, int),
+            (display, surface, attribute, value));
     (void)display; (void)surface; (void)attribute; (void)value; return EGL_TRUE;
 }
 
 unsigned eglQuerySurface(void *display, void *surface, int attribute, int *value) {
+    FWD_RET_V(unsigned, eglQuerySurface, (void*, void*, int, int*),
+            (display, surface, attribute, value));
     (void)display; (void)surface;
     if (!value) return EGL_FALSE;
     switch (attribute) {
@@ -2685,7 +2700,10 @@ unsigned eglQuerySurface(void *display, void *surface, int attribute, int *value
     return EGL_TRUE;
 }
 
-int eglGetError(void) { return EGL_SUCCESS; }
+int eglGetError(void) {
+    FWD_RET_V(int, eglGetError, (void), ());
+    return EGL_SUCCESS;
+}
 
 /* Stubs for extensions resolved via eglGetProcAddress. The game queries
  * these after eglCreateContext (per BN analysis of sub_d01d10). Each
@@ -2717,20 +2735,23 @@ static void stub_glEGLImageTargetTexture2DOES(unsigned target, void *image) {
 }
 
 /* ---- Hooked: GLES 3.x ----
- * Pure no-op stubs to satisfy the game's rendering calls without a real
- * context. Returns are designed to be plausible enough for the game to
- * believe rendering succeeded:
- *   - glGen*  returns an incrementing handle per object
- *   - glGetShaderiv/glGetProgramiv return GL_TRUE for COMPILE_STATUS /
- *     LINK_STATUS so the Radium shader pipeline doesn't bail on "failed
- *     to compile" branches
- *   - glCheckFramebufferStatus returns GL_FRAMEBUFFER_COMPLETE
- *   - glGetError returns GL_NO_ERROR
- *   - glGetString advertises GLES 3.1 + the OES/EXT extensions the game's
- *     Texture2dDirect checks for
  *
- * When we pivot to real host GL (Step 21.8 option B), each stub body
- * gets replaced with a forwarded call; signatures stay the same.
+ * Two modes, selected by SPIKE3_REAL_GL env var (Step 56):
+ *
+ * 1. Unset (default): pure no-op stubs. Game's rendering calls all succeed
+ *    with plausible values, no actual rendering happens. Used for all of
+ *    Steps 1-55 — reaching steady state without needing a real GL stack.
+ *    - glGen* returns an incrementing handle
+ *    - glGetShaderiv/glGetProgramiv return GL_TRUE for COMPILE_STATUS /
+ *      LINK_STATUS
+ *    - glCheckFramebufferStatus returns GL_FRAMEBUFFER_COMPLETE
+ *    - glGetError returns GL_NO_ERROR
+ *    - glGetString advertises GLES 3.1 + common OES/EXT extensions
+ *
+ * 2. Set: each stub forwards to the real Mesa implementation via
+ *    dlsym(RTLD_NEXT, ...) (cached per-function). Expects the Mesa overlay
+ *    at mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/ to be on
+ *    LD_LIBRARY_PATH. See _emulation/SETUP.md §3b.
  */
 
 #define GL_NO_ERROR              0
@@ -2765,7 +2786,6 @@ static uint32_t gl_next_program_id = 1;
  * functions. */
 static int gl_log_budget_object_create = 40;
 static int gl_log_budget_draw          = 20;
-static int gl_log_budget_uniform       = 20;
 static int gl_log_budget_state         = 40;
 #define GLLOG(kind, fmt, ...) do { \
     if (gl_log_budget_##kind > 0) { \
@@ -2776,16 +2796,19 @@ static int gl_log_budget_state         = 40;
 
 /* --- Query / error --- */
 
-unsigned glGetError(void) { return GL_NO_ERROR; }
+unsigned glGetError(void) {
+    FWD_RET(unsigned, glGetError, (void), ());
+    return GL_NO_ERROR;
+}
 
 const unsigned char *glGetString(unsigned name) {
+    FWD_RET(const unsigned char*, glGetString, (unsigned), (name));
     switch (name) {
     case GL_VERSION:                  return (const unsigned char *)"OpenGL ES 3.1 (stub)";
     case GL_VENDOR:                   return (const unsigned char *)"shim";
     case GL_RENDERER:                 return (const unsigned char *)"shim GLES3";
     case GL_SHADING_LANGUAGE_VERSION: return (const unsigned char *)"OpenGL ES GLSL ES 3.10";
     case GL_EXTENSIONS:
-        /* Advertise the OES/EXT extensions Texture2dDirect / Radium check. */
         return (const unsigned char *)
             "GL_OES_EGL_image GL_OES_EGL_image_external "
             "GL_OES_texture_float GL_OES_texture_half_float "
@@ -2797,13 +2820,12 @@ const unsigned char *glGetString(unsigned name) {
 }
 
 const unsigned char *glGetStringi(unsigned name, unsigned index) {
+    FWD_RET(const unsigned char*, glGetStringi, (unsigned, unsigned), (name, index));
     (void)name; (void)index; return (const unsigned char *)"";
 }
 
-/* Track which pnames glGetIntegerv has been asked about, so we can log each
- * unknown pname exactly once without swamping the log. 1 KB bitmap indexed
- * by the low bits of the pname (sufficient since GL enum low bits rarely
- * collide within a session). */
+/* Log each unknown glGetIntegerv pname exactly once via a 4KB bitmap keyed
+ * on the low 12 bits of the pname. Only used by the stub path. */
 static unsigned char gl_getint_seen[4096];
 static void gl_getint_log_unknown(unsigned pname) {
     unsigned slot = pname & 0xFFF;
@@ -2813,61 +2835,47 @@ static void gl_getint_log_unknown(unsigned pname) {
 }
 
 void glGetIntegerv(unsigned pname, int *params) {
+    FWD_VOID(glGetIntegerv, (unsigned, int*), (pname, params));
     if (!params) return;
     switch (pname) {
-    /* Sizes / dims */
     case GL_MAX_TEXTURE_SIZE:                    *params = 4096; break;
     case GL_MAX_VIEWPORT_DIMS:                   params[0] = 4096; params[1] = 4096; break;
-    case 0x851C: /* GL_MAX_CUBE_MAP_TEXTURE_SIZE */ *params = 2048; break;
-    case 0x84E8: /* GL_MAX_RENDERBUFFER_SIZE */  *params = 4096; break;
-    case 0x88FF: /* GL_MAX_3D_TEXTURE_SIZE */    *params = 2048; break;
-    case 0x88FE: /* GL_MAX_ARRAY_TEXTURE_LAYERS */ *params = 256; break;
-
-    /* Texture units */
+    case 0x851C: *params = 2048; break;    /* GL_MAX_CUBE_MAP_TEXTURE_SIZE */
+    case 0x84E8: *params = 4096; break;    /* GL_MAX_RENDERBUFFER_SIZE */
+    case 0x88FF: *params = 2048; break;    /* GL_MAX_3D_TEXTURE_SIZE */
+    case 0x88FE: *params = 256;  break;    /* GL_MAX_ARRAY_TEXTURE_LAYERS */
     case GL_MAX_TEXTURE_IMAGE_UNITS:             *params = 16; break;
-    case 0x8B4C: /* GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS */ *params = 16; break;
-    case 0x8B4D: /* GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS */ *params = 32; break;
-
-    /* Vertex pipeline */
+    case 0x8B4C: *params = 16; break;      /* GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS */
+    case 0x8B4D: *params = 32; break;      /* GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS */
     case GL_MAX_VERTEX_ATTRIBS:                  *params = 16; break;
-    case 0x8DFB: /* GL_MAX_VERTEX_UNIFORM_VECTORS */   *params = 256; break;
-    case 0x8A2B: /* GL_MAX_VERTEX_UNIFORM_COMPONENTS */ *params = 1024; break;
-    case 0x8B4A: /* GL_MAX_VERTEX_UNIFORM_BLOCKS */    *params = 12; break;
-    case 0x8B4B: /* GL_MAX_VARYING_COMPONENTS */ *params = 60; break;
-    case 0x8DFC: /* GL_MAX_VARYING_VECTORS */    *params = 15; break;
-    case 0x9122: /* GL_MAX_VERTEX_OUTPUT_COMPONENTS — ES 3.x per-stage */ *params = 64; break;
-
-    /* Fragment pipeline */
-    case 0x8DFD: /* GL_MAX_FRAGMENT_UNIFORM_VECTORS */ *params = 224; break;
-    case 0x8B49: /* GL_MAX_FRAGMENT_UNIFORM_COMPONENTS */ *params = 896; break;
-    case 0x8A2D: /* GL_MAX_FRAGMENT_UNIFORM_BLOCKS */ *params = 12; break;
-    case 0x9125: /* GL_MAX_FRAGMENT_INPUT_COMPONENTS — ES 3.x per-stage */ *params = 60; break;
-
-    /* Framebuffer */
-    case 0x8CDF: /* GL_MAX_COLOR_ATTACHMENTS */  *params = 4; break;
-    case 0x8824: /* GL_MAX_DRAW_BUFFERS */       *params = 4; break;
-    case 0x8D57: /* GL_MAX_SAMPLES */            *params = 4; break;
-
-    /* Uniform buffers */
-    case 0x8A2E: /* GL_MAX_COMBINED_UNIFORM_BLOCKS */ *params = 24; break;
-    case 0x8A2F: /* GL_MAX_UNIFORM_BUFFER_BINDINGS */ *params = 24; break;
-    case 0x8A30: /* GL_MAX_UNIFORM_BLOCK_SIZE */ *params = 16384; break;
-    case 0x8A34: /* GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT */ *params = 256; break;
-
-    /* Program binary formats (count only; we claim zero since none supported) */
-    case 0x87FE: /* GL_NUM_PROGRAM_BINARY_FORMATS */ *params = 0; break;
-
-    default:
-        *params = 0;
-        gl_getint_log_unknown(pname);
-        break;
+    case 0x8DFB: *params = 256;  break;    /* GL_MAX_VERTEX_UNIFORM_VECTORS */
+    case 0x8A2B: *params = 1024; break;    /* GL_MAX_VERTEX_UNIFORM_COMPONENTS */
+    case 0x8B4A: *params = 12;   break;    /* GL_MAX_VERTEX_UNIFORM_BLOCKS */
+    case 0x8B4B: *params = 60;   break;    /* GL_MAX_VARYING_COMPONENTS */
+    case 0x8DFC: *params = 15;   break;    /* GL_MAX_VARYING_VECTORS */
+    case 0x9122: *params = 64;   break;    /* GL_MAX_VERTEX_OUTPUT_COMPONENTS */
+    case 0x8DFD: *params = 224;  break;    /* GL_MAX_FRAGMENT_UNIFORM_VECTORS */
+    case 0x8B49: *params = 896;  break;    /* GL_MAX_FRAGMENT_UNIFORM_COMPONENTS */
+    case 0x8A2D: *params = 12;   break;    /* GL_MAX_FRAGMENT_UNIFORM_BLOCKS */
+    case 0x9125: *params = 60;   break;    /* GL_MAX_FRAGMENT_INPUT_COMPONENTS */
+    case 0x8CDF: *params = 4;    break;    /* GL_MAX_COLOR_ATTACHMENTS */
+    case 0x8824: *params = 4;    break;    /* GL_MAX_DRAW_BUFFERS */
+    case 0x8D57: *params = 4;    break;    /* GL_MAX_SAMPLES */
+    case 0x8A2E: *params = 24;   break;    /* GL_MAX_COMBINED_UNIFORM_BLOCKS */
+    case 0x8A2F: *params = 24;   break;    /* GL_MAX_UNIFORM_BUFFER_BINDINGS */
+    case 0x8A30: *params = 16384;break;    /* GL_MAX_UNIFORM_BLOCK_SIZE */
+    case 0x8A34: *params = 256;  break;    /* GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT */
+    case 0x87FE: *params = 0;    break;    /* GL_NUM_PROGRAM_BINARY_FORMATS */
+    default: *params = 0; gl_getint_log_unknown(pname); break;
     }
 }
 void glGetFloatv(unsigned pname, float *params) {
+    FWD_VOID(glGetFloatv, (unsigned, float*), (pname, params));
     if (params) *params = 0.0f;
     (void)pname;
 }
 void glGetBooleanv(unsigned pname, unsigned char *params) {
+    FWD_VOID(glGetBooleanv, (unsigned, unsigned char*), (pname, params));
     if (params) *params = GL_FALSE;
     (void)pname;
 }
@@ -2875,247 +2883,212 @@ void glGetBooleanv(unsigned pname, unsigned char *params) {
 /* --- Object creation --- */
 
 void glGenTextures(int n, unsigned *out) {
+    FWD_VOID(glGenTextures, (int, unsigned*), (n, out));
     for (int i = 0; i < n; i++) out[i] = gl_next_tex_id++;
     GLLOG(object_create, "glGenTextures(%d) -> [%u..]", n, n ? out[0] : 0);
 }
-void glDeleteTextures(int n, const unsigned *ids) { (void)n; (void)ids; }
-
+void glDeleteTextures(int n, const unsigned *ids) {
+    FWD_VOID(glDeleteTextures, (int, const unsigned*), (n, ids));
+    (void)n; (void)ids;
+}
 void glGenBuffers(int n, unsigned *out) {
+    FWD_VOID(glGenBuffers, (int, unsigned*), (n, out));
     for (int i = 0; i < n; i++) out[i] = gl_next_buf_id++;
     GLLOG(object_create, "glGenBuffers(%d) -> [%u..]", n, n ? out[0] : 0);
 }
-void glDeleteBuffers(int n, const unsigned *ids) { (void)n; (void)ids; }
-
+void glDeleteBuffers(int n, const unsigned *ids) {
+    FWD_VOID(glDeleteBuffers, (int, const unsigned*), (n, ids));
+    (void)n; (void)ids;
+}
 void glGenFramebuffers(int n, unsigned *out) {
+    FWD_VOID(glGenFramebuffers, (int, unsigned*), (n, out));
     for (int i = 0; i < n; i++) out[i] = gl_next_fb_id++;
     GLLOG(object_create, "glGenFramebuffers(%d) -> [%u..]", n, n ? out[0] : 0);
 }
-void glDeleteFramebuffers(int n, const unsigned *ids) { (void)n; (void)ids; }
-
+void glDeleteFramebuffers(int n, const unsigned *ids) {
+    FWD_VOID(glDeleteFramebuffers, (int, const unsigned*), (n, ids));
+    (void)n; (void)ids;
+}
 void glGenRenderbuffers(int n, unsigned *out) {
+    FWD_VOID(glGenRenderbuffers, (int, unsigned*), (n, out));
     for (int i = 0; i < n; i++) out[i] = gl_next_rb_id++;
     GLLOG(object_create, "glGenRenderbuffers(%d) -> [%u..]", n, n ? out[0] : 0);
 }
-void glDeleteRenderbuffers(int n, const unsigned *ids) { (void)n; (void)ids; }
-
+void glDeleteRenderbuffers(int n, const unsigned *ids) {
+    FWD_VOID(glDeleteRenderbuffers, (int, const unsigned*), (n, ids));
+    (void)n; (void)ids;
+}
 void glGenVertexArrays(int n, unsigned *out) {
+    FWD_VOID(glGenVertexArrays, (int, unsigned*), (n, out));
     for (int i = 0; i < n; i++) out[i] = gl_next_vao_id++;
     GLLOG(object_create, "glGenVertexArrays(%d) -> [%u..]", n, n ? out[0] : 0);
 }
-void glDeleteVertexArrays(int n, const unsigned *ids) { (void)n; (void)ids; }
-
-/* Per-shader-id type tracking so glShaderSource captures can name the
- * right file suffix (vertex=0x8B31, fragment=0x8B30). Indexed by shader id. */
-#define GL_SHADER_TYPE_MAX 1024
-static uint32_t gl_shader_type[GL_SHADER_TYPE_MAX];
+void glDeleteVertexArrays(int n, const unsigned *ids) {
+    FWD_VOID(glDeleteVertexArrays, (int, const unsigned*), (n, ids));
+    (void)n; (void)ids;
+}
 
 unsigned glCreateShader(unsigned type) {
+    FWD_RET(unsigned, glCreateShader, (unsigned), (type));
     unsigned id = gl_next_shader_id++;
-    if (id < GL_SHADER_TYPE_MAX) gl_shader_type[id] = type;
     GLLOG(object_create, "glCreateShader(type=0x%x) -> %u", type, id);
     return id;
 }
-void glDeleteShader(unsigned shader) { (void)shader; }
-
+void glDeleteShader(unsigned shader) {
+    FWD_VOID(glDeleteShader, (unsigned), (shader));
+    (void)shader;
+}
 unsigned glCreateProgram(void) {
+    FWD_RET(unsigned, glCreateProgram, (void), ());
     unsigned id = gl_next_program_id++;
     GLLOG(object_create, "glCreateProgram() -> %u", id);
     return id;
 }
-void glDeleteProgram(unsigned program) { (void)program; }
+void glDeleteProgram(unsigned program) {
+    FWD_VOID(glDeleteProgram, (unsigned), (program));
+    (void)program;
+}
 
 /* --- Binding --- */
 
-void glBindTexture(unsigned target, unsigned tex)       { (void)target; (void)tex; }
-void glBindBuffer(unsigned target, unsigned buf)        { (void)target; (void)buf; }
-void glBindFramebuffer(unsigned target, unsigned fb)    { (void)target; (void)fb; }
-void glBindRenderbuffer(unsigned target, unsigned rb)   { (void)target; (void)rb; }
-void glBindVertexArray(unsigned array)                   { (void)array; }
-void glActiveTexture(unsigned tex)                       { (void)tex; }
-
-/* --- Texture data / params ---
- *
- * Capture policy (Step 23.3): when `data` is non-NULL, dump the payload to
- * _emulation/textures/. StreamingImage_Bind (BN VA 0xca7210) drives most
- * of these calls with pixel data sourced from decoded image.bin entries;
- * capturing them gives us the game's runtime texture stream. */
-
-static uint32_t gl_tex_capture_count = 0;
-
-static int gl_bytes_per_pixel(unsigned format, unsigned type) {
-    /* Packed types carry their own total width; return it directly. */
-    switch (type) {
-    case 0x8363: return 2;  /* UNSIGNED_SHORT_5_6_5 */
-    case 0x8033: return 2;  /* UNSIGNED_SHORT_4_4_4_4 */
-    case 0x8034: return 2;  /* UNSIGNED_SHORT_5_5_5_1 */
-    case 0x8368: return 4;  /* UNSIGNED_INT_2_10_10_10_REV */
-    case 0x8DAD: return 4;  /* UNSIGNED_INT_24_8 (depth-stencil) */
-    default: break;
-    }
-    int comp;
-    switch (format) {
-    case 0x1906: comp = 1; break;   /* ALPHA */
-    case 0x1909: comp = 1; break;   /* LUMINANCE */
-    case 0x190A: comp = 2; break;   /* LUMINANCE_ALPHA */
-    case 0x1903: comp = 1; break;   /* RED */
-    case 0x8227: comp = 2; break;   /* RG */
-    case 0x1907: comp = 3; break;   /* RGB */
-    case 0x1908: comp = 4; break;   /* RGBA */
-    case 0x80E0: comp = 3; break;   /* BGR */
-    case 0x80E1: comp = 4; break;   /* BGRA (EXT_texture_format_BGRA8888) */
-    case 0x1902: comp = 1; break;   /* DEPTH_COMPONENT */
-    default:     comp = 4; break;
-    }
-    int byte_per_comp;
-    switch (type) {
-    case 0x1400: case 0x1401: byte_per_comp = 1; break; /* [U]BYTE */
-    case 0x1402: case 0x1403: byte_per_comp = 2; break; /* [U]SHORT */
-    case 0x1404: case 0x1405: byte_per_comp = 4; break; /* [U]INT */
-    case 0x1406: byte_per_comp = 4; break;              /* FLOAT */
-    case 0x140B: byte_per_comp = 2; break;              /* HALF_FLOAT */
-    default:     byte_per_comp = 1; break;
-    }
-    return comp * byte_per_comp;
+void glBindTexture(unsigned target, unsigned tex) {
+    FWD_VOID(glBindTexture, (unsigned, unsigned), (target, tex));
+    (void)target; (void)tex;
+}
+void glBindBuffer(unsigned target, unsigned buf) {
+    FWD_VOID(glBindBuffer, (unsigned, unsigned), (target, buf));
+    (void)target; (void)buf;
+}
+void glBindFramebuffer(unsigned target, unsigned fb) {
+    FWD_VOID(glBindFramebuffer, (unsigned, unsigned), (target, fb));
+    (void)target; (void)fb;
+}
+void glBindRenderbuffer(unsigned target, unsigned rb) {
+    FWD_VOID(glBindRenderbuffer, (unsigned, unsigned), (target, rb));
+    (void)target; (void)rb;
+}
+void glBindVertexArray(unsigned array) {
+    FWD_VOID(glBindVertexArray, (unsigned), (array));
+    (void)array;
+}
+void glActiveTexture(unsigned tex) {
+    FWD_VOID(glActiveTexture, (unsigned), (tex));
+    (void)tex;
 }
 
-static void gl_capture_tex(const char *call, int w, int h,
-                           unsigned format, unsigned type, const void *data) {
-    if (!data || w <= 0 || h <= 0) return;
-    int bpp = gl_bytes_per_pixel(format, type);
-    size_t sz = (size_t)w * (size_t)h * (size_t)bpp;
-    uint32_t seq = __atomic_fetch_add(&gl_tex_capture_count, 1, __ATOMIC_SEQ_CST);
-    char path[160];
-    snprintf(path, sizeof(path),
-             "_emulation/textures/tex_%06u_%dx%d_fmt%04x_type%04x.raw",
-             seq, w, h, format, type);
-    FILE *f = fopen(path, "wb");
-    if (f) {
-        fwrite(data, 1, sz, f);
-        fclose(f);
-        if (seq < 12 || (seq % 100) == 0) {
-            SHIM_LOG("%s capture %u: %dx%d fmt=0x%x type=0x%x -> %s (%zu B)",
-                     call, seq, w, h, format, type, path, sz);
-        }
-    }
-}
+/* --- Texture data / params --- */
 
 void glTexImage2D(unsigned target, int level, int internalfmt,
                   int w, int h, int border, unsigned format, unsigned type,
                   const void *data) {
+    FWD_VOID(glTexImage2D,
+             (unsigned, int, int, int, int, int, unsigned, unsigned, const void*),
+             (target, level, internalfmt, w, h, border, format, type, data));
     GLLOG(object_create, "glTexImage2D %dx%d internal=0x%x fmt=0x%x type=0x%x data=%s",
           w, h, internalfmt, format, type, data ? "<ptr>" : "NULL");
-    gl_capture_tex("glTexImage2D", w, h, format, type, data);
     (void)target; (void)level; (void)border;
 }
 void glTexSubImage2D(unsigned target, int level, int xoff, int yoff,
                      int w, int h, unsigned format, unsigned type,
                      const void *data) {
-    gl_capture_tex("glTexSubImage2D", w, h, format, type, data);
+    FWD_VOID(glTexSubImage2D,
+             (unsigned, int, int, int, int, int, unsigned, unsigned, const void*),
+             (target, level, xoff, yoff, w, h, format, type, data));
     (void)target; (void)level; (void)xoff; (void)yoff;
+    (void)w; (void)h; (void)format; (void)type; (void)data;
 }
-
-static uint32_t gl_ctex_capture_count = 0;
-
-static void gl_capture_ctex(const char *call, int w, int h,
-                            unsigned format, int size, const void *data) {
-    if (!data || size <= 0) return;
-    uint32_t seq = __atomic_fetch_add(&gl_ctex_capture_count, 1, __ATOMIC_SEQ_CST);
-    char path[160];
-    snprintf(path, sizeof(path),
-             "_emulation/textures/tex_compressed_%06u_%dx%d_fmt%04x.bin",
-             seq, w, h, format);
-    FILE *f = fopen(path, "wb");
-    if (f) {
-        fwrite(data, 1, (size_t)size, f);
-        fclose(f);
-        if (seq < 12 || (seq % 100) == 0) {
-            SHIM_LOG("%s capture %u: %dx%d fmt=0x%x size=%d -> %s",
-                     call, seq, w, h, format, size, path);
-        }
-    }
-}
-
 void glCompressedTexImage2D(unsigned target, int level, unsigned internalfmt,
                             int w, int h, int border, int size, const void *data) {
-    gl_capture_ctex("glCompressedTexImage2D", w, h, internalfmt, size, data);
-    (void)target; (void)level; (void)border;
+    FWD_VOID(glCompressedTexImage2D,
+             (unsigned, int, unsigned, int, int, int, int, const void*),
+             (target, level, internalfmt, w, h, border, size, data));
+    (void)target; (void)level; (void)internalfmt;
+    (void)w; (void)h; (void)border; (void)size; (void)data;
 }
 void glCompressedTexSubImage2D(unsigned target, int level, int xoff, int yoff,
                                int w, int h, unsigned format, int size,
                                const void *data) {
-    gl_capture_ctex("glCompressedTexSubImage2D", w, h, format, size, data);
+    FWD_VOID(glCompressedTexSubImage2D,
+             (unsigned, int, int, int, int, int, unsigned, int, const void*),
+             (target, level, xoff, yoff, w, h, format, size, data));
     (void)target; (void)level; (void)xoff; (void)yoff;
+    (void)w; (void)h; (void)format; (void)size; (void)data;
 }
 void glTexParameteri(unsigned target, unsigned pname, int param) {
+    FWD_VOID(glTexParameteri, (unsigned, unsigned, int), (target, pname, param));
     (void)target; (void)pname; (void)param;
 }
 void glTexParameterf(unsigned target, unsigned pname, float param) {
+    FWD_VOID(glTexParameterf, (unsigned, unsigned, float), (target, pname, param));
     (void)target; (void)pname; (void)param;
 }
-void glPixelStorei(unsigned pname, int param) { (void)pname; (void)param; }
-void glGenerateMipmap(unsigned target) { (void)target; }
+void glPixelStorei(unsigned pname, int param) {
+    FWD_VOID(glPixelStorei, (unsigned, int), (pname, param));
+    (void)pname; (void)param;
+}
+void glGenerateMipmap(unsigned target) {
+    FWD_VOID(glGenerateMipmap, (unsigned), (target));
+    (void)target;
+}
 
 /* --- Buffer data --- */
 
 void glBufferData(unsigned target, intptr_t size, const void *data, unsigned usage) {
+    FWD_VOID(glBufferData, (unsigned, intptr_t, const void*, unsigned),
+             (target, size, data, usage));
     (void)target; (void)size; (void)data; (void)usage;
 }
 void glBufferSubData(unsigned target, intptr_t offset, intptr_t size, const void *data) {
+    FWD_VOID(glBufferSubData, (unsigned, intptr_t, intptr_t, const void*),
+             (target, offset, size, data));
     (void)target; (void)offset; (void)size; (void)data;
 }
 void *glMapBufferRange(unsigned target, intptr_t offset, intptr_t len, unsigned access) {
+    FWD_RET(void*, glMapBufferRange, (unsigned, intptr_t, intptr_t, unsigned),
+            (target, offset, len, access));
     (void)target; (void)offset; (void)len; (void)access; return NULL;
 }
-unsigned char glUnmapBuffer(unsigned target) { (void)target; return GL_TRUE; }
+unsigned char glUnmapBuffer(unsigned target) {
+    FWD_RET(unsigned char, glUnmapBuffer, (unsigned), (target));
+    (void)target; return GL_TRUE;
+}
 
 /* --- Shader --- */
 
-static uint32_t gl_shader_capture_count = 0;
-
 void glShaderSource(unsigned shader, int count, const char *const *string, const int *length) {
-    if (count <= 0 || !string) return;
-    size_t total = 0;
-    for (int i = 0; i < count; i++) {
-        size_t n = (length && length[i] >= 0) ? (size_t)length[i]
-                                               : (string[i] ? strlen(string[i]) : 0);
-        total += n;
-    }
-    char *buf = (char *)malloc(total + 1);
-    if (!buf) return;
-    size_t off = 0;
-    for (int i = 0; i < count; i++) {
-        size_t n = (length && length[i] >= 0) ? (size_t)length[i]
-                                               : (string[i] ? strlen(string[i]) : 0);
-        if (n && string[i]) memcpy(buf + off, string[i], n);
-        off += n;
-    }
-    buf[total] = 0;
-    uint32_t seq = __atomic_fetch_add(&gl_shader_capture_count, 1, __ATOMIC_SEQ_CST);
-    uint32_t type = (shader < GL_SHADER_TYPE_MAX) ? gl_shader_type[shader] : 0;
-    char path[160];
-    snprintf(path, sizeof(path),
-             "_emulation/shaders/shader_%03u_id%u_type%04x.glsl",
-             seq, shader, type);
-    FILE *f = fopen(path, "wb");
-    if (f) {
-        fwrite(buf, 1, total, f);
-        fclose(f);
-        SHIM_LOG("shader capture %u: id=%u type=0x%x -> %s (%zu B)",
-                 seq, shader, type, path, total);
-    }
-    free(buf);
+    FWD_VOID(glShaderSource, (unsigned, int, const char* const*, const int*),
+             (shader, count, string, length));
+    (void)shader; (void)count; (void)string; (void)length;
 }
-void glCompileShader(unsigned shader) { (void)shader; }
-void glAttachShader(unsigned program, unsigned shader) { (void)program; (void)shader; }
-void glDetachShader(unsigned program, unsigned shader) { (void)program; (void)shader; }
-void glLinkProgram(unsigned program) { (void)program; }
-void glValidateProgram(unsigned program) { (void)program; }
-void glUseProgram(unsigned program) { (void)program; }
+void glCompileShader(unsigned shader) {
+    FWD_VOID(glCompileShader, (unsigned), (shader));
+    (void)shader;
+}
+void glAttachShader(unsigned program, unsigned shader) {
+    FWD_VOID(glAttachShader, (unsigned, unsigned), (program, shader));
+    (void)program; (void)shader;
+}
+void glDetachShader(unsigned program, unsigned shader) {
+    FWD_VOID(glDetachShader, (unsigned, unsigned), (program, shader));
+    (void)program; (void)shader;
+}
+void glLinkProgram(unsigned program) {
+    FWD_VOID(glLinkProgram, (unsigned), (program));
+    (void)program;
+}
+void glValidateProgram(unsigned program) {
+    FWD_VOID(glValidateProgram, (unsigned), (program));
+    (void)program;
+}
+void glUseProgram(unsigned program) {
+    FWD_VOID(glUseProgram, (unsigned), (program));
+    (void)program;
+}
 
 void glGetShaderiv(unsigned shader, unsigned pname, int *params) {
+    FWD_VOID(glGetShaderiv, (unsigned, unsigned, int*), (shader, pname, params));
     (void)shader;
     if (!params) return;
-    /* Claim success for every status query — keeps Radium from bailing. */
     switch (pname) {
     case GL_COMPILE_STATUS:  *params = GL_TRUE; break;
     case GL_INFO_LOG_LENGTH: *params = 0; break;
@@ -3123,150 +3096,295 @@ void glGetShaderiv(unsigned shader, unsigned pname, int *params) {
     }
 }
 void glGetProgramiv(unsigned program, unsigned pname, int *params) {
+    FWD_VOID(glGetProgramiv, (unsigned, unsigned, int*), (program, pname, params));
     (void)program;
     if (!params) return;
     switch (pname) {
-    case GL_LINK_STATUS:      *params = GL_TRUE; break;
-    case GL_ACTIVE_UNIFORMS:  *params = 0; break;
-    case GL_ACTIVE_ATTRIBUTES:*params = 0; break;
-    case GL_INFO_LOG_LENGTH:  *params = 0; break;
-    default:                  *params = 0; break;
+    case GL_LINK_STATUS:       *params = GL_TRUE; break;
+    case GL_ACTIVE_UNIFORMS:   *params = 0; break;
+    case GL_ACTIVE_ATTRIBUTES: *params = 0; break;
+    case GL_INFO_LOG_LENGTH:   *params = 0; break;
+    default:                   *params = 0; break;
     }
 }
 void glGetShaderInfoLog(unsigned shader, int max, int *len, char *log) {
+    FWD_VOID(glGetShaderInfoLog, (unsigned, int, int*, char*),
+             (shader, max, len, log));
     (void)shader; (void)max;
     if (len) *len = 0;
     if (log && max > 0) log[0] = 0;
 }
 void glGetProgramInfoLog(unsigned program, int max, int *len, char *log) {
+    FWD_VOID(glGetProgramInfoLog, (unsigned, int, int*, char*),
+             (program, max, len, log));
     (void)program; (void)max;
     if (len) *len = 0;
     if (log && max > 0) log[0] = 0;
 }
 
 int glGetUniformLocation(unsigned program, const char *name) {
+    FWD_RET(int, glGetUniformLocation, (unsigned, const char*), (program, name));
     (void)program; (void)name; return 0;
 }
 int glGetAttribLocation(unsigned program, const char *name) {
+    FWD_RET(int, glGetAttribLocation, (unsigned, const char*), (program, name));
     (void)program; (void)name; return 0;
 }
 void glBindAttribLocation(unsigned program, unsigned index, const char *name) {
+    FWD_VOID(glBindAttribLocation, (unsigned, unsigned, const char*),
+             (program, index, name));
     (void)program; (void)index; (void)name;
 }
 
-/* Uniforms — many variants, all no-op */
-#define GL_UNIFORM_1(n, t) void glUniform1##n(int loc, t v0) { \
-    (void)loc; (void)v0; GLLOG(uniform, "glUniform1" #n); }
-#define GL_UNIFORM_2(n, t) void glUniform2##n(int loc, t v0, t v1) { \
-    (void)loc; (void)v0; (void)v1; GLLOG(uniform, "glUniform2" #n); }
-#define GL_UNIFORM_3(n, t) void glUniform3##n(int loc, t v0, t v1, t v2) { \
-    (void)loc; (void)v0; (void)v1; (void)v2; GLLOG(uniform, "glUniform3" #n); }
-#define GL_UNIFORM_4(n, t) void glUniform4##n(int loc, t v0, t v1, t v2, t v3) { \
-    (void)loc; (void)v0; (void)v1; (void)v2; (void)v3; GLLOG(uniform, "glUniform4" #n); }
-GL_UNIFORM_1(i, int) GL_UNIFORM_2(i, int) GL_UNIFORM_3(i, int) GL_UNIFORM_4(i, int)
-GL_UNIFORM_1(f, float) GL_UNIFORM_2(f, float) GL_UNIFORM_3(f, float) GL_UNIFORM_4(f, float)
-void glUniform1iv(int loc, int count, const int *v)   { (void)loc; (void)count; (void)v; }
-void glUniform1fv(int loc, int count, const float *v) { (void)loc; (void)count; (void)v; }
-void glUniform2fv(int loc, int count, const float *v) { (void)loc; (void)count; (void)v; }
-void glUniform3fv(int loc, int count, const float *v) { (void)loc; (void)count; (void)v; }
-void glUniform4fv(int loc, int count, const float *v) { (void)loc; (void)count; (void)v; }
+/* Uniforms — all no-op in stub mode, forwarded in real mode. */
+void glUniform1i(int loc, int v0) {
+    FWD_VOID(glUniform1i, (int, int), (loc, v0));
+    (void)loc; (void)v0;
+}
+void glUniform2i(int loc, int v0, int v1) {
+    FWD_VOID(glUniform2i, (int, int, int), (loc, v0, v1));
+    (void)loc; (void)v0; (void)v1;
+}
+void glUniform3i(int loc, int v0, int v1, int v2) {
+    FWD_VOID(glUniform3i, (int, int, int, int), (loc, v0, v1, v2));
+    (void)loc; (void)v0; (void)v1; (void)v2;
+}
+void glUniform4i(int loc, int v0, int v1, int v2, int v3) {
+    FWD_VOID(glUniform4i, (int, int, int, int, int), (loc, v0, v1, v2, v3));
+    (void)loc; (void)v0; (void)v1; (void)v2; (void)v3;
+}
+void glUniform1f(int loc, float v0) {
+    FWD_VOID(glUniform1f, (int, float), (loc, v0));
+    (void)loc; (void)v0;
+}
+void glUniform2f(int loc, float v0, float v1) {
+    FWD_VOID(glUniform2f, (int, float, float), (loc, v0, v1));
+    (void)loc; (void)v0; (void)v1;
+}
+void glUniform3f(int loc, float v0, float v1, float v2) {
+    FWD_VOID(glUniform3f, (int, float, float, float), (loc, v0, v1, v2));
+    (void)loc; (void)v0; (void)v1; (void)v2;
+}
+void glUniform4f(int loc, float v0, float v1, float v2, float v3) {
+    FWD_VOID(glUniform4f, (int, float, float, float, float), (loc, v0, v1, v2, v3));
+    (void)loc; (void)v0; (void)v1; (void)v2; (void)v3;
+}
+void glUniform1iv(int loc, int count, const int *v) {
+    FWD_VOID(glUniform1iv, (int, int, const int*), (loc, count, v));
+    (void)loc; (void)count; (void)v;
+}
+void glUniform1fv(int loc, int count, const float *v) {
+    FWD_VOID(glUniform1fv, (int, int, const float*), (loc, count, v));
+    (void)loc; (void)count; (void)v;
+}
+void glUniform2fv(int loc, int count, const float *v) {
+    FWD_VOID(glUniform2fv, (int, int, const float*), (loc, count, v));
+    (void)loc; (void)count; (void)v;
+}
+void glUniform3fv(int loc, int count, const float *v) {
+    FWD_VOID(glUniform3fv, (int, int, const float*), (loc, count, v));
+    (void)loc; (void)count; (void)v;
+}
+void glUniform4fv(int loc, int count, const float *v) {
+    FWD_VOID(glUniform4fv, (int, int, const float*), (loc, count, v));
+    (void)loc; (void)count; (void)v;
+}
 void glUniformMatrix3fv(int loc, int count, unsigned char trans, const float *v) {
+    FWD_VOID(glUniformMatrix3fv, (int, int, unsigned char, const float*),
+             (loc, count, trans, v));
     (void)loc; (void)count; (void)trans; (void)v;
 }
 void glUniformMatrix4fv(int loc, int count, unsigned char trans, const float *v) {
+    FWD_VOID(glUniformMatrix4fv, (int, int, unsigned char, const float*),
+             (loc, count, trans, v));
     (void)loc; (void)count; (void)trans; (void)v;
 }
 
 /* Vertex attribs */
 void glVertexAttribPointer(unsigned idx, int size, unsigned type, unsigned char norm,
                            int stride, const void *ptr) {
+    FWD_VOID(glVertexAttribPointer,
+             (unsigned, int, unsigned, unsigned char, int, const void*),
+             (idx, size, type, norm, stride, ptr));
     (void)idx; (void)size; (void)type; (void)norm; (void)stride; (void)ptr;
 }
-void glEnableVertexAttribArray(unsigned idx)  { (void)idx; }
-void glDisableVertexAttribArray(unsigned idx) { (void)idx; }
+void glEnableVertexAttribArray(unsigned idx) {
+    FWD_VOID(glEnableVertexAttribArray, (unsigned), (idx));
+    (void)idx;
+}
+void glDisableVertexAttribArray(unsigned idx) {
+    FWD_VOID(glDisableVertexAttribArray, (unsigned), (idx));
+    (void)idx;
+}
 
 /* --- Framebuffer --- */
 
 void glFramebufferTexture2D(unsigned target, unsigned att, unsigned ttarget,
                             unsigned tex, int level) {
+    FWD_VOID(glFramebufferTexture2D, (unsigned, unsigned, unsigned, unsigned, int),
+             (target, att, ttarget, tex, level));
     (void)target; (void)att; (void)ttarget; (void)tex; (void)level;
 }
 void glFramebufferRenderbuffer(unsigned target, unsigned att, unsigned rbtarget, unsigned rb) {
+    FWD_VOID(glFramebufferRenderbuffer, (unsigned, unsigned, unsigned, unsigned),
+             (target, att, rbtarget, rb));
     (void)target; (void)att; (void)rbtarget; (void)rb;
 }
 void glRenderbufferStorage(unsigned target, unsigned internalfmt, int w, int h) {
+    FWD_VOID(glRenderbufferStorage, (unsigned, unsigned, int, int),
+             (target, internalfmt, w, h));
     (void)target; (void)internalfmt; (void)w; (void)h;
 }
 unsigned glCheckFramebufferStatus(unsigned target) {
+    FWD_RET(unsigned, glCheckFramebufferStatus, (unsigned), (target));
     (void)target; return GL_FRAMEBUFFER_COMPLETE;
 }
 
 /* --- State --- */
 
-void glEnable(unsigned cap)  { GLLOG(state, "glEnable(0x%x)",  cap); }
-void glDisable(unsigned cap) { GLLOG(state, "glDisable(0x%x)", cap); }
-unsigned char glIsEnabled(unsigned cap) { (void)cap; return GL_FALSE; }
-void glBlendFunc(unsigned src, unsigned dst) { (void)src; (void)dst; }
+void glEnable(unsigned cap) {
+    FWD_VOID(glEnable, (unsigned), (cap));
+    GLLOG(state, "glEnable(0x%x)", cap);
+}
+void glDisable(unsigned cap) {
+    FWD_VOID(glDisable, (unsigned), (cap));
+    GLLOG(state, "glDisable(0x%x)", cap);
+}
+unsigned char glIsEnabled(unsigned cap) {
+    FWD_RET(unsigned char, glIsEnabled, (unsigned), (cap));
+    (void)cap; return GL_FALSE;
+}
+void glBlendFunc(unsigned src, unsigned dst) {
+    FWD_VOID(glBlendFunc, (unsigned, unsigned), (src, dst));
+    (void)src; (void)dst;
+}
 void glBlendFuncSeparate(unsigned srcRGB, unsigned dstRGB, unsigned srcA, unsigned dstA) {
+    FWD_VOID(glBlendFuncSeparate, (unsigned, unsigned, unsigned, unsigned),
+             (srcRGB, dstRGB, srcA, dstA));
     (void)srcRGB; (void)dstRGB; (void)srcA; (void)dstA;
 }
-void glBlendEquation(unsigned mode) { (void)mode; }
-void glBlendEquationSeparate(unsigned rgb, unsigned a) { (void)rgb; (void)a; }
+void glBlendEquation(unsigned mode) {
+    FWD_VOID(glBlendEquation, (unsigned), (mode));
+    (void)mode;
+}
+void glBlendEquationSeparate(unsigned rgb, unsigned a) {
+    FWD_VOID(glBlendEquationSeparate, (unsigned, unsigned), (rgb, a));
+    (void)rgb; (void)a;
+}
 void glBlendColor(float r, float g, float b, float a) {
+    FWD_VOID(glBlendColor, (float, float, float, float), (r, g, b, a));
     (void)r; (void)g; (void)b; (void)a;
 }
 void glViewport(int x, int y, int w, int h) {
+    FWD_VOID(glViewport, (int, int, int, int), (x, y, w, h));
     (void)x; (void)y; (void)w; (void)h;
 }
 void glScissor(int x, int y, int w, int h) {
+    FWD_VOID(glScissor, (int, int, int, int), (x, y, w, h));
     (void)x; (void)y; (void)w; (void)h;
 }
-void glDepthFunc(unsigned func) { (void)func; }
-void glDepthMask(unsigned char mask) { (void)mask; }
-void glDepthRangef(float n, float f) { (void)n; (void)f; }
-void glCullFace(unsigned mode) { (void)mode; }
-void glFrontFace(unsigned mode) { (void)mode; }
+void glDepthFunc(unsigned func) {
+    FWD_VOID(glDepthFunc, (unsigned), (func));
+    (void)func;
+}
+void glDepthMask(unsigned char mask) {
+    FWD_VOID(glDepthMask, (unsigned char), (mask));
+    (void)mask;
+}
+void glDepthRangef(float n, float f) {
+    FWD_VOID(glDepthRangef, (float, float), (n, f));
+    (void)n; (void)f;
+}
+void glCullFace(unsigned mode) {
+    FWD_VOID(glCullFace, (unsigned), (mode));
+    (void)mode;
+}
+void glFrontFace(unsigned mode) {
+    FWD_VOID(glFrontFace, (unsigned), (mode));
+    (void)mode;
+}
 void glStencilFunc(unsigned func, int ref, unsigned mask) {
+    FWD_VOID(glStencilFunc, (unsigned, int, unsigned), (func, ref, mask));
     (void)func; (void)ref; (void)mask;
 }
-void glStencilMask(unsigned mask) { (void)mask; }
-void glStencilOp(unsigned f, unsigned zf, unsigned zp) { (void)f; (void)zf; (void)zp; }
+void glStencilMask(unsigned mask) {
+    FWD_VOID(glStencilMask, (unsigned), (mask));
+    (void)mask;
+}
+void glStencilOp(unsigned f, unsigned zf, unsigned zp) {
+    FWD_VOID(glStencilOp, (unsigned, unsigned, unsigned), (f, zf, zp));
+    (void)f; (void)zf; (void)zp;
+}
 void glColorMask(unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
+    FWD_VOID(glColorMask, (unsigned char, unsigned char, unsigned char, unsigned char),
+             (r, g, b, a));
     (void)r; (void)g; (void)b; (void)a;
 }
-void glLineWidth(float w) { (void)w; }
-void glPolygonOffset(float f, float u) { (void)f; (void)u; }
+void glLineWidth(float w) {
+    FWD_VOID(glLineWidth, (float), (w));
+    (void)w;
+}
+void glPolygonOffset(float f, float u) {
+    FWD_VOID(glPolygonOffset, (float, float), (f, u));
+    (void)f; (void)u;
+}
 void glClearColor(float r, float g, float b, float a) {
+    FWD_VOID(glClearColor, (float, float, float, float), (r, g, b, a));
     (void)r; (void)g; (void)b; (void)a;
 }
-void glClearDepthf(float d) { (void)d; }
-void glClearStencil(int s)  { (void)s; }
-void glClear(unsigned mask) { (void)mask; }
+void glClearDepthf(float d) {
+    FWD_VOID(glClearDepthf, (float), (d));
+    (void)d;
+}
+void glClearStencil(int s) {
+    FWD_VOID(glClearStencil, (int), (s));
+    (void)s;
+}
+void glClear(unsigned mask) {
+    FWD_VOID(glClear, (unsigned), (mask));
+    (void)mask;
+}
 
 /* --- Draw --- */
 
 void glDrawArrays(unsigned mode, int first, int count) {
+    FWD_VOID(glDrawArrays, (unsigned, int, int), (mode, first, count));
     (void)mode; (void)first;
     GLLOG(draw, "glDrawArrays(count=%d)", count);
 }
 void glDrawElements(unsigned mode, int count, unsigned type, const void *idx) {
+    FWD_VOID(glDrawElements, (unsigned, int, unsigned, const void*),
+             (mode, count, type, idx));
     (void)mode; (void)type; (void)idx;
     GLLOG(draw, "glDrawElements(count=%d)", count);
 }
 void glDrawArraysInstanced(unsigned mode, int first, int count, int inst) {
+    FWD_VOID(glDrawArraysInstanced, (unsigned, int, int, int),
+             (mode, first, count, inst));
     (void)mode; (void)first; (void)count; (void)inst;
 }
 void glDrawElementsInstanced(unsigned mode, int count, unsigned type, const void *idx, int inst) {
+    FWD_VOID(glDrawElementsInstanced, (unsigned, int, unsigned, const void*, int),
+             (mode, count, type, idx, inst));
     (void)mode; (void)count; (void)type; (void)idx; (void)inst;
 }
-void glVertexAttribDivisor(unsigned idx, unsigned divisor) { (void)idx; (void)divisor; }
+void glVertexAttribDivisor(unsigned idx, unsigned divisor) {
+    FWD_VOID(glVertexAttribDivisor, (unsigned, unsigned), (idx, divisor));
+    (void)idx; (void)divisor;
+}
 
 /* --- Sync --- */
 
-void glFinish(void) {}
-void glFlush(void) {}
+void glFinish(void) {
+    FWD_VOID(glFinish, (void), ());
+}
+void glFlush(void) {
+    FWD_VOID(glFlush, (void), ());
+}
 void glReadPixels(int x, int y, int w, int h, unsigned fmt, unsigned type, void *data) {
-    (void)x; (void)y; (void)w; (void)h; (void)fmt; (void)type;
+    FWD_VOID(glReadPixels, (int, int, int, int, unsigned, unsigned, void*),
+             (x, y, w, h, fmt, type, data));
+    (void)x; (void)y; (void)fmt; (void)type;
     if (data) memset(data, 0, (size_t)w * (size_t)h * 4);
 }
 
@@ -3388,13 +3506,20 @@ long snd_pcm_writei(void *pcm, const void *buffer, unsigned long size) {
 }
 
 
+typedef void (*pfn_t)(void);
+
 void (*eglGetProcAddress(const char *name))(void) {
-    /* Funnel every game-queried extension through our stubs. These match
-     * the names BN showed the game resolving inside glWindow::setGlContext
-     * (KHR image/sync + GL_OES_EGL_image) plus eglGetPlatformDisplayEXT
-     * itself (the game queries it before calling it, and falls back if
-     * it's NULL). */
-    typedef void (*pfn_t)(void);
+    /* Never forwarded to Mesa, even under SPIKE3_REAL_GL. Mesa's real
+     * eglCreateImageKHR / eglCreateSyncKHR / glEGLImageTargetTexture2DOES
+     * would be handed our fake GBM BOs and fake sync handles and SEGV on
+     * the first deref (Step 56.6 diagnosis). The KHR stubs below accept
+     * those handles silently. eglGetPlatformDisplay[EXT] returns our own
+     * trampoline; forwarding happens *inside* its body via FWD_RET_V,
+     * where the fake display the game stores matches our other interceptors.
+     * Unknown names return NULL rather than falling through to
+     * dlsym(RTLD_NEXT, name) — every unstubbed extension is one we have
+     * not proven fake-handle-safe. Names match BN's reading of
+     * glWindow::setGlContext (KHR image/sync + GL_OES_EGL_image). */
     struct { const char *name; pfn_t fn; } table[] = {
         { "eglGetPlatformDisplayEXT",         (pfn_t)eglGetPlatformDisplayEXT },
         { "eglGetPlatformDisplay",            (pfn_t)eglGetPlatformDisplay },

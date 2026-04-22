@@ -4758,13 +4758,190 @@ The first SPIKE3_REAL_GL=1 run is almost certainly going to surface new failures
 ### 55.11: Artifacts
 
 - `_emulation/mesa_sw_overlay/` — all overlay work lives here.
-  - `pkg/` — extracted overlay (225 MB, `.gitignore`-worthy; reproducible from `debs*/`)
-  - `debs/` — 25.0.7 transitive deps (38 .deb files, ~25 MB)
-  - `debs_2408/` — 24.0.8 Mesa core + libllvm17 (3 .deb files)
+  - `pkg/` — extracted overlay (365 MB, `.gitignore`-worthy; reproducible from `debs*/`)
+  - `debs/` — 25.0.7 + transitive deps (30 .deb files, 63 MB)
+  - `debs_2408/` — 24.0.8 Mesa core + libllvm17t64 (4 .deb files, 6.9 MB)
+  - `build_overlay.sh` — one-shot reproducer (pulls + extracts + patches)
+  - `.gitignore` — excludes `pkg/` and `.deb`s
   - `probe.c`, `probe` — dlopen gate-check
   - `egl_probe.c`, `egl_probe` — EGL init gate-check
   - `gles_probe.c`, `gles_probe` — EGL + GLES3 + glClear probe (original)
   - `gles_probe2.c`, `gles_probe2` — multi-clear + shaded-triangle probe (6/6 pass)
+- `_emulation/SETUP.md` — new dev-environment setup doc for onboarding contributors.
 - `_emulation/run_step55_sanity.log` — zero-risk run proving overlay is load-time innocent.
 
+## Step 56: Shim gate `SPIKE3_REAL_GL` lands; first real-Mesa runs trip on extension interception (2026-04-22)
+
+Goal: remove the shim's EGL/GLES/GBM fake-success stubs so the game's calls fall through to the Mesa overlay we built in Step 55. Two-phase outcome — infrastructure works cleanly, first real-GL run surfaces an extension-handling gap that wasn't obvious from Step 55's isolated probes.
+
+### 56.1: Infrastructure changes (shim gating)
+
+`spi_shim.c` grew an `is_real_gl()` helper reading `SPIKE3_REAL_GL` env var + two `FWD_RET` / `FWD_VOID` forwarding macros. Each macro, as the first statement of a gated stub, resolves the real function via `dlsym(RTLD_NEXT, ...)` (cached per-function in a static pointer) and tail-calls it when the flag is set; falls through to the stub body otherwise.
+
+Applied to:
+- **EGL** (~20 functions): `eglGetDisplay` / `eglGetPlatformDisplay[EXT]` / `eglInitialize` / `eglTerminate` / `eglQueryString` / `eglBindAPI` / `eglGet|ChooseConfig[s]` / `eglGetConfigAttrib` / `eglCreate|DestroyContext` / `eglCreate|DestroyWindowSurface` / `eglCreatePbufferSurface` / `eglMakeCurrent` / `eglSwapBuffers` / `eglSwapInterval` / `eglSurfaceAttrib` / `eglQuerySurface` / `eglGetError` / `eglGetProcAddress`.
+- **GLES** (~80 functions): all the Gen/Delete/Bind/Tex/Buffer/Shader/Program/Uniform/VertexAttrib/Framebuffer/State/Draw/Sync families.
+- **GBM** — **INITIALLY FORWARDED, THEN REVERTED to stub-always** (Step 56.2 below).
+
+Removed instrumentation — per user direction, runtime capture of textures / shader sources / DMD frames was dropped as duplicative of the asset-extraction path (`_extraction/tools/spike_extract/`) and irrelevant on Spike 3 (no physical DMD). Deleted: `gl_capture_tex`, `gl_capture_ctex`, `gl_bytes_per_pixel`, `gl_tex_capture_count`, `gl_ctex_capture_count`, `gl_shader_capture_count`, `gl_shader_type[]`, `GL_SHADER_TYPE_MAX`, `is_dmd` / `mapped` fields in `gbm_bo_entry`, DMD-frame dump block in `gbm_bo_unmap`, `dmd_frame_counter`, and mkdirs for `_emulation/{dmd,shaders,textures}/`.
+
+Uniform macros (`GL_UNIFORM_1/2/3/4(i/f, type)`) were expanded out into individual function bodies — macros don't mesh cleanly with adding per-function FWD calls, and the expansion is ~30 lines that are now each individually greppable.
+
+Sizes:
+- `spi_shim.c`: 4,959 → 5,196 LOC (macro def + FWD lines partially offset by capture removal)
+- `spi_shim.so`: 155 KB → 158 KB (FWD-pointer statics)
+
+### 56.2: Regression verified — stub mode unchanged
+
+With `SPIKE3_REAL_GL` unset, the shim behaves identically to Step 54:
+- 10,761 log lines over 20s (baseline 10-13k)
+- 30 Step-54 milestone markers
+- No segfault, no assertion, no `libEGL fatal`, no undefined symbol
+
+Run artifact: `_emulation/run_step56_regression3.log`.
+
+### 56.3: First real-GL run trips on `eglGetError` assertion
+
+`SPIKE3_REAL_GL=1` + overlay env vars (`LIBGL_DRIVERS_PATH=<overlay>/dri`, `MESA_LOADER_DRIVER_OVERRIDE=swrast`, `LIBGL_ALWAYS_SOFTWARE=1`, `EGL_PLATFORM=surfaceless`) + LD_LIBRARY_PATH pointing at the 365 MB Mesa overlay:
+
+```
+game: glWindow.cpp:970: void glWindow::setGlContext():
+  Assertion `eglGetError() == EGL_SUCCESS' failed.
+qemu: uncaught target signal 6 (Aborted) - core dumped
+```
+
+Root cause analysis: the game's GL setup calls `eglCreateWindowSurface` with a `native_window` that's actually a fake GBM surface handle (from our `gbm_surface_create` stub). Real Mesa with `EGL_PLATFORM=surfaceless` cannot consume window surfaces at all — and can't consume the fake GBM handle either way. The call returns `EGL_NO_SURFACE`, setting the error, and the game's assertion fires.
+
+### 56.4: Fix v1 — GBM un-forwarded + `eglCreateWindowSurface` redirected to pbuffer
+
+Two changes:
+
+1. **GBM un-forwarded.** Mesa's GBM backend needs a real DRM device our fake `/dev/dri/card1` socketpair cannot satisfy (real Mesa gbm does `DRM_IOCTL_MODE_CREATE_DUMB` and friends, not the subset we intercept). Surgically removed the 32 `FWD_RET`/`FWD_VOID` lines from the GBM section via a Python one-shot (scanning for `FWD_RET(`/`FWD_VOID(` line-starts in the GBM region 2261–2503). GBM stays pure-stub in both modes.
+
+2. **`eglCreateWindowSurface` redirects to `eglCreatePbufferSurface` in real-GL mode.** The game's `native_window` is ignored; a pbuffer of `FAKE_MODE_HDISPLAY × FAKE_MODE_VDISPLAY` (1920×1080) is created via `dlsym(RTLD_NEXT, "eglCreatePbufferSurface")` and returned. Game sees an EGL surface it can bind; Mesa gets something it can actually attach a context to.
+
+### 56.5: Fix v1 run — SEGV in idle polling, zero game output
+
+After the v1 fix, `SPIKE3_REAL_GL=1` run `_emulation/run_step56_realgl_v2.log` still segfaults:
+
+- 3,669 log lines before SEGV, vs ~13k for a clean baseline run — game crashed before reaching normal steady state.
+- **Zero** game-side output in the log — no `Godot Engine` banner, no `Radium` log lines, no `/root/*_scene` load messages. Crash occurred *before* Godot init.
+- Netbridge handshake completed, bridge RESP framing OK. Then SEGV 11 somewhere in the shim-dump tail.
+- No EGL call logs visible (the FWD macros short-circuit before the existing `SHIM_LOG` calls, so we have no forward-path visibility).
+
+### 56.6: Hypothesis — EGL extension pointers returned through a now-forwarded `eglGetProcAddress`
+
+When `SPIKE3_REAL_GL=1`, `eglGetProcAddress` forwards to Mesa's real implementation. Mesa returns **Mesa's own** `eglCreateImageKHR`, `eglCreateSyncKHR`, `eglWaitSyncKHR`, `eglClientWaitSyncKHR`, `glEGLImageTargetTexture2DOES`. The game then calls those with:
+- A fake GBM BO pointer (from our stubbed `gbm_bo_create`), not a real EGLClientBuffer.
+- A fake EGL image handle.
+
+Mesa dereferences → SEGV. In stub mode, `eglGetProcAddress` returned our `stub_*` functions which accepted fake handles silently.
+
+**The fix is in Step 57** (new task): keep our `stub_*` functions as the authoritative return values for the KHR image/sync family and `glEGLImageTargetTexture2DOES`, regardless of SPIKE3_REAL_GL state. Forward only `eglGetPlatformDisplay*EXT` queries to Mesa. Also add SHIM_LOG coverage to every EGL function's forward path so the next crash is traceable.
+
+### 56.7: What's proven and what's open
+
+**Proven:**
+- Shim gating infrastructure works. FWD macros dispatch cleanly, `dlsym(RTLD_NEXT)` finds the real Mesa symbols (overlay is in LD_LIBRARY_PATH), caching is correct.
+- Regression is intact. With `SPIKE3_REAL_GL` unset, Step-54 behavior bit-for-bit preserved. No test harness collateral.
+- Texture/shader/DMD capture removal is safe. Those paths were dead, removing them didn't regress steady-state.
+
+**Open:**
+- `SPIKE3_REAL_GL=1` SEGVs before Godot init. Cause is almost certainly the extension-interception gap; Step 57 handles it. Expected to need 1-2 more sub-steps after that to reach Godot init and a real render.
+- We don't know yet whether `eglCreateContext` succeeded (no log from it). Step 57's added SHIM_LOGs will answer.
+- Surfaceless vs. window-based swap semantics: real `eglSwapBuffers` on a pbuffer is a no-op in spec, but the game may assume buffer-flip timing (vsync, page-flip events through the DRM socketpair). This may surface after Step 57.
+
+### 56.8: Artifacts
+
+- `_emulation/spi_shim.c` — +440 LOC (gating + macros) / -160 LOC (capture removal); net +280 LOC.
+- `_emulation/spi_shim.so` — rebuilt, 158,752 bytes.
+- `_emulation/run_step56_regression.log`, `run_step56_regression2.log`, `run_step56_regression3.log` — stub-mode regression runs, all clean.
+- `_emulation/run_step56_realgl.log` — first real-GL run; `eglGetError` assertion.
+- `_emulation/run_step56_realgl_v2.log` — with GBM un-forwarded + pbuffer redirect; SEGV at ~3.6k lines before Godot init.
+
+
+## Step 57: `eglGetProcAddress` pinned to our stub table; `FWD_RET_V` instrumentation pinpoints the real crash site (2026-04-22)
+
+Goal (from Step 56.6): close the KHR extension-interception SEGV by guaranteeing our `stub_*` functions are the authoritative pointers the game retrieves, regardless of `SPIKE3_REAL_GL`. Add forward-path log coverage so the next crash is traceable.
+
+### 57.1: Infrastructure changes
+
+Three surgical edits to `spi_shim.c`:
+
+1. **New `FWD_RET_V` / `FWD_VOID_V` macros** (lines 133–150). Identical to `FWD_RET` / `FWD_VOID` except for a `SHIM_LOG("FWD " #FN)` emitted before the `dlsym(RTLD_NEXT, ...)` tail-call. Used only at low-frequency sites so the ~10k-line/20s GLES steady-state flood doesn't drown any diagnostic signal.
+2. **EGL sites swapped** from `FWD_RET` to `FWD_RET_V` — 20 call sites covering `eglGetDisplay` / `eglGetPlatformDisplay[EXT]` / `eglInitialize` / `eglTerminate` / `eglQueryString` / `eglBindAPI` / `eglGetConfigs` / `eglChooseConfig` / `eglGetConfigAttrib` / `eglCreate|DestroyContext` / `eglCreatePbufferSurface` / `eglDestroySurface` / `eglMakeCurrent` / `eglSwapBuffers` / `eglSwapInterval` / `eglSurfaceAttrib` / `eglQuerySurface` / `eglGetError`. Done via `sed -i -E '2515,2704 s/\bFWD_RET\b/FWD_RET_V/g'`, verified with grep (exactly 20 matches in the EGL range, zero collateral). GLES stays on silent `FWD_RET`.
+3. **`eglGetProcAddress` no longer forwards.** Deleted the top-of-function `FWD_RET(pfn_t, eglGetProcAddress, ...)` at what was line 3512. The static lookup table is now consulted *always*, regardless of mode. A Step-57-specific comment explains the invariant: Mesa's real `eglCreateImageKHR` / `eglCreateSyncKHR` / `glEGLImageTargetTexture2DOES` would be handed our fake GBM BOs and fake sync handles and SEGV on the first deref; the KHR stubs accept those handles silently; `eglGetPlatformDisplay[EXT]` returns our own trampoline which forwards *inside* its body via `FWD_RET_V`; unknown names return NULL rather than falling through to `dlsym(RTLD_NEXT, name)` because every unstubbed extension is one we have not proven fake-handle-safe.
+
+Sizes:
+- `spi_shim.c`: 5,196 → 5,215 LOC (net +19: two verbose macros, one longer comment, one deleted FWD line).
+- `spi_shim.so`: 158,752 → 158,968 bytes (+216 B).
+
+Clean build, zero warnings.
+
+### 57.2: Regression verified — stub mode preserved
+
+With `SPIKE3_REAL_GL` unset:
+
+- 11,478 log lines in 22 s (Step 56 baseline: 10,761 in 20 s; both fall in the 10–13k-lines envelope).
+- Exit 124 (timeout, not crash).
+- Zero `Segmentation`, `Aborted`, `assertion`, `libEGL fatal`, `cannot open shared`, `undefined symbol` — matches Step 56.2 criteria.
+- Tail is the same event-registry / update-type dispatch dump as Step 56 regression3.
+
+Run artifact: `_emulation/run_step57_regression.log`.
+
+### 57.3: Real-GL run — progresses 4 EGL calls further; aborts in config setup
+
+With `SPIKE3_REAL_GL=1` + overlay env vars (`LIBGL_DRIVERS_PATH`, `MESA_LOADER_DRIVER_OVERRIDE=swrast`, `LIBGL_ALWAYS_SOFTWARE=1`, `EGL_PLATFORM=surfaceless`) + `LD_LIBRARY_PATH` into `mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu`:
+
+```
+terminate called after throwing an instance of 'std::bad_array_new_length'
+  what():  std::bad_array_new_length
+qemu: uncaught target signal 6 (Aborted) - core dumped
+```
+
+Exit 134 (SIGABRT). 3,056 log lines before the abort. Crucially: **this is a different failure from Step 56.5's SEGV**. The KHR-extension SEGV class is closed.
+
+### 57.4: Diagnosis — fake-display contamination between our stubs and real Mesa
+
+The `FWD_RET_V` log trace captures the exact flow:
+
+```
+[shim] eglGetProcAddress("eglGetPlatformDisplayEXT") -> stub 0x7652ad28bfac
+[shim] FWD eglGetPlatformDisplayEXT
+[shim] eglGetPlatformDisplayEXT(platform=0x31d7, dpy=0x765230001180) -> fake
+[shim] FWD eglInitialize
+[shim] FWD eglBindAPI
+[shim] FWD eglGetConfigs
+terminate called after throwing an instance of 'std::bad_array_new_length'
+```
+
+Read of the flow:
+
+1. Game calls `eglGetProcAddress("eglGetPlatformDisplayEXT")`. Our table returns **our wrapper** (Step 57 fix confirmed — Mesa is not consulted).
+2. Game calls the wrapper with `platform = 0x31d7` (`EGL_PLATFORM_GBM_KHR`) and the fake GBM device pointer we returned earlier from `gbm_create_device`.
+3. `FWD_RET_V` fires inside the wrapper. `dlsym(RTLD_NEXT, "eglGetPlatformDisplayEXT")` returns **NULL** — Mesa's `libEGL_mesa.so.0` exports `eglGetPlatformDisplay` (the EGL 1.5 core symbol) but not the `EXT` alias; the `EXT` variant is reachable only through the `eglGetProcAddress` chain, which we have (correctly) pinned to our own wrapper. `_real` stays NULL, the fall-through stub body runs, returns `FAKE_EGL_DISPLAY`.
+4. Game now holds `FAKE_EGL_DISPLAY` and feeds it to `eglInitialize`. `FWD_RET_V` finds Mesa's real `eglInitialize` (direct EGL 1.0 symbol), forwards with the fake display — Mesa doesn't recognize it, returns `EGL_FALSE`, doesn't populate `*major` / `*minor`.
+5. `eglBindAPI(OPENGL_ES_API)` forwards successfully — this call is display-less.
+6. `eglGetConfigs(FAKE_DISPLAY, NULL, 0, &num_config)` forwards to Mesa — Mesa rejects the fake display, returns `EGL_FALSE`, `*num_config` is left uninitialised (or set to a garbage value by Mesa's error path).
+7. Game's downstream `new EGLConfig[num_config]` trips libstdc++'s array-new-length check → `std::__throw_bad_array_new_length` → SIGABRT.
+
+Mechanism in one sentence: because Mesa doesn't export `eglGetPlatformDisplayEXT` as a direct symbol, our EXT wrapper silently falls back to the fake-display stub body, and every subsequent EGL call that *does* forward to Mesa then sees an alien display handle and fails.
+
+### 57.5: What's proven and what's open
+
+**Proven:**
+- `eglGetProcAddress` stub table is authoritative. The Step 56.6 SEGV class (KHR image/sync/EGLImageTargetTexture2DOES driven by Mesa dereferencing fake handles) is closed by construction — our pointers are the only pointers the game ever retrieves through that API.
+- `FWD_RET_V` instrumentation is the right diagnostic granularity. 4 EGL calls produced 4 log lines, visible in-stream with the SPI / DRM / GBM shim chatter; GLES hot paths remain silent.
+- Stub-mode behaviour is preserved bit-for-bit (same line volume, same exit condition, same tail dump).
+
+**Open — Step 58 territory:**
+- Resolve the EXT-symbol gap. Mesa in surfaceless mode exposes only `EGL_PLATFORM_SURFACELESS_MESA` (0x31DD) and exports `eglGetPlatformDisplay` (not the EXT alias) directly. Fix: make our `eglGetPlatformDisplay[EXT]` wrappers, when `SPIKE3_REAL_GL` is set, retry `dlsym(RTLD_NEXT, "eglGetPlatformDisplay")` (no EXT suffix) and call it with `EGL_PLATFORM_SURFACELESS_MESA` + `EGL_DEFAULT_DISPLAY` (NULL), ignoring the game's GBM platform/handle. Return Mesa's real display to the game. All subsequent EGL calls (`eglInitialize` / `eglGetConfigs` / `eglChooseConfig` / `eglCreateContext` / `eglMakeCurrent` / `eglSwapBuffers`) then receive a valid Mesa display and should succeed.
+- After that fix, the next crash is likely at `eglCreateWindowSurface` (Step 56.4's pbuffer redirect is still in place; confirm it still works with a real display) or `eglCreateContext` (config attributes may need translation). Each is its own sub-step.
+
+### 57.6: Artifacts
+
+- `_emulation/spi_shim.c` — +19 LOC net (two verbose macros + Step 57 comment on `eglGetProcAddress`; one deleted FWD line; 20 EGL sites renamed).
+- `_emulation/spi_shim.so` — rebuilt, 158,968 bytes.
+- `_emulation/run_step57_regression.log` — 11,478 lines, exit 124, clean.
+- `_emulation/run_step57_realgl.log` — 3,056 lines, exit 134, `std::bad_array_new_length` abort; FWD trace captures the exact failure sequence.
 
