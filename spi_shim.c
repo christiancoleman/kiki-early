@@ -2922,6 +2922,14 @@ int gbm_surface_has_free_buffers(void *surface) {
  *   2. dlsym("eglGetPlatformDisplay") — EGL 1.5 core, always exported.
  *   3. dlsym("eglGetDisplay") — EGL 1.0 legacy, last-ditch.
  * If none resolve, fall through to the stub body returning FAKE_EGL_DISPLAY. */
+
+/* Forward decls — defined alongside eglMakeCurrent further down. Captured
+ * here so the fallback-pbuffer path at makeCurrent time has something to
+ * pass to Mesa's eglCreatePbufferSurface(display, config, ...). */
+extern void *shim_last_real_display;
+extern void *shim_last_real_config;
+extern void *shim_fallback_pbuf;
+
 static void *shim_real_platform_display(unsigned /*unused game-requested*/ platform) {
     (void)platform;
     static void *(*real_1_5)(unsigned, void*, const intptr_t*) = NULL;
@@ -2929,13 +2937,21 @@ static void *shim_real_platform_display(unsigned /*unused game-requested*/ platf
                               dlsym(RTLD_NEXT, "eglGetPlatformDisplay");
     if (real_1_5) {
         void *d = real_1_5(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
-        if (d) { SHIM_LOG("  → Mesa real display %p via eglGetPlatformDisplay(SURFACELESS)", d); return d; }
+        if (d) {
+            SHIM_LOG("  → Mesa real display %p via eglGetPlatformDisplay(SURFACELESS)", d);
+            shim_last_real_display = d;  /* capture for later fallback-pbuffer creation */
+            return d;
+        }
     }
     static void *(*real_legacy)(void*) = NULL;
     if (!real_legacy) real_legacy = (void *(*)(void*))dlsym(RTLD_NEXT, "eglGetDisplay");
     if (real_legacy) {
         void *d = real_legacy(EGL_DEFAULT_DISPLAY);
-        if (d) { SHIM_LOG("  → Mesa real display %p via legacy eglGetDisplay", d); return d; }
+        if (d) {
+            SHIM_LOG("  → Mesa real display %p via legacy eglGetDisplay", d);
+            shim_last_real_display = d;
+            return d;
+        }
     }
     return NULL;
 }
@@ -3098,6 +3114,13 @@ unsigned eglChooseConfig(void *display, const int *attrib_list,
                                configs, config_size, num_config);
             SHIM_LOG("  Mesa eglChooseConfig -> ret=%u, *num_config=%d",
                      r, num_config ? *num_config : -1);
+            /* Capture the first config for the fallback-pbuffer path in
+             * eglMakeCurrent (game may call eglMakeCurrent with no surface
+             * so we need a config to fabricate one). */
+            if (r && configs && num_config && *num_config > 0 && !shim_last_real_config) {
+                shim_last_real_config = configs[0];
+                SHIM_LOG("  captured EGLConfig %p for fallback-pbuffer use", configs[0]);
+            }
             return r;
         }
         SHIM_LOG("  no real eglChooseConfig; falling back to stub");
@@ -3205,10 +3228,85 @@ unsigned eglDestroySurface(void *display, void *surface) {
     (void)display; (void)surface; return EGL_TRUE;
 }
 
+/* Tracked across EGL calls so we can lazily create a fallback pbuffer when
+ * the game does surfaceless eglMakeCurrent(draw=NULL). Captured in
+ * shim_real_platform_display (display) and eglChooseConfig (config).
+ * Non-static so the forward decls upstream can find them. */
+void *shim_last_real_display = NULL;
+void *shim_last_real_config  = NULL;
+void *shim_fallback_pbuf     = NULL;
+
 unsigned eglMakeCurrent(void *display, void *draw, void *read, void *context) {
-    FWD_RET_V(unsigned, eglMakeCurrent, (void*, void*, void*, void*),
-            (display, draw, read, context));
-    SHIM_LOG("eglMakeCurrent(dpy=%p, draw=%p, read=%p, ctx=%p)",
+    if (__builtin_expect(is_real_gl(), 0)) {
+        /* The game calls eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)
+         * — a surfaceless context binding. On real hardware its eglCreateWindowSurface
+         * path produces a GBM-backed window surface and `draw` wouldn't be NULL, but
+         * in our run the game never calls eglCreateWindowSurface at all. Without a
+         * drawing surface the default framebuffer reports GL_FRAMEBUFFER_UNDEFINED
+         * (0x8219) and every glDrawArrays returns GL_INVALID_FRAMEBUFFER_OPERATION
+         * (0x506) — exactly what we captured at SpriteRenderer.cpp:143.
+         *
+         * Fix: when the game passes NULL, substitute a pbuffer we create ourselves
+         * from the first known-good EGLConfig. Gives the default framebuffer a real
+         * backing so draws succeed. The game doesn't care what surface it drew to
+         * because it never reads back — the present path is separate (DRM page flip
+         * / EGLImage-sampled FBOs). */
+        if (draw == NULL || read == NULL) {
+            if (!shim_fallback_pbuf && display && shim_last_real_config) {
+                static void *(*real_cps)(void*, void*, const int*) = NULL;
+                if (!real_cps) real_cps = (void*(*)(void*, void*, const int*))
+                                          dlsym(RTLD_NEXT, "eglCreatePbufferSurface");
+                if (real_cps) {
+                    int pb_attrs[] = {
+                        0x3057, FAKE_MODE_HDISPLAY,
+                        0x3056, FAKE_MODE_VDISPLAY,
+                        0x3038,
+                    };
+                    shim_fallback_pbuf = real_cps(display, shim_last_real_config, pb_attrs);
+                    SHIM_LOG("[mkcur] created fallback pbuffer %p (%dx%d) for surfaceless makeCurrent",
+                             shim_fallback_pbuf, FAKE_MODE_HDISPLAY, FAKE_MODE_VDISPLAY);
+                }
+            }
+            if (shim_fallback_pbuf) {
+                if (draw == NULL) draw = shim_fallback_pbuf;
+                if (read == NULL) read = shim_fallback_pbuf;
+            }
+        }
+
+        static unsigned (*real)(void*, void*, void*, void*) = NULL;
+        if (!real) real = (unsigned(*)(void*, void*, void*, void*))
+                          dlsym(RTLD_NEXT, "eglMakeCurrent");
+        SHIM_LOG("FWD eglMakeCurrent(dpy=%p, draw=%p, read=%p, ctx=%p)",
+                 display, draw, read, context);
+        unsigned r = real ? real(display, draw, read, context) : EGL_TRUE;
+        if (!r) {
+            SHIM_LOG("  → makeCurrent FAILED (returned 0)");
+            return r;
+        }
+
+        /* Diagnostic — only if draw isn't NULL, otherwise we'd set EGL_BAD_SURFACE
+         * and the game's next eglGetError would assert. */
+        static unsigned (*real_gerr)(void)              = NULL;
+        static unsigned (*real_cfb)(unsigned)           = NULL;
+        static const unsigned char *(*real_gstr)(unsigned) = NULL;
+        if (!real_gerr) real_gerr = (unsigned(*)(void))dlsym(RTLD_NEXT, "glGetError");
+        if (!real_cfb)  real_cfb  = (unsigned(*)(unsigned))dlsym(RTLD_NEXT, "glCheckFramebufferStatus");
+        if (!real_gstr) real_gstr = (const unsigned char*(*)(unsigned))dlsym(RTLD_NEXT, "glGetString");
+        if (real_gerr) (void)real_gerr();
+        unsigned fbstatus = real_cfb ? real_cfb(0x8D40 /*GL_FRAMEBUFFER*/) : 0;
+        unsigned err_after = real_gerr ? real_gerr() : 0;
+        SHIM_LOG("  glCheckFramebufferStatus(DEFAULT) = 0x%x (COMPLETE=0x8CD5), glGetError=0x%x",
+                 fbstatus, err_after);
+        if (real_gstr) {
+            const unsigned char *ver = real_gstr(0x1F02);
+            const unsigned char *rend = real_gstr(0x1F01);
+            SHIM_LOG("  GL_VERSION='%s' GL_RENDERER='%s'",
+                     ver ? (const char*)ver : "(null)",
+                     rend ? (const char*)rend : "(null)");
+        }
+        return r;
+    }
+    SHIM_LOG("eglMakeCurrent(dpy=%p, draw=%p, read=%p, ctx=%p) -> EGL_TRUE (stub)",
              display, draw, read, context);
     return EGL_TRUE;
 }
@@ -3927,6 +4025,20 @@ void glFramebufferTexture2D(unsigned target, unsigned att, unsigned ttarget,
              (target, att, ttarget, tex, level));
     (void)target; (void)att; (void)ttarget; (void)tex; (void)level;
 }
+/* GLES3 FBO attach variant — same EXTERNAL_OES→TEXTURE_2D swap rationale.
+ * Game binary imports this symbol (verified via readelf --dyn-syms). Exported
+ * so both PLT path and our eglGetProcAddress table route here. */
+void glFramebufferTextureLayer(unsigned target, unsigned att, unsigned tex,
+                               int level, int layer) {
+    if (__builtin_expect(is_real_gl(), 0)) {
+        static uint64_t c = 0;
+        if (++c <= 6) SHIM_LOG("[gl] glFramebufferTextureLayer #%lu target=0x%x att=0x%x tex=%u layer=%d",
+                               (unsigned long)c, target, att, tex, layer);
+    }
+    FWD_VOID(glFramebufferTextureLayer, (unsigned, unsigned, unsigned, int, int),
+             (target, att, tex, level, layer));
+    (void)target; (void)att; (void)tex; (void)level; (void)layer;
+}
 void glFramebufferRenderbuffer(unsigned target, unsigned att, unsigned rbtarget, unsigned rb) {
     SHIM_GL_DBG_HOOK(glFramebufferRenderbuffer);
     FWD_VOID(glFramebufferRenderbuffer, (unsigned, unsigned, unsigned, unsigned),
@@ -4224,6 +4336,11 @@ void (*eglGetProcAddress(const char *name))(void) {
      * dlsym(RTLD_NEXT, name) — every unstubbed extension is one we have
      * not proven fake-handle-safe. Names match BN's reading of
      * glWindow::setGlContext (KHR image/sync + GL_OES_EGL_image). */
+    /* Forward decls so we can put core-GL symbols in the table. Bodies are
+     * exported top-level functions elsewhere in this file. */
+    extern void glFramebufferTexture2D(unsigned, unsigned, unsigned, unsigned, int);
+    extern void glFramebufferTextureLayer(unsigned, unsigned, unsigned, int, int);
+    extern void glFramebufferRenderbuffer(unsigned, unsigned, unsigned, unsigned);
     struct { const char *name; pfn_t fn; } table[] = {
         { "eglGetPlatformDisplayEXT",         (pfn_t)eglGetPlatformDisplayEXT },
         { "eglGetPlatformDisplay",            (pfn_t)eglGetPlatformDisplay },
@@ -4234,6 +4351,12 @@ void (*eglGetProcAddress(const char *name))(void) {
         { "eglWaitSyncKHR",                   (pfn_t)stub_eglWaitSyncKHR },
         { "eglClientWaitSyncKHR",             (pfn_t)stub_eglClientWaitSyncKHR },
         { "glEGLImageTargetTexture2DOES",     (pfn_t)glEGLImageTargetTexture2DOES },
+        /* FBO attach functions — Step 58.post.3 pivot. Route these here so
+         * the EXTERNAL_OES→TEXTURE_2D swap inside our wrapper applies even
+         * if the game resolves these via eglGetProcAddress instead of PLT. */
+        { "glFramebufferTexture2D",           (pfn_t)glFramebufferTexture2D },
+        { "glFramebufferTextureLayer",        (pfn_t)glFramebufferTextureLayer },
+        { "glFramebufferRenderbuffer",        (pfn_t)glFramebufferRenderbuffer },
         { NULL, NULL },
     };
     for (int i = 0; table[i].name; i++) {

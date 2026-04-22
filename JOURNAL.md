@@ -5173,6 +5173,48 @@ The Step-58.post plan (`glFramebufferTexture2D` intercept to swap `EXTERNAL_OES`
 
 Verification is one run with the existing shim and an expanded `eglGetProcAddress` logger — effectively free. Worth doing before committing to either fix.
 
+## Step 59: fallback pbuffer unblocks the render — real pixels out, boot-splash is drawing (2026-04-22)
+
+User's strategic pivot (Step 58.post.3) of ignoring Godot paid off in one session. Traced the real blocker cleanly: the game calls `eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)` — a surfaceless context binding — but still draws to `fb=0` (the default framebuffer). On real hardware the game's GBM→DRM render chain apparently provides an implicit drawable that we don't reproduce; on our shim, Mesa's default framebuffer for a surfaceless context is `GL_FRAMEBUFFER_UNDEFINED (0x8219)`, so every `glDrawArrays` / `glUseProgram` returned `GL_INVALID_FRAMEBUFFER_OPERATION (0x506)` by spec. Those were the `SpriteRenderer.cpp:143` and `Shader.cpp:17` errors we'd been chasing all of Step 58 — never an FBO-completeness problem on a user framebuffer, always the *default* framebuffer failing because no surface was bound.
+
+### Diagnostic path
+
+Extended the `eglGetProcAddress` table with `glFramebufferTexture2D` / `glFramebufferTextureLayer` / `glFramebufferRenderbuffer` to catch any via-procaddress FBO creation — confirmed the game never queries these names. Combined with zero glGenFramebuffers/glFramebufferTexture2D intercepts through PLT, this was strong evidence the game simply doesn't create user FBOs in this boot path; it draws straight to the default framebuffer.
+
+Added a post-`eglMakeCurrent` diagnostic querying `glCheckFramebufferStatus(GL_FRAMEBUFFER)` and `eglQuerySurface(draw, EGL_WIDTH/HEIGHT)`. That revealed `draw=NULL` (surfaceless) and default-FBO status `0x8219 = GL_FRAMEBUFFER_UNDEFINED`. Same run also tripped the Step-56.3 `eglGetError() == EGL_SUCCESS` assertion because `eglQuerySurface` on a NULL surface sets `EGL_BAD_SURFACE` — fixed by guarding the diagnostic.
+
+### Fix
+
+In `eglMakeCurrent`: when `draw == NULL || read == NULL` under SPIKE3_REAL_GL, lazily create a fallback pbuffer by calling Mesa's real `eglCreatePbufferSurface(display, first_EGLConfig_we_saw, {WIDTH, HEIGHT, EGL_NONE})` and substitute it for the NULL handles before forwarding to Mesa. The config comes from a capture in `eglChooseConfig` (captured the first Mesa-returned config right after the `WINDOW_BIT→PBUFFER_BIT` patch). The display comes from a capture in `shim_real_platform_display`.
+
+The game never reads back from the default framebuffer — its actual present path is DRM `MODE_PAGE_FLIP` on GBM BOs, and its scene content goes through EGLImage-sampled FBOs that read external textures as sources. So substituting a pbuffer it didn't know it had doesn't break anything downstream; it just gives `glDrawArrays` somewhere to draw *to*, which is sufficient to unblock the render queue.
+
+### Result
+
+- **Zero `OpenGL Error` messages** in the run — down from 4 per previous real-GL runs.
+- `glCheckFramebufferStatus(DEFAULT) = 0x8CD5 (GL_FRAMEBUFFER_COMPLETE)` — the default framebuffer is now usable.
+- Game runs to timeout (exit 124, 11,186 lines), same steady state as before.
+- Frame bridge captured **22 × 1920×1080 PNGs** via `MODE_PAGE_FLIP` hook.
+- PNG analysis: **~34% non-zero pixels, full 0–255 range** (vs. 0.02% non-zero, max 81 in Step 58's all-black captures). That's real image content.
+- The content is stable frame-to-frame (34.0%, 34.2%, 34.2%, 34.2%...) which is consistent with a static image (e.g. the Stern boot splash — `SternLogo_800x480.png` that we saw get loaded earlier in the run).
+
+### Why the Godot pivot mattered
+
+If we'd kept chasing "why isn't Godot initializing," we'd never have looked at `eglMakeCurrent`'s arguments. The Godot-ignoring stance forced the right reframe: the render pipeline is purely Stern's own, so the failure had to be in the Stern-side GL/EGL plumbing, and the diagnostic path (`glCheckFramebufferStatus` on the default FB right after `eglMakeCurrent`) was only worth writing if we'd stopped looking for a Godot gate. Entry [82]'s "single EGL context architecture" + the user's "Reference implementation A runs a different Spike 3 title without Godot" observation collapsed the search space to a bounded GL problem.
+
+### Artifacts
+
+- `_emulation/spi_shim.c` — +120 LOC net: fallback-pbuffer state (`shim_last_real_display`, `shim_last_real_config`, `shim_fallback_pbuf`), config capture in `eglChooseConfig`, display capture in `shim_real_platform_display`, pbuffer substitution + diagnostic block in `eglMakeCurrent`, forward decls for the three globals, extra `glFramebufferTextureLayer` export, three extra entries in `eglGetProcAddress` table.
+- `_emulation/spi_shim.so` — rebuilt.
+- `_emulation/run_step58q_procaddr.log` — proved `glFramebufferTexture2D` not queried via `eglGetProcAddress`.
+- `_emulation/run_step58r_mkcur.log` — revealed `draw=NULL` + `GL_FRAMEBUFFER_UNDEFINED (0x8219)`; also tripped the Step 56.3 assertion because our `eglQuerySurface(NULL,...)` clobbered EGL state.
+- `_emulation/run_step58s_fallpbuf.log` — first run with fallback pbuffer; zero 0x506 errors, FBO status COMPLETE.
+- `_emulation/run_step58t_viewer.log` + `_emulation/frames/frame_000001.png` through `frame_000022.png` — first real-pixel captures; 34% non-zero content.
+
+### What's next
+
+Look at an actual saved PNG to see what the boot-splash is drawing. If it's the Stern logo, we know the render chain is end-to-end functional for static content. Then the next questions open up: why only 4 page flips (is the splash expected to be multi-frame animated)? Does the game ever transition past boot-splash into attract/gameplay without additional prodding? Those are game-logic questions now, not rendering questions.
+
 ## Step 58.post.3: strategic pivot — ignore Godot entirely (2026-04-22)
 
 User called out that Reference implementation A for a different Spike 3 title doesn't involve Godot. FotE and Pokemon LE are both Spike 3 games; the platform-level render pipeline is the common denominator. If Godot were required at runtime for the render loop, Researcher A's emulator wouldn't be working without it.
