@@ -35,6 +35,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <signal.h>
+#include <setjmp.h>
 #include <execinfo.h>
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
@@ -577,9 +578,16 @@ static const struct shim_cmode_entry shim_cmode_table[] = {
     { 0x4859438, 0x29, 0x84, "rocket_wizard" },
 };
 
-/* Resolve the game binary's load base via backtrace + dladdr.
- * Mirrors the logic in shim_dump_sound_globals. Returns 0 on failure. */
+/* Resolve the game binary's load base. Caches on first success — needed
+ * because some shim code paths (e.g. the Step 52 sweep timer thread) run
+ * from threads that have no game frames on their stack, making backtrace
+ * + dladdr return nothing. Any shim hook called from a game thread will
+ * populate the cache via this function before the timer thread needs it. */
+static uintptr_t shim_cached_game_base = 0;
 static uintptr_t shim_resolve_game_base(void) {
+    uintptr_t cached = __atomic_load_n(&shim_cached_game_base, __ATOMIC_ACQUIRE);
+    if (cached) return cached;
+
     void *bt[64];
     int nb = backtrace(bt, 64);
     for (int i = 0; i < nb; i++) {
@@ -587,7 +595,9 @@ static uintptr_t shim_resolve_game_base(void) {
         if (dladdr(bt[i], &bi) && bi.dli_fname &&
             strstr(bi.dli_fname, "/game") &&
             !strstr(bi.dli_fname, ".so")) {
-            return (uintptr_t)bi.dli_fbase;
+            uintptr_t base = (uintptr_t)bi.dli_fbase;
+            __atomic_store_n(&shim_cached_game_base, base, __ATOMIC_RELEASE);
+            return base;
         }
     }
     return 0;
@@ -802,8 +812,414 @@ static void shim_dump_dispatch_tables(void) {
     }
 }
 
+/* ---- Step 52: Pokémon LE switch manifest ------------------------------
+ *
+ * Transcribed from the Pokémon LE / Premium manual (500-55AJ-01) switch
+ * reference table. Only switches actually present in this machine are
+ * listed — the manual allocates ID space with gaps (3, 4, 13, 14, 24, 26,
+ * 32, 38, 39, 42, 43, 47, 48, 62, 65, 68, 69, 75, 77, 81-89, 91, 92, 95)
+ * that correspond to unused slots. Do not fire those IDs; they have no
+ * meaning on this machine.
+ *
+ * The `id` field is the manual's switch number (1..105). `node_addr` is
+ * the node-local address (e.g. "8-SW-17") which maps to the RS485 node
+ * bus frame the netbridge builds — if we ever need to emulate the wire
+ * protocol more faithfully, that column is the key.
+ *
+ * `issues` is a free-form comment documenting known problems when firing
+ * this switch from the shim (filled in as we discover them).
+ * ------------------------------------------------------------------------ */
+
+struct shim_switch_entry {
+    int         id;           /* manual ID (1..105, plus C10/C11 as 200+10, 200+11) */
+    const char *name;         /* human-readable */
+    const char *location;     /* Playfield / Cabinet / CoinDoor */
+    const char *type;         /* Leaf / Opto / Rollover / Target / Micro / MagSw / Plumb */
+    const char *node_addr;    /* e.g. "8-SW-17" */
+    const char *issues;       /* NULL if none known, otherwise terse comment */
+};
+
+static const struct shim_switch_entry shim_switch_manifest[] = {
+    /* Playfield rollovers / ramps / lanes — Node 8 */
+    {  1, "Left Outlane",              "Playfield", "Rollover", "8-SW-17", NULL },
+    {  2, "Left Return Lane",          "Playfield", "Rollover", "8-SW-18", NULL },
+    {  5, "Right Return Lane",         "Playfield", "Rollover", "8-SW-19", NULL },
+    {  6, "Right Outlane",             "Playfield", "Rollover", "8-SW-20", NULL },
+    /* Flippers / slingshots */
+    {  7, "Left Slingshot",            "Playfield", "Leaf",     "8-SW-30", NULL },
+    {  8, "Right Slingshot",           "Playfield", "Leaf",     "8-SW-29", NULL },
+    {  9, "Left Flipper Button",       "Cabinet",   "Leaf",     "8-SW-25", NULL },
+    { 10, "Right Flipper Button",      "Cabinet",   "Leaf",     "8-SW-24", NULL },
+    { 11, "Left Flipper EOS",          "Playfield", "Leaf",     "8-SW-16", NULL },
+    { 12, "Right Flipper EOS",         "Playfield", "Leaf",     "8-SW-31", NULL },
+    /* Trough — Node 8 extension 8a (opto array) */
+    { 15, "Trough 6",                  "Playfield", "Opto",     "8-SW-32", NULL },
+    { 16, "Trough 5",                  "Playfield", "Opto",     "8-SW-33", NULL },
+    { 17, "Trough 4",                  "Playfield", "Opto",     "8-SW-34", NULL },
+    { 18, "Trough 3",                  "Playfield", "Opto",     "8-SW-35", NULL },
+    { 19, "Trough 2",                  "Playfield", "Opto",     "8-SW-36", NULL },
+    { 20, "Trough 1",                  "Playfield", "Opto",     "8-SW-37", NULL },
+    { 21, "Trough Jam",                "Playfield", "Opto",     "8-SW-38", NULL },
+    /* Shooter lane + bowl */
+    { 22, "Shooter Lane",              "Playfield", "Micro",    "8-SW-28", NULL },
+    { 25, "Bowl Opto",                 "Playfield", "Opto",     "8-SW-27", NULL },
+    /* Berry targets + left ramp cluster */
+    { 27, "Berry Target Left",         "Playfield", "Target",   "8-SW-9",  NULL },
+    { 28, "Berry Target Center",       "Playfield", "Target",   "8-SW-10", NULL },
+    { 29, "Left Ramp Enter Opto",      "Playfield", "Opto",     "8-SW-11", NULL },
+    { 30, "Left Ramp Made 2 Gate",     "Playfield", "Micro",    "8-SW-12", NULL },
+    { 31, "Subway Enter",              "Playfield", "Opto",     "8-SW-8",  NULL },
+    /* Lower standup target bank */
+    { 33, "Lower Left Target-Top",     "Playfield", "Target",   "8-SW-0",  NULL },
+    { 34, "Lower Left Target-Mid",     "Playfield", "Target",   "8-SW-1",  NULL },
+    { 35, "Lower Left Target-Bot",     "Playfield", "Target",   "8-SW-2",  NULL },
+    { 36, "Lower Right Target-Top",    "Playfield", "Target",   "8-SW-3",  NULL },
+    { 37, "Lower Right Target-Bot",    "Playfield", "Target",   "8-SW-4",  NULL },
+    /* Ejects */
+    { 40, "Left Eject Opto",           "Playfield", "Opto",     "8-SW-5",  NULL },
+    { 41, "Right Eject",               "Playfield", "Micro",    "9-SW-1",  NULL },
+    /* Node 9 — orbits / ramps / arena / BATTLE / Team Rocket */
+    { 44, "Left Orbit",                "Playfield", "Rollover", "9-SW-8",  NULL },
+    { 45, "Left Ramp Made 1 Opto",     "Playfield", "Opto",     "9-SW-9",  NULL },
+    { 46, "Rear Ramp Made",            "Playfield", "Micro",    "9-SW-29", NULL },
+    { 49, "Arena Left 10 Pt",          "Playfield", "Leaf",     "9-SW-13", NULL },
+    { 50, "Arena Right 10 Pt",         "Playfield", "Leaf",     "9-SW-14", NULL },
+    { 51, "(B)ATTLE Target",           "Playfield", "Target",   "9-SW-26", NULL },
+    { 52, "B(A)TTLE Target",           "Playfield", "Target",   "9-SW-27", NULL },
+    { 53, "BA(T)TLE Target",           "Playfield", "Target",   "9-SW-17", NULL },
+    { 54, "BAT(T)LE Target",           "Playfield", "Target",   "9-SW-18", NULL },
+    { 55, "BATT(L)E Target",           "Playfield", "Target",   "9-SW-19", NULL },
+    { 56, "BATTL(E) Target",           "Playfield", "Target",   "9-SW-20", NULL },
+    { 57, "Team Rocket Target Left",   "Playfield", "Target",   "9-SW-21", NULL },
+    { 58, "Team Rocket Target Right",  "Playfield", "Target",   "9-SW-22", NULL },
+    { 59, "Meowth Hit Opto",           "Playfield", "Opto",     "9-SW-23", NULL },
+    { 60, "Meowth Up",                 "Playfield", "MagSw",    "9-SW-24", NULL },
+    { 61, "Meowth Down",               "Playfield", "MagSw",    "9-SW-25", NULL },
+    { 63, "Top Pop Bumper",            "Playfield", "Leaf",     "9-SW-28", NULL },
+    { 64, "Bot Pop Bumper",            "Playfield", "Leaf",     "9-SW-30", NULL },
+    { 66, "Top Lane Left",             "Playfield", "Rollover", "9-SW-10", NULL },
+    { 67, "Top Lane Right",            "Playfield", "Rollover", "9-SW-11", NULL },
+    /* Berry right target + captive ball + spinner + right ramp */
+    { 70, "Berry Target Right",        "Playfield", "Target",   "9-SW-0",  NULL },
+    { 71, "Captive Ball-Lower",        "Playfield", "Rollover", "9-SW-4",  NULL },
+    { 72, "Captive Ball-Upper",        "Playfield", "Rollover", "9-SW-5",  NULL },
+    { 73, "Captive Ball-Target",       "Playfield", "Target",   "9-SW-6",  NULL },
+    { 74, "Right Ramp Hold",           "Playfield", "Micro",    "9-SW-15", NULL },
+    { 76, "Right Ramp Made Opto",      "Playfield", "Opto",     "9-SW-31", NULL },
+    { 78, "Spinner Opto",              "Playfield", "Opto",     "9-SW-7",  NULL },
+    { 79, "Team Rocket Enter",         "Playfield", "Rollover", "9-SW-2",  NULL },
+    { 80, "Right Orbit",               "Playfield", "Rollover", "9-SW-3",  NULL },
+    /* Cabinet / coin door — Node 1 */
+    { 90, "Action Button",             "Cabinet",   "Leaf",     "1-SW-2",  NULL },
+    { 93, "Start Button",              "Cabinet",   "Micro",    "1-SW-11", NULL },
+    { 94, "Tournament Start Button",   "Cabinet",   "Micro",    "1-SW-12", NULL },
+    { 96, "Left Coin",                 "CoinDoor",  "Micro",    "1-SW-16", NULL },
+    { 97, "Right Coin",                "CoinDoor",  "Micro",    "1-SW-18", NULL },
+    { 98, "Center Coin",               "CoinDoor",  "Micro",    "1-SW-17", NULL },
+    { 99, "Fourth Coin",               "CoinDoor",  "Micro",    "1-SW-19", NULL },
+    {100, "Fifth Coin",                "CoinDoor",  "Micro",    "1-SW-20", NULL },
+    {101, "Tilt Pendulum",             "Cabinet",   "Plumb",    "1-SW-14", NULL },
+    {102, "Sixth Coin",                "Cabinet",   "Micro",    "1-SW-21", NULL },
+    {103, "Ticket Notch",              "Cabinet",   "Micro",    "1-SW-8",  NULL },
+    {104, "Slam Tilt",                 "Cabinet",   "Micro",    "1-SW-22", NULL },
+    {105, "Ticket Low",                "Cabinet",   "Micro",    "1-SW-7",  NULL },
+    /* Coin-door service switches (ID prefixed with "C" in the manual) */
+    {210, "Service Plus",              "CoinDoor",  "Micro",    "0-SW-9",  NULL },
+    /* Note: the manual's C11 entry is truncated in the source we have;
+     * when we have the full row, add {211, "Service", ...}. */
+};
+
+/* Lookup helper. Returns NULL if switch id isn't in the manifest. */
+static const struct shim_switch_entry *shim_find_switch(int id) {
+    size_t N = sizeof(shim_switch_manifest) / sizeof(shim_switch_manifest[0]);
+    for (size_t i = 0; i < N; i++) {
+        if (shim_switch_manifest[i].id == id) return &shim_switch_manifest[i];
+    }
+    return NULL;
+}
+
+/* ---- Step 52: fire_event trampoline + event sweep ---------------------
+ *
+ * BN Step 52 revealed:
+ *   fire_event @ 0x9c12a0: uint64_t(int32_t event_id, int64_t event_data)
+ *     - bounds-checks event_id <= 0xce
+ *     - walks linked list at data_485ea80[event_id*8]
+ *     - each node: {callback_fn_ptr @ +0, priority @ +0x08, next @ +0x10}
+ *     - calls callback(event_data); short-circuits on !(ret & 1)
+ *
+ * Trampoline pattern:
+ *   fire_event_addr = game_base + (0x9c12a0 - 0x400000)
+ *
+ * Event sweep fires every event_id 0..0xce with event_data=0 and diffs
+ * cmode state before/after. Events whose handlers dereference event_data
+ * as a pointer will SEGV with fault_addr=0; we catch and recover.
+ *
+ * Triggered by SIGUSR2 (kept out of the main dump path so we can still
+ * use SIGUSR1 for state snapshots without firing events).
+ * ------------------------------------------------------------------------ */
+
+static sigjmp_buf shim_event_sweep_jmp;
+static volatile sig_atomic_t shim_event_fire_in_progress = 0;
+static volatile int shim_current_sweep_event_id = -1;
+
+static uint64_t shim_fire_event(int32_t event_id, int64_t event_data) {
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) return (uint64_t)-1;
+    typedef uint64_t (*fire_event_t)(int32_t, int64_t);
+    fire_event_t fn = (fire_event_t)(game_base + (0x9c12a0 - 0x400000));
+    return fn(event_id, event_data);
+}
+
+/* Minimal cmode state snapshot. For each of the 42 cmodes captures
+ * 2 u64 words: +0x308 (the field most likely to change on activation,
+ * though it's subclass-reinterpreted) and +0x60 (zero at static init,
+ * non-zero post-activation in some cmodes). 42×16 = 672 bytes. */
+static void shim_capture_cmode_snap(uintptr_t game_base, uint64_t *out) {
+    size_t N = sizeof(shim_cmode_table) / sizeof(shim_cmode_table[0]);
+    for (size_t i = 0; i < N; i++) {
+        uintptr_t rt = game_base + (shim_cmode_table[i].bn_va - 0x400000);
+        memcpy(&out[i*2 + 0], (void*)(rt + 0x308), 8);
+        memcpy(&out[i*2 + 1], (void*)(rt + 0x60),  8);
+    }
+}
+
+/* ---- Step 52: switch-closure API -------------------------------------
+ *
+ * shim_fire_switch(switch_id) simulates a physical switch closure at the
+ * game's in-memory switch state array (data_4880220, per PROTOCOL.md).
+ *
+ * Current behaviour (Plan-C pending):
+ *   1. Look up the switch in the manifest; refuse if not listed (manual
+ *      enumerates all real switches; unlisted IDs are unused slots).
+ *   2. Snapshot cmode state (+0x308/+0x60 across 42 cmodes).
+ *   3. Write 1 to data_4880220 + id * 0x30 + 0x28.
+ *   4. Re-snapshot; log deltas with switch name.
+ *   5. After a short dwell, write 0 back (simulating release).
+ *
+ * What's missing until Plan C returns: the "switch decoder" — the
+ * function that consumes UART cmd 0x27 bytes, writes into data_4880220,
+ * AND calls fire_event(derived_event_id, struct_ptr). Without it, the
+ * game sees the state byte flip but no event fires, so it may not react
+ * until its own poll cycle notices. Once we find the decoder we can
+ * either call it from shim_fire_switch or fire the right event ourselves.
+ * ------------------------------------------------------------------------ */
+
+#define SHIM_SWITCH_STATE_BASE 0x4880220   /* BN VA; stride 0x30, state @ +0x28 */
+#define SHIM_SWITCH_COUNT_ADDR 0x48cbaa0   /* BN VA; dynamic switch count */
+
+static int shim_fire_switch(int switch_id) {
+    const struct shim_switch_entry *sw = shim_find_switch(switch_id);
+    if (!sw) {
+        char msg[128];
+        int mn = snprintf(msg, sizeof(msg),
+            "\n--- shim_fire_switch: id %d not in manifest (unused slot?) ---\n",
+            switch_id);
+        ssize_t u = write(STDERR_FILENO, msg, (size_t)mn); (void)u;
+        return -1;
+    }
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        const char *m = "\n--- shim_fire_switch: game_base unresolved ---\n";
+        ssize_t u = write(STDERR_FILENO, m, strlen(m)); (void)u;
+        return -1;
+    }
+
+    /* Bounds-check against the game's runtime switch count. */
+    uint32_t sw_count = 0;
+    memcpy(&sw_count,
+           (void*)(game_base + (SHIM_SWITCH_COUNT_ADDR - 0x400000)),
+           4);
+    if (sw_count > 0 && (uint32_t)switch_id >= sw_count) {
+        char msg[192];
+        int mn = snprintf(msg, sizeof(msg),
+            "\n--- shim_fire_switch: id %d (%s) out of range — runtime "
+            "count is %u ---\n",
+            switch_id, sw->name, sw_count);
+        ssize_t u = write(STDERR_FILENO, msg, (size_t)mn); (void)u;
+        return -1;
+    }
+
+    uintptr_t state_addr = game_base +
+        (SHIM_SWITCH_STATE_BASE - 0x400000) + (uintptr_t)switch_id * 0x30 + 0x28;
+
+    char hdr[256];
+    int hn = snprintf(hdr, sizeof(hdr),
+        "\n--- shim_fire_switch: %d '%s' (%s, %s, %s) state@0x%lx ---\n",
+        switch_id, sw->name, sw->location, sw->type, sw->node_addr,
+        (unsigned long)state_addr);
+    ssize_t u = write(STDERR_FILENO, hdr, (size_t)hn); (void)u;
+
+    uint64_t snap_before[42 * 2];
+    uint64_t snap_after[42 * 2];
+    shim_capture_cmode_snap(game_base, snap_before);
+
+    uint8_t before_state = 0;
+    memcpy(&before_state, (void*)state_addr, 1);
+
+    /* Close the switch. */
+    uint8_t closed = 1;
+    memcpy((void*)state_addr, &closed, 1);
+
+    /* Give the game a tick to notice. In practice the game's switch
+     * poll runs off netbridge cmd 0x27 responses — so the shim-side
+     * flip may go unnoticed until Plan C's translator hook is added.
+     * We still sleep briefly in case any polling thread samples the
+     * state array directly. */
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 20 * 1000 * 1000 }; /* 20 ms */
+    nanosleep(&ts, NULL);
+
+    shim_capture_cmode_snap(game_base, snap_after);
+
+    /* Release the switch. */
+    memcpy((void*)state_addr, &before_state, 1);
+
+    /* Report deltas. */
+    size_t N = sizeof(shim_cmode_table) / sizeof(shim_cmode_table[0]);
+    char delta_buf[1800];
+    size_t delta_off = 0;
+    int delta_count = 0;
+    for (size_t i = 0; i < N; i++) {
+        if (snap_after[i*2 + 0] != snap_before[i*2 + 0] ||
+            snap_after[i*2 + 1] != snap_before[i*2 + 1]) {
+            delta_count++;
+            if (delta_off < sizeof(delta_buf) - 128) {
+                int added = snprintf(
+                    delta_buf + delta_off, sizeof(delta_buf) - delta_off,
+                    "  %s(+0x308:%lx->%lx)",
+                    shim_cmode_table[i].name_hint,
+                    (unsigned long)snap_before[i*2 + 0],
+                    (unsigned long)snap_after[i*2 + 0]);
+                delta_off += (size_t)added;
+            }
+        }
+    }
+
+    char tail[2048];
+    int tn = snprintf(tail, sizeof(tail),
+        "  switch %d '%s': before_state=%u Δ=%d%s\n",
+        switch_id, sw->name, before_state, delta_count,
+        delta_count > 0 ? delta_buf : " (no cmode state change — translator "
+                                      "not yet hooked, see PROTOCOL.md)");
+    u = write(STDERR_FILENO, tail, (size_t)tn); (void)u;
+
+    return delta_count;
+}
+
+static void shim_event_sweep(void) {
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        const char *m = "\n--- event sweep: game_base not resolved ---\n";
+        ssize_t u = write(STDERR_FILENO, m, strlen(m)); (void)u;
+        return;
+    }
+
+    const char *hdr =
+        "\n--- event sweep: firing events 0x00..0xce with event_data=0 ---\n"
+        "format:  event <id>  ret=<ret>  Δ=<#changed>[  <cmode>(+0x308: <before>-><after>)]...\n";
+    ssize_t u = write(STDERR_FILENO, hdr, strlen(hdr)); (void)u;
+
+    size_t N = sizeof(shim_cmode_table) / sizeof(shim_cmode_table[0]);
+    uint64_t baseline[42 * 2];
+    uint64_t post[42 * 2];
+    shim_capture_cmode_snap(game_base, baseline);
+
+    int crashed_events = 0;
+    int reactive_events = 0;
+    int fired_ok = 0;
+
+    int timed_out_events = 0;
+    for (int ev = 0; ev <= 0xce; ev++) {
+        shim_current_sweep_event_id = ev;
+        shim_event_fire_in_progress = 1;
+
+        uint64_t ret = (uint64_t)-1;
+        int did_fire = 0;
+        int setjmp_result;
+
+        /* alarm(1) delivers SIGALRM to this thread (blocked elsewhere by the
+         * sigmask set on the timer thread). SIGALRM handler recognises
+         * in_progress and siglongjmps back with value 2. */
+        alarm(1);
+        setjmp_result = sigsetjmp(shim_event_sweep_jmp, 1);
+        if (setjmp_result == 0) {
+            ret = shim_fire_event(ev, 0);
+            alarm(0);
+            did_fire = 1;
+            fired_ok++;
+        } else if (setjmp_result == 2) {
+            alarm(0);
+            timed_out_events++;
+        } else {
+            /* setjmp_result == 1 — came from SEGV */
+            alarm(0);
+            crashed_events++;
+        }
+        shim_event_fire_in_progress = 0;
+
+        if (did_fire) {
+            shim_capture_cmode_snap(game_base, post);
+
+            char delta_buf[1800];
+            size_t delta_off = 0;
+            int delta_count = 0;
+            for (size_t i = 0; i < N; i++) {
+                if (post[i*2 + 0] != baseline[i*2 + 0] ||
+                    post[i*2 + 1] != baseline[i*2 + 1]) {
+                    delta_count++;
+                    if (delta_off < sizeof(delta_buf) - 128) {
+                        int added = snprintf(
+                            delta_buf + delta_off,
+                            sizeof(delta_buf) - delta_off,
+                            "  %s(+0x308:%lx->%lx)",
+                            shim_cmode_table[i].name_hint,
+                            (unsigned long)baseline[i*2 + 0],
+                            (unsigned long)post[i*2 + 0]);
+                        delta_off += (size_t)added;
+                    }
+                }
+            }
+
+            char line[2048];
+            int ln;
+            if (delta_count > 0) {
+                reactive_events++;
+                ln = snprintf(line, sizeof(line),
+                    "  event 0x%02x ret=%lu Δ=%d %s\n",
+                    ev, (unsigned long)ret, delta_count, delta_buf);
+                /* Use post as new baseline for cumulative tracking */
+                memcpy(baseline, post, sizeof(baseline));
+            } else {
+                ln = snprintf(line, sizeof(line),
+                    "  event 0x%02x ret=%lu Δ=0\n",
+                    ev, (unsigned long)ret);
+            }
+            u = write(STDERR_FILENO, line, (size_t)ln); (void)u;
+        }
+    }
+
+    char sum[220];
+    int sl = snprintf(sum, sizeof(sum),
+        "\n--- sweep complete: fired=%d reactive=%d crashed=%d timeouts=%d (of 207) ---\n",
+        fired_ok, reactive_events, crashed_events, timed_out_events);
+    u = write(STDERR_FILENO, sum, (size_t)sl); (void)u;
+}
+
 static void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
     (void)ucontext;
+
+    /* Event sweep recovery path: if a SEGV fires while we're inside
+     * shim_fire_event(), log the failure and longjmp back to the sweep
+     * loop so we can continue with the next event instead of aborting. */
+    if (shim_event_fire_in_progress) {
+        char msg[192];
+        int mn = snprintf(msg, sizeof(msg),
+            "\n  [sweep] event 0x%02x CRASHED sig=%d fault=%p — recovering\n",
+            shim_current_sweep_event_id, sig, info->si_addr);
+        ssize_t u2 = write(STDERR_FILENO, msg, (size_t)mn); (void)u2;
+        shim_event_fire_in_progress = 0;
+        siglongjmp(shim_event_sweep_jmp, 1);
+    }
 
     char hdr[256];
     int hn = snprintf(hdr, sizeof(hdr),
@@ -847,10 +1263,22 @@ static void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
     raise(sig);
 }
 
-/* SIGTERM / SIGUSR1 handler: dump sound globals and exit cleanly.
+/* SIGTERM / SIGUSR1 / SIGUSR2 handler:
+ *   SIGTERM/SIGINT — dump state and exit cleanly.
+ *   SIGUSR1        — dump state and keep running.
+ *   SIGUSR2        — run event sweep (fire events 0x00..0xce) and keep running.
+ *
  * Lets us extract memory state when `timeout` kills QEMU (SIGTERM)
- * or when the user triggers a manual dump via `kill -USR1 <pid>`. */
+ * or when the user triggers a manual dump via `kill -USR1 <pid>` /
+ * a sweep via `kill -USR2 <pid>`. */
 static void shim_term_dump_handler(int sig) {
+    if (sig == SIGUSR2) {
+        const char *m = "\n=== SHIM SIGUSR2: RUNNING EVENT SWEEP ===\n";
+        ssize_t u = write(STDERR_FILENO, m, strlen(m)); (void)u;
+        shim_event_sweep();
+        return;
+    }
+
     char hdr[128];
     int hn = snprintf(hdr, sizeof(hdr),
         "\n=== SHIM SIGTERM/USR1 DUMP (sig=%d) ===\n", sig);
@@ -863,6 +1291,421 @@ static void shim_term_dump_handler(int sig) {
     if (sig == SIGTERM || sig == SIGINT) {
         _exit(0);
     }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include <sys/un.h>
+#include <sys/time.h>
+
+static int shim_bridge_listen_fd = -1;
+static int shim_bridge_client_fd = -1;
+static pthread_mutex_t shim_bridge_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t shim_bridge_start_ms = 0;
+
+static uint64_t shim_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+/* Write a JSON event to the subscriber if connected. Graceful on disconnect. */
+static void shim_bridge_emit(const char *json_line) {
+    if (!json_line) return;
+    size_t len = strlen(json_line);
+    pthread_mutex_lock(&shim_bridge_lock);
+    if (shim_bridge_client_fd >= 0) {
+        ssize_t w = send(shim_bridge_client_fd, json_line, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w < 0 && (errno == EPIPE || errno == ECONNRESET || errno == EBADF)) {
+            close(shim_bridge_client_fd);
+            shim_bridge_client_fd = -1;
+            SHIM_LOG("[bridge] subscriber disconnected");
+        }
+    }
+    pthread_mutex_unlock(&shim_bridge_lock);
+}
+
+/* Accept loop — runs in its own thread. Blocks on accept(); whenever a
+ * subscriber connects we stash the fd. If a previous subscriber is still
+ * connected we disconnect them first (one consumer at a time). */
+static void *shim_bridge_accept_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct sockaddr_un addr;
+        socklen_t addrlen = sizeof(addr);
+        int fd = accept(shim_bridge_listen_fd, (struct sockaddr*)&addr, &addrlen);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            SHIM_LOG("[bridge] accept() failed: %s — listener terminating", strerror(errno));
+            return NULL;
+        }
+
+        pthread_mutex_lock(&shim_bridge_lock);
+        if (shim_bridge_client_fd >= 0) {
+            close(shim_bridge_client_fd);
+            SHIM_LOG("[bridge] evicted prior subscriber (new one connected)");
+        }
+        shim_bridge_client_fd = fd;
+        pthread_mutex_unlock(&shim_bridge_lock);
+
+        SHIM_LOG("[bridge] subscriber connected on fd %d", fd);
+
+        /* Send a hello so the subscriber knows we're live. */
+        char hello[256];
+        int hn = snprintf(hello, sizeof(hello),
+            "{\"t\":\"hello\",\"shim\":\"pokemon_le\",\"cmodes\":42,\"ts_ms\":%lu}\n",
+            (unsigned long)(shim_now_ms() - shim_bridge_start_ms));
+        (void)send(fd, hello, (size_t)hn, MSG_NOSIGNAL);
+    }
+    return NULL;
+}
+
+/* Polling thread — samples 42 cmodes' +0x308 at 10 Hz, emits on deltas. */
+static void *shim_bridge_poll_thread(void *arg) {
+    (void)arg;
+
+    /* Wait for game_base to resolve (populated by ioctl hook or similar). */
+    uintptr_t game_base = 0;
+    for (int attempt = 0; attempt < 60; attempt++) {
+        game_base = shim_resolve_game_base();
+        if (game_base) break;
+        sleep(1);
+    }
+    if (!game_base) {
+        SHIM_LOG("[bridge] poll thread: game_base never resolved; giving up");
+        return NULL;
+    }
+
+    size_t N = sizeof(shim_cmode_table) / sizeof(shim_cmode_table[0]);
+    uint64_t last[42];
+    /* Prime baseline */
+    for (size_t i = 0; i < N; i++) {
+        uintptr_t rt = game_base + (shim_cmode_table[i].bn_va - 0x400000);
+        memcpy(&last[i], (void*)(rt + 0x308), 8);
+    }
+
+    SHIM_LOG("[bridge] poll thread live (game_base=0x%lx, polling %zu cmodes @ 10 Hz)",
+             game_base, N);
+
+    for (;;) {
+        /* 100 ms between polls */
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+
+        for (size_t i = 0; i < N; i++) {
+            uintptr_t rt = game_base + (shim_cmode_table[i].bn_va - 0x400000);
+            uint64_t now_val;
+            memcpy(&now_val, (void*)(rt + 0x308), 8);
+            if (now_val != last[i]) {
+                char line[320];
+                int ln = snprintf(line, sizeof(line),
+                    "{\"t\":\"cmode\",\"id\":%u,\"name\":\"%s\","
+                    "\"flags\":%u,\"init\":%lu,\"init_prev\":%lu,"
+                    "\"ts_ms\":%lu}\n",
+                    shim_cmode_table[i].expected_mode_id,
+                    shim_cmode_table[i].name_hint,
+                    shim_cmode_table[i].expected_type_flags,
+                    (unsigned long)now_val,
+                    (unsigned long)last[i],
+                    (unsigned long)(shim_now_ms() - shim_bridge_start_ms));
+                shim_bridge_emit(line);
+                SHIM_LOG("[bridge] cmode delta: %s init %lx -> %lx",
+                         shim_cmode_table[i].name_hint,
+                         (unsigned long)last[i], (unsigned long)now_val);
+                last[i] = now_val;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* SPIKE3_POKE_CMODE=<name>:<hex_value>:<delay_sec> — force a cmode's +0x308
+ * field to <hex_value> after <delay_sec> seconds, then reset to 0 after
+ * another 3 s. Lets us simulate mode activations without needing the
+ * game's Stage-2 event logic to agree. Name matches shim_cmode_table.name_hint
+ * (e.g. "story_charmander_1", "battle_coast"). */
+static void *shim_poke_cmode_thread(void *arg) {
+    char *spec = (char*)arg;
+    if (!spec) return NULL;
+
+    char *colon1 = strchr(spec, ':');
+    if (!colon1) { free(spec); return NULL; }
+    *colon1 = 0;
+    char *name = spec;
+    char *rest = colon1 + 1;
+    char *colon2 = strchr(rest, ':');
+    uint64_t value = 0;
+    long delay = 35;
+    if (colon2) {
+        *colon2 = 0;
+        value = strtoull(rest, NULL, 0);
+        delay = atol(colon2 + 1);
+    } else {
+        value = strtoull(rest, NULL, 0);
+    }
+
+    /* Look up cmode. */
+    size_t N = sizeof(shim_cmode_table) / sizeof(shim_cmode_table[0]);
+    const struct shim_cmode_entry *entry = NULL;
+    for (size_t i = 0; i < N; i++) {
+        if (strcmp(shim_cmode_table[i].name_hint, name) == 0) {
+            entry = &shim_cmode_table[i];
+            break;
+        }
+    }
+    if (!entry) {
+        SHIM_LOG("[poke_cmode] unknown cmode name: %s", name);
+        free(spec);
+        return NULL;
+    }
+
+    SHIM_LOG("[poke_cmode] will poke %s +0x308 = 0x%lx after %ld s",
+             name, (unsigned long)value, delay);
+
+    sleep((unsigned int)delay);
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[poke_cmode] game_base unresolved; aborting");
+        free(spec);
+        return NULL;
+    }
+
+    uintptr_t addr = game_base + (entry->bn_va - 0x400000) + 0x308;
+    SHIM_LOG("[poke_cmode] writing 0x%lx to %s @ rt 0x%lx (activation)",
+             (unsigned long)value, name, (unsigned long)addr);
+    memcpy((void*)addr, &value, 8);
+
+    /* Hold for 3 seconds so the bridge has time to emit + subscriber reacts */
+    sleep(3);
+
+    uint64_t zero = 0;
+    SHIM_LOG("[poke_cmode] writing 0 to %s @ rt 0x%lx (deactivation)",
+             name, (unsigned long)addr);
+    memcpy((void*)addr, &zero, 8);
+
+    free(spec);
+    return NULL;
+}
+
+/* Start the bridge: create listener socket, spawn accept + poll threads.
+ * Called from the constructor; no-op unless SPIKE3_BRIDGE=1. */
+static void shim_bridge_start(void) {
+    const char *enabled = getenv("SPIKE3_BRIDGE");
+    if (!enabled || enabled[0] != '1') return;
+
+    const char *sock_path = getenv("SPIKE3_BRIDGE_SOCKET");
+    if (!sock_path || !sock_path[0]) sock_path = "/tmp/spike3_bridge.sock";
+
+    /* Unlink any stale socket. */
+    unlink(sock_path);
+
+    shim_bridge_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (shim_bridge_listen_fd < 0) {
+        SHIM_LOG("[bridge] socket() failed: %s", strerror(errno));
+        return;
+    }
+
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+
+    if (bind(shim_bridge_listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        SHIM_LOG("[bridge] bind(%s) failed: %s", sock_path, strerror(errno));
+        close(shim_bridge_listen_fd);
+        shim_bridge_listen_fd = -1;
+        return;
+    }
+
+    if (listen(shim_bridge_listen_fd, 1) < 0) {
+        SHIM_LOG("[bridge] listen() failed: %s", strerror(errno));
+        close(shim_bridge_listen_fd);
+        shim_bridge_listen_fd = -1;
+        return;
+    }
+
+    shim_bridge_start_ms = shim_now_ms();
+
+    pthread_t t_accept, t_poll;
+    if (pthread_create(&t_accept, NULL, shim_bridge_accept_thread, NULL) == 0) {
+        pthread_detach(t_accept);
+    }
+    if (pthread_create(&t_poll, NULL, shim_bridge_poll_thread, NULL) == 0) {
+        pthread_detach(t_poll);
+    }
+
+    SHIM_LOG("[bridge] listening on %s (AF_UNIX)", sock_path);
+}
+
+/* Step 52: SIGALRM handler used to break out of hung event handlers during
+ * the sweep. Installed in the constructor; blocked on all threads except
+ * the sweep timer thread so alarm() delivers to the right place. */
+static void shim_event_sweep_alarm_handler(int sig, siginfo_t *info, void *uc) {
+    (void)info; (void)uc;
+    if (shim_event_fire_in_progress) {
+        char msg[160];
+        int n = snprintf(msg, sizeof(msg),
+            "\n  [sweep] event 0x%02x TIMEOUT (sig=%d) — recovering\n",
+            shim_current_sweep_event_id, sig);
+        ssize_t u = write(STDERR_FILENO, msg, (size_t)n); (void)u;
+        shim_event_fire_in_progress = 0;
+        siglongjmp(shim_event_sweep_jmp, 2);
+    }
+    /* else: unexpected SIGALRM outside the sweep — just ignore */
+}
+
+/* Step 52: SIGUSR2 gets intercepted by QEMU user-mode itself, so we can't
+ * rely on external signals to trigger action from outside. Instead we use
+ * env-var-driven timer threads:
+ *
+ *   SPIKE3_SWEEP_AFTER=<sec>      → run shim_event_sweep() after N seconds
+ *                                    (requires SPIKE3_SWEEP_EVENTS=1 opt-in)
+ *   SPIKE3_FIRE_SWITCH=<id[,id]>  → run shim_fire_switch() on each id after
+ *                                    <SPIKE3_SWITCH_DELAY or 30> seconds
+ *   SPIKE3_SWITCH_DELAY=<sec>     → delay before fire_switch calls (default 30)
+ */
+static void *shim_sweep_timer_thread(void *arg) {
+    long seconds = (long)arg;
+    if (seconds <= 0) return NULL;
+
+    /* Unblock SIGALRM on this thread only — the constructor blocked it on
+     * the main thread (so all threads created by the game inherit that
+     * mask), leaving this thread as the sole recipient of alarm() signals.
+     * Keeps siglongjmp-on-timeout well-defined (same thread as sigsetjmp
+     * in shim_event_sweep). */
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, SIGALRM);
+    pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
+
+    char msg[128];
+    int mn = snprintf(msg, sizeof(msg),
+        "\n=== shim_sweep_timer: sleeping %ld seconds then firing sweep ===\n",
+        seconds);
+    ssize_t u = write(STDERR_FILENO, msg, (size_t)mn); (void)u;
+
+    sleep((unsigned int)seconds);
+
+    const char *m = "\n=== shim_sweep_timer: firing sweep NOW ===\n";
+    u = write(STDERR_FILENO, m, strlen(m)); (void)u;
+
+    shim_event_sweep();
+    return NULL;
+}
+
+/* SPIKE3_FORCE_GSTREAMER=<seconds> — after N seconds, trampoline into the
+ * game's gstreamer_init function at BN VA 0xcc1ec0. Diagnostic: tells us
+ * whether gstreamer is reachable + functional when explicitly called.
+ * If our gst_init_check hook fires afterwards, gstreamer is callable and
+ * the dormancy we observed is purely "the game never chooses to call it
+ * under current conditions" (hardware-gated, config-gated, etc.). */
+static void *shim_force_gstreamer_thread(void *arg) {
+    long seconds = (long)arg;
+    if (seconds <= 0) return NULL;
+
+    char msg[160];
+    int mn = snprintf(msg, sizeof(msg),
+        "\n=== shim_force_gstreamer: sleeping %ld s then calling game's gstreamer_init @ 0xcc1ec0 ===\n",
+        seconds);
+    ssize_t u = write(STDERR_FILENO, msg, (size_t)mn); (void)u;
+
+    sleep((unsigned int)seconds);
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        const char *m = "[shim] force_gstreamer: game_base unresolved; aborting\n";
+        u = write(STDERR_FILENO, m, strlen(m)); (void)u;
+        return NULL;
+    }
+
+    typedef void (*gstreamer_init_t)(void);
+    uintptr_t addr = game_base + (0xcc1ec0 - 0x400000);
+    gstreamer_init_t gstreamer_init_fn = (gstreamer_init_t)addr;
+
+    char hdr[200];
+    int hn = snprintf(hdr, sizeof(hdr),
+        "[shim] force_gstreamer: calling gstreamer_init via trampoline @ %p  (game_base=0x%lx)\n",
+        (void*)addr, game_base);
+    u = write(STDERR_FILENO, hdr, (size_t)hn); (void)u;
+
+    gstreamer_init_fn();
+
+    const char *done = "[shim] force_gstreamer: gstreamer_init returned\n";
+    u = write(STDERR_FILENO, done, strlen(done)); (void)u;
+    return NULL;
+}
+
+/* SPIKE3_FIRE_SWITCH=<id1:id2:...> — fire one or more switches after
+ * SPIKE3_SWITCH_DELAY seconds (default 30).
+ *
+ * NOTE: colon-delimited, not comma — QEMU's `-E var=value` uses comma as
+ * the var separator (discovered via Step 46 V4L2 probe). If you invoke
+ * the shim directly (not via QEMU), commas also work.
+ *
+ * Each ID is spaced by ~200 ms to let the game's poll cycle breathe. */
+static void *shim_fire_switch_thread(void *arg) {
+    char *list_copy = (char*)arg;
+    if (!list_copy || !list_copy[0]) { free(list_copy); return NULL; }
+
+    const char *delay_s = getenv("SPIKE3_SWITCH_DELAY");
+    long delay = delay_s && delay_s[0] ? atol(delay_s) : 30;
+    if (delay < 0) delay = 0;
+    if (delay > 3600) delay = 3600;
+
+    char msg[200];
+    int mn = snprintf(msg, sizeof(msg),
+        "\n=== shim_fire_switch_thread: sleeping %ld s then firing switches [%s] ===\n",
+        delay, list_copy);
+    ssize_t u = write(STDERR_FILENO, msg, (size_t)mn); (void)u;
+
+    sleep((unsigned int)delay);
+
+    /* Parse colon-or-comma-separated IDs (":," covers both for safety). */
+    char *save = NULL;
+    char *tok = strtok_r(list_copy, ":,", &save);
+    while (tok) {
+        while (*tok == ' ') tok++;
+        int id = atoi(tok);
+        if (id > 0) {
+            shim_fire_switch(id);
+            /* short gap between fires so the game's poll can observe
+             * one state transition at a time */
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 200*1000*1000 };
+            nanosleep(&ts, NULL);
+        }
+        tok = strtok_r(NULL, ":,", &save);
+    }
+
+    free(list_copy);
+    return NULL;
 }
 
 __attribute__((constructor))
@@ -882,6 +1725,87 @@ static void shim_install_crash_handler(void) {
     sigaction(SIGTERM, &sa2, NULL);
     sigaction(SIGINT,  &sa2, NULL);
     sigaction(SIGUSR1, &sa2, NULL);
+    sigaction(SIGUSR2, &sa2, NULL);  /* Step 52: event sweep (signal path, usually swallowed by qemu) */
+
+    /* Step 52: SIGALRM handler for per-event timeout during sweep. */
+    struct sigaction sa3;
+    memset(&sa3, 0, sizeof(sa3));
+    sa3.sa_sigaction = shim_event_sweep_alarm_handler;
+    sa3.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa3.sa_mask);
+    sigaction(SIGALRM, &sa3, NULL);
+
+    /* Step 52: block SIGALRM on this (main) thread. Threads created later
+     * by the game inherit this mask, so SIGALRM won't disturb anything
+     * other than the sweep timer thread (which unblocks SIGALRM on itself
+     * before running the sweep). */
+    sigset_t block_alarm;
+    sigemptyset(&block_alarm);
+    sigaddset(&block_alarm, SIGALRM);
+    pthread_sigmask(SIG_BLOCK, &block_alarm, NULL);
+
+    /* Step 52: env-var-triggered delayed sweep.
+     * Opt-in — only runs when SPIKE3_SWEEP_EVENTS=1 is also set, to keep
+     * default runs on the switch-first path (see EVENT_SWEEP_STEP52.md
+     * for why the blind sweep is low-signal). */
+    const char *sweep_enabled = getenv("SPIKE3_SWEEP_EVENTS");
+    if (sweep_enabled && sweep_enabled[0] == '1') {
+        const char *s = getenv("SPIKE3_SWEEP_AFTER");
+        if (s && s[0]) {
+            long sec = atol(s);
+            if (sec > 0 && sec < 3600) {
+                pthread_t t;
+                if (pthread_create(&t, NULL, shim_sweep_timer_thread,
+                                   (void*)(intptr_t)sec) == 0) {
+                    pthread_detach(t);
+                }
+            }
+        }
+    }
+
+    /* Step 52: env-var-triggered targeted switch firing. */
+    const char *fs = getenv("SPIKE3_FIRE_SWITCH");
+    if (fs && fs[0]) {
+        char *copy = strdup(fs);
+        if (copy) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, shim_fire_switch_thread, copy) == 0) {
+                pthread_detach(t);
+            } else {
+                free(copy);
+            }
+        }
+    }
+
+    /* Step 53: env-var-triggered gstreamer init force-call (diagnostic). */
+    const char *fg = getenv("SPIKE3_FORCE_GSTREAMER");
+    if (fg && fg[0]) {
+        long sec = atol(fg);
+        if (sec > 0 && sec < 3600) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, shim_force_gstreamer_thread,
+                               (void*)(intptr_t)sec) == 0) {
+                pthread_detach(t);
+            }
+        }
+    }
+
+    /* Step 54: optional state bridge over Unix socket. */
+    shim_bridge_start();
+
+    /* Step 54: optional cmode poke (force activation for testing). */
+    const char *pc = getenv("SPIKE3_POKE_CMODE");
+    if (pc && pc[0]) {
+        char *copy = strdup(pc);
+        if (copy) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, shim_poke_cmode_thread, copy) == 0) {
+                pthread_detach(t);
+            } else {
+                free(copy);
+            }
+        }
+    }
 }
 
 /* Synthesize a page-flip completion event on the shim side of the DRM
@@ -3067,6 +3991,13 @@ ssize_t write(int fd, const void *buf, size_t count) {
 int ioctl(int fd, unsigned long request, ...) {
     resolve_all();
 
+    /* Step 52: prime the cached game_base from a guest-thread context.
+     * This hook is called constantly (SPI poll loop) so the cache gets
+     * populated very early — before the sweep timer thread needs it. */
+    if (!__atomic_load_n(&shim_cached_game_base, __ATOMIC_ACQUIRE)) {
+        (void)shim_resolve_game_base();
+    }
+
     va_list args;
     va_start(args, request);
     void *arg = va_arg(args, void *);
@@ -3759,8 +4690,15 @@ int avcodec_receive_frame(void *avctx, void *frame) {
     if (ret == 0) av_recv_ok_count++; else av_recv_err_count++;
 
     /* Real decode returned EAGAIN AND we have a pending packet — inject
-     * a dummy frame instead of propagating EAGAIN. */
-    if (ret == -11 /* EAGAIN */ && shim_pending_dummies > 0) {
+     * a dummy frame instead of propagating EAGAIN.
+     * Step 52: gated behind SPIKE3_INJECT_VIDEO=1 so event-sweep runs default
+     * to the Step-45 stable-shutdown baseline (no injection → no DRM-prime SEGV). */
+    static int inject_enabled = -1;
+    if (inject_enabled < 0) {
+        const char *s = getenv("SPIKE3_INJECT_VIDEO");
+        inject_enabled = (s && s[0] == '1') ? 1 : 0;
+    }
+    if (inject_enabled && ret == -11 /* EAGAIN */ && shim_pending_dummies > 0) {
         shim_init_dummy_frame();
         if (shim_dummy_frame) {
             real_av_frame_ref_t   aref   = shim_resolve_libav("av_frame_ref",   "LIBAVUTIL_57");
@@ -3800,3 +4738,214 @@ int avcodec_receive_frame(void *avctx, void *frame) {
     }
     return ret;
 }
+
+/* ---- Step 53: GStreamer interception (passthrough + logging) ----------
+ *
+ * Goal: observe the game's GStreamer pipeline construction so we can
+ * later redirect the sink element to appsink and route frames to a host-
+ * renderable surface. This pass is OBSERVATION ONLY — every call falls
+ * through to the real libgstreamer-1.0 after logging.
+ *
+ * Element creation:
+ *   gst_element_factory_make(factory, name)
+ *   gst_parse_launch(description, err)
+ *
+ * Pipeline assembly:
+ *   gst_bin_add, gst_bin_add_many
+ *   gst_element_link, gst_element_link_many
+ *
+ * Lifecycle:
+ *   gst_element_set_state
+ *
+ * We also hook gst_init_check so we can confirm gstreamer initialises
+ * cleanly under QEMU+sysroot (the gstreamer plugins live at
+ * <sysroot>/usr/lib64/gstreamer-1.0/ — 36 plugins inc. libgstkms.so,
+ * libgstapp.so, libgstisomp4.so, libgstvideoconvertscale.so).
+ *
+ * GStreamer opaque types are referenced as void* to avoid needing gst
+ * headers in the shim build. The ABI is stable — enums are ints,
+ * handles are pointers.
+ * ------------------------------------------------------------------------ */
+
+typedef void (*real_gst_element_factory_make_t)(void);  /* placeholder; see below */
+
+/* Real function pointers resolved lazily via dlsym(RTLD_NEXT). */
+static void *(*real_gst_element_factory_make)(const char *, const char *) = NULL;
+static void *(*real_gst_parse_launch)(const char *, void *) = NULL;
+static int   (*real_gst_bin_add)(void *, void *) = NULL;
+static int   (*real_gst_element_link)(void *, void *) = NULL;
+static int   (*real_gst_element_set_state)(void *, int) = NULL;
+static int   (*real_gst_init_check)(int *, char ***, void *) = NULL;
+
+static void *shim_resolve_gst(const char *sym) {
+    void *r = dlsym(RTLD_NEXT, sym);
+    if (!r) {
+        /* Fallback: open libgstreamer-1.0 directly (RTLD_NOLOAD in case
+         * it's already loaded; otherwise RTLD_LAZY). */
+        void *h = dlopen("libgstreamer-1.0.so.0", RTLD_LAZY | RTLD_NOLOAD);
+        if (!h) h = dlopen("libgstreamer-1.0.so.0", RTLD_LAZY);
+        if (h) r = dlsym(h, sym);
+    }
+    return r;
+}
+
+static unsigned gst_factory_make_count    = 0;
+static unsigned gst_parse_launch_count    = 0;
+static unsigned gst_bin_add_count         = 0;
+static unsigned gst_element_link_count    = 0;
+static unsigned gst_set_state_count       = 0;
+
+static const char *gst_state_name(int state) {
+    switch (state) {
+        case 0: return "VOID_PENDING";
+        case 1: return "NULL";
+        case 2: return "READY";
+        case 3: return "PAUSED";
+        case 4: return "PLAYING";
+        default: return "UNKNOWN";
+    }
+}
+
+int gst_init_check(int *argc, char ***argv, void *err) {
+    if (!real_gst_init_check)
+        real_gst_init_check = shim_resolve_gst("gst_init_check");
+    if (!real_gst_init_check) {
+        SHIM_LOG("[gst] gst_init_check: FAILED TO RESOLVE real symbol");
+        return 0;
+    }
+    int r = real_gst_init_check(argc, argv, err);
+    const char *pp = getenv("GST_PLUGIN_PATH");
+    SHIM_LOG("[gst] gst_init_check() -> %d  (GST_PLUGIN_PATH=%s)", r,
+             pp ? pp : "(unset)");
+    return r;
+}
+
+static void (*real_gst_deinit)(void) = NULL;
+void gst_deinit(void) {
+    if (!real_gst_deinit)
+        real_gst_deinit = shim_resolve_gst("gst_deinit");
+    SHIM_LOG("[gst] gst_deinit() called  (factory_make=%u parse=%u bin_add=%u link=%u setstate=%u)",
+             gst_factory_make_count, gst_parse_launch_count,
+             gst_bin_add_count, gst_element_link_count, gst_set_state_count);
+    if (real_gst_deinit) real_gst_deinit();
+}
+
+void *gst_element_factory_make(const char *factory, const char *name) {
+    if (!real_gst_element_factory_make)
+        real_gst_element_factory_make = shim_resolve_gst("gst_element_factory_make");
+    if (!real_gst_element_factory_make) return NULL;
+
+    void *r = real_gst_element_factory_make(factory, name);
+    gst_factory_make_count++;
+
+    /* Flag sinks and decoders — we care most about those. */
+    int is_sink = factory && strstr(factory, "sink") != NULL;
+    int is_dec  = factory && (strstr(factory, "dec") != NULL ||
+                              strstr(factory, "parse") != NULL);
+    const char *tag = is_sink ? " [SINK]" : (is_dec ? " [DECODE]" : "");
+
+    SHIM_LOG("[gst] #%u factory_make(factory=\"%s\", name=\"%s\") -> %p%s",
+             gst_factory_make_count,
+             factory ? factory : "(null)",
+             name ? name : "(null)",
+             r, tag);
+    return r;
+}
+
+void *gst_parse_launch(const char *description, void *err) {
+    if (!real_gst_parse_launch)
+        real_gst_parse_launch = shim_resolve_gst("gst_parse_launch");
+    if (!real_gst_parse_launch) return NULL;
+
+    void *r = real_gst_parse_launch(description, err);
+    gst_parse_launch_count++;
+    SHIM_LOG("[gst] #%u parse_launch(\"%s\") -> %p",
+             gst_parse_launch_count,
+             description ? description : "(null)", r);
+    return r;
+}
+
+int gst_bin_add(void *bin, void *element) {
+    if (!real_gst_bin_add)
+        real_gst_bin_add = shim_resolve_gst("gst_bin_add");
+    if (!real_gst_bin_add) return 0;
+
+    int r = real_gst_bin_add(bin, element);
+    gst_bin_add_count++;
+    /* First 16 and every 10th after that — keeps the log from drowning
+     * in identical bin_add lines during heavy pipeline construction. */
+    if (gst_bin_add_count <= 16 || (gst_bin_add_count % 10) == 0) {
+        SHIM_LOG("[gst] #%u bin_add(bin=%p, el=%p) -> %d",
+                 gst_bin_add_count, bin, element, r);
+    }
+    return r;
+}
+
+/* Variadic bin_add_many — libgstreamer may inline-call its own
+ * gst_bin_add (bypassing our LD_PRELOAD), so we reimplement in terms of
+ * our hooked gst_bin_add to guarantee we see every element. */
+int gst_bin_add_many(void *bin, void *first, ...) {
+    if (!first) return 1;  /* no elements — "success" */
+    int all_ok = gst_bin_add(bin, first);
+    va_list ap;
+    va_start(ap, first);
+    for (;;) {
+        void *e = va_arg(ap, void *);
+        if (!e) break;
+        if (!gst_bin_add(bin, e)) all_ok = 0;
+    }
+    va_end(ap);
+    return all_ok;
+}
+
+int gst_element_link(void *src, void *dest) {
+    if (!real_gst_element_link)
+        real_gst_element_link = shim_resolve_gst("gst_element_link");
+    if (!real_gst_element_link) return 0;
+
+    int r = real_gst_element_link(src, dest);
+    gst_element_link_count++;
+    if (gst_element_link_count <= 16 || (gst_element_link_count % 10) == 0) {
+        SHIM_LOG("[gst] #%u element_link(src=%p, dest=%p) -> %d",
+                 gst_element_link_count, src, dest, r);
+    }
+    return r;
+}
+
+/* Variadic link_many — chain-links each neighbour pair. */
+int gst_element_link_many(void *first, void *second, ...) {
+    if (!first || !second) return 0;
+    if (!gst_element_link(first, second)) return 0;
+    va_list ap;
+    va_start(ap, second);
+    void *prev = second;
+    int ok = 1;
+    for (;;) {
+        void *next = va_arg(ap, void *);
+        if (!next) break;
+        if (!gst_element_link(prev, next)) { ok = 0; break; }
+        prev = next;
+    }
+    va_end(ap);
+    return ok;
+}
+
+int gst_element_set_state(void *element, int state) {
+    if (!real_gst_element_set_state)
+        real_gst_element_set_state = shim_resolve_gst("gst_element_set_state");
+    if (!real_gst_element_set_state) return 0;
+
+    int r = real_gst_element_set_state(element, state);
+    gst_set_state_count++;
+    /* Always log PLAYING/NULL transitions (pipeline start/stop milestones);
+     * sample-log the rest to keep noise down. */
+    int is_milestone = (state == 4 /*PLAYING*/) || (state == 1 /*NULL*/);
+    if (is_milestone || gst_set_state_count <= 24 ||
+        (gst_set_state_count % 20) == 0) {
+        SHIM_LOG("[gst] #%u element_set_state(el=%p, state=%s) -> %d%s",
+                 gst_set_state_count, element, gst_state_name(state), r,
+                 is_milestone ? "  [MILESTONE]" : "");
+    }
+    return r;
+}
+

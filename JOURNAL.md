@@ -4261,5 +4261,335 @@ One small high-value one to fully close scene_id → Radium SHA-1:
 - JOURNAL Step 51 (this entry).
 
 
+## Step 52: fire_event trampoline, switch state array, switch-first API pivot (2026-04-21)
+
+User ran BN prompt 5 to close out the Stage-5 gaps identified in Step 51. Results refuted one prior interpretation, identified the event-firing primitive, and located the switch state array. Session then pivoted from a blind event-ID sweep to a switch-indexed scaffolding after finding the sweep low-signal.
+
+### 52.1: scene_id correction — the 0x480eab0 table is cawards state, not Radium picker
+
+Step 51 speculated that `sub_8ae4dc` populates a `secondary_id` at scene_data `+0x0c` that maps `scene_id` → Radium SHA-1. **Refuted.**
+
+`sub_8ae460` is the `__cxa_guard_acquire` singleton init for a `cawards_manager` (vtable literal: `_vtable_for_cawards_manager{for 'HookListener'}`). `sub_8ae4dc` writes per-player threshold constants into sub-arrays of the 0x1a0 records:
+
+| Offset in slot | Value written | Likely meaning |
+|---|---|---|
+| +0x18 | clamped ≤ `0x186a0` (100000) | counter cap |
+| +0x30 | `0x64` (100) | multiplier |
+| +0x48 | `0x7a120` (500000) | goal threshold |
+| +0x60 | `0xa` (10) | small counter |
+| +0x78 | `0x12c` (300) | small counter |
+| +0x90 | `|= 1 << x0_18` | category bitfield |
+
+All indexed by `((sub_9d0eb0() - 1) << 3)` = 5-player-max per-player stride. Plus a closing `do { sub_8ad3b0(tbl, 0..2); sub_b29ef0(0x5a); } while` 10-iter loop that looks like cawards category setup.
+
+Conclusion: `data_480eab0` is (or at least includes) per-mode cawards/achievement state, not a Radium scene picker. The real `scene_id` → Radium SHA-1 mapping almost certainly lives inside the `BDLMode*` factory functions — e.g. `sub_90e3f4` (Charmander1Start factory, 288 bytes) explicitly references `7949bb14a9a21abf5e2885a01eb5ed4f9c3a8eca` per Step 49.2.
+
+**Files updated:** `_emulation/MODE_TABLE.md` (struck the `secondary_id` claim, flagged the cawards origin, left scene_id → Radium as open); `memory/project_emulation_progress.md` (bumped to Step 52 with correction called out).
+
+### 52.2: fire_event — the dispatcher we can trampoline into
+
+BN confirmed `sub_9c12a0` at VA `0x9c12a0`:
+
+```c
+uint64_t fire_event(int32_t event_id, int64_t event_data) {
+    if (event_id > 0xce) { CC_criticalErrorHandler(0x6a); return 1; }
+    for (int64_t* i = data_485ea80[event_id]; i; i = i[2]) {
+        if (i[0]) {
+            int32_t r = ((int32_t(*)(int64_t))i[0])(event_data);
+            if (!(r & 1)) return r & 0xff;
+        }
+    }
+    return 1;
+}
+```
+
+- Linked-list node at `data_485ea80 + event_id * 8`: `{callback_fn @ +0x00, priority @ +0x08, next @ +0x10}` (`i[2]` at 8-byte stride = byte offset +0x10).
+- Event_id bounds 0..0xce (206 slots, matches Step 51's `sub_9c11d0` registrar bound).
+- Short-circuit: any callback returning an even value halts the chain; odd (conventionally 1) = continue.
+
+Five callers identified: `sub_b129f0`, `sub_bd39f0`, `sub_b16f64`, `sub_b82990`, `sub_b12760`. The switch→event translator is one of them (or an indirect). Plan-C BN query in flight.
+
+**Shim addition:** `shim_fire_event(event_id, event_data)` trampoline at `game_base + (0x9c12a0 - 0x400000)`. Relies on a new `shim_cached_game_base` atomic that any guest-thread shim hook (the `ioctl()` wrapper, specifically) primes on first invocation — needed because shim threads spawned via `pthread_create` have no game frames on their backtrace, so `shim_resolve_game_base()` would otherwise return 0 from the timer thread.
+
+### 52.3: switch state array layout verified
+
+From BN decomp of `sub_a50850` (switch state reader) and `sub_a50350` (switch validation):
+
+| Field | Address | Detail |
+|---|---|---|
+| State array base | `data_4880220` (BN VA) | stride `0x30` per switch |
+| Count | `data_48cbaa0` | runtime-populated (dynamic, bounds check) |
+| State byte | `+0x28` within record | returned by `sub_a50850` with invert applied |
+| Config ptr | `+0x10` within record | pointer to a struct whose `+0x30` byte carries flags: bit 2 = invert, bits 5/6 = broken/stuck masks |
+| `sw_broken` | `data_4880228[id]` | NVRAM-backed |
+| `sw_stuck_active` | `data_4880230[id]` | NVRAM-backed |
+| `sw_alert_count` | `data_4880238[id*2]` | 16-bit, NVRAM-backed |
+
+Observed at runtime (Step 52g): state bytes for real switches were not all 0/1 — Left Flipper Button (id 9) read `0x20` (32), Right Flipper Button (id 10) read `0xab` (171). Two plausible explanations: (a) the field is a packed uint32 (sub_a50850 types it as `uint32_t x0_3 = *(x1 + 0x28)`) and only a specific bit is the "closed" flag, or (b) the runtime is using the adjacent bytes for something else. Not pinned down yet; scaffolding writes 0x01 to the byte at `+0x28` and restores the prior value on "release", which is faithful to what sub_a50850's return-value-and-compare pattern suggests.
+
+### 52.4: blind event-ID sweep — executed, preserved, deprioritised
+
+Built `shim_event_sweep()` that fires every `event_id ∈ [0x00, 0xce]` with `event_data=0` and diffs cmode state (+0x308 and +0x60 per cmode, 42 cmodes). Guard harness: `sigsetjmp(shim_event_sweep_jmp)` in the loop body; `SIGSEGV` handler at top checks `shim_event_fire_in_progress` and `siglongjmp`s back if set; `SIGALRM` handler via `alarm(1)` catches hung events.
+
+Thread safety for `siglongjmp`: `SIGALRM` is blocked on all threads except the timer thread itself, via `pthread_sigmask(SIG_BLOCK)` in the shim constructor + `pthread_sigmask(SIG_UNBLOCK)` in the timer thread entry. Since the block mask is inherited by threads spawned later (including all of the game's threads), `alarm()` reliably delivers to the timer thread. `siglongjmp` from the `SIGALRM` handler then lands back in the same thread that did `sigsetjmp`.
+
+Complete sweep totals (run_step52e, sweep @ 35 s, 207/207 covered):
+
+| Category | Count |
+|---|---:|
+| Fired cleanly (ret=1, Δ=0) | 164 |
+| Reactive (Δ>0) | **2** |
+| Crashed (handler deref'd event_data=0) | 37 |
+| Timed out (handler didn't return in 1 s) | 4 |
+
+Only 2 reactive events observed:
+- **`event 0x3e`** → activates `battle_coast` (+0x308: `0` → `0x100000000`)
+- **`event 0x43`** → touches `base_03`
+
+Observed but not reproducible (timing-dependent): `event 0x26` activated `base_03` in one earlier run but not in another. This is direct evidence that most events expect a valid `event_data` struct, and that a single firing context isn't enough to cover them.
+
+**Full narrative:** `_emulation/EVENT_SWEEP_STEP52.md`.
+
+### 52.5: Pivot — switch-first API
+
+User's direction: don't keep iterating event IDs blindly; the manual enumerates every real switch, and unused IDs are by design. Build scaffolding for firing one switch at a time with inline comments on known-bad ones, rather than an exhaustive sweep that produces 1% signal.
+
+Changes landed:
+
+1. **Switch manifest** — `shim_switch_manifest[]` in `spi_shim.c` transcribed from Pokémon LE manual (500-55AJ-01), ~69 real switches covering Node 8 (playfield main), Node 9 (arena/BATTLE/Team Rocket), Node 1 (cabinet/coin), plus C10 service. ID gaps (3, 4, 13, 14, 24, 26, 32, 38, 39, 42, 43, 47, 48, 62, 65, 68, 69, 75, 77, 81-89, 91, 92, 95) preserved as absences — unused slots by design.
+2. **`shim_fire_switch(int id)`** — looks up entry, bounds-checks against `data_48cbaa0` runtime count, snapshots 42 cmodes, writes `0x01` to state byte, 20 ms dwell, re-snapshots, restores previous state, logs human-readable report.
+3. **`SPIKE3_FIRE_SWITCH=id1:id2:...` env var** + `SPIKE3_SWITCH_DELAY` — colon-delimited (QEMU `-E` swallows commas). Timer thread fires each switch with 200 ms spacing.
+4. **Blind sweep gated behind `SPIKE3_SWEEP_EVENTS=1`** — default off. Sweep code preserved for later use once we have valid `event_data` structs to try.
+
+### 52.6: First switch-API test (run_step52g)
+
+```
+=== shim_fire_switch_thread: sleeping 35 s then firing switches [93:9:10:22] ===
+
+--- shim_fire_switch: 93 'Start Button' (Cabinet, Micro, 1-SW-11) state@0x76ceb3dc13b8 ---
+  switch 93 'Start Button': before_state=0 Δ=0 (no cmode state change — translator not yet hooked)
+
+--- shim_fire_switch: 9 'Left Flipper Button' (Cabinet, Leaf, 8-SW-25) state@0x76ceb3dc03f8 ---
+  switch 9 'Left Flipper Button': before_state=32 Δ=0 (no cmode state change — translator not yet hooked)
+
+--- shim_fire_switch: 10 'Right Flipper Button' (Cabinet, Leaf, 8-SW-24) state@0x76ceb3dc0428 ---
+  switch 10 'Right Flipper Button': before_state=171 Δ=0 (no cmode state change — translator not yet hooked)
+
+--- shim_fire_switch: 22 'Shooter Lane' (Playfield, Micro, 8-SW-28) state@0x76ceb3dc0668 ---
+  switch 22 'Shooter Lane': before_state=0 Δ=0 (no cmode state change — translator not yet hooked)
+```
+
+All four switches:
+- Found their entries in the manifest.
+- Computed a valid state byte address (rebased through `shim_cached_game_base`).
+- Read a pre-state byte and wrote `0x01`.
+- Observed **no cmode state change** — expected, since the UART decode path that reads switch state and fires derived events (Plan C) isn't hooked yet. The shim's direct write tells the game's read path "closed", but nothing *polls* the state array except the game's own UART cmd 0x27 receive path. Until we intercept that path (or call the translator directly), the switch flip is silent to the rest of the game.
+
+Abort at run tail (exit 134, `pure virtual method called` in Godot's string_name cleanup) is the usual shutdown noise, not related to the switch API — fires at line 18919 of stderr, 2345 lines after the last switch report at line 16574.
+
+### 52.7: Secondary observation — flipper state bytes are non-boolean
+
+Left Flipper before_state = `0x20`, Right Flipper before_state = `0xab`. The game reads `uint32_t x0_3 = *(switch_rec + 0x28)` per `sub_a50850` — so the field might be a packed u32 rather than a plain boolean byte. Deferred investigation: BN query on writers to `+0x28` (the UART decoder) will show whether the byte is just `{0,1}` from the netbridge or has embedded state (debounce counter, last-change timestamp, etc.).
+
+### 52.8: Status and next moves
+
+**Closed in Step 52:**
+- `fire_event` identified + trampoline built
+- Switch state array layout verified
+- Cawards correction landed
+- Switch-first API in place with manifest from manual
+- Bind sweep deprioritised (kept as env-var-gated reference)
+
+**Open, tracked:**
+- **Plan C** (in-flight BN query): decomp `sub_b129f0` / `sub_bd39f0` / `sub_b16f64` / `sub_b82990` / `sub_b12760` + xref writers to `data_4880220 + n*0x30 + 0x28` to find the switch→event translator.
+- **Flipper-state byte encoding** — what's in `+0x28` when the switch is closed vs open vs in-transit.
+- **Scene_id → Radium SHA-1** — decomp one BDLMode factory (e.g. `sub_90e3f4`, 288 bytes) to find where the SHA-1 gets wired into a cmode.
+
+### 52.9: Artifacts
+
+- `_emulation/spi_shim.c` — added: `shim_cached_game_base` atomic; cache prime in `ioctl()`; `shim_fire_event()` trampoline; `shim_event_sweep()` + `shim_capture_cmode_snap()`; sigsetjmp guard in SEGV handler; SIGALRM handler + per-thread block mask; timer thread; `shim_switch_manifest[]` table with ~69 entries; `shim_fire_switch()` API; `SPIKE3_SWEEP_EVENTS` gate; `SPIKE3_FIRE_SWITCH` / `SPIKE3_SWITCH_DELAY` env vars; `SPIKE3_INJECT_VIDEO` gate for the Step-47 frame injector (default off = Step-45 stable baseline).
+- `_emulation/spi_shim.so` — rebuilt, 153,328 bytes.
+- `_emulation/EVENT_SWEEP_STEP52.md` — narrative + raw totals from the blind sweep.
+- `_emulation/MODE_TABLE.md` — corrected scene_data section + updated next-BN-queries.
+- `_emulation/PROTOCOL.md` — added `fire_event` section and `switch state array` section.
+- `_emulation/run_step52c.stderr` — sweep @ 40 s (incomplete).
+- `_emulation/run_step52d.stderr` — sweep @ 25 s, hung at 0x5d (pre-alarm).
+- `_emulation/run_step52e.stderr` — full sweep @ 35 s, 207/207 covered.
+- `_emulation/run_step52g.stderr` — switch-API test, 4 switches fired cleanly.
+- `memory/MEMORY.md` + `memory/project_emulation_progress.md` — updated descriptions to reflect Step 52.
+
+### 52.10: BN prompt sent for Plan C
+
+```
+Decompile these 5 callers of fire_event @ 0x9c12a0:
+- sub_b129f0, sub_bd39f0, sub_b16f64, sub_b82990, sub_b12760
+
+For each: PseudoC body, param types, whether it reads from data_4880220
+(switch state array) or calls sub_a50850, what values it passes as
+event_id + event_data to fire_event.
+
+If none is the switch→event translator, xref:
+- Callers of sub_a50850 — which functions read the switch state array?
+- Writers to data_4880220 + sw_num*0x30 + 0x28 — the UART decode path
+  that updates switch state when cmd 0x27 arrives from netbridge.
+
+Bonus: signature + body of sub_8ad030 (used by sub_8ae4dc with keys 0/1/2
+to index into data_480eab0 — clarifies whether cawards data overlays the
+scene_data struct or is a separate arena).
+```
+
+
+## Step 53: Two-stage switch architecture, event semantics, gstreamer proven dormant (2026-04-21)
+
+User ran BN Plan C. Three hard findings reshape our model.
+
+### 53.1: None of the 5 fire_event callers is the switch translator
+
+| Caller | event_id | event_data | Role |
+|---|---:|---|---|
+| `sub_b129f0` | `0xc2` | `0` | Mode state transitions |
+| `sub_bd39f0` | `0x12` | `&uint16` | Validated events (checks lookup tables at `0x4787fa8`, `0x4780724` before firing) |
+| `sub_b16f64` | `0xc3` | `1..4` | Lamp timer events; sources from `data_4807430` |
+| `sub_b82990` | `0x06` | `&struct` | Award/score events; reads `data_47790f8`, range `0 < id < 0xf0` |
+| `sub_b12760` | `0xc1` | `0` | Mode init complete |
+
+None reads `data_4880220`.
+
+**Actual switch reader: `sub_b24f70 @ 0xb24f70`** — iterates switch-id arrays at `data_47643a8`, calls `sub_a50850` to read each switch state, updates game/display state. **Does not call `fire_event`.**
+
+The dispatch is **two-stage**:
+- Stage 1: `sub_b24f70` reads switch state → writes updated state into cmode fields / lamp subsystems.
+- Stage 2: separate monitoring functions watch those cmode fields and call `fire_event` with derived event_ids + payloads.
+
+Implication for our shim: **`shim_fire_switch` is already at the right layer.** It writes the same byte the UART cmd 0x27 decode path would — `sub_b24f70` picks it up on its next poll. No synthesis of event_ids needed; the game's own Stage-2 logic generates them. This validates the "switch-first API" pivot from Step 52.
+
+### 53.2: Cawards is parallel-array, not overlay (bonus query)
+
+`sub_8ad030` is a bounds-check helper: `returns arg2 if arg2 < *(arg1+0xc) else error`. `*(arg1+0xc)` is the size field of a header struct. Called by `sub_8ae4dc` with keys 0/1/2 to validate into three per-key parallel arrays stored within the 0x1a0 slot. **So cawards uses a header + parallel-array layout, NOT an overlay onto a Radium-picker field.** scene_id → Radium SHA-1 mapping remains open and almost certainly lives inside the `BDLMode*` factory chain.
+
+### 53.3: Gstreamer is linked but unused in Pokémon LE 0.81
+
+User pushed back on the "dead code" claim — fair, since BN showed defined symbols `gstreamer_init`, `gstreamer_shutdown`, `gstreamer_message_bus_thread`. We verified rigorously:
+
+| Check | Result |
+|---|---|
+| Direct `bl 0x8c1ec0` callers | 0 |
+| `adrp+add` computing 0x8c1ec0 | 1 (self-reference inside gstreamer_init) |
+| R_AARCH64_RELATIVE relocs addend-0x8c1ec0 | 0 of 177,481 total |
+| Byte-level `0x8c1ec0` / `0xcc1ec0` static pointer | 0 |
+| `.dynsym` entry | no |
+| dlopen/dlsym imports | **none** — no runtime plugin loading |
+| gst_* imports besides init_check + deinit | **zero** — no element-factory-make, parse-launch, pipeline, bin, bus, pad, caps, buffer APIs |
+| Element-name strings (`"appsink"`, `"kmssink"`, …) | 0 |
+| Gst type-name strings (`GstElement`, `GstPipeline`, …) | 0 |
+| GObject imports (`g_object_*`, `g_signal_*`, `g_type_*`) | 0 — only `g_main_loop_{new,quit,run,unref}` + `g_thread_{new,join,exit}` |
+| Force-call `gstreamer_init` via shim trampoline | Succeeds; `gst_init_check` returns 1; main loop + VideoMessageBus thread start; NO subsequent gst activity in the game |
+
+Conclusion: the gstreamer subsystem is scaffolding linked from Stern's shared Spike 3 codebase, but Pokémon LE 0.81 contains no code that would ever add a GstBus watch, create a pipeline, or post a message. The VideoMessageBus thread, if started, would block in `g_main_loop_run` processing exactly zero events. The game's video path is **100% direct libavcodec** via Stern's `SpiVideoStreamDecoderBase` (HEVC DRM-prime, Step 47 wall) and Radium's `VideoStreamDecoder` classes.
+
+PROTOCOL.md updated with corrected gstreamer section. Shim gst hooks stay in place — harmless, will fire if any unexpected code path ever reaches them.
+
+### 53.4: Hardware context captured
+
+Per user-supplied FotE / Pokémon LE manual excerpts: the Spike 3 CPU Node (520-1007-42, what the user owns) is CM4-based with two micro-HDMI outputs (HDMI 0 = AUX, HDMI 1 = MIRROR) and a 34-pin CN6 LCD header whose resolution is jumper-selected (800×480 / 1024×600 / 1360×768 / 1920×1080). This maps directly to the FrameSize distribution of the 36 Radium scenes — the game renders into surfaces that correspond to physical panels on the CPU board. Downstream nodes (cabinet, playfield driver, LED boards) are not in the user's inventory.
+
+Captured as `memory/reference_spike3_cpu_board.md`.
+
+### 53.5: Artifacts
+
+- PROTOCOL.md — added "Switch → event dispatch is a two-stage architecture", "Known event_id semantics" table, corrected "GStreamer — linked but unused" section.
+- MODE_TABLE.md — added sub_8ad030 findings; cawards confirmed parallel-array.
+- `memory/reference_spike3_cpu_board.md` — hardware map.
+- `_emulation/spi_shim.c` — gstreamer hooks (gst_element_factory_make, gst_parse_launch, gst_bin_add, gst_bin_add_many, gst_element_link, gst_element_link_many, gst_element_set_state, gst_init_check, gst_deinit) + `shim_force_gstreamer_thread` diagnostic. Via `SPIKE3_FORCE_GSTREAMER=<sec>` and `SPIKE3_INJECT_VIDEO=1` (gates Step-47 frame injection off by default for stable runs).
+
+## Step 54: Live state bridge — game drives Pokemon video rendering (2026-04-21)
+
+With gstreamer ruled out, pivoted to Track-B synchronisation: stream cmode state from the running game to the reference-player so the player shows the clip that matches whichever cmode is currently live.
+
+### 54.1: DMD is black — modern Spike 3 has no physical DMD
+
+Before building the state bridge, investigated captured DMD frames. **The single 1024×256 frame we capture per run is entirely zero-filled.** Consistent with the user's note that modern Spike 3 has no physical DMD — the CN20 10-pin header exists for optional accessories but is not populated on Pokémon LE. The game allocates the buffer (framework default) but never paints it. "DMD live display" is not a viable quick win.
+
+### 54.2: State bridge — shim side
+
+Added to `spi_shim.c`:
+- `/tmp/spike3_bridge.sock` AF_UNIX SOCK_STREAM listener, enabled by `SPIKE3_BRIDGE=1`.
+- Accept thread: one subscriber at a time; evicts prior on new connect.
+- Poll thread: samples the 42 cmodes' `+0x308` at 10 Hz, emits newline-delimited JSON on change:
+
+```
+{"t":"cmode","id":21,"name":"story_charmander_1","flags":40,
+ "init":1792,"init_prev":0,"ts_ms":12345}
+```
+
+- `SPIKE3_POKE_CMODE=<name>:<hex_value>:<delay_sec>` — direct write to a named cmode's `+0x308`. Bypasses the game's Stage-2 logic so we can force activations for testing.
+
+Non-blocking: `MSG_NOSIGNAL | MSG_DONTWAIT`, graceful on subscriber disconnect.
+
+### 54.3: State bridge — subscriber side
+
+`_emulation/historical-state-subscriber.py`:
+- Retrying AF_UNIX client — reconnects at 1 Hz until the shim's listener is up.
+- Parses newline-delimited JSON, pretty-prints cmode deltas with `+ / - / Δ` markers (activation / deactivation / change).
+- `--play` mode: on any delta where `init != 0` AND the cmode has a clip-family mapping, launches `reference-player-v2.py --play-clip <FAMILY>_Start`. Previous player is terminated before new one starts.
+- `CMODE_TO_CLIP_FAMILY` covers Pokémon story modes, Pikachu-vs-X, Team Rocket multiball/wizard, Magikarp multiball. Battle environment modes (coast/forest/desert/mountain) are deliberately excluded — their backgrounds use HEVC DRM-prime (Step 47 wall), not Radium clips.
+
+### 54.4: End-to-end validation (run_step54e, 2026-04-21)
+
+Config: `SPIKE3_BRIDGE=1 SPIKE3_POKE_CMODE=story_charmander_1:0x700:35`, subscriber launched with `--play`.
+
+Timeline:
+- t=0–35 s: game boots, reaches Godot scene load, shim bridge accepts subscriber.
+- t=35 s: poke thread writes `0x700` to `story_charmander_1 +0x308` (was `0xd00`).
+- t=35.1 s: poll thread detects delta, emits JSON.
+- t=35.1 s: subscriber receives, looks up `"story_charmander_1" → "PK_Charmander1"`, launches `reference-player-v2.py --play-clip PK_Charmander1_Start`.
+- t=35.2 s: reference-player opens `60ed7e50…/scene.assets/33.asset/0.asset`, decodes 1920×1080 @ 29.97 fps HEVC via PyAV, renders to pyglet+WSLg window.
+- t=38 s: poke thread writes `0` (deactivation); subscriber logs `-` transition but does not kill player.
+
+Subscriber log:
+```
+[v2] GenericClipDriver: playing 'PK_Charmander1_Start' on Video id=217 (looping on EOS)
+[v2] PyAV opened 33.asset (1920×1080 @ 29.97 fps, codec=hevc, pix_fmt=yuv420p)
+[v2] Video._render 'video.in_game_videos' (1360×768) → texture#1
+```
+
+`ps -ef | grep reference-player` confirmed the player process running at ~99 % CPU, actively rendering.
+
+**This is the first time the running game binary's state has driven real Pokémon visual output.** Not full-emulation rendering (game's own UI compositor is still stubbed out), but a complete pipeline: game logic → cmode state → shim poll → Unix socket → subscriber → player → WSLg window.
+
+### 54.5: Incidental finding — `+0x308` baselines are non-zero for ~9 cmodes
+
+Step 50b observed that 9/42 cmodes have non-zero `+0x308` after static init. `story_charmander_1`'s baseline was `0xd00`. The field is subclass-interpreted, not a uniform "activation flag." Initial subscriber filter `"prev==0 AND init!=0"` missed all transitions for those 9 cmodes; widened to "`init != 0`" which catches any state that indicates the mode is live.
+
+Longer-term, a cleaner signal would be hooking `sub_b24f70` directly to observe per-switch → per-cmode-field writes. That would give us a precise "mode X just transitioned to state Y" event without having to infer from `+0x308` deltas.
+
+### 54.6: What this unlocks
+
+- **Immediate**: user can now force any Pokémon cmode to appear live and see the corresponding Radium clip play. Exercise flag: `SPIKE3_POKE_CMODE=story_squirtle_1:0x700:30`, run with `--play`, watch PK_Squirtle1_Start.
+- **Next stepping stone**: wire `shim_fire_switch` to produce organic cmode deltas. We know writing to `data_4880220 + sw*0x30 + 0x28` is the right input; once Stage 1 (`sub_b24f70`) is running and seeing our writes, real switch→mode→video chains should flow. May need to force a few preconditions (ball trough, start button sequence) to move the game past attract into gameplay.
+- **Bigger**: cycle the Radium clip through Start → LoopingBG → Award → Total based on secondary cmode-state observations. Requires more observation of which fields change when.
+- **Biggest (deferred)**: real EGL via Mesa/WSLg so the game's own compositor renders. Sysroot already contains aarch64 libEGL / libGLESv2 / libgbm, but they're ARM-embedded-GPU builds (armada, exynos, imx-dcss DRI drivers) — won't reach the host's GPU through QEMU user-mode. Multi-session job; real path is probably QEMU system mode with virtio-gpu or running on the CM4.
+
+### 54.7: Texture PNG dump
+
+Also extracted a sample of the 5 captured 1920×1080 RGBA textures + 3 sprite atlases to `_emulation/textures_png_preview/`. These are raw GL texture uploads the game performed; they contain real Pokémon art (boot splash, HUD elements, sprite sheets). Not rendered to a window yet, but visible directly in any image viewer — tangible proof the capture pipeline has been gathering real data all along.
+
+### 54.8: Artifacts
+
+- `_emulation/spi_shim.c` — added `shim_bridge_start`, `shim_bridge_accept_thread`, `shim_bridge_poll_thread`, `shim_bridge_emit`; `shim_poke_cmode_thread`. Two new env vars: `SPIKE3_BRIDGE=1`, `SPIKE3_POKE_CMODE=<name>:<hex>:<sec>`.
+- `_emulation/spi_shim.so` — rebuilt, 155,136 bytes.
+- `_emulation/historical-state-subscriber.py` — new subscriber (~140 LOC). Two modes: `--print-only` default, `--play` for reference-player launch.
+- `_emulation/textures_png_preview/` — 8 texture PNGs (3 MB total).
+- `_emulation/run_step54{a,b,c,d,e}.{stdout,stderr}` — progression of test runs.
+- `_emulation/bridge_subscriber_{a..e}.log` — subscriber captures at each iteration.
+- `memory/reference_spike3_cpu_board.md` — hardware context doc.
+
+### 54.9: Next moves (options, user to choose)
+
+1. **Cycle clips through Start → LoopingBG** — play the Start clip once, then switch to LoopingBG when it ends. Subscriber-side work, ~30 min.
+2. **Organic switch drive** — try `SPIKE3_FIRE_SWITCH=93:22:15:20:19:18:17:16` (start + shooter lane + trough balls) to see if the game moves past attract into a real mode. If it does, all the cmode changes would flow through the bridge naturally, no poke needed.
+3. **Hook `sub_b24f70`** — intercept the switch-state reader to log which switch closures drive which cmode fields. Cleanest long-term observability.
+4. **Real EGL via Mesa/WSLg** — the big rendering job, multi-session. Shelved for now.
+
 
 

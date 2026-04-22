@@ -224,6 +224,158 @@ Verified by: JOURNAL Step 41 (stages 1–2) and Step 42 (stages 3–5, architect
 
 ---
 
+## Game event dispatch — `fire_event` verified (Step 52)
+
+**Function:** `sub_9c12a0` at BN VA `0x9c12a0` / file offset `0x5c12a0`.
+
+**Signature:** `uint64_t fire_event(int32_t event_id, int64_t event_data)`
+
+```c
+uint64_t fire_event(int32_t event_id, int64_t event_data) {
+    if (event_id > 0xce) {
+        CC_criticalErrorHandler(0x6a);
+        return 1;
+    }
+    for (int64_t* i = data_485ea80[event_id]; i; i = i[2]) {
+        if (i[0]) {
+            int32_t r = ((int32_t (*)(int64_t))i[0])(event_data);
+            if (!(r & 1)) return r & 0xff;
+        }
+    }
+    return 1;
+}
+```
+
+**Linked-list node layout at `data_485ea80 + event_id * 8`**:
+
+| Offset | Field | Notes |
+|---|---|---|
+| `+0x00` | `callback_fn` | `int32_t (*)(int64_t event_data)` — handler function pointer |
+| `+0x08` | `priority` | byte; insertion is descending-priority (verified Step 51 via `sub_9c11d0`) |
+| `+0x10` | `next` | `node*` — loop variable `i[2]` (LP64: stride 8, so `i[2]` = byte offset +0x10) |
+
+**Bounds:** `event_id` 0..0xce (206 event types max). Exceeding triggers critical error code `0x6a`.
+
+**Return semantic:** dispatcher returns `1` on full-chain completion. If any handler returns `!(r & 1)` (i.e. even value), dispatch short-circuits and the dispatcher returns `r & 0xff`. Handlers that want the chain to continue return an odd value (conventionally `1`).
+
+**Registered handlers (observed Step 51 runtime):** 102 / 207 event slots populated, 236 total handlers. Event `0xc5` has 2 handlers — one is `sub_950d60`, which iterates the 42-cmode registry at `data_4767b30` and calls vtable slot `+0xf0` on each.
+
+**Known callers of `fire_event`** (needs further BN resolution, Step 52): `sub_b129f0`, `sub_bd39f0`, `sub_b16f64`, `sub_b82990`, `sub_b12760`. One (directly or transitively) is the switch→event translator.
+
+**Trampoline pattern for the shim:**
+
+```c
+typedef uint64_t (*fire_event_t)(int32_t event_id, int64_t event_data);
+uintptr_t game_base = shim_resolve_game_base();
+fire_event_t fire_event = (fire_event_t)(game_base + (0x9c12a0 - 0x400000));
+uint64_t r = fire_event(event_id, event_data);
+```
+
+`event_data` is opaque to the dispatcher and handler-specific. Event `0xc5` ignores it (handler invokes cmode vtable with no args). Other events may require a valid pointer; calling with `event_data=0` for unknown events can SEGV in the handler.
+
+---
+
+## Switch state array — verified (Step 52)
+
+The game maintains an in-memory mirror of each physical switch's state. The array is populated by the UART cmd `0x27` receive path (netbridge → CPU, 1-byte status payload per poll cycle — see "Cmd 0x27 status byte" above); the specific decoder function that writes into this array is not yet identified.
+
+**Layout:**
+- Base: `data_4880220` (BN VA)
+- Stride: `0x30` bytes per record
+- Count: `data_48cbaa0` (runtime-determined; Pokemon LE has ~105 switch IDs per the manual, but the live count reflects only installed+valid switches)
+
+**Per-switch record:**
+
+| Offset | Field | Notes |
+|---|---|---|
+| `+0x10` | `config_ptr` | pointer to a config struct whose `+0x30` byte encodes flags |
+| `+0x10 → +0x30` | config flags | bit 2 (`0x04`) = invert, bits 5+6 (`0x60`) = broken/stuck masks |
+| `+0x28` | `state` | current state byte — 1 closed, 0 open. Inverted before return if invert flag is set. |
+
+**Parallel arrays keyed by switch number:**
+
+- `data_4880228[sw_num]` — `sw_broken` flag (NVRAM-backed, persists across reboots)
+- `data_4880230[sw_num]` — `sw_stuck_active` flag (NVRAM-backed)
+- `data_4880238[sw_num * 2]` — `sw_alert_count` (16-bit, NVRAM-backed)
+
+**Readers:**
+
+- `sub_a50850(sw_num) @ 0xa50850` — returns the state byte with the invert flag applied. Short-circuits to 0 on `sw_num == 0` or `sw_num >= data_48cbaa0`.
+- `sub_a50350(sw_num) @ 0xa50350` — returns 1 if the switch is "OK" (not broken, not stuck, alert count clear); 0 otherwise. Gates event firing.
+
+**Injection target for shim-side VPX bridge:** writing a byte to `game_base + (0x4880220 - 0x400000) + sw_num * 0x30 + 0x28` simulates a switch closure at the state-array level.
+
+---
+
+## Switch → event dispatch is a two-stage architecture (verified Step 53)
+
+Step 52 hypothesised a single "switch translator" function that would both read `data_4880220` and call `fire_event`. **Refuted.** The actual design decouples hardware input from event dispatch:
+
+### Stage 1 — `sub_b24f70 @ 0xb24f70` — switch-state reader / display updater
+
+Reads switch state via `sub_a50850(sw_num)` at call site `0xb25438`. Iterates over switch-id arrays at `data_47643a8` (offset tables that group switches by function). **Does not call `fire_event`**. Its output is "updated game/display state" — writes to cmode fields, lamp state, display elements.
+
+### Stage 2 — game logic observes state changes and fires events
+
+Separate functions (not yet fully enumerated) observe the state changes Stage 1 produces and call `fire_event` with specific event_ids + payloads. Each of the 5 direct callers of `fire_event` does one narrow job:
+
+| Caller | VA | event_id | event_data | Purpose |
+|---|---|---:|---|---|
+| `sub_b129f0` | `0xb129f0` | `0xc2` | `0` | Mode state transitions |
+| `sub_bd39f0` | `0xbd39f0` | `0x12` | `&uint16` | Event validator — checks against lookup tables at `0x4787fa8` and `0x4780724` before firing |
+| `sub_b16f64` | `0xb16f64` | `0xc3` | `1..4` | Lamp timer events; sources data from `data_4807430` |
+| `sub_b82990` | `0xb82990` | `0x06` | `&struct` | Award / score events; reads `data_47790f8`, range-checks `0 < arg1 < 0xf0` |
+| `sub_b12760` | `0xb12760` | `0xc1` | `0` | Mode init completion — fires once at end of setup |
+
+None of them reads the switch state array.
+
+### Implications for the shim
+
+- **Direct write to `data_4880220 + n*0x30 + 0x28` is the correct lowest-level input** — it's the same byte the UART cmd 0x27 receive path writes. Stage 1 (`sub_b24f70`) picks it up on its next poll iteration.
+- **Calling `fire_event(id, 0)` blindly bypasses Stage 1 entirely** — it sidesteps all the game logic that decides *which* event to fire based on state. That's why the Step 52 blind sweep had 1 % signal.
+- **To test a specific game behaviour, close the relevant switch via the state array and let the game's own Stage 2 decide what events to fire.** This is what `shim_fire_switch` already does.
+- A shim hook on `sub_b24f70` would let us observe which switch closures trigger which state changes — useful introspection.
+
+### Known event_id semantics (Step 53)
+
+| event_id | Observed meaning | Evidence |
+|---:|---|---|
+| `0x06` | Awards / score events | `sub_b82990` payload is a struct from `data_47790f8`; range check `0 < id < 0xf0` |
+| `0x12` | Validated events (filtered through lookup tables before firing) | `sub_bd39f0` validates against tables at `0x4787fa8` + `0x4780724` |
+| `0x3e` | **Battle-environment activation (empirical)** — activated `cmode_battle_coast` during Step 52e sweep | `+0x308: 0 → 0x100000000` |
+| `0xc1` | Mode init complete | `sub_b12760` fires once at end of setup |
+| `0xc2` | Mode state transition | `sub_b129f0` fires unconditionally |
+| `0xc3` | Lamp timer event (payload 1..4 selects lamp subgroup) | `sub_b16f64` cycles values 1-4 |
+| `0xc5` | "Broadcast to all 42 cmodes" — calls vtable slot `+0xf0` on each | Step 51: `sub_950d60` is event-0xc5 handler |
+
+All other event_ids remain semantically unknown. The full mapping lives in the chain of callers that reach each event via `sub_9c12a0`.
+
+---
+
+## GStreamer — linked but unused in Pokémon LE 0.81 (verified Step 53)
+
+**The game binary does not actively use GStreamer.** This was empirically confirmed by:
+
+1. **Import analysis**: the game imports exactly TWO gst-prefixed symbols — `gst_init_check` and `gst_deinit`. Zero imports from `libgstapp`, `libgstvideo`, `libgstbase`, `libgstallocators`. No `gst_element_factory_make`, no `gst_parse_launch`, no `gst_pipeline_*`, no `gst_bin_*`, no `gst_pad_*`, no `gst_caps_*`, no `gst_buffer_*`. Compare: **28 libavcodec/libavutil/libavformat imports** that ARE actively used.
+2. **String analysis**: no element-name strings (`"appsink"`, `"kmssink"`, `"decodebin"`, `"playbin"`, `"videoconvert"`, etc.) anywhere in the binary. No `GstElement`/`GstPipeline`/`GstPad`/etc. type-name strings.
+3. **Dynamic loading**: no `dlopen`/`dlsym`/`dlvsym` imports — the game does not runtime-load a gstreamer plugin module.
+4. **Shim force-call test**: trampoline into `game_base + (0xcc1ec0 - 0x400000)` at runtime successfully invokes `gstreamer_init`, which calls `gst_init_check` → returns 1, gstreamer initialises, plugin-scanner warns about missing helper binary, `VideoMessageBus` thread starts. Everything works when explicitly invoked — but the game itself never invokes it.
+
+**`gstreamer_init`** (`sub_cc1ec0`), **`gstreamer_shutdown`** (`sub_cc2158`), **`gstreamer_message_bus_thread`** (`sub_cc1ea0`) are all defined in the game binary but appear to be leftover framework code from Stern's shared Spike 3 platform. Other Spike 3 titles may use gstreamer; this one does not.
+
+### Why this matters for rendering
+
+- **Gstreamer offers zero leverage** for intercepting Pokémon LE's video pipeline.
+- The actual video path is **100% direct libavcodec** via Stern's `spi_video_player` module (`SpiVideoStreamDecoderBase` class) plus Radium's own `VideoStreamDecoder`.
+- To render video, the Step-47 DRM-prime approach (fabricate `AVDRMFrameDescriptor` with a real DMA-BUF fd, consume via `glEGLImageTargetTexture2DOES`) remains the correct path. Or a separate approach: swap in a real EGL/GLES3 backend (Mesa on WSLg) and let the pipeline run end-to-end on a real GPU.
+- The shim's gstreamer hooks stay in place — harmless, forward to real libgstreamer, and will fire if any code we haven't seen yet does reach them — but they are not an active interception point.
+
+### Shim trampoline (kept as diagnostic)
+
+`SPIKE3_FORCE_GSTREAMER=<seconds>` fires a timer thread that, after N seconds, calls `game_base + (0xcc1ec0 - 0x400000)` — the game's `gstreamer_init`. Useful for confirming the function is callable without the game initiating the call. Not part of the normal run configuration.
+
+---
+
 ## g_asset_registry — `std::unordered_map` layout verified (Step 43)
 
 **Location:** BN VA `0x48ca4d0` → ELF VA `0x44ca4d0` → runtime VA `game_base + 0x44ca4d0` (QEMU ASLR-dependent game_base resolved via `dladdr(frames[i])` on any backtrace frame whose `dli_fname` ends with `/game` and is NOT a `.so`).
