@@ -4945,3 +4945,264 @@ Mechanism in one sentence: because Mesa doesn't export `eglGetPlatformDisplayEXT
 - `_emulation/run_step57_regression.log` — 11,478 lines, exit 124, clean.
 - `_emulation/run_step57_realgl.log` — 3,056 lines, exit 134, `std::bad_array_new_length` abort; FWD trace captures the exact failure sequence.
 
+
+## Step 58: Mesa display + config negotiation + frame bridge — game now reaches DMA-BUF FBO setup (2026-04-22)
+
+User pivoted the plan: stop treating "pixels on screen" as a future milestone, build it now. This step bundles four concerns into one landing — EGL platform-display translation, `eglChooseConfig` attribute patching, a frame-bridge IPC channel with a Python viewer, and the diagnostic instrumentation that guided each sub-fix. Ending state: Mesa is doing real GL init for the game, the game walks through Stern-logo load, netbridge init, power-dist init, DRM mode negotiation, and crashes NULL-dereferencing inside the `create_egl_framebuffer` path (0xd00800 in BN) because our `stub_eglCreateImageKHR` returns a handle with no texture backing. That's the Step-59 target.
+
+### Why bundle, why these four things together
+
+The goal was a first rendered frame reaching a Python viewer, so the display-acquisition fix and the IPC it delivers into had to land together. Splitting them would leave Mesa rendering into a pbuffer nobody can see. Diagnostic instrumentation (the attribute-array logger, the `FWD <fn>` verbose macros from Step 57) drove every decision — we needed to see what the game actually asked Mesa for, not guess.
+
+### Display acquisition — `GBM_KHR` → `SURFACELESS_MESA`
+
+Step 57's FWD_RET_V trace pinpointed that Mesa doesn't export `eglGetPlatformDisplayEXT` as a direct dynamic symbol; the fall-back to our fake-display stub was poisoning every subsequent forwarded call. Fix: `eglGetDisplay` / `eglGetPlatformDisplay` / `eglGetPlatformDisplayEXT` all route through a new `shim_real_platform_display()` helper that tries `eglGetPlatformDisplay` (EGL 1.5 core, always exported) and falls through to legacy `eglGetDisplay`, calling with `EGL_PLATFORM_SURFACELESS_MESA` (0x31DD) + `EGL_DEFAULT_DISPLAY`. The game's `GBM_KHR` platform and GBM device pointer are dropped; semantically we're saying "we don't have a real display controller, just give me a surfaceless Mesa display we can render into an offscreen buffer with." Mesa accepts this and returns a real EGLDisplay handle. The game treats it as opaque.
+
+First run with this change confirmed `eglInitialize` / `eglBindAPI` / `eglGetConfigs` all succeed — the Step 57 `std::bad_array_new_length` abort is gone. New failure mode: `eglChooseConfig` returns `*num_config = 0`, game logs its own `failed to find appropriate egl configs for attributes`, continues through netbridge/power-dist init, hits a downstream SEGV eventually.
+
+### Attribute negotiation — `WINDOW_BIT` → `PBUFFER_BIT`
+
+Added a diagnostic dump to `eglChooseConfig` that walks the attribute list, names each EGL enum, and logs Mesa's returned config count. The game's ask: 8/8/8/0 RGBA, 24-bit depth, GLES2-renderable, `EGL_SURFACE_TYPE = EGL_WINDOW_BIT (0x4)`. Mesa's surfaceless+swrast platform only advertises `EGL_PBUFFER_BIT` configs — no match on the surface-type bit.
+
+Fix: copy the attribute list into a scratch buffer on the way in, replace `EGL_WINDOW_BIT` with `EGL_PBUFFER_BIT` on `EGL_SURFACE_TYPE`, pass the patched list to Mesa. This is end-to-end consistent with the Step 56.4 `eglCreateWindowSurface → eglCreatePbufferSurface` redirect — the game asks for a window surface at its API level, gets a pbuffer behind the scenes, doesn't know the difference. Mesa now returns 24 matching configs. Game walks through 24 × `eglGetConfigAttrib` calls (iterating every config looking for `EGL_NATIVE_VISUAL_ID = 0x34325258 = XR24`), then logs `failed to find egl config for gbm format` — no Mesa config declares that visual ID, because Mesa's surfaceless configs have no native-visual tie. Non-fatal; game continues and picks something.
+
+### Frame bridge — parallel socket for binary framebuffers
+
+New `/tmp/spike3_frame.sock` (AF_UNIX SOCK_STREAM), independent from the existing cmode-delta JSON bridge at `/tmp/spike3_bridge.sock`. Gated by `SPIKE3_FRAME_BRIDGE=1`.
+
+Separate socket rather than mixing with the JSON bridge because the traffic shape is fundamentally different — 8 MB binary payloads at render rate vs. newline-terminated JSON at human event rate. Mixing forces every subscriber to parse two framings. Two sockets, one purpose each, is simpler. When the architecture needs to go over UDP or TCP to a VPX client on another box later, the binary wire format is already there — just change the bind target.
+
+Wire protocol (little-endian, 16-byte header + W·H·4 payload): u32 magic `0xF00FBABA`, u32 seq, u16 width, u16 height, u8 format (0=RGBA8), u8 flags (bit 0 = y_flipped for GL bottom-up origin), u16 reserved. Shim holds the socket lock across header + payload send, MSG_DONTWAIT on both — if the subscriber can't keep up (kernel send buffer full), we drop the subscriber rather than queue partial frames.
+
+Hook lives inside `eglSwapBuffers` in real-GL mode: captures via `dlsym(RTLD_NEXT, "glReadPixels")` *before* the swap (back-buffer contents undefined post-swap per EGL spec), sends header + payload, then tail-calls Mesa's swap. Throttled log every 64 frames so the 30–60 Hz swap rate doesn't flood stderr.
+
+Python viewer `_emulation/frame_viewer.py` connects, reads the header, reads the payload, Y-flips if flagged, displays in a tkinter window via `PIL.ImageTk`. Decoder runs in a background thread into a `queue.Queue(maxsize=1)` so Tk's event loop isn't blocked by recv. `--no-display` for headless, `--save-every N` dumps every Nth frame as PNG, `--scale` rescales the window.
+
+The bridge is currently **dormant** — no swaps happen because the game crashes before reaching the render loop. But connecting the viewer against a running game session works end-to-end with no errors; when Step 59 unblocks rendering, frames should start flowing with no further bridge work.
+
+### Instrumentation that made the difference
+
+`FWD_RET_V` from Step 57 was load-bearing here — without per-call forward logs we'd have had no idea that the config-negotiation wall was specifically at the surface-type bit. Added one more ad-hoc diagnostic in this step (the attribute-array decoder) rather than generalizing; config-attrib queries are a one-shot, generalizing the decoder isn't worth it yet.
+
+### Progress vs. Step 57
+
+- Step 57: exit 134 (SIGABRT `std::bad_array_new_length`) at 3,056 lines, crashed in `eglGetConfigs` config-array setup.
+- Step 58: exit 139 (SIGSEGV, NULL deref) at 3,963 lines, crashes inside `./game+0x901a7c` (file offset 0x501a7c).
+
+Milestones crossed this run that Step 57 never touched:
+- `/games/spike3/bin/SternLogo_800x480.png` — Stern logo PNG access (first asset load).
+- `netbridge image okay, CRC32=0x357f5327` — netbridge firmware verified.
+- `power dist: ... power dist. boot version: 1.0.0, runtime version: 0.0.0` — power-dist node mode-switch completed (boot → runtime).
+- `drm mode 0 w 1920 h 1080` — DRM mode negotiated at expected resolution.
+- `DRM ioctl MODE_ADDFB -> fb_id=100` — game creating a DRM framebuffer object. This is the last successful ioctl before the SEGV.
+
+### Breaking the DMA-BUF wall — EGLImage texture backing + VISUAL_ID + dlsym experiments
+
+The first DMA-BUF attempt extended `stub_eglCreateImageKHR` / `stub_glEGLImageTargetTexture2DOES` from pure stubs into real GL-texture backing: parse the attribute list for width/height/fourcc, allocate a unique sentinel, store `{sentinel → (w,h,fourcc)}` in a 128-entry map; when `glEGLImageTargetTexture2DOES` is called, look up the sentinel and call Mesa's real `glTexImage2D(target, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL)` on the currently-bound texture — giving it real storage that the game's subsequent `glFramebufferTexture2D` can attach. No real DMA-BUF needed; Mesa's own GL machinery allocates, we substitute a regular GL texture for the zero-copy DMA-BUF the game thinks it's getting.
+
+First run with this change: still SEGV, no change. Our override wasn't being hit. The game doesn't call `eglGetProcAddress("eglCreateImageKHR")` through our PLT intercept; the eglGetProcAddress log showed only `"eglGetPlatformDisplayEXT"`. Hypothesized the game was using `dlopen`/`dlsym` against libEGL.so.1 directly, bypassing LD_PRELOAD.
+
+Added a `dlopen`/`dlsym` intercept block that tracks handles returned by `dlopen` for libEGL / libGLES / libgbm and substitutes our overrides for `eglCreateImageKHR` / `eglDestroyImageKHR` / `glEGLImageTargetTexture2DOES` on `dlsym` lookups against those handles. Bootstrap via `dlvsym(RTLD_NEXT, "dlopen", "GLIBC_2.34")` / `"GLIBC_2.17"` since our dlsym overrides itself. Log every `dlopen` to confirm interception.
+
+Run-time confirmed: the ONLY `dlopen` calls the process makes are Mesa's own driver loading (`swrast_dri.so`). The game never dlopens libEGL.so.1 — it's DT_NEEDED, loaded at process start. So dlopen hooking was a dead end for this binary, but kept in place as a small, safe instrumentation.
+
+Meanwhile, `readelf -d` confirmed `libEGL.so.1` IS a DT_NEEDED of `game`, and the dynamic symbol table had `eglCreateContext` marked `UND GLOBAL` — a normal PLT import that LD_PRELOAD *should* intercept. But Step 58-c's FWD log still showed no `FWD eglCreateContext`. The discrepancy wasn't resolved; eglCreateContext was silently reaching Mesa through some path we haven't traced. Critically it wasn't blocking — Mesa got a real context either way, the game held onto it, `eglMakeCurrent` (which IS intercepted) bound it, and the game continued.
+
+Final surgical fix — the third open from the earlier plan — `EGL_NATIVE_VISUAL_ID` override in `eglGetConfigAttrib`: forward to Mesa normally, then unconditionally overwrite `*value = 0x34325258` (XR24) for `attribute == EGL_NATIVE_VISUAL_ID (0x302E)`. Mesa's surfaceless configs don't declare any native visual ID; the game's config-filter loop (24 × `eglGetConfigAttrib`) was rejecting every Mesa config against the GBM fourcc our stubs advertise. Overwriting the returned VISUAL_ID to match GBM's XR24 passes the filter.
+
+### It runs
+
+With all four of {SURFACELESS display, WINDOW→PBUFFER surface-type patch, EGLImage → GL-texture backing, NATIVE_VISUAL_ID override} in place, the game **reaches steady state** under real Mesa:
+
+- **Exit 124** (timeout, not crash) at 11,245 log lines — matches the stub-mode regression baseline (11,411 lines). The game is ALIVE.
+- `FWD eglCreateContext` fires cleanly (the Step 58-c silent-bypass mystery apparently only manifested when the game was already failing; once config negotiation works, context creation goes through our normal PLT intercept).
+- `eglGetProcAddress` is now queried for the full extension set — `eglCreateImageKHR`, `eglDestroyImageKHR`, `eglCreateSyncKHR`, `eglDestroySyncKHR`, `eglWaitSyncKHR`, `eglClientWaitSyncKHR`, `glEGLImageTargetTexture2DOES`. Our table returns our overrides for each.
+- `eglCreateImageKHR(target=0x3270 [EGL_LINUX_DMA_BUF_EXT], w=1024, h=256, fourcc=0x34324241 [AB24/ABGR8888])` fires — the game is constructing DMA-BUF-style EGLImages through our override.
+- `glEGLImageTargetTexture2DOES(target=0x8d65 [GL_TEXTURE_EXTERNAL_OES], image=...) → glTexImage2D 1024x256 RGBA8` fires — our override materializes the texture backing, Mesa allocates real storage.
+- Three `DRM ioctl MODE_ADDFB` calls (fb_id 100 / 101 / 102) — the game is setting up triple-buffered framebuffers for scanout.
+- Four `DRM ioctl MODE_PAGE_FLIP #{1..4}` calls — the game is presenting frames through DRM page-flip, cycling through the three framebuffers.
+
+**The render pipeline is live.** Game → GBM BO → EGLImage (our override) → GL texture with real Mesa storage → FBO color attachment → Godot renders → DRM page-flip to present. The full chain works end-to-end.
+
+### The remaining gap — frames route through MODE_PAGE_FLIP, not eglSwapBuffers
+
+Our frame-bridge hook lives inside `eglSwapBuffers`, which **never fires** — the game uses DRM page-flip for presentation, not EGL swap. 4 page flips in the run, 0 swaps. The pixels are real and rendered into real Mesa-allocated textures, but our `glReadPixels` call site is wrong.
+
+Relocation options for the capture hook (pick later):
+
+1. **Hook `MODE_PAGE_FLIP` ioctl.** Track `{fb_id → BO handle}` from `MODE_ADDFB`, `{BO handle → EGLImage sentinel}` from the EGLImage creation chain, `{sentinel → tex_id}` we already have. On page-flip, look up the chain → bind the backing texture to a throwaway FBO → `glReadPixels` → send over the frame bridge. Most principled.
+
+2. **Periodic timer thread.** Fire every 33 ms, bind the most-recently-allocated EGLImage texture to a throwaway FBO, read + send. Simpler, less precise timing.
+
+3. **Hook `glFramebufferTexture2D` + periodic.** Track which texture is the main color attachment; read it periodically. Middle ground.
+
+Route 1 is the right answer for fidelity. Route 2 ships frames tomorrow. Call either way; the frame bridge infrastructure, Python viewer, wire protocol are all in place and unchanged.
+
+### Also noteworthy
+
+- The corrupted-looking `ERROR::SHADER: Compile-time error: Type: VERTEX` messages from the pre-VISUAL_ID runs are gone in the successful run. They were a cascade consequence of the upstream config failure — the game couldn't form a valid EGL surface, so shader compiles in its pre-render setup failed, and the game's own error printer was dumping the shader info log through a dangling pointer (hence the garbage-byte `��[S|` output). Fixing EGL init fixed them.
+
+- `eglCreateContext` eventually does appear in the FWD trace. Theory: the game tries eglCreateContext early (silent bypass we observed), and when its own init code sees the context setup didn't complete cleanly, retries via a second path that DOES go through PLT. Both paths end up at Mesa's eglCreateContext; only the second one shows in our log. Non-blocking either way.
+
+### Artifacts
+
+- `_emulation/spi_shim.c` — +680 LOC net (Step 58 total): SURFACELESS translation helper; 3 display-acquisition function rewrites; attribute-list patching + attribute-name decoder in `eglChooseConfig`; frame bridge socket + accept thread + capture hook; `dlopen`/`dlsym` intercept infrastructure; 128-entry EGLImage sentinel → texture map with `glTexImage2D`-backed resolution; `EGL_NATIVE_VISUAL_ID` override in `eglGetConfigAttrib`; SHIM_LOG definition moved earlier in the file to predate the new `dlopen`/`dlsym` hooks. Size 5,215 → 5,895 LOC.
+- `_emulation/spi_shim.so` — rebuilt ~235 KB.
+- `_emulation/frame_viewer.py` — new, 186 LOC, tkinter + PIL + numpy subscriber; works against the bridge end-to-end but dormant until capture point moves to `MODE_PAGE_FLIP` or equivalent.
+- `_emulation/run_step58_regression.log` — stub-mode regression, 11,411 lines, exit 124, clean.
+- `_emulation/run_step58_realgl.log` — first real-GL with SURFACELESS, revealed `eglChooseConfig` empty-return.
+- `_emulation/run_step58b_realgl.log` — attribute-array logger added, confirmed `WINDOW_BIT` mismatch.
+- `_emulation/run_step58c_realgl.log` — surface-type patched, 24 configs returned, crash at `./game+0x901a7c` in `create_egl_framebuffer` DMA-BUF path.
+- `_emulation/run_step58d_realgl.log` — EGLImage texture backing added; override not called; same crash.
+- `_emulation/run_step58e_realgl.log` — added `dlopen`/`dlsym` intercept; dlopen only fires for Mesa's own DRI driver, not libEGL; same crash.
+- `_emulation/run_step58f_realgl.log` — **breakthrough run**, NATIVE_VISUAL_ID override in place; 11,245 lines, exit 124, EGLImage chain fully exercised, 3 ADDFB + 4 PAGE_FLIP, no SEGV. The game is live.
+
+### What a future session picks up
+
+1. Relocate the frame capture from `eglSwapBuffers` to either `MODE_PAGE_FLIP` (fidelity) or a periodic timer (shipping fast). Both reuse everything in `shim_frame_capture_and_send` except the trigger.
+2. Once frames flow, connect `frame_viewer.py` and watch the Stern boot splash + Godot attract mode render live.
+3. The switch-injection half of the VPX bridge architecture (message type 0x02 in the frame-bridge earlier protocol sketch) remains unimplemented — comes next, but doesn't need to precede first-frame-visible.
+
+### Step 58 addendum — capture relocated to MODE_PAGE_FLIP; pipeline end-to-end, but pixels are black
+
+The remainder of the session drove the frame capture into the DRM page-flip path. Summary of what was built and what that reveals about the game's render state.
+
+**Capture infrastructure.** The `eglSwapBuffers` hook was replaced with a no-op forward (the game never calls swap — confirmed, 0 swaps in 22 s). A new `shim_frame_capture_at_page_flip()` fires inside the `MODE_PAGE_FLIP` ioctl handler, dlsym-resolves Mesa's `glReadPixels` / `glGetIntegerv` / `glBindFramebuffer`, reads from whatever is bound as `GL_READ_FRAMEBUFFER`, and ships the RGBA over the bridge. Every 2nd flip is captured (30 Hz at 60 fps source). `shim_frame_send` was refactored from MSG_DONTWAIT + drop-on-first-EAGAIN to blocking `send(MSG_NOSIGNAL)`; the 200 KB default kernel send buffer cannot hold an 8 MB frame, and a non-blocking path would drop the subscriber on literally every frame. Blocking in the ioctl handler is acceptable — the game's thread tolerates millisecond stalls there.
+
+**Pipeline end-to-end confirmed.** Final run `run_step58m_realgl.log` + viewer: shim sent ≥ 25 frames (sequence numbers seen), viewer decoded header + RGBA, saved 25 consecutive PNGs (`frame_000001.png` through `frame_000025.png`). No socket errors, no dropped frames until the game exited on timeout and the viewer saw `socket closed by peer`. The full chain — shim's `glReadPixels` → 16-byte header + 8 MB payload over `/tmp/spike3_frame.sock` → viewer's numpy reshape + PIL save — is operational.
+
+**But the pixels are black.** `np.count_nonzero(frame)` returns 2 out of 6.2 M for every saved frame; max pixel value 81 (out of 255). Investigation:
+
+1. Capture was initially against `fb=0` (the pbuffer the game received from `eglCreateWindowSurface` → pbuffer redirect). Reads all black — the game isn't compositing into the default framebuffer.
+2. Added a `glBindFramebuffer` hook that records the game's most recent non-zero draw-FBO into `shim_last_draw_fbo`; capture switched to read from that. `from_fbo=0` still — the hook NEVER saw a non-zero FBO bind.
+3. Diagnostic: count glBindFramebuffer calls under real-GL. Result: 20 calls across 22 s, ALL with `fb=0`. The game is only ever binding the default framebuffer through the standard PLT path.
+4. Cross-reference: grep for `glFramebufferTexture2D` / `glGenFramebuffers` / `glDrawArrays` / `glDrawElements` in the intercepted log — zero hits. (Our shim exports all of them per `nm -D spi_shim.so`, so they would be intercepted if called.)
+5. Shader errors that plagued the pre-VISUAL_ID runs are gone (0 in the final runs) — Mesa is compiling shaders successfully, so the pipeline can work, the game just isn't issuing draw calls into it.
+
+**What this means.** The game's 22-second run executes the EGL + DRM setup, allocates one 1024×256 `GL_TEXTURE_EXTERNAL_OES` via our EGLImage path (probably a font/UI atlas), cycles the DRM triple-buffer with 4 empty page flips, and then idles in the netbridge event loop. **There is no Godot-scene render activity yet.** The 4 page flips are pipeline priming, not frame presentation of rendered content. The `"Godot Engine"` banner that normally appears in Godot-based games is absent from all real-GL logs — Godot never finishes its boot sequence.
+
+Why Godot hasn't booted to the scene tree is the next investigation target — probably waiting on some expected runtime state that our mocks don't satisfy (a switch, an asset load, a netbridge event, a service_s_worker response, a clock). The user's BN notes on `create_egl_framebuffer` (0xd00800) described the path the game *would* take for actual scene rendering; in this boot it's not reaching that callsite, or it's reaching it but bypassing our LD_PRELOAD the same way `eglCreateContext` and `eglCreateImageKHR` did.
+
+**State left for next session.** The capture path is complete and proven to deliver pixels. `frame_viewer.py` works. The blocker is upstream: find what's keeping Godot from initializing, unblock it, then rendering flows through the capture we already built. No more GL-level bring-up required.
+
+### Step 58 final artifacts
+
+Added to the earlier list:
+- `_emulation/spi_shim.c` — now 5,970 LOC. Added: `shim_frametex_record` + 32-entry registry (vestigial, kept for diagnostic); `shim_frame_capture_at_page_flip` (game-thread GL readback); refactored `shim_frame_send` / `shim_frame_send_all` to blocking `send`; `#include <poll.h>` (dormant now that send is blocking); `glBindFramebuffer` hook that tracks `shim_last_draw_fbo` for future use; diagnostic bind-count logger.
+- `_emulation/spi_shim.so` — rebuilt ~240 KB.
+- `_emulation/run_step58m_realgl.log` + 25 × `_emulation/frames/frame_*.png` — first successful end-to-end capture; frames are black (game state, not pipeline issue).
+- `_emulation/run_step58n_realgl.log` — capture with last-draw-FBO tracking enabled; identical black output, proved the game binds only `fb=0`.
+- `_emulation/run_bindfb_check.log` — diagnostic confirming 20 `glBindFramebuffer(fb=0)` calls, zero `glDraw*` / `glFramebufferTexture2D` / `glGenFramebuffers` in the intercepted log.
+- `_emulation/run_step58_stub_final.log` — final stub-mode regression, 11,725 lines, exit 124, zero fatals. All Step-58 additions are neutral to stub mode.
+
+
+
+### Artifacts
+
+- `_emulation/spi_shim.c` — +330 LOC net (SURFACELESS translation helper, 3 display-acquisition function rewrites, attribute-list patching + name decoder in `eglChooseConfig`, frame bridge socket state + accept thread + capture-and-send, constructor hook). Size 5,215 → 5,545 LOC.
+- `_emulation/spi_shim.so` — rebuilt 225,232 bytes (was 158,968 at Step 57; +66 KB for new bridge infra + patching logic).
+- `_emulation/frame_viewer.py` — new, 186 LOC, tkinter + PIL + numpy subscriber with headless and PNG-save modes.
+- `_emulation/run_step58_regression.log` — stub-mode regression, 11,411 lines / 22 s / exit 124, clean. Matches Step 57 baseline (11,478 lines).
+- `_emulation/run_step58_realgl.log` — first real-GL run with SURFACELESS translation, 4,141 lines, exit 139. Revealed the `eglChooseConfig` empty-return.
+- `_emulation/run_step58b_realgl.log` — added attribute-array logger, 3,971 lines, exit 139. Confirmed `EGL_SURFACE_TYPE = EGL_WINDOW_BIT` was the mismatch.
+- `_emulation/run_step58c_realgl.log` — surface-type patch applied, Mesa returns 24 configs, game crosses 4 new milestones (SternLogo, netbridge, power-dist, DRM mode), crashes in `create_egl_framebuffer` DMA-BUF path. 3,963 lines.
+
+## Step 58.post: BN notebook read; boot-splash ⊥ Godot confirmed; blocker hypothesis pivots (2026-04-22)
+
+User exported the full BN analyst notebook to `_emulation/Binary Ninja Notebook Export (2026-04-22).json` (172 KB / 80 entries / 10 categories). Read in full. Key conclusions that reshape our next move:
+
+**Architectural separation is explicit.** Entries [76], [77], [78] document that the game runs TWO distinct render pipelines:
+- Boot-splash / DMD renderer at `0xcff000-0xd05000`: direct EGL/GLES 2.0 with `GL_TEXTURE_EXTERNAL_OES` + `samplerExternalOES`, custom shaders at `0x3a1ffe8` (vertex), `0x3a200a8` (fragment), `0x3a23d78` (color transform), `0x3a1df50` (gradient). Shader compiler at `Shader.cpp` (`0xce6530`) — **the exact source of our `OpenGL Error: 0x506 at Shader.cpp line 17`**.
+- Godot engine: RendererRD (Vulkan) or GLES3 backend, separate FBO setup, incompatible GLSL versions (GLES 3.0 / GLSL 450).
+
+The `create_egl_framebuffer` at `0xd00800` — the DMA-BUF pipeline we've been investigating — is the **boot-splash path only**. Godot has its own FBO path we haven't observed yet.
+
+**Implication for our diagnosis.** The 4× `0x506` errors (3× SpriteRenderer.cpp:143 glDrawArrays, 1× Shader.cpp:17 glUseProgram) are **boot-splash failures only**, not blockers on Godot. Our plan to fix EGLImage → GL_TEXTURE_2D substitution doesn't unlock Godot rendering; it fixes a pipeline Godot doesn't use.
+
+**What the notebook does NOT answer (sent as follow-up query):**
+1. Godot engine entry points: `OS::initialize`, `DisplayServer::create`, `RenderingServer::init`, `SceneTree::init`, `Main::setup` / `Main::start` — where are they in the binary?
+2. `procDispatch` thread (`sub_b2ae90`) decompilation — does it call Godot init or not?
+3. **The 10-second timeout loop at `0xb2aba0`** (entry [2]) — `pthread_cond_timedwait` with timing thresholds at 0x257ms / 0xe0fms. What condition variable does it wait on, and who signals it? If Godot init is gated on that signal, this is our actual blocker.
+4. Explicit confirmation of a second `eglCreateContext` (one for boot-splash, one for Godot) or just one shared context.
+5. Init-sequence gating: what must complete before Godot starts?
+6. Is `SceneLoaderLayeredDisplayElement` (entry [70]; base class for all 130+ BDLMode-derived types) a Godot `Node` subclass or Stern's own?
+
+**Bonus findings relevant for later:**
+- Entry [51]: game selects `/dev/ttyAMA5` vs `/dev/ttyAMA2` from `uname().release[8]` — host kernel version character affects our UART shim.
+- Entry [2]: primary event loop triggers `/bin/sync` + `/sbin/reboot -f` under "specific conditions." We run 22s without a reboot, so those conditions aren't tripping, but worth knowing there's a self-destruct path.
+- Entries [1], [9]: SIGINT / SIGBUS / SIGSEGV handlers registered at `_start @ 0x861270`. SIGBUS specifically for hardware access faults.
+- Entries [30], [73]: game logic is data-driven via scene files (`image-sc*.bin`, 885+ scenes); compiled binary is presentation engine + event dispatcher only. Fire_event at `0x9c12a0`; mode init table at `_INIT_74 @ 0x8733c0` (matches earlier Step-50 findings).
+- Entries [35], [37], [41]: `/dev/spidev4.0` is a serial bridge to an I/O controller MCU, not true SPI — we already shim this correctly.
+- Entry [46]: Godot audio uses Godot's native AudioStream pipeline (OggVorbis), NOT GStreamer. GStreamer is video-only. Confirms the Step 53 finding that gstreamer is dormant for audio.
+- Entry [32]/[33]: 4 embedded MP3s directly in data sections at 0x462e006 / 0x46742ee / 0x474b61e / 0x476599e (~100 KB each).
+
+**Caveat per user warning:** notebook entries were written over multiple BN analysis sessions and **may self-contradict** when a later observation refines an earlier one. Early entries call this a "slot machine" — BN analyst's initial (wrong) interpretation; this is Stern's Pokémon Pinball. When anything in the notebook seems suspicious, cross-reference with our own logs before trusting it.
+
+**Holding position until the follow-up BN query returns.** No shim changes this turn — no point wiring up a DMA-BUF/EGLImage fix for the boot-splash if the Godot gate is a condition variable elsewhere. Saved notebook pointer to memory (`reference_bn_notebook.md`) so future sessions can re-enter the context without re-reading 172 KB of JSON.
+
+## Step 58.post.2: BN follow-up (v4) overturns the two-pipeline story (2026-04-22)
+
+Follow-up BN queries landed as notebook versions v2–v4 (entries 81–86, append-only). The architectural read from Step 58.post was **wrong** — a correction the analyst made in the follow-up pass.
+
+**[82] Single EGL context architecture — boot-splash is the ONLY rendering system.** There is exactly one EGL context creation callsite (`create_boot_splash_egl_context @ 0xd01d10`). Godot's rendering classes (`RasterizerSceneGLES3`, `GLES3::MeshStorage`, `ShaderGLES3`) are compiled into the binary but never instantiated at runtime. Boot-splash renders everything, including what would have been Godot scene content. *If boot-splash init fails, there is NO fallback path.* This directly contradicts entry [76]'s older claim of "two distinct pipelines" — [76] was the analyst's initial (wrong) interpretation.
+
+**[81] No standard Godot init.** `OS::initialize` / `DisplayServer::create` / `RenderingServer::init` / `SceneTree::init` / `Main::setup` / `Main::start` are all absent from the runtime flow. The game accesses Godot components through a custom `godot_spike_bridge` interface, not Godot's own bootstrap. So the "where does Godot init?" question from Step 58.post has no answer because it never happens — `procDispatch` at `sub_b2ae90` drives the entire show through condition variables and event firing.
+
+**Consequences.**
+- The 4× `0x506 GL_INVALID_FRAMEBUFFER_OPERATION` errors are not boot-splash-only collateral that we could ignore. They're the entire render pipeline failing. Every black frame is what the boot-splash actually tried to draw.
+- The Step 58.post plan ("let boot-splash fail, Godot will take over") doesn't work because there is no Godot to take over. Fixing the boot-splash FBO is the blocker.
+- `create_egl_framebuffer (0xd00800)` — the DMA-BUF / `GL_TEXTURE_EXTERNAL_OES` pipeline — isn't "boot-splash only" in the sense of being a skippable subset; it's the only FBO setup the game has.
+
+**[84] 10-second timeout at 0xb2aba0 is fully traced.** Condition variable `g_main_loop_condition_var (0x48c9288)`. Single signaler is `process_dispatch_loop (0xb292ac)`, which signals at `0xb293c8` after draining the event queue and firing event `0x92`. Dispatch thread runs on its own CV `0x48c86f8` monitoring `event_queue_change_counter (0x48c8728)`. Main loop stalls if nothing enqueues events for `process_dispatch_loop` to consume. Not directly our current blocker (the game runs past this — no reboot in 22 s), but useful for switch-injection work later.
+
+**[85] Timing thresholds 0x257 ms (599 ms) and 0xe0f ms (3599 ms).** Gate downstream operations on `(now - g_boot_time_reference @ 0x48ca668)` being in a range AND `system_state_flags` bit `0x10` being set. Threshold getters at `get_timestamp_threshold_1 @ 0xb84120` and `get_timestamp_threshold_2 @ 0xb68590`. The bit-0x10 flag is almost certainly "boot-splash init succeeded" — which for us is never set because init fails.
+
+**[86] Shutdown gate.** `/bin/sync` + `/sbin/reboot -f` only fires when `shutdown_condition_flag_1 (0x48c9468)` set AND `shutdown_condition_flag_2 (0x48c9469)` clear. We're not hitting this — confirms the 22 s timeout is just qemu killing us, not the game rebooting.
+
+**[83] Switch input pipeline.** Switch changes are detected by polling `g_switch_state_array (0x4880220)` (not interrupt-driven), piped through `/dev/spidev4.0` serial packets. Clarifies that the earlier notebook speculation about UART command `0x27` was wrong. Relevant for when we build the VPX-→-game switch-injection direction of the frame bridge; not today's blocker.
+
+### Revised next move
+
+The Step-58.post plan (`glFramebufferTexture2D` intercept to swap `EXTERNAL_OES` → `TEXTURE_2D`) was the right IDEA but the wrong execution — the intercept never fired because the game doesn't reach our `glFramebufferTexture2D` export through the PLT (GLAD-style cached function pointers bypass LD_PRELOAD). Two viable approaches:
+
+1. **Resolve the substitution via `eglGetProcAddress` instead.** We already intercept `eglGetProcAddress` and return our own stubs for KHR extensions. Extend the table to return shim wrappers for `glFramebufferTexture2D` / `glFramebufferTextureLayer` / `glFramebufferRenderbuffer` / `glCheckFramebufferStatus`. If the game resolves these via `eglGetProcAddress` (which our Step 58 log showed it does for KHR extensions), our wrappers get the call and can rewrite the target.
+
+2. **Upstream swap in `glEGLImageTargetTexture2DOES`.** Rather than attach `EXTERNAL_OES` textures to an FBO at all, maintain a parallel `GL_TEXTURE_2D` texture per EGLImage: when the game binds a `EXTERNAL_OES` texture via our `glEGLImageTargetTexture2DOES`, silently create a `TEXTURE_2D` with same dimensions, record the {external_tex_id → 2d_tex_id} mapping. The game then calls `glFramebufferTexture2D(GL_TEXTURE_EXTERNAL_OES, external_tex)` which still fails — UNLESS we also intercept the FBO attach via (1). The two approaches work together.
+
+3. **Verify via `eglGetProcAddress` query count first.** Before building, check whether the game queries `eglGetProcAddress("glFramebufferTexture2D")`. If it doesn't, approach (1) won't fire either, and we need a different interception mechanism (possibly hooking `dlsym(RTLD_DEFAULT, ...)` or auditing the game's GL function-pointer table in memory).
+
+Verification is one run with the existing shim and an expanded `eglGetProcAddress` logger — effectively free. Worth doing before committing to either fix.
+
+## Step 58.post.3: strategic pivot — ignore Godot entirely (2026-04-22)
+
+User called out that Reference implementation A for a different Spike 3 title doesn't involve Godot. FotE and Pokemon LE are both Spike 3 games; the platform-level render pipeline is the common denominator. If Godot were required at runtime for the render loop, Researcher A's emulator wouldn't be working without it.
+
+Reconciling with the BN notebook evidence:
+- Entry [25] explicitly frames this as "selectively uses Godot Engine components as libraries while maintaining complete independence" — that's Stern linking Godot's utility classes statically (Array, Dictionary, Variant, Resource) without booting the engine.
+- Entry [81] "no traditional Godot initialization functions" fits "engine never booted."
+- Entry [82] "Godot's rendering classes compiled into the binary but NEVER INSTANTIATED" fits "utility classes used, engine not used."
+- The `GodotSpikeBridge` class we found is a publish-queue for sound events and game events — not render-related. It's plausibly used by Stern's own scene-logic code (the 130+ BDLMode classes), not by a running Godot VM.
+- The previs project at `assets/godot/pokemon_battle_previs/` is a DEV tool. Its autoload `Spike` → `godot_spike_bridge.gd` is a GDScript STUB mimicking the C++ class's interface so dev scenes can run standalone outside the game binary.
+
+Reframing Track A: the render pipeline is entirely Stern's own. `create_boot_splash_egl_context (0xd01d10)` is THE EGL context. `create_egl_framebuffer (0xd00800)` is THE FBO setup. `SpriteRenderer` and `Shader` (at `Shader.cpp:17`, our error site) are Stern's own C++ classes drawing from Radium scene data loaded out of `image.bin`. The `0x506 GL_INVALID_FRAMEBUFFER_OPERATION` errors we captured are the whole render pipeline failing — fixing them is the full job, bounded and GL-scoped. No Godot excavation required.
+
+The 10-second `pthread_cond_timedwait` gate at `0xb2aba0` (entry [84]) waits on events fired by `process_dispatch_loop`. I had been assuming those events came from `GodotSpikeBridge.pending_events`. More likely candidates now that Godot is off the table: SPI/netbridge packets from the hardware MCU bridge, internal timers, scene-loader completion callbacks. Our SPI stub returning zeros at ~1 kHz is probably enough activity to keep the dispatch wheel turning (game runs 22 s without rebooting, consistent with "timeout never tripping because events keep coming").
+
+What stays in the notebook that's still useful:
+- All boot-splash / render-path entries [74] [75] [76] [77] [78] [79] [80] [82] [85]
+- Hardware bridge entries [35] [36] [37] [38] [39] [41] [50] [83]
+- BDLMode / scene-loader entries [69] [70] [73]
+- Asset-loading entries [13] [14] [19] [20] [24]
+- Sound-ID pipeline entries [42] [43] [45] [63] [64] [67]
+
+What's parked (revisit only if Track A hits a game-logic issue that turns out to be script-driven):
+- GodotSpikeBridge internals — class methods, what it drains to, where it's registered
+- Godot VM status at runtime
+- SceneLoaderLayeredDisplayElement relationship to Godot
+
+Revised next action: extend the `eglGetProcAddress` intercept as a two-way instrument. (a) log every unknown name the game queries — tells us what core GL functions the game resolves through eglGetProcAddress vs direct linkage; (b) if the game queries `glFramebufferTexture2D` / `glFramebufferTextureLayer` / `glFramebufferRenderbuffer` through this path, return our wrapper so the `EXTERNAL_OES → TEXTURE_2D` swap actually fires. If it doesn't query through this path, we learn the game uses `libglapi.so.0`'s internal dispatch table and the fix needs to happen at a lower layer (patch the dispatch table at memory-address level post-context-create). Either outcome is informative and the change itself is ~30 LOC plus a sort-uniq pass on the log afterward.
+
+
+
+
+

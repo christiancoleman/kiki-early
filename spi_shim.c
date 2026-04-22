@@ -149,6 +149,118 @@ static int is_real_gl(void) {
     }                                                                    \
 } while (0)
 
+#define SHIM_LOG(fmt, ...) fprintf(stderr, "[shim] " fmt "\n", ##__VA_ARGS__)
+
+/* ---- Step 59: dlopen/dlsym interception for dynamically-loaded libEGL ----
+ *
+ * The game resolves key EGL/GLES symbols (eglCreateImageKHR,
+ * glEGLImageTargetTexture2DOES, eglCreateContext) by dlopen'ing
+ * libEGL.so.1 / libGLESv2.so.2 / libgbm.so.1 and dlsym'ing from the
+ * returned handles. LD_PRELOAD doesn't intercept those handle-specific
+ * lookups — only calls routed through the global PLT/GOT chain hit our
+ * shim. Step 58's FWD trace was silent on eglCreateContext /
+ * eglCreateImageKHR for exactly this reason.
+ *
+ * We intercept dlopen to record handles for the three libraries of
+ * interest, and intercept dlsym so that lookups against those handles
+ * substitute our overrides for specific symbols we need to re-route
+ * (EGLImage creation and DMA-BUF-to-texture binding). Every other
+ * symbol — including 99% of EGL core and all of GLES — falls through
+ * to the real library unchanged.
+ *
+ * Bootstrap: dlsym is itself overridden, so we cache the real dlsym/dlopen
+ * once on first call via dlvsym. glibc on this sysroot exports both
+ * GLIBC_2.34 and GLIBC_2.17 versions; we prefer 2.34 and fall back.
+ * dlvsym is not overridden by us, so it always resolves to the real one. */
+
+static void *shim_tracked_dl_handles[16];
+static int   shim_tracked_dl_handles_count = 0;
+static pthread_mutex_t shim_tracked_dl_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int shim_dl_handle_is_tracked(void *h) {
+    pthread_mutex_lock(&shim_tracked_dl_lock);
+    for (int i = 0; i < shim_tracked_dl_handles_count; i++) {
+        if (shim_tracked_dl_handles[i] == h) {
+            pthread_mutex_unlock(&shim_tracked_dl_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&shim_tracked_dl_lock);
+    return 0;
+}
+
+static void shim_dl_handle_track(void *h) {
+    pthread_mutex_lock(&shim_tracked_dl_lock);
+    if (shim_tracked_dl_handles_count < 16) {
+        shim_tracked_dl_handles[shim_tracked_dl_handles_count++] = h;
+    }
+    pthread_mutex_unlock(&shim_tracked_dl_lock);
+}
+
+static void *shim_real_dlopen_p = NULL;
+static void *shim_real_dlsym_p  = NULL;
+
+static void shim_resolve_real_dl(void) {
+    if (!shim_real_dlopen_p) {
+        shim_real_dlopen_p = dlvsym(RTLD_NEXT, "dlopen", "GLIBC_2.34");
+        if (!shim_real_dlopen_p)
+            shim_real_dlopen_p = dlvsym(RTLD_NEXT, "dlopen", "GLIBC_2.17");
+    }
+    if (!shim_real_dlsym_p) {
+        shim_real_dlsym_p = dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
+        if (!shim_real_dlsym_p)
+            shim_real_dlsym_p = dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.17");
+    }
+}
+
+void *dlopen(const char *filename, int flags) {
+    shim_resolve_real_dl();
+    void *(*real)(const char*, int) = (void *(*)(const char*, int))shim_real_dlopen_p;
+    if (!real) return NULL;
+    void *h = real(filename, flags);
+    /* Log every dlopen to confirm our override is actually being hit. */
+    SHIM_LOG("[dlopen] \"%s\" flags=0x%x -> handle=%p", filename ? filename : "(NULL)", flags, h);
+    if (h && filename) {
+        if (strstr(filename, "libEGL")  ||
+            strstr(filename, "libGLES") ||
+            strstr(filename, "libgbm")) {
+            SHIM_LOG("[dlopen] tracking %s handle=%p for dlsym intercept", filename, h);
+            shim_dl_handle_track(h);
+        }
+    }
+    return h;
+}
+
+void *dlsym(void *handle, const char *symbol) {
+    shim_resolve_real_dl();
+    void *(*real)(void*, const char*) = (void *(*)(void*, const char*))shim_real_dlsym_p;
+    if (!real) return NULL;
+
+    /* Substitute only for handles we tracked (EGL/GLES/GBM). RTLD_NEXT /
+     * RTLD_DEFAULT / unknown handles fall through untouched. */
+    if (handle != RTLD_DEFAULT && handle != RTLD_NEXT && symbol &&
+        shim_dl_handle_is_tracked(handle)) {
+        if (strcmp(symbol, "eglCreateImageKHR") == 0) {
+            extern void *eglCreateImageKHR(void*, void*, unsigned, void*, const int*);
+            SHIM_LOG("[dlsym intercept] eglCreateImageKHR -> shim override");
+            return (void*)eglCreateImageKHR;
+        }
+        if (strcmp(symbol, "eglDestroyImageKHR") == 0) {
+            extern unsigned eglDestroyImageKHR(void*, void*);
+            SHIM_LOG("[dlsym intercept] eglDestroyImageKHR -> shim override");
+            return (void*)eglDestroyImageKHR;
+        }
+        if (strcmp(symbol, "glEGLImageTargetTexture2DOES") == 0) {
+            extern void glEGLImageTargetTexture2DOES(unsigned, void*);
+            SHIM_LOG("[dlsym intercept] glEGLImageTargetTexture2DOES -> shim override");
+            return (void*)glEGLImageTargetTexture2DOES;
+        }
+        /* Log once per miss so we know what else the game is asking for. */
+        SHIM_LOG("[dlsym] tracked handle %p wants %s (passthrough)", handle, symbol);
+    }
+    return real(handle, symbol);
+}
+
 /* ---- SPI ioctl definitions ---- */
 
 #define SPI_IOC_WR_MODE          0x40016b01
@@ -248,7 +360,7 @@ static uint32_t uart_write_count = 0;
 static int uart_is_active(void) { return uart_game_fd >= 0; }
 static int is_drm_fd(int fd) { return drm_game_fd >= 0 && fd == drm_game_fd; }
 
-#define SHIM_LOG(fmt, ...) fprintf(stderr, "[shim] " fmt "\n", ##__VA_ARGS__)
+/* SHIM_LOG moved up to just after the macros — see the early definition. */
 
 /* ---- Real function pointers ---- */
 
@@ -1392,6 +1504,7 @@ static void shim_term_dump_handler(int sig) {
 
 
 #include <sys/un.h>
+#include <poll.h>
 #include <sys/time.h>
 
 static int shim_bridge_listen_fd = -1;
@@ -1632,6 +1745,283 @@ static void shim_bridge_start(void) {
     SHIM_LOG("[bridge] listening on %s (AF_UNIX)", sock_path);
 }
 
+/* ---- Step 58: frame bridge — glReadPixels → AF_UNIX stream → frame_viewer ----
+ *
+ * Separate socket from the JSON state bridge above because frames are
+ * fundamentally different traffic: 8 MB binary each, 30-60 Hz, latency-
+ * sensitive. Mixing them with newline-terminated JSON on the same socket
+ * would force every subscriber to parse both framings. Two sockets, one
+ * purpose each, is simpler.
+ *
+ * Wire protocol (little-endian, 16-byte header + W*H*4 payload):
+ *     u32 magic       — 0xF00FBABA
+ *     u32 seq         — monotonic sequence number
+ *     u16 width       — pixel width (typically FAKE_MODE_HDISPLAY = 1920)
+ *     u16 height      — pixel height (typically FAKE_MODE_VDISPLAY = 1080)
+ *     u8  format      — 0 = RGBA8, 1 = BGRA8 (reserved for future use)
+ *     u8  flags       — bit 0: y_flipped (GL bottom-up origin)
+ *     u16 reserved    — zero
+ *
+ * Header + payload are sent as a single atomic "message" from the
+ * subscriber's perspective (we hold the socket lock across both).
+ * If the subscriber can't keep up (kernel send buffer full), we drop
+ * the subscriber — partial-frame recovery isn't worth the complexity.
+ *
+ * Gated by SPIKE3_FRAME_BRIDGE=1 (independent from SPIKE3_BRIDGE).
+ * Hook fires inside eglSwapBuffers (real-GL mode only) BEFORE the swap;
+ * EGL spec leaves back-buffer contents undefined post-swap.
+ * ------------------------------------------------------------------------ */
+
+static int  shim_frame_listen_fd = -1;
+static int  shim_frame_client_fd = -1;
+static pthread_mutex_t shim_frame_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t shim_frame_seq = 0;
+static uint8_t *shim_frame_buf = NULL;
+static size_t   shim_frame_buf_size = 0;
+
+static void *shim_frame_accept_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct sockaddr_un addr;
+        socklen_t addrlen = sizeof(addr);
+        int fd = accept(shim_frame_listen_fd, (struct sockaddr*)&addr, &addrlen);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            SHIM_LOG("[frame] accept() failed: %s — listener terminating", strerror(errno));
+            return NULL;
+        }
+        pthread_mutex_lock(&shim_frame_lock);
+        if (shim_frame_client_fd >= 0) {
+            close(shim_frame_client_fd);
+            SHIM_LOG("[frame] evicted prior subscriber");
+        }
+        shim_frame_client_fd = fd;
+        pthread_mutex_unlock(&shim_frame_lock);
+        SHIM_LOG("[frame] subscriber connected on fd %d", fd);
+    }
+    return NULL;
+}
+
+static void shim_frame_drop_client_locked(void) {
+    if (shim_frame_client_fd >= 0) {
+        close(shim_frame_client_fd);
+        shim_frame_client_fd = -1;
+    }
+}
+
+/* glReadPixels the current GL surface and ship the RGBA to the subscriber.
+ * Called from eglSwapBuffers in real-GL mode. No-op if no subscriber, if
+ * SPIKE3_FRAME_BRIDGE is off, or if Mesa's glReadPixels can't be resolved. */
+/* Blocking full-send. Linux's default net.core.wmem_max is ~200 KB while our
+ * frame payload is ~8 MB, so a non-blocking path gives us at best 1/40 of a
+ * frame per send — the subscriber would get dropped on literally every frame.
+ * Instead, use a blocking send and let the kernel handle back-pressure. The
+ * caller (MODE_PAGE_FLIP ioctl handler) runs in the game's render thread;
+ * ioctl latency is already measured in milliseconds so brief waits are fine.
+ * Returns 0 on full send, -1 on hard socket error. */
+static int shim_frame_send_all(int fd, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+/* Ship a raw RGBA buffer over the frame bridge socket. Atomic header +
+ * payload under the socket lock; uses poll-retry to tolerate the small
+ * kernel send buffer (200 KB vs ~8 MB frames). Drops the subscriber only
+ * after the retry timeout expires or on hard socket error. */
+static void shim_frame_send(int w, int h, const uint8_t *rgba) {
+    if (shim_frame_client_fd < 0 || !rgba) return;
+    const size_t payload_sz = (size_t)w * (size_t)h * 4u;
+
+    uint8_t hdr[16];
+    uint32_t magic = 0xF00FBABA;
+    uint32_t seq   = __atomic_add_fetch(&shim_frame_seq, 1, __ATOMIC_SEQ_CST);
+    memcpy(hdr + 0, &magic, 4);
+    memcpy(hdr + 4, &seq,   4);
+    uint16_t w16 = (uint16_t)w, h16 = (uint16_t)h;
+    memcpy(hdr + 8,  &w16, 2);
+    memcpy(hdr + 10, &h16, 2);
+    hdr[12] = 0;      /* format = RGBA8 */
+    hdr[13] = 1;      /* flags: y_flipped (GL origin bottom-left) */
+    memset(hdr + 14, 0, 2);
+
+    pthread_mutex_lock(&shim_frame_lock);
+    if (shim_frame_client_fd < 0) { pthread_mutex_unlock(&shim_frame_lock); return; }
+    int fd = shim_frame_client_fd;
+
+    if (shim_frame_send_all(fd, hdr, 16) != 0 ||
+        shim_frame_send_all(fd, rgba, payload_sz) != 0) {
+        shim_frame_drop_client_locked();
+        SHIM_LOG("[frame] subscriber disconnected (seq=%u): %s",
+                 seq, strerror(errno));
+    }
+    pthread_mutex_unlock(&shim_frame_lock);
+}
+
+/* ---- Step 58.2: frame capture tracking ----
+ *
+ * The game presents via DRM MODE_PAGE_FLIP, not eglSwapBuffers, so the
+ * capture trigger sits in the DRM ioctl path below. The target is whichever
+ * GL texture the game's create_egl_framebuffer bound as an FBO color
+ * attachment via glEGLImageTargetTexture2DOES — our override already runs
+ * glTexImage2D(w, h, RGBA8) to give it Mesa-allocated storage. We track
+ * every texture we touched that way; at page-flip we read from the largest
+ * one (assumed to be the main render target). */
+
+/* Forward decl — defined alongside the glBindFramebuffer hook. */
+extern volatile unsigned shim_last_draw_fbo;
+
+#define SHIM_FRAMETEX_MAX 32
+struct shim_frametex {
+    unsigned tex_id;
+    unsigned target;  /* GL_TEXTURE_2D or GL_TEXTURE_EXTERNAL_OES */
+    int w, h;
+};
+static struct shim_frametex shim_frametex[SHIM_FRAMETEX_MAX];
+static int shim_frametex_count = 0;
+static pthread_mutex_t shim_frametex_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned shim_capture_fbo = 0;  /* lazily created at first capture */
+static uint32_t shim_capture_flip_counter = 0;
+
+/* Upsert {tex_id, target, w, h} into the tracked list. Called from
+ * glEGLImageTargetTexture2DOES right after we glTexImage2D'd the storage. */
+static void shim_frametex_record(unsigned target, int w, int h) {
+    static void (*real_glGetIntegerv)(unsigned, int*) = NULL;
+    if (!real_glGetIntegerv) real_glGetIntegerv = (void(*)(unsigned,int*))
+                                                   dlsym(RTLD_NEXT, "glGetIntegerv");
+    if (!real_glGetIntegerv) return;
+
+    int bind_param;
+    switch (target) {
+        case 0x0DE1: bind_param = 0x8069; break;  /* GL_TEXTURE_BINDING_2D */
+        case 0x8D65: bind_param = 0x8D67; break;  /* GL_TEXTURE_BINDING_EXTERNAL_OES */
+        default: return;
+    }
+    int tex_id = 0;
+    real_glGetIntegerv((unsigned)bind_param, &tex_id);
+    if (tex_id <= 0) return;
+
+    pthread_mutex_lock(&shim_frametex_lock);
+    for (int i = 0; i < shim_frametex_count; i++) {
+        if (shim_frametex[i].tex_id == (unsigned)tex_id) {
+            shim_frametex[i].w = w;
+            shim_frametex[i].h = h;
+            shim_frametex[i].target = target;
+            pthread_mutex_unlock(&shim_frametex_lock);
+            return;
+        }
+    }
+    if (shim_frametex_count < SHIM_FRAMETEX_MAX) {
+        shim_frametex[shim_frametex_count++] = (struct shim_frametex){
+            .tex_id = (unsigned)tex_id, .target = target, .w = w, .h = h,
+        };
+        SHIM_LOG("[frame_cap] tracking tex=%u target=0x%x %dx%d (%d tracked)",
+                 (unsigned)tex_id, target, w, h, shim_frametex_count);
+    }
+    pthread_mutex_unlock(&shim_frametex_lock);
+}
+
+/* Capture the current read-framebuffer to the frame bridge at page-flip.
+ *
+ * Evolution of this function has proven that the "pick the biggest tracked
+ * EGLImage texture and read from it" strategy doesn't work: the only
+ * EGLImage the game creates in this boot path is a 1024×256 sampler tied
+ * to GL_TEXTURE_EXTERNAL_OES, which cannot be attached as an FBO color
+ * attachment (glCheckFramebufferStatus returns GL_FRAMEBUFFER_INCOMPLETE_
+ * MISSING_ATTACHMENT = 0x8CD7). That texture is a font/UI atlas, not the
+ * main render target — the game renders through a different path we haven't
+ * traced yet.
+ *
+ * Pragmatic fallback: read from whatever READ_FRAMEBUFFER is currently
+ * bound when MODE_PAGE_FLIP fires. If the game unbinds its render FBO
+ * before page-flipping, we read the default framebuffer (the pbuffer we
+ * gave it in eglCreateWindowSurface); if the render FBO is still bound,
+ * we read that. Either way we don't need texture tracking or a capture
+ * FBO — just glReadPixels at the game's display resolution.
+ *
+ * Runs in the game thread (DRM ioctl handler), so the game's EGL context
+ * is current. No context stealing, no race with the game's GL state. */
+static void shim_frame_capture_at_page_flip(void) {
+    if (shim_frame_client_fd < 0) return;
+    if ((++shim_capture_flip_counter) & 1) return;  /* every 2nd flip */
+
+    static void (*real_glReadPixels)(int, int, int, int, unsigned, unsigned, void*) = NULL;
+    static void (*real_glGetIntegerv)(unsigned, int*) = NULL;
+    static void (*real_glBindFramebuffer)(unsigned, unsigned) = NULL;
+    if (!real_glReadPixels)
+        real_glReadPixels  = (void(*)(int,int,int,int,unsigned,unsigned,void*))
+                             dlsym(RTLD_NEXT, "glReadPixels");
+    if (!real_glGetIntegerv)
+        real_glGetIntegerv = (void(*)(unsigned,int*))dlsym(RTLD_NEXT, "glGetIntegerv");
+    if (!real_glBindFramebuffer)
+        real_glBindFramebuffer = (void(*)(unsigned,unsigned))dlsym(RTLD_NEXT, "glBindFramebuffer");
+    if (!real_glReadPixels || !real_glGetIntegerv || !real_glBindFramebuffer) return;
+
+    int verbose = (shim_capture_flip_counter < 8) ||
+                  ((shim_capture_flip_counter & 63) == 0);
+
+    /* Save current read-FBO; bind the game's most recent draw FBO (which it
+     * likely unbound before calling page-flip, hence read_fbo=0 earlier).
+     * If we don't know a game draw FBO yet, read whatever is current. */
+    int prev_read = 0;
+    real_glGetIntegerv(0x8CAA /* GL_READ_FRAMEBUFFER_BINDING */, &prev_read);
+    unsigned game_fbo = __atomic_load_n(&shim_last_draw_fbo, __ATOMIC_RELAXED);
+    if (game_fbo != 0) {
+        real_glBindFramebuffer(0x8CA8 /* GL_READ_FRAMEBUFFER */, game_fbo);
+    }
+
+    int w = FAKE_MODE_HDISPLAY, h = FAKE_MODE_VDISPLAY;
+    size_t need = (size_t)w * h * 4;
+    if (!shim_frame_buf || shim_frame_buf_size < need) {
+        free(shim_frame_buf);
+        shim_frame_buf = malloc(need);
+        shim_frame_buf_size = shim_frame_buf ? need : 0;
+    }
+    if (!shim_frame_buf) goto restore;
+
+    real_glReadPixels(0, 0, w, h, 0x1908 /* GL_RGBA */, 0x1401 /* GL_UNSIGNED_BYTE */,
+                      shim_frame_buf);
+    shim_frame_send(w, h, shim_frame_buf);
+    if (verbose)
+        SHIM_LOG("[frame_cap] sent %dx%d (flip #%u, from_fbo=%u prev_read=%d)",
+                 w, h, shim_capture_flip_counter, game_fbo, prev_read);
+
+restore:
+    if (game_fbo != 0)
+        real_glBindFramebuffer(0x8CA8, (unsigned)prev_read);
+}
+
+static void shim_frame_start(void) {
+    const char *enabled = getenv("SPIKE3_FRAME_BRIDGE");
+    if (!enabled || enabled[0] != '1') return;
+    const char *sock_path = getenv("SPIKE3_FRAME_SOCKET");
+    if (!sock_path || !sock_path[0]) sock_path = "/tmp/spike3_frame.sock";
+
+    unlink(sock_path);
+    shim_frame_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (shim_frame_listen_fd < 0) {
+        SHIM_LOG("[frame] socket() failed: %s", strerror(errno));
+        return;
+    }
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+    if (bind(shim_frame_listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+        listen(shim_frame_listen_fd, 1) < 0) {
+        SHIM_LOG("[frame] bind/listen(%s) failed: %s", sock_path, strerror(errno));
+        close(shim_frame_listen_fd); shim_frame_listen_fd = -1; return;
+    }
+    pthread_t t;
+    if (pthread_create(&t, NULL, shim_frame_accept_thread, NULL) == 0) pthread_detach(t);
+    SHIM_LOG("[frame] listening on %s (AF_UNIX)", sock_path);
+}
+
 /* Step 52: SIGALRM handler used to break out of hung event handlers during
  * the sweep. Installed in the constructor; blocked on all threads except
  * the sweep timer thread so alarm() delivers to the right place. */
@@ -1859,6 +2249,9 @@ static void shim_install_crash_handler(void) {
 
     /* Step 54: optional state bridge over Unix socket. */
     shim_bridge_start();
+
+    /* Step 58: optional frame bridge (glReadPixels → AF_UNIX stream). */
+    shim_frame_start();
 
     /* Step 54: optional cmode poke (force activation for testing). */
     const char *pc = getenv("SPIKE3_POKE_CMODE");
@@ -2510,23 +2903,87 @@ int gbm_surface_has_free_buffers(void *surface) {
 #define EGL_NO_CONTEXT       ((void *)0)
 #define EGL_NO_SURFACE       ((void *)0)
 #define EGL_OPENGL_ES_API    0x30A0
+#define EGL_PLATFORM_GBM_KHR         0x31D7
+#define EGL_PLATFORM_WAYLAND_KHR     0x31D8
+#define EGL_PLATFORM_X11_KHR         0x31D5
+#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
+#define EGL_DEFAULT_DISPLAY          ((void *)0)
+
+/* Under SPIKE3_REAL_GL, translate the game's display query into a form Mesa
+ * can actually satisfy on our overlay. Mesa 24.0.9 in surfaceless mode only
+ * accepts EGL_PLATFORM_SURFACELESS_MESA (0x31DD) with a NULL native handle.
+ * The game asks for EGL_PLATFORM_GBM_KHR (0x31D7) with a fake GBM device.
+ * Translation: drop the game's platform/handle, ask Mesa for surfaceless.
+ *
+ * Fallback chain for resolving the real function:
+ *   1. dlsym("eglGetPlatformDisplay[EXT]") — usually works for non-EXT,
+ *      returns NULL for EXT (Mesa exports the EXT variant only via
+ *      eglGetProcAddress, not as a direct dynamic symbol).
+ *   2. dlsym("eglGetPlatformDisplay") — EGL 1.5 core, always exported.
+ *   3. dlsym("eglGetDisplay") — EGL 1.0 legacy, last-ditch.
+ * If none resolve, fall through to the stub body returning FAKE_EGL_DISPLAY. */
+static void *shim_real_platform_display(unsigned /*unused game-requested*/ platform) {
+    (void)platform;
+    static void *(*real_1_5)(unsigned, void*, const intptr_t*) = NULL;
+    if (!real_1_5) real_1_5 = (void *(*)(unsigned, void*, const intptr_t*))
+                              dlsym(RTLD_NEXT, "eglGetPlatformDisplay");
+    if (real_1_5) {
+        void *d = real_1_5(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+        if (d) { SHIM_LOG("  → Mesa real display %p via eglGetPlatformDisplay(SURFACELESS)", d); return d; }
+    }
+    static void *(*real_legacy)(void*) = NULL;
+    if (!real_legacy) real_legacy = (void *(*)(void*))dlsym(RTLD_NEXT, "eglGetDisplay");
+    if (real_legacy) {
+        void *d = real_legacy(EGL_DEFAULT_DISPLAY);
+        if (d) { SHIM_LOG("  → Mesa real display %p via legacy eglGetDisplay", d); return d; }
+    }
+    return NULL;
+}
 
 void *eglGetDisplay(void *native_display) {
-    FWD_RET_V(void*, eglGetDisplay, (void*), (native_display));
+    if (is_real_gl()) {
+        SHIM_LOG("FWD eglGetDisplay(%p) — translating to SURFACELESS_MESA", native_display);
+        void *d = shim_real_platform_display(0);
+        if (d) return d;
+        SHIM_LOG("  no real Mesa display found; falling back to stub");
+    }
     SHIM_LOG("eglGetDisplay(%p) -> fake display", native_display);
     return FAKE_EGL_DISPLAY;
 }
 
 void *eglGetPlatformDisplay(unsigned platform, void *native_display, const intptr_t *attrib_list) {
-    FWD_RET_V(void*, eglGetPlatformDisplay, (unsigned, void*, const intptr_t*),
-            (platform, native_display, attrib_list));
+    if (is_real_gl()) {
+        SHIM_LOG("FWD eglGetPlatformDisplay(platform=0x%x, dpy=%p) — translating to SURFACELESS_MESA",
+                 platform, native_display);
+        void *d = shim_real_platform_display(platform);
+        if (d) { (void)attrib_list; return d; }
+        SHIM_LOG("  no real Mesa display found; falling back to stub");
+    }
     SHIM_LOG("eglGetPlatformDisplay(platform=0x%x, dpy=%p) -> fake", platform, native_display);
     (void)attrib_list; return FAKE_EGL_DISPLAY;
 }
 
 void *eglGetPlatformDisplayEXT(unsigned platform, void *native_display, const int *attrib_list) {
-    FWD_RET_V(void*, eglGetPlatformDisplayEXT, (unsigned, void*, const int*),
-            (platform, native_display, attrib_list));
+    if (is_real_gl()) {
+        /* Mesa may or may not export the EXT symbol as a direct dynamic symbol.
+         * Try it first; if NULL, fall back to the non-EXT EGL 1.5 path. */
+        static void *(*real_ext)(unsigned, void*, const int*) = NULL;
+        static int real_ext_tried = 0;
+        if (!real_ext_tried) {
+            real_ext = (void *(*)(unsigned, void*, const int*))
+                       dlsym(RTLD_NEXT, "eglGetPlatformDisplayEXT");
+            real_ext_tried = 1;
+        }
+        if (real_ext) {
+            SHIM_LOG("FWD eglGetPlatformDisplayEXT(platform=0x%x) — direct forward", platform);
+            return real_ext(platform, native_display, attrib_list);
+        }
+        SHIM_LOG("FWD eglGetPlatformDisplayEXT(platform=0x%x) — EXT symbol not exported, translating to SURFACELESS_MESA",
+                 platform);
+        void *d = shim_real_platform_display(platform);
+        if (d) { (void)attrib_list; return d; }
+        SHIM_LOG("  no real Mesa display found; falling back to stub");
+    }
     SHIM_LOG("eglGetPlatformDisplayEXT(platform=0x%x, dpy=%p) -> fake", platform, native_display);
     (void)attrib_list; return FAKE_EGL_DISPLAY;
 }
@@ -2571,10 +3028,80 @@ unsigned eglGetConfigs(void *display, void **configs, int config_size, int *num_
     return EGL_TRUE;
 }
 
+/* Map EGL attribute enum to a short readable name for the diagnostic log. */
+static const char *shim_egl_attr_name(int a) {
+    switch (a) {
+        case 0x3020: return "BUFFER_SIZE";
+        case 0x3021: return "ALPHA_SIZE";
+        case 0x3022: return "BLUE_SIZE";
+        case 0x3023: return "GREEN_SIZE";
+        case 0x3024: return "RED_SIZE";
+        case 0x3025: return "DEPTH_SIZE";
+        case 0x3026: return "STENCIL_SIZE";
+        case 0x3027: return "CONFIG_CAVEAT";
+        case 0x3028: return "CONFIG_ID";
+        case 0x302D: return "NATIVE_RENDERABLE";
+        case 0x302E: return "NATIVE_VISUAL_ID";
+        case 0x302F: return "NATIVE_VISUAL_TYPE";
+        case 0x3031: return "SAMPLES";
+        case 0x3032: return "SAMPLE_BUFFERS";
+        case 0x3033: return "SURFACE_TYPE";
+        case 0x303F: return "COLOR_BUFFER_TYPE";
+        case 0x3040: return "RENDERABLE_TYPE";
+        case 0x3042: return "CONFORMANT";
+        case 0x3038: return "NONE";
+        default:     return "?";
+    }
+}
+
 unsigned eglChooseConfig(void *display, const int *attrib_list,
                          void **configs, int config_size, int *num_config) {
-    FWD_RET_V(unsigned, eglChooseConfig, (void*, const int*, void**, int, int*),
-            (display, attrib_list, configs, config_size, num_config));
+    if (__builtin_expect(is_real_gl(), 0)) {
+        /* Copy the game's attrib list into a local scratch so we can patch
+         * EGL_SURFACE_TYPE = EGL_WINDOW_BIT (0x4) → EGL_PBUFFER_BIT (0x1).
+         * Mesa surfaceless only advertises PBUFFER configs, so a WINDOW_BIT
+         * ask returns zero matches. Our eglCreateWindowSurface interceptor
+         * already redirects to eglCreatePbufferSurface (Step 56.4), so this
+         * translation is end-to-end consistent — the game sees a "window"
+         * surface at its API but gets a pbuffer backing it. */
+        int patched[128];
+        int plen = 0;
+        int patched_surface = 0;
+        if (attrib_list) {
+            for (int i = 0; attrib_list[i] != 0x3038 && i < 60; i += 2) {
+                int a = attrib_list[i], v = attrib_list[i+1];
+                if (a == 0x3033 /* EGL_SURFACE_TYPE */ && (v & 0x4) /* WINDOW_BIT set */) {
+                    int v2 = (v & ~0x4) | 0x1;   /* drop WINDOW, add PBUFFER */
+                    SHIM_LOG("  patching SURFACE_TYPE: 0x%x -> 0x%x (WINDOW→PBUFFER)", v, v2);
+                    v = v2;
+                    patched_surface = 1;
+                }
+                patched[plen++] = a;
+                patched[plen++] = v;
+            }
+        }
+        patched[plen++] = 0x3038; /* EGL_NONE terminator */
+
+        SHIM_LOG("FWD eglChooseConfig(dpy=%p, config_size=%d)%s:",
+                 display, config_size, patched_surface ? " [patched]" : "");
+        for (int i = 0; i < plen - 1; i += 2) {
+            SHIM_LOG("    attrib[%d] = 0x%x (%s)  value = 0x%x (%d)",
+                     i, patched[i], shim_egl_attr_name(patched[i]),
+                     patched[i+1], patched[i+1]);
+        }
+
+        static unsigned (*_real)(void*, const int*, void**, int, int*) = NULL;
+        if (!_real) _real = (unsigned(*)(void*, const int*, void**, int, int*))
+                            dlsym(RTLD_NEXT, "eglChooseConfig");
+        if (_real) {
+            unsigned r = _real(display, attrib_list ? patched : NULL,
+                               configs, config_size, num_config);
+            SHIM_LOG("  Mesa eglChooseConfig -> ret=%u, *num_config=%d",
+                     r, num_config ? *num_config : -1);
+            return r;
+        }
+        SHIM_LOG("  no real eglChooseConfig; falling back to stub");
+    }
     (void)display; (void)attrib_list;
     if (num_config) *num_config = 1;
     if (configs && config_size >= 1) configs[0] = FAKE_EGL_CONFIG;
@@ -2582,8 +3109,23 @@ unsigned eglChooseConfig(void *display, const int *attrib_list,
 }
 
 unsigned eglGetConfigAttrib(void *display, void *config, int attribute, int *value) {
-    FWD_RET_V(unsigned, eglGetConfigAttrib, (void*, void*, int, int*),
-            (display, config, attribute, value));
+    if (__builtin_expect(is_real_gl(), 0)) {
+        static unsigned (*_real)(void*, void*, int, int*) = NULL;
+        if (!_real) _real = (unsigned(*)(void*, void*, int, int*))
+                            dlsym(RTLD_NEXT, "eglGetConfigAttrib");
+        if (_real) {
+            unsigned r = _real(display, config, attribute, value);
+            /* Override EGL_NATIVE_VISUAL_ID to the GBM XR24 fourcc the game
+             * expects — Mesa's surfaceless configs have no native-visual
+             * tie, so this attribute returns 0 by default and the game's
+             * per-config GBM-format filter fails. */
+            if (attribute == 0x302E /* EGL_NATIVE_VISUAL_ID */ && value) {
+                *value = 0x34325258; /* XR24 — matches gbm_bo_get_format stub */
+            }
+            return r;
+        }
+        /* dlsym miss — fall through to stub body below */
+    }
     (void)display; (void)config;
     if (!value) return EGL_FALSE;
     /* EGL attribute constants from <EGL/egl.h>. */
@@ -2672,6 +3214,10 @@ unsigned eglMakeCurrent(void *display, void *draw, void *read, void *context) {
 }
 
 unsigned eglSwapBuffers(void *display, void *surface) {
+    /* Plain forward — capture trigger moved to MODE_PAGE_FLIP (Step 58.2)
+     * because this game uses DRM page-flip for presentation and never
+     * actually calls eglSwapBuffers in practice. Left in place as a pure
+     * forward so any future code path that DOES call it still works. */
     FWD_RET_V(unsigned, eglSwapBuffers, (void*, void*), (display, surface));
     (void)display; (void)surface; return EGL_TRUE;
 }
@@ -2705,18 +3251,142 @@ int eglGetError(void) {
     return EGL_SUCCESS;
 }
 
-/* Stubs for extensions resolved via eglGetProcAddress. The game queries
- * these after eglCreateContext (per BN analysis of sub_d01d10). Each
- * returns a fake sentinel so the game's subsequent calls unblock. */
+/* Extension stubs resolved via eglGetProcAddress AND exported top-level so
+ * direct PLT calls from the game also land here. The KHR image/sync family
+ * plus glEGLImageTargetTexture2DOES are never forwarded to Mesa (Step 57's
+ * invariant): Mesa's real impls would dereference fake GBM handles.
+ *
+ * eglCreateImageKHR in particular has a real job under SPIKE3_REAL_GL: the
+ * game's create_egl_framebuffer (BN 0xd00800) builds a DMA-BUF attribute
+ * list and expects the returned EGLImage to back an FBO color attachment.
+ * Our GBM stubs don't produce real DMA-BUFs (gbm_bo_get_fd returns -1), so
+ * we fake the zero-copy path with a regular GL texture: parse the attribute
+ * list, return a unique sentinel, map {sentinel → {w,h,fourcc}}, and when
+ * glEGLImageTargetTexture2DOES is called we look up and glTexImage2D(NULL)
+ * the currently-bound texture to give it real storage. */
 
-static void *stub_eglCreateImageKHR(void *display, void *ctx, unsigned target,
-                                    void *buffer, const intptr_t *attrib_list) {
-    (void)display; (void)ctx; (void)target; (void)buffer; (void)attrib_list;
-    return FAKE_EGL_IMAGE;
+#define SHIM_EGL_IMAGE_MAP_SIZE 128
+static struct shim_egl_image_entry {
+    void    *egl_image;  /* sentinel returned by eglCreateImageKHR */
+    int      width;
+    int      height;
+    unsigned fourcc;     /* DRM FOURCC from EGL_LINUX_DRM_FOURCC_EXT */
+} shim_egl_image_map[SHIM_EGL_IMAGE_MAP_SIZE];
+static int shim_egl_image_map_count = 0;
+static pthread_mutex_t shim_egl_image_map_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* EGLImage attribute decoder. Called with the int32 attribute array the
+ * game hands to eglCreateImageKHR for a EGL_LINUX_DMA_BUF_EXT import.
+ * Attribute enums: EGL_WIDTH=0x3057, EGL_HEIGHT=0x3056,
+ * EGL_LINUX_DRM_FOURCC_EXT=0x3271, terminator EGL_NONE=0x3038. */
+static void shim_egl_image_parse_attribs(const int *attrib_list,
+                                         int *w, int *h, unsigned *fmt) {
+    if (!attrib_list) return;
+    for (int i = 0; attrib_list[i] != 0x3038 && i < 32; i += 2) {
+        switch (attrib_list[i]) {
+            case 0x3057: *w   = attrib_list[i+1]; break;
+            case 0x3056: *h   = attrib_list[i+1]; break;
+            case 0x3271: *fmt = (unsigned)attrib_list[i+1]; break;
+        }
+    }
 }
-static unsigned stub_eglDestroyImageKHR(void *display, void *image) {
-    (void)display; (void)image; return EGL_TRUE;
+
+static void *shim_egl_image_register(int w, int h, unsigned fmt) {
+    void *sentinel = malloc(1);  /* unique non-null pointer — game treats as opaque */
+    if (!sentinel) return FAKE_EGL_IMAGE;
+    pthread_mutex_lock(&shim_egl_image_map_lock);
+    if (shim_egl_image_map_count >= SHIM_EGL_IMAGE_MAP_SIZE) {
+        pthread_mutex_unlock(&shim_egl_image_map_lock);
+        SHIM_LOG("[egl_image] map full (%d); returning FAKE_EGL_IMAGE",
+                 SHIM_EGL_IMAGE_MAP_SIZE);
+        free(sentinel);
+        return FAKE_EGL_IMAGE;
+    }
+    shim_egl_image_map[shim_egl_image_map_count++] = (struct shim_egl_image_entry){
+        .egl_image = sentinel, .width = w, .height = h, .fourcc = fmt,
+    };
+    pthread_mutex_unlock(&shim_egl_image_map_lock);
+    return sentinel;
 }
+
+static int shim_egl_image_lookup(void *image, int *w, int *h, unsigned *fmt) {
+    pthread_mutex_lock(&shim_egl_image_map_lock);
+    for (int i = 0; i < shim_egl_image_map_count; i++) {
+        if (shim_egl_image_map[i].egl_image == image) {
+            *w = shim_egl_image_map[i].width;
+            *h = shim_egl_image_map[i].height;
+            *fmt = shim_egl_image_map[i].fourcc;
+            pthread_mutex_unlock(&shim_egl_image_map_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&shim_egl_image_map_lock);
+    return 0;
+}
+
+/* Top-level exports — reachable both via eglGetProcAddress table AND via
+ * direct PLT-linked calls from the game. Note the int-based attrib_list
+ * signature (KHR extension uses EGLint, not EGLAttrib intptr_t). */
+void *eglCreateImageKHR(void *display, void *ctx, unsigned target,
+                        void *buffer, const int *attrib_list) {
+    int      w = 0, h = 0;
+    unsigned fmt = 0x34325258;  /* XR24 — matches GBM default */
+    shim_egl_image_parse_attribs(attrib_list, &w, &h, &fmt);
+    /* Sanity-clamp to our render mode if attribs were malformed. */
+    if (w <= 0 || w > 8192)  w = FAKE_MODE_HDISPLAY;
+    if (h <= 0 || h > 8192)  h = FAKE_MODE_VDISPLAY;
+    void *img = shim_egl_image_register(w, h, fmt);
+    SHIM_LOG("eglCreateImageKHR(dpy=%p, target=0x%x, buf=%p) "
+             "[w=%d h=%d fourcc=0x%x] -> %p",
+             display, target, buffer, w, h, fmt, img);
+    (void)ctx;
+    return img;
+}
+
+unsigned eglDestroyImageKHR(void *display, void *image) {
+    /* Free the sentinel and remove from map. We don't glDeleteTextures the
+     * backing — the game's glFramebufferTexture2D has already stored a ref,
+     * and we don't track texture lifetimes. Bounded leak by map size. */
+    pthread_mutex_lock(&shim_egl_image_map_lock);
+    for (int i = 0; i < shim_egl_image_map_count; i++) {
+        if (shim_egl_image_map[i].egl_image == image) {
+            free(shim_egl_image_map[i].egl_image);
+            shim_egl_image_map[i] = shim_egl_image_map[--shim_egl_image_map_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&shim_egl_image_map_lock);
+    SHIM_LOG("eglDestroyImageKHR(%p)", image);
+    (void)display;
+    return EGL_TRUE;
+}
+
+void glEGLImageTargetTexture2DOES(unsigned target, void *image) {
+    int w = 0, h = 0; unsigned fmt = 0;
+    if (!shim_egl_image_lookup(image, &w, &h, &fmt)) {
+        SHIM_LOG("glEGLImageTargetTexture2DOES: unknown image %p, no-op", image);
+        return;
+    }
+    /* Redefine the currently-bound texture's storage via Mesa's glTexImage2D.
+     * This is the non-zero-copy substitute for a DMA-BUF-backed EGLImage.
+     * The currently-bound texture (on 'target') becomes a w×h RGBA8 texture;
+     * the game's subsequent glFramebufferTexture2D attaches it to the FBO. */
+    static void (*real_glTexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void*) = NULL;
+    if (!real_glTexImage2D) real_glTexImage2D = (void (*)(unsigned, int, int, int, int, int, unsigned, unsigned, const void*))
+                                                 dlsym(RTLD_NEXT, "glTexImage2D");
+    if (!real_glTexImage2D) {
+        SHIM_LOG("glEGLImageTargetTexture2DOES: glTexImage2D unresolved; no-op");
+        return;
+    }
+    /* GL_RGBA8 = 0x8058 internal, GL_RGBA = 0x1908 format, GL_UNSIGNED_BYTE = 0x1401. */
+    real_glTexImage2D(target, 0, 0x8058, w, h, 0, 0x1908, 0x1401, NULL);
+    SHIM_LOG("glEGLImageTargetTexture2DOES(target=0x%x, image=%p) -> glTexImage2D %dx%d RGBA8",
+             target, image, w, h);
+    /* Register for frame capture at MODE_PAGE_FLIP. */
+    shim_frametex_record(target, w, h);
+}
+
+/* Sync extensions — still pure stubs; no real work needed. */
 static void *stub_eglCreateSyncKHR(void *display, unsigned type, const intptr_t *attrib_list) {
     (void)display; (void)type; (void)attrib_list; return FAKE_EGL_SYNC;
 }
@@ -2729,9 +3399,6 @@ static int stub_eglWaitSyncKHR(void *display, void *sync, int flags) {
 static int stub_eglClientWaitSyncKHR(void *display, void *sync, int flags, uint64_t timeout) {
     (void)display; (void)sync; (void)flags; (void)timeout;
     return 0x30F6;  /* EGL_CONDITION_SATISFIED_KHR */
-}
-static void stub_glEGLImageTargetTexture2DOES(unsigned target, void *image) {
-    (void)target; (void)image;
 }
 
 /* ---- Hooked: GLES 3.x ----
@@ -2900,7 +3567,16 @@ void glDeleteBuffers(int n, const unsigned *ids) {
     FWD_VOID(glDeleteBuffers, (int, const unsigned*), (n, ids));
     (void)n; (void)ids;
 }
+/* Step 58 debug: prove which FBO/texture paths the game actually exercises.
+ * Each of these hooks logs its first few invocations then falls silent. */
+#define SHIM_GL_DBG_HOOK(NAME) \
+    do { static uint64_t _c = 0; \
+         if (__builtin_expect(is_real_gl(), 0) && ++_c <= 4) \
+             SHIM_LOG("[gl] " #NAME " #%lu entered", (unsigned long)_c); \
+    } while (0)
+
 void glGenFramebuffers(int n, unsigned *out) {
+    SHIM_GL_DBG_HOOK(glGenFramebuffers);
     FWD_VOID(glGenFramebuffers, (int, unsigned*), (n, out));
     for (int i = 0; i < n; i++) out[i] = gl_next_fb_id++;
     GLLOG(object_create, "glGenFramebuffers(%d) -> [%u..]", n, n ? out[0] : 0);
@@ -2959,7 +3635,26 @@ void glBindBuffer(unsigned target, unsigned buf) {
     FWD_VOID(glBindBuffer, (unsigned, unsigned), (target, buf));
     (void)target; (void)buf;
 }
+/* Track the game's most recent draw FBO so the MODE_PAGE_FLIP capture hook
+ * has something to read from even after the game unbinds (our pbuffer read
+ * at fb=0 is empty because the game isn't compositing into it). Ignore
+ * binds to 0 (unbind) and to our own capture FBO. Thread-safe via atomic.
+ * Forward-declared as extern alongside shim_frame_capture_at_page_flip. */
+volatile unsigned shim_last_draw_fbo = 0;
+
 void glBindFramebuffer(unsigned target, unsigned fb) {
+    if (__builtin_expect(is_real_gl(), 0)) {
+        /* Count + occasional log — diagnostic for whether this hook fires at all. */
+        static uint64_t bind_count = 0;
+        uint64_t c = __atomic_add_fetch(&bind_count, 1, __ATOMIC_RELAXED);
+        if (c <= 20 || (c & 1023) == 0)
+            SHIM_LOG("[gl] glBindFramebuffer #%lu target=0x%x fb=%u", (unsigned long)c, target, fb);
+        if ((target == 0x8D40 /* GL_FRAMEBUFFER */ ||
+             target == 0x8CA9 /* GL_DRAW_FRAMEBUFFER */) &&
+            fb != 0 && fb != shim_capture_fbo) {
+            __atomic_store_n(&shim_last_draw_fbo, fb, __ATOMIC_RELAXED);
+        }
+    }
     FWD_VOID(glBindFramebuffer, (unsigned, unsigned), (target, fb));
     (void)target; (void)fb;
 }
@@ -3081,6 +3776,7 @@ void glValidateProgram(unsigned program) {
     (void)program;
 }
 void glUseProgram(unsigned program) {
+    SHIM_GL_DBG_HOOK(glUseProgram);
     FWD_VOID(glUseProgram, (unsigned), (program));
     (void)program;
 }
@@ -3221,11 +3917,18 @@ void glDisableVertexAttribArray(unsigned idx) {
 
 void glFramebufferTexture2D(unsigned target, unsigned att, unsigned ttarget,
                             unsigned tex, int level) {
+    if (__builtin_expect(is_real_gl(), 0)) {
+        static uint64_t c = 0;
+        if (++c <= 6) SHIM_LOG("[gl] glFramebufferTexture2D #%lu target=0x%x att=0x%x ttarget=0x%x tex=%u",
+                               (unsigned long)c, target, att, ttarget, tex);
+        if (ttarget == 0x8D65) ttarget = 0x0DE1;  /* EXTERNAL_OES → TEXTURE_2D */
+    }
     FWD_VOID(glFramebufferTexture2D, (unsigned, unsigned, unsigned, unsigned, int),
              (target, att, ttarget, tex, level));
     (void)target; (void)att; (void)ttarget; (void)tex; (void)level;
 }
 void glFramebufferRenderbuffer(unsigned target, unsigned att, unsigned rbtarget, unsigned rb) {
+    SHIM_GL_DBG_HOOK(glFramebufferRenderbuffer);
     FWD_VOID(glFramebufferRenderbuffer, (unsigned, unsigned, unsigned, unsigned),
              (target, att, rbtarget, rb));
     (void)target; (void)att; (void)rbtarget; (void)rb;
@@ -3348,6 +4051,7 @@ void glClear(unsigned mask) {
 /* --- Draw --- */
 
 void glDrawArrays(unsigned mode, int first, int count) {
+    SHIM_GL_DBG_HOOK(glDrawArrays);
     FWD_VOID(glDrawArrays, (unsigned, int, int), (mode, first, count));
     (void)mode; (void)first;
     GLLOG(draw, "glDrawArrays(count=%d)", count);
@@ -3523,13 +4227,13 @@ void (*eglGetProcAddress(const char *name))(void) {
     struct { const char *name; pfn_t fn; } table[] = {
         { "eglGetPlatformDisplayEXT",         (pfn_t)eglGetPlatformDisplayEXT },
         { "eglGetPlatformDisplay",            (pfn_t)eglGetPlatformDisplay },
-        { "eglCreateImageKHR",                (pfn_t)stub_eglCreateImageKHR },
-        { "eglDestroyImageKHR",               (pfn_t)stub_eglDestroyImageKHR },
+        { "eglCreateImageKHR",                (pfn_t)eglCreateImageKHR },
+        { "eglDestroyImageKHR",               (pfn_t)eglDestroyImageKHR },
         { "eglCreateSyncKHR",                 (pfn_t)stub_eglCreateSyncKHR },
         { "eglDestroySyncKHR",                (pfn_t)stub_eglDestroySyncKHR },
         { "eglWaitSyncKHR",                   (pfn_t)stub_eglWaitSyncKHR },
         { "eglClientWaitSyncKHR",             (pfn_t)stub_eglClientWaitSyncKHR },
-        { "glEGLImageTargetTexture2DOES",     (pfn_t)stub_glEGLImageTargetTexture2DOES },
+        { "glEGLImageTargetTexture2DOES",     (pfn_t)glEGLImageTargetTexture2DOES },
         { NULL, NULL },
     };
     for (int i = 0; table[i].name; i++) {
@@ -4451,6 +5155,10 @@ int ioctl(int fd, unsigned long request, ...) {
                 SHIM_LOG("DRM ioctl MODE_PAGE_FLIP #%u crtc=%u fb=%u flags=0x%x",
                          flip_count, p->crtc_id, p->fb_id, p->flags);
             }
+            /* Step 58.2: capture frame to the frame bridge at the present
+             * boundary. Runs in the game's thread, so the GL context the
+             * game made current is live — we can glReadPixels directly. */
+            shim_frame_capture_at_page_flip();
             return 0;
         }
 
