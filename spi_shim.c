@@ -1697,6 +1697,73 @@ static void *shim_poke_cmode_thread(void *arg) {
     return NULL;
 }
 
+/* Step 60: direct poke of system_state_flags bit 0x10.
+ *
+ * BN entry [85] established that the main loop at 0xb2aba0 gates downstream
+ * progression on `system_state_flags bit 0x10` being set AND elapsed time in
+ * [599 ms, 3599 ms]. The two legitimate writers (sub_a61380 / sub_a61040)
+ * only set the bit on fire_event(0x46|0x4d) success, which means firing those
+ * events via our shim_fire_event trampoline won't set the bit — only the game
+ * internally calling sub_a61380 can do that.
+ *
+ * This thread brute-forces the experiment: after a configurable delay into
+ * the timing window, atomically OR the bit in directly. Three outcomes per
+ * the journal Step-60 plan:
+ *   - boot-splash advances  → bit was the gate, find the legitimate trigger
+ *   - no change             → bit is part of conjunction with other state
+ *   - crash                 → downstream code needs more setup than just the bit
+ *
+ * Spec: SPIKE3_POKE_STATE_FLAG=<hex_or_dec_bit_mask>:<delay_ms>
+ *   default mask  = 0x10
+ *   default delay = 1500 ms (solidly inside the [599, 3599] ms window).
+ * Example: SPIKE3_POKE_STATE_FLAG=0x10:1500 */
+#define SYSTEM_STATE_FLAGS_BN_VA 0x4882388
+
+static void *shim_poke_state_flag_thread(void *arg) {
+    char *spec = (char*)arg;
+    unsigned mask = 0x10;
+    long delay_ms = 1500;
+    if (spec && *spec) {
+        char *copy = spec;
+        char *colon = strchr(copy, ':');
+        if (colon) {
+            *colon = 0;
+            if (copy[0]) mask = (unsigned)strtoul(copy, NULL, 0);
+            delay_ms = atol(colon + 1);
+        } else {
+            /* bare value = mask only, keep default delay */
+            mask = (unsigned)strtoul(copy, NULL, 0);
+        }
+    }
+    SHIM_LOG("[poke_state_flag] will OR 0x%x into system_state_flags @ 0x%x after %ld ms",
+             mask, SYSTEM_STATE_FLAGS_BN_VA, delay_ms);
+
+    if (delay_ms > 0) {
+        struct timespec ts = {
+            .tv_sec  = delay_ms / 1000,
+            .tv_nsec = (delay_ms % 1000) * 1000000L,
+        };
+        nanosleep(&ts, NULL);
+    }
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[poke_state_flag] game_base unresolved; aborting");
+        free(spec);
+        return NULL;
+    }
+    volatile uint16_t *flag_ptr =
+        (volatile uint16_t *)(game_base + (SYSTEM_STATE_FLAGS_BN_VA - 0x400000));
+    uint16_t before = *flag_ptr;
+    __atomic_or_fetch(flag_ptr, (uint16_t)mask, __ATOMIC_SEQ_CST);
+    uint16_t after = *flag_ptr;
+    SHIM_LOG("[poke_state_flag] @ rt %p: 0x%04x → 0x%04x (mask 0x%x applied)",
+             (void*)flag_ptr, before, after, mask);
+
+    free(spec);
+    return NULL;
+}
+
 /* Start the bridge: create listener socket, spawn accept + poll threads.
  * Called from the constructor; no-op unless SPIKE3_BRIDGE=1. */
 static void shim_bridge_start(void) {
@@ -2260,6 +2327,21 @@ static void shim_install_crash_handler(void) {
         if (copy) {
             pthread_t t;
             if (pthread_create(&t, NULL, shim_poke_cmode_thread, copy) == 0) {
+                pthread_detach(t);
+            } else {
+                free(copy);
+            }
+        }
+    }
+
+    /* Step 60: optional system_state_flags bit poke (force boot-splash gate). */
+    const char *psf = getenv("SPIKE3_POKE_STATE_FLAG");
+    if (psf && psf[0]) {
+        /* Accept "1" as shorthand for "use defaults (bit 0x10, 1500ms)". */
+        char *copy = strdup(psf[0] == '1' && psf[1] == 0 ? "" : psf);
+        if (copy) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, shim_poke_state_flag_thread, copy) == 0) {
                 pthread_detach(t);
             } else {
                 free(copy);
