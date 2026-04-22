@@ -1,0 +1,13 @@
+# extracted overlay (365 MB) — rebuilt from debs*/ by build_overlay.sh
+pkg/
+
+# cached .debs (rebuilt on demand) — comment out this line if you want
+# to commit them for network-independent reproducibility
+debs/*.deb
+debs_2408/*.deb
+
+# compiled probes
+probe
+egl_probe
+gles_probe
+gles_probe2

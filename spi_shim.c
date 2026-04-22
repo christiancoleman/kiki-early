@@ -15,6 +15,14 @@
  * Run:
  *   cd games/pokemon_le && qemu-aarch64 -L /path/to/sysroot \
  *     -E LD_PRELOAD=/path/to/spi_shim.so ./game
+
+        qemu-aarch64 -L /mnt/c/Workspace/pokemon-le-0.81.0 \
+            -E LD_PRELOAD=$(pwd)/_emulation/spi_shim.so \
+            -E SPIKE3_SYSROOT=/mnt/c/Workspace/pokemon-le-0.81.0 \
+            -E SPIKE3_BRIDGE=1 \
+            -E "SPIKE3_POKE_CMODE=story_charmander_1:0x700:35" \
+            ./game
+
  */
 
 #define _GNU_SOURCE

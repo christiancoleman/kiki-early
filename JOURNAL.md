@@ -4591,5 +4591,180 @@ Also extracted a sample of the 5 captured 1920×1080 RGBA textures + 3 sprite at
 3. **Hook `sub_b24f70`** — intercept the switch-state reader to log which switch closures drive which cmode fields. Cleanest long-term observability.
 4. **Real EGL via Mesa/WSLg** — the big rendering job, multi-session. Shelved for now.
 
+## Step 55: Plan A dead, Plan B-lite lives — aarch64 Mesa software raster works under qemu-user (2026-04-22)
+
+Went in planning virtio-gpu host-GPU passthrough; came out with a complete software-rasterization path that works in qemu-user-mode and renders real pixels through llvmpipe. No VM, no kernel, no `/dev/dri`.
+
+### 55.1: Verdict on Plan A (virgl → host GPU)
+
+Empirically disproven on WSL2. Probe sequence:
+
+| Check | Result |
+|---|---|
+| `qemu-system-x86_64` + `virtio-gpu-gl-pci` + `egl-headless` on startup | `qemu-system-x86_64: egl: no drm render node available` / `egl: render node init failed` |
+| `qemu-system-x86_64` + `virtio-gpu-gl-pci` + `gtk,gl=on` (TCG, no KVM) | Window starts fine, GL-display init succeeds. `gl=on` for the display ≠ virgl. |
+| WSL2 `/dev/dri` | absent |
+| WSL2 `/dev/dxg` | present, but virglrenderer's host-side EGL path wants a DRM render node |
+| Host `libvirglrenderer1` installed | yes (1.1.0) — library is ready, just no DRI node to target |
+
+Conclusion: virglrenderer-on-WSL2 cannot initialise host EGL because WSL2 does not expose a DRM render node. Plan A is deferred until a native Linux host is available (or WSL2 gains a DRI bridge). Full failure log + verdict in session transcript; short form in `_emulation/mesa_sw_overlay/README.md`.
+
+### 55.2: Gemini cross-check — one correction taken, one confused pivot, one useful reframe
+
+User solicited a second opinion. Three findings worth recording:
+
+- **Correction (adopted):** Box64 / FEX-Emu translate x86→aarch64, not the other way. Prior suggestion to list them as aarch64→x86 emulators was wrong; qemu-user is the correct tool in that direction. There is no mature aarch64→x86 equivalent of Box64.
+- **Confused pivot:** Gemini suggested using Mesa's d3d12 Gallium driver to talk to WSL's `/dev/dxg`. Three stacked problems prevent this working:
+  1. No aarch64 Mesa build with the d3d12 driver ships anywhere — it's x86_64-first upstream, and Debian arm64 does not package it;
+  2. WSL's D3D12 userspace libraries (`/usr/lib/wsl/lib/libd3d12.so`, `libd3d12core.so`, `libdxcore.so`) are x86_64 ELFs — an aarch64 process cannot load them; qemu-user cannot bridge ISAs inside a single process;
+  3. DXGKrnl's ioctl set is custom (not in qemu-user's translation table) and carries pointer-bearing structs whose arg-layouts qemu-user won't rewrite.
+- **Useful reframe (adopted):** stay in qemu-user-mode, replace the sysroot's Mesa DRI drivers with a software-raster aarch64 build, remove the shim's EGL/GLES fake-success. No VM. This became Step 55 proper.
+
+### 55.3: Mesa overlay architecture
+
+Target: sysroot Mesa reports "Mesa 24.0.9" in its `libEGL.so.1` version strings. Gate-check plan: overlay a Debian-arm64 Mesa near that version next to the sysroot, force-load `swrast` via `MESA_LOADER_DRIVER_OVERRIDE`, initialise surfaceless EGL.
+
+All overlay files live in `games/pokemon_le/_emulation/mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/` and are built by downloading arm64 `.deb`s and extracting with `dpkg-deb -x` — **no `sudo`, no foreign-architecture `dpkg --add-architecture`, no sysroot modification**.
+
+### 55.4: Dep-closure walk (Debian 25.0.7 first attempt)
+
+Pulled 4 arm64 packages from `deb.debian.org/debian/pool/main/m/mesa/`:
+- `libgl1-mesa-dri_25.0.7-2_arm64.deb` (46 KB) — **megadriver**: every `*_dri.so` is a symlink to one 133 KB `libdril_dri.so` loader. Actual driver code lives in…
+- `mesa-libgallium_25.0.7-2_arm64.deb` (8 MB) — `libgallium-25.0.7-2.so`, the engine libdril dlopens on first driver-call. New packaging in Mesa 25.x.
+- `libegl-mesa0`, `libgbm1` — 25.0.7 versions, not used in final overlay.
+
+`libgallium-25.0.7-2.so` NEEDED list revealed the transitive closure. Iterative pull loop (parse the missing-lib from each dlopen failure, look up `apt-cache show <pkg>` on the host to get the pool filename, swap `_amd64.deb` → `_arm64.deb`, `curl` from Debian, `dpkg-deb -x` into overlay, retry) grew the overlay to 30 arm64 packages, final size **365 MB uncompressed** (63 MB of .deb):
+
+LLVM-19 (libLLVM.so.19.1, 123 MB) • libzstd1 • libelf1t64 • libsensors5 • libdrm-{amdgpu,nouveau,radeon,intel}1 • libxcb1 + 6 xcb sub-libs • libx11-xcb1 • libxshmfence1 • libwayland-client0 • libwayland-server0 • libedit2 • libtinfo6 • libxml2 • libbsd0 + libmd0 • libicu76 • libz3-4 • libxau6 + libxdmcp6 • libstdc++6.
+
+Probe: `dlopen("libgallium-25.0.7-2.so")` under qemu-aarch64 with `LD_LIBRARY_PATH` pointing at the overlay. After 19 iterations, dlopen succeeded — full 25.0.7 gallium + its 120-ish transitive deps resolvable.
+
+### 55.5: Mesa version-string gate rejected 25.0.7 driver against 24.0.9 libEGL
+
+Next run (EGL probe using sysroot's `libEGL.so.1`):
+
+```
+libEGL fatal: did not find extension DRI_Mesa version 1
+```
+
+Sysroot's 24.0.9 libEGL wants `DRI_Mesa` v1 from its driver; Debian 25.0.7 driver doesn't provide that specific extension signature. ABI divergence between 24.x and 25.x on the driver ↔ loader interface.
+
+### 55.6: Backswap to Mesa 24.0.8-1 (closest match available)
+
+Debian's source-version history (queried via `snapshot.debian.org/package/mesa/`) shows Mesa 24.0.9 never shipped — the series jumps `24.0.8-1` → `24.1.0-1`. Ubuntu noble arm64 only had 24.0.5. **Mesa 24.0.9 exact is sysroot-only.** Best available: 24.0.8-1 (one patch-level off, 24.0.x is a pure bugfix series so ABI is identical).
+
+Pulled via `snapshot.debian.org/mr/binary/libgl1-mesa-dri/24.0.8-1/binfiles` → `/file/<sha1>`:
+- `libgl1-mesa-dri_24.0.8-1_arm64.deb` (7 MB) — **different architecture**: one 28 MB `armada-drm_dri.so` with every other driver as a hardlink. All gallium code is statically inside (no separate `libgallium.so` in 24.x).
+- `libegl-mesa0_24.0.8-1_arm64.deb`, `libgbm1_24.0.8-1_arm64.deb`.
+
+Overlaid on top of the 25.0.7 tree. 24.0.8 drivers won.
+
+24.0.8 swrast_dri.so NEEDED: all satisfied by the existing overlay + sysroot — `libLLVM-17.so.1` replaces LLVM-19 as the JIT. Debian 13 renamed the package `libllvm17` → `libllvm17t64` (time_t-64-bit transition). Pulled `libllvm17t64_17.0.6-22+b2_arm64.deb` from trixie (119 MB). Both LLVM-17 and LLVM-19 now coexist in the overlay — LLVM-17 is the one actually used by the 24.0.8 driver.
+
+Retry: new error, progress.
+
+```
+libEGL fatal: DRI driver not from this Mesa build ('24.0.8-1' vs '24.0.9')
+```
+
+Mesa's own strict version-string check, not a real ABI gate. Driver reports its build as `"24.0.8-1"`, libEGL was compiled with `PACKAGE_VERSION="24.0.9"`, strcmp fails. No escape env var exists — grepped sysroot libEGL for `MESA_.*VERSION|SKIP|allow_driver` and found nothing actionable.
+
+### 55.7: Defeat the version-string check by in-place binary patch
+
+The string `"24.0.8-1\0"` is stored 8 times in `armada-drm_dri.so` (rodata), including at the `DRI_Mesa` extension descriptor and in several error-message contexts. Python patch:
+
+```python
+for path in glob("…/pkg/usr/lib/aarch64-linux-gnu/dri/*_dri.so"):
+    with open(path, "rb") as f: data = bytearray(f.read())
+    data = data.replace(b"24.0.8-1", b"24.0.9\x00\x00")   # same 8-byte length
+    open(path, "wb").write(data)
+```
+
+8 occurrences patched. Driver still loads (the changed bytes are in strings only, no code).
+
+Retry EGL probe:
+```
+libEGL.so.1 loaded: 0x…
+EGL 1.5  vendor='Mesa Project'
+  client apis: OpenGL OpenGL_ES
+  extensions (first 400c): EGL_EXT_create_context_robustness EGL_EXT_query_reset_notification_strategy …
+EXIT=0
+```
+
+**EGL init passes.** Surfaceless, no `/dev/dri`, no X11 touched.
+
+### 55.8: End-to-end render validation — multi-clear + shaded triangle
+
+Stronger probe (`_emulation/mesa_sw_overlay/gles_probe2.c`): runs 4 distinct `glClear` colors + a real vertex/fragment shader pair + `glDrawArrays` triangle + `glReadPixels` at a point inside the triangle and a point outside.
+
+```
+EGL: 1.5  Mesa Project
+GL_RENDERER: llvmpipe (LLVM 17.0.6, 128 bits)
+GL_VERSION:  OpenGL ES 3.2 Mesa 24.0.9
+GL_GLSL_VER: OpenGL ES GLSL ES 3.20
+
+Test 1: three distinct glClear colors
+  clear #1 purple          at(64,64) expect=bf 19 e6 ff  got=bf 1a e6 ff  OK
+  clear #2 teal            at(64,64) expect=33 cc 4c ff  got=33 cc 4c ff  OK
+  clear #3 black           at(64,64) expect=00 00 00 ff  got=00 00 00 ff  OK
+  clear #4 white           at(64,64) expect=ff ff ff 40  got=ff ff ff 40  OK
+  subtotal: 4/4
+
+Test 2: shaded triangle (shader compile + link + draw)
+  vertex shader compile: OK
+  fragment shader compile: OK
+  program link: OK
+  inside-tri center        at(64,64) expect=e6 33 99 ff  got=e5 33 99 ff  OK
+  outside-tri corner       at( 4, 4) expect=0d 0d 0d ff  got=0d 0d 0d ff  OK
+
+TOTAL: 6/6 passes
+VERDICT: ALL PASS — llvmpipe is really rasterizing
+```
+
+Game uses GLES 3.0; we're providing 3.2 via llvmpipe with GLSL ES 3.20. The two off-by-ones (bf **1a** e6 ff vs bf 19 e6 ff, e**5** 33 99 ff vs e6 33 99 ff) are unorm rounding (0.1 × 255 = 25.5 rounds up; 0.9 × 255 = 229.5 rounds down this run) — both within my ±2 tolerance and both confirm the driver is doing real math, not a constant fill.
+
+### 55.9: Zero-risk sanity — game + overlay + unchanged shim
+
+Before modifying the shim, proved the 225 MB overlay on `LD_LIBRARY_PATH` doesn't disturb the existing Step-54 pipeline:
+
+```
+cd games/pokemon_le && timeout 25 qemu-aarch64 -L /mnt/c/Workspace/pokemon-le-0.81.0 \
+    -E LD_PRELOAD=.../spi_shim.so \
+    -E LD_LIBRARY_PATH=.../mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu:…:sysroot dirs \
+    -E SPIKE3_SYSROOT=/mnt/c/Workspace/pokemon-le-0.81.0 \
+    ./game > run_step55_sanity.log 2>&1
+```
+
+Result: 12,827 log lines, steady state reached (shim's `shim_dump_dispatch_tables` output + SPI poll), 34 Step-54 milestone markers hit (Radium / ManualGodotScene / pokemon_battle_scene / Godot Engine / /root/Main / bridge), **zero overlay-induced errors** (no "DRI driver not from this Mesa", no "undefined symbol", no "version mismatch", no "cannot open shared object").
+
+Confirmed: the overlay is load-time innocent. Because the shim's EGL/GLES hooks are still intercepting every call, Mesa never actually gets invoked during the run — but none of its 120-ish .so files cause any conflict just by being resolvable on `LD_LIBRARY_PATH`.
+
+### 55.10: What's unlocked, what's next
+
+**Unlocked (this step):** A working aarch64 software-raster GL stack layered on top of the sysroot. No VM, no virtio, no kernel, no `/dev/dri`, no host GPU. Just a library overlay + four env vars:
+
+```
+LD_LIBRARY_PATH=<overlay>:<sysroot dirs>
+LIBGL_DRIVERS_PATH=<overlay>/dri
+MESA_LOADER_DRIVER_OVERRIDE=swrast
+LIBGL_ALWAYS_SOFTWARE=1
+EGL_PLATFORM=surfaceless
+```
+
+**Next (Step 56, planned):** Gate the shim's EGL + GLESv2 + GBM interceptors behind an env var (`SPIKE3_REAL_GL=1`). With the flag off, existing Step-54 behaviour. With the flag on, the shim short-circuits its GL fake-success paths and the game's calls fall through to real Mesa. Bridge/audio/UART/DRM-socketpair/memcpy/pthread_create/`system()`/ALSA stubs all stay always-on; only GL leaves.
+
+The first SPIKE3_REAL_GL=1 run is almost certainly going to surface new failures — surfaceless platform means the game's GBM/DRM page-flip path will hit surfaces we haven't matched to real EGL resources, shader-compile errors could light up, Godot may assert on a config we didn't handle. Each is its own sub-step. But we now have a **real** pipeline to walk down instead of a stack of stubs that always "succeed" by fiat.
+
+### 55.11: Artifacts
+
+- `_emulation/mesa_sw_overlay/` — all overlay work lives here.
+  - `pkg/` — extracted overlay (225 MB, `.gitignore`-worthy; reproducible from `debs*/`)
+  - `debs/` — 25.0.7 transitive deps (38 .deb files, ~25 MB)
+  - `debs_2408/` — 24.0.8 Mesa core + libllvm17 (3 .deb files)
+  - `probe.c`, `probe` — dlopen gate-check
+  - `egl_probe.c`, `egl_probe` — EGL init gate-check
+  - `gles_probe.c`, `gles_probe` — EGL + GLES3 + glClear probe (original)
+  - `gles_probe2.c`, `gles_probe2` — multi-clear + shaded-triangle probe (6/6 pass)
+- `_emulation/run_step55_sanity.log` — zero-risk run proving overlay is load-time innocent.
 
 
