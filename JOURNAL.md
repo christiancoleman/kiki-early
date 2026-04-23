@@ -5271,6 +5271,47 @@ What's parked (revisit only if Track A hits a game-logic issue that turns out to
 Revised next action: extend the `eglGetProcAddress` intercept as a two-way instrument. (a) log every unknown name the game queries — tells us what core GL functions the game resolves through eglGetProcAddress vs direct linkage; (b) if the game queries `glFramebufferTexture2D` / `glFramebufferTextureLayer` / `glFramebufferRenderbuffer` through this path, return our wrapper so the `EXTERNAL_OES → TEXTURE_2D` swap actually fires. If it doesn't query through this path, we learn the game uses `libglapi.so.0`'s internal dispatch table and the fix needs to happen at a lower layer (patch the dispatch table at memory-address level post-context-create). Either outcome is informative and the change itself is ~30 LOC plus a sort-uniq pass on the log afterward.
 
 
+## Step 63: shim refactor — seven phases of carving, before we keep digging (2026-04-22 → 2026-04-23)
 
+Step 58.post.3 ended with a narrow plan: instrument `eglGetProcAddress` to see what core-GL names the game queries. Before writing it I re-read `spi_shim.c` and concluded the file itself had become the problem. At ~6400 LOC in a single translation unit, every new diagnostic meant scrolling past unrelated state, and I kept asking myself "does this subsystem hook the LFS variant?" or "is this fd predicate already defined somewhere above?" The Godot pivot (Step 58.post.3) reframed the investigation as a bounded Stern-only GL problem — but a bounded search space doesn't help when the tool you use to search it is illegible. The next several investigation steps are going to accrete a lot of diagnostic code; landing all of that on top of a 6400-line monolith would make it impossible to tell what subsystem each new hook belonged to, or whether an existing hook already covered the case.
+
+So we took the detour: carve the shim into subsystem translation units along the boundaries of its actual behavior, preserve every line (including BN-derived RE code — cmode tables, switch manifests, dispatch-table dumpers), and give it the shared header it had been missing. Baseline-match each phase against the pre-refactor smoke run; anything that deviates is a regression and gets fixed before moving on. Pure maintainability investment — no new behavior, no new diagnostics (except defensively), no attempt to advance the game-logic frontier.
+
+### The seven phases
+
+| Phase | Module                | Owns                                                                        |
+|-------|-----------------------|-----------------------------------------------------------------------------|
+| 1     | `spi_shim.h`          | `SHIM_LOG`, `FWD_RET`/`FWD_VOID` and verbose variants, is_real_gl() proto. First step — macros every TU needs. |
+| 2     | `shim_bridges.c`      | state bridge poll thread, frame bridge (`glReadPixels` → RGBA socket), page-flip capture. No-op unless `SPIKE3_BRIDGE=1` / `SPIKE3_FRAME_BRIDGE=1`. |
+| 3     | `shim_diagnostics.c`  | cmode registry (42 BN-extracted entries), event sweep, SIGSEGV/SIGUSR2 dump handlers, dispatch-table dumpers, sound-globals dump. **The explicit home for RE output.** |
+| 4     | `shim_nodebus.c`      | UART netbridge framing + response synth. Keeps the game's dispatch wheel turning without real hardware. |
+| 5     | `shim_fs.c`           | `open`/`openat`/`open64`/`openat64`/`fopen`/`fopen64`, device intercept dispatcher, GPIO sysfs fake-fd pool, sysroot path remap. Step 62's LFS hooks carved here kept them together. |
+| 6     | `shim_gl.c`           | EGL surface/context plumbing, GLES stubs, fallback pbuffer, `eglGetProcAddress` table. Step 59's pbuffer fix lives here. |
+| 7a    | `shim_io.c`           | `close`, `read`, `lseek`, `write` + LFS variants (`lseek64`, `pread`/`pread64`, `pwrite`/`pwrite64`). |
+| 7b    | `shim_ioctl.c`        | `ioctl` dispatch for UART/SPI/DRM/V4L2/I2C + DRM page-flip event synthesis. |
+
+`spi_shim.c` dropped from 6385 → 2235 lines (65% moved). What's left is globals, `intercept_device`, the `resolve_all` dlsym pump, crash-handler install, and a few tie-together bits that Phases 8–9 will address.
+
+### What the refactor paid for immediately
+
+**(1) Found a blind spot in our LFS hook coverage.** Phase 7 pre-emptively added `lseek64`, `pread`/`pread64`, `pwrite`/`pwrite64` with a `SHIM_LFS_FIRST_CALL` banner macro that logs the first time each new variant fires. On the next smoke run, `pread64` immediately banner-banged — 7 calls on `fd=31` at offsets 102M, 282M, 811M with 44,800-byte chunks. Reactive logic would have left that path silent forever; proactive instrumentation surfaced it the moment we wired the hook. The `fd=31` provenance isn't yet mapped (no `OPEN64 OK` line binds a path to fd 31 — likely inherited, or dup'd, or opened by a thread whose path fell outside `should_log_open`'s filter), but we now know the game is doing random-access reads on a large file during steady state. The 811M offset exceeds `main.pck` (210 MB), so it's almost certainly `image.bin` (1.1 GB) — a concrete new lead we didn't have before Phase 7.
+
+**(2) Codified "hook both variants" as policy.** `shim_io.c`'s top block-comment records the rule-of-thumb: if you hook `FN`, hook `FN64`; the asymmetry is an unreliability generator, not a redundancy. We documented the three remaining asymmetries (`fopen` plain, `pread` plain, `pwrite` plain) with `fopen` flagged highest-priority because it takes a path and could silently leak un-remapped paths past `shim_fs.c`.
+
+**(3) Research code has a home.** `shim_diagnostics.c` is now the explicit container for BN-extracted knowledge and the probing machinery that reads it — cmode table, event sweep, dispatch-table dumpers, sound-globals dump. Memory `feedback_preserve_re_knowledge` was written mid-refactor after I almost deleted the cmode table during Phase 3 as "unused." Future RE findings land there instead of being wedged into whatever unrelated file was most recently touched.
+
+**(4) Baseline-match regression harness.** Each phase's smoke run compared to the pre-refactor baseline. Through Phase 7 the only deviation is GPIO jitter (single-bit read-order difference that doesn't affect game logic). No behavioral drift, which matters because several phases moved hooks across TU boundaries and we had no type-checking layer to catch a silently-dropped dependency.
+
+### What the refactor does NOT change
+
+The game still stops where Step 59 + Step 62 left it: boot-splash with 40 page flips / 215 unique frames over 185 s, Godot banner prints, scripts load, `/root/Main` still missing, `VideoStreamPlayer::play()` still trips `is_inside_tree() == false` on orphaned nodes at destruct. This step didn't advance the state machine. That's fine and intentional — we paid tech-debt tax so Phases 8–9 and the subsequent investigation can move cheaply.
+
+### What's next
+
+- **Phase 8 (`shim_patches.c`)** — pull the runtime patches out of `spi_shim.c`: memcpy NULL-guard, Step 62 SpiDecoder::Play vtable patch, Step 64 `get_format` NOP, libavcodec HW-accel bypass, dummy-frame injection. These all share the "find-and-replace after dlopen" shape and belong together.
+- **Phase 9 (`shim_inject.c`)** — switch-manifest poker, event-sweep scheduler, `vp_patch` thread. All write into game memory at timed intervals; same operational shape.
+- **Follow-up: Phase 7 asymmetries.** Add `fopen`, `pread`, `pwrite` plain-variant hooks with the FIRST-CALL banner. Start with `fopen`.
+- **Follow-up: `fd=31` provenance.** Walk the full log for what was opened in the window before `pread64 #1` (or loosen `should_log_open` to dump every open regardless of path filter).
+- **After 8/9:** return to the investigation frontier. Two concrete threads — (a) the `/root/Main` custom-init question (how does Stern's boot path bring Main into the tree, given BN [81] says standard `SceneTree::init` is bypassed?); (b) the `VideoStreamPlayer is_inside_tree()` destructor trip (orphaned nodes that shouldn't have been constructed, or should have been parented to a fake root before `play()`).
 
 
