@@ -8,12 +8,12 @@ workstation, and synthesizes whatever the game expects.
 
 ## Get started
 
-1. One-time environment setup: see [`SETUP.md`](SETUP.md).
+1. One-time environment setup: see [`docs/SETUP.md`](docs/SETUP.md).
 2. Build the shim: `./build.sh`
 3. Run the game: `./run_game.sh` (defaults to a 185 s real-GL run with all
    patches enabled; knobs documented at the top of the script).
 4. Optional live frame viewer (second terminal): `python3 frame_viewer.py`
-5. Daily log of what each step was trying + what we learned: [`JOURNAL.md`](JOURNAL.md).
+5. Daily log of what each step was trying + what we learned: [`docs/JOURNAL.md`](docs/JOURNAL.md).
 
 ## Module guide
 
@@ -264,10 +264,11 @@ called from `shim_vp_patch_thread` in `spi_shim.c`.
 | 8 | `shim_patches.c` (memcpy NULL-guard + Step 62 vtable + Step 64 NOP + libavcodec hooks + dummy-frame injection) | 501 |
 | 9 | `shim_inject.c` (switch manifest + event sweep + 6 env-gated worker threads + SIGALRM handler) | 770 |
 
-Each phase was regression-tested against `REFACTOR_BASELINE.txt` — the
-post-Phase-6 run log captured before any carving. Every phase has matched
-the baseline within timing-variance noise (`gpio` retry count ±4, frame
-count ±30) on all 22 error classes + all 7 hook-fired log lines.
+Each phase was regression-tested against `runs/baseline/REFACTOR_BASELINE.txt`
+— the post-Phase-6 run log captured before any carving. Every phase has
+matched the baseline within timing-variance noise (`gpio` retry count ±4,
+frame count ±30) on all 22 error classes + all 7 hook-fired log lines.
+Per-phase deltas are preserved in `runs/baseline/PHASE{1..9}_REPORT.txt`.
 
 **The refactor is complete.** `spi_shim.c` is down to ~960 lines of
 device-state + device-intercept dispatcher + INLINE_SYSCALL-dodging
@@ -307,16 +308,44 @@ stat/xstat/lxstat/fstatat family with `*64` cousins.
 
 | File | Purpose |
 |---|---|
-| [`SETUP.md`](SETUP.md) | One-time dev-environment setup |
-| [`JOURNAL.md`](JOURNAL.md) | Step-by-step log of every attempt, success, and failure |
-| [`PROTOCOL.md`](PROTOCOL.md) | Verified on-wire protocol facts (netbridge, DRM events, etc.) |
-| [`MODE_TABLE.md`](MODE_TABLE.md) | The 42 C-modes — names, addresses, flag meanings |
-| [`HANDOFF.md`](HANDOFF.md) | Current-state snapshot for picking up the work cold |
-| [`ASSETS.md`](ASSETS.md) | Running log of what assets the game loads |
-| [`EVENT_SWEEP_STEP52.md`](EVENT_SWEEP_STEP52.md) | Write-up of the Step 52 event-sweep approach |
-| [`VIDEO_CLIPS.md`](VIDEO_CLIPS.md) | Catalogue of the 229 extracted video clips |
-| `REFACTOR_BASELINE.txt` | Error-count reference the refactor is regression-tested against |
-| `PHASE*_REPORT.txt` | Per-phase refactor smoke-run diff vs. baseline |
+| [`docs/SETUP.md`](docs/SETUP.md) | One-time dev-environment setup |
+| [`docs/JOURNAL.md`](docs/JOURNAL.md) | Step-by-step log of every attempt, success, and failure |
+| [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | Verified on-wire protocol facts (netbridge, DRM events, etc.) |
+| [`docs/MODE_TABLE.md`](docs/MODE_TABLE.md) | The 42 C-modes — names, addresses, flag meanings |
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | Current-state snapshot for picking up the work cold |
+| [`docs/ASSETS.md`](docs/ASSETS.md) | Running log of what assets the game loads |
+| [`docs/EVENT_SWEEP_STEP52.md`](docs/EVENT_SWEEP_STEP52.md) | Write-up of the Step 52 event-sweep approach |
+| [`docs/VIDEO_CLIPS.md`](docs/VIDEO_CLIPS.md) | Catalogue of the 229 extracted video clips |
+| `runs/baseline/REFACTOR_BASELINE.txt` | Error-count reference the refactor is regression-tested against |
+| `runs/baseline/PHASE*_REPORT.txt` | Per-phase refactor smoke-run diff vs. baseline |
+| `runs/baseline/historic_frame_counts.txt` | Per-phase frame-dir sizes preserved when the PNGs themselves were pruned on 2026-04-23 |
+| `reference/Binary Ninja Notebook Export (*).json` | Snapshot of the BN analyst's working notebook |
+
+## Restoring legacy capture hooks (shaders / textures / DMD)
+
+Step 56 removed three data-capture pipelines that had been useful early but
+were duplicative of `_extraction/` asset extraction:
+
+| Capture | Previous output path | Hook that wrote it |
+|---|---|---|
+| Shader source (GLSL) | `_emulation/shaders/shader_NNN_idM_typeXXXX.glsl` | `glShaderSource` in `shim_gl.c` |
+| Texture pixel data | `_emulation/textures/tex_NNNNNN_WxH_fmtXXXX_typeYYYY.raw` | `glTexImage2D` / `glTexSubImage2D` in `shim_gl.c` |
+| Compressed texture | `_emulation/textures/tex_compressed_NNNNNN_fmtXXXX.bin` | `glCompressedTexImage2D` / `glCompressedTexSubImage2D` in `shim_gl.c` |
+| DMD frame (BGRA) | `_emulation/dmd/frame_NNNNNN.bgra` (1024×256×4 = 1 MB/frame) | `gbm_bo_unmap` in `shim_gl.c` when the BO was tagged `is_dmd` |
+
+The physical dumps were deleted on 2026-04-23; the hook code was already
+gone since Step 56. To restore:
+
+1. Look at the git history for `shim_gl.c` around Step 56 (or the pre-Phase-6
+   monolith) — the hooks had roughly this shape: track shader/texture IDs in
+   a side table, then dump payload bytes on first write.
+2. Re-add the capture calls to the existing `glShaderSource`/`glTexImage2D`/
+   `gbm_bo_unmap` stub bodies in `shim_gl.c`.
+3. Re-add the output-directory `mkdir`s in `shim_init_dirs()` in `spi_shim.c`
+   (`_emulation/captures/{shaders,textures,dmd}`).
+
+`docs/ASSETS.md` has the detailed per-format byte-count tables the hooks
+used to size their dumps.
 
 ## Environment variables at runtime
 

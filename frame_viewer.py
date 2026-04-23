@@ -201,7 +201,7 @@ def main():
                     help="save every Nth frame as PNG (0 = off)")
     ap.add_argument("--save-dir",
                     default="/mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le/"
-                            "_emulation/frames")
+                            "_emulation/captures/frames")
     ap.add_argument("--no-display", action="store_true",
                     help="headless mode — save frames only, no Tk window")
     args = ap.parse_args()

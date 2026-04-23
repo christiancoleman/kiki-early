@@ -239,15 +239,15 @@ static void shim_dump_sound_globals(void) {
     u = write(STDERR_FILENO, summary, (size_t)sn);
 
     /* Walk the full _M_nxt chain and dump each node's raw bytes to
-     * _emulation/asset_registry.bin for the standalone parser. Each
+     * _emulation/captures/asset_registry.bin for the standalone parser. Each
      * node is assumed ≤128 bytes (libstdc++ _Hash_node<pair<K,V>,true>
      * with cached hash; larger than typical but conservative). */
     const size_t NODE_SIZE = 128;
     uint64_t node_count = 0;
-    int fd = open("_emulation/asset_registry.bin",
+    int fd = open("_emulation/captures/asset_registry.bin",
                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
-        const char *msg = "\n[shim] failed to open _emulation/asset_registry.bin\n";
+        const char *msg = "\n[shim] failed to open _emulation/captures/asset_registry.bin\n";
         u = write(STDERR_FILENO, msg, strlen(msg));
     } else {
         /* File layout:
@@ -303,7 +303,7 @@ static void shim_dump_sound_globals(void) {
         char msg[256];
         int ml = snprintf(msg, sizeof(msg),
             "\n[shim] asset_registry dumped: %lu nodes × %zu bytes → "
-            "_emulation/asset_registry.bin (%lu bytes total, elem_count=%lu)\n",
+            "_emulation/captures/asset_registry.bin (%lu bytes total, elem_count=%lu)\n",
             node_count, NODE_SIZE, 64 + 64 + node_count * NODE_SIZE, element_count);
         u = write(STDERR_FILENO, msg, (size_t)ml);
     }

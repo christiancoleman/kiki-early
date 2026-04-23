@@ -266,8 +266,10 @@ real_write_t real_write = NULL;   /* used by shim_nodebus.c + shim_io.c write() 
 
 /* ---- Shim directory init ----
  *
- * Audio capture (_emulation/audio/stream.s16le) is the only data-capture
- * pipeline still in use — texture/shader/DMD capture was removed in Step 56
+ * Audio capture (_emulation/captures/audio/stream.s16le) is the only
+ * data-capture pipeline still in use — texture/shader/DMD capture was
+ * removed in Step 56 (capture_hooks_note in README.md documents how to
+ * restore them if ever needed)
  * (duplicative of _extraction/ asset extraction, and DMD doesn't exist on
  * modern Spike 3 hardware).
  *
@@ -277,9 +279,10 @@ real_write_t real_write = NULL;   /* used by shim_nodebus.c + shim_io.c write() 
 
 __attribute__((constructor))
 static void shim_init_dirs(void) {
-    mkdir("_emulation",           0755);
-    mkdir("_emulation/audio",     0755);
-    mkdir("/tmp/cache",           0755);
+    mkdir("_emulation",                0755);
+    mkdir("_emulation/captures",       0755);
+    mkdir("_emulation/captures/audio", 0755);
+    mkdir("/tmp/cache",                0755);
 }
 
 
@@ -528,7 +531,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
  *   1000000 / 44100)` inside writei to match real ALSA timing.
  *
  * Capture: every `snd_pcm_writei` buffer is appended to
- * `_emulation/audio/stream.s16le`. Playback / conversion:
+ * `_emulation/captures/audio/stream.s16le`. Playback / conversion:
  *   ffplay -f s16le -ar 44100 -ac 2 stream.s16le
  *   ffmpeg -f s16le -ar 44100 -ac 2 -i stream.s16le stream.wav
  */
@@ -602,7 +605,10 @@ long snd_pcm_writei(void *pcm, const void *buffer, unsigned long size) {
         size_t bytes = (size_t)size * 4; /* stereo × 2 bytes = 4 B/frame */
         pthread_mutex_lock(&alsa_capture_lock);
         if (!alsa_capture_file) {
-            alsa_capture_file = fopen("_emulation/audio/stream.s16le", "ab");
+            /* "wb" truncates on the first open of each run so stream.s16le
+             * starts fresh per game invocation. Within a single run the shim
+             * holds the FILE* and appends naturally via subsequent fwrites. */
+            alsa_capture_file = fopen("_emulation/captures/audio/stream.s16le", "wb");
         }
         if (alsa_capture_file) {
             fwrite(buffer, 1, bytes, alsa_capture_file);

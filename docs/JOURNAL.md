@@ -6,6 +6,8 @@ Step-by-step log of the emulation exploration for running the Pokemon Pinball `g
 
 **Reference architecture** (from Researcher A's working emulator): QEMU user-mode + library hooking (gstreamer/ffmpeg/OpenGL forwarded to host) + file I/O interception (devfs emulation) + node bus emulation.
 
+> **Path note (2026-04-23 reorganization):** Entries below Step 64 reference path prefixes that were reorganized into `_emulation/docs/`, `_emulation/captures/`, `_emulation/runs/logs/`, etc. Historic references like `_emulation/run_step45.log` now live at `_emulation/runs/logs/run_step45.log`; `_emulation/audio/stream.s16le` at `_emulation/captures/audio/stream.s16le`. See the current `_emulation/README.md` "Directory layout" section for the authoritative map. Historical paths are retained except where replaced by an explicit alias.
+
 ## Reading the journal
 
 The entries present at this revision are retained, including historical numbering quirks. These are historical working notes:

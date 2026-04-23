@@ -411,7 +411,7 @@ Across all 2452 nodes: **unique key count = 2452** (confirmed via shim dump). U3
 1. Lambda typeinfo at BN VA `0x46bb1f8` → rodata string at `0x3bc8f08`.
 2. libstdc++ `std::function` manager `sub_b086b4` at file offset `0xb086b4` (stateless-lambda variant: op 0 = get_type_info, op 1 = get_functor_ptr, op 2 = clone_functor).
 3. Xrefs to the manager → `sub_8d3460` at file offset `0x8d3460` (25-string sound-event registration, documented above).
-4. Shim memory dump (`_emulation/spi_shim.c` → `shim_dump_sound_globals`) reads the `_Hashtable` struct + walks `_M_nxt` chain → `_emulation/asset_registry.bin` binary dump (format documented in `_extraction/tools/spike_extract/registry_dump.py`).
+4. Shim memory dump (`_emulation/shim_diagnostics.c` → `shim_dump_sound_globals`) reads the `_Hashtable` struct + walks `_M_nxt` chain → `_emulation/captures/asset_registry.bin` binary dump (format documented in `_extraction/tools/spike_extract/registry_dump.py`).
 5. Parser matches 2452/2452 against image.bin section 7 → registry is a cache, not a source of new info.
 
 Verified by: JOURNAL Step 43.
