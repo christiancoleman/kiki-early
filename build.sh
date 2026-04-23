@@ -33,6 +33,8 @@ SOURCES=(
     shim_nodebus.c
     shim_fs.c
     shim_gl.c
+    shim_io.c
+    shim_ioctl.c
 )
 
 echo "[build] $CC $CFLAGS"

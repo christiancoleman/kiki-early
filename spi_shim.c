@@ -184,50 +184,8 @@ void *dlsym(void *handle, const char *symbol) {
     return real(handle, symbol);
 }
 
-/* ---- SPI ioctl definitions ---- */
 
-#define SPI_IOC_WR_MODE          0x40016b01
-#define SPI_IOC_WR_MAX_SPEED_HZ  0x40046b04
-#define SPI_IOC_MESSAGE_1        0x40206b00
 
-struct spi_ioc_transfer {
-    uint64_t tx_buf;
-    uint64_t rx_buf;
-    uint32_t len;
-    uint32_t speed_hz;
-    uint16_t delay_usecs;
-    uint8_t  bits_per_word;
-    uint8_t  cs_change;
-    uint8_t  tx_nbits;
-    uint8_t  rx_nbits;
-    uint8_t  word_delay_usecs;
-    uint8_t  pad;
-};
-
-/* ---- I2C ioctl definitions ---- */
-
-#define I2C_SLAVE       0x0703
-#define I2C_SLAVE_FORCE 0x0706
-#define I2C_RDWR        0x0707
-#define I2C_SMBUS       0x0720
-
-/* ---- DRM fake resource IDs ----
- *
- * We expose: 1 CRTC (id 1), 1 encoder (id 20), 2 connectors (ids 10, 11).
- * First connector is "connected" with one 800x480@60 mode; second is
- * disconnected (just exists to satisfy the >=2 connector check the game
- * does before falling back to card0 — see BN analysis of sub_d01160).
- * No framebuffers initially.
- */
-
-#define FAKE_CRTC_ID       1
-#define FAKE_ENCODER_ID    20
-#define FAKE_CONNECTOR_A   10   /* connected, primary display */
-#define FAKE_CONNECTOR_B   11   /* disconnected, but exists */
-/* FAKE_MODE_HDISPLAY / FAKE_MODE_VDISPLAY in spi_shim.h */
-
-static uint32_t drm_next_dumb_handle = 1;
-static uint32_t drm_next_fb_id = 100;
 
 /* ---- Fake fd assignments ----
  *
@@ -247,24 +205,21 @@ static uint32_t drm_next_fb_id = 100;
  *     to synthesize replies)
  */
 
-#define FAKE_FD_SPI   1023
-#define FAKE_FD_I2C   1022
-/* DRM is a real socketpair (same pattern as UART) so the game's select() +
- * drmHandleEvent loop can drive forward on synthesized page-flip events. */
+/* FAKE_FD_SPI / FAKE_FD_I2C / FAKE_FD_V4L2_MEDIA / FAKE_FD_V4L2_VIDEO are in
+ * spi_shim.h (so shim_io.c + shim_ioctl.c can range-check fds). DRM and UART
+ * use real socketpair fds; is_drm_fd() / is_uart_fd() predicates check them. */
 
 /* ---- V4L2 stub fds (Step 46) ----
  * libavcodec's v4l2_request HEVC decoder respects LIBVA_V4L2_REQUEST_MEDIA_PATH
  * and LIBVA_V4L2_REQUEST_VIDEO_PATH env vars. We set both at run time to
  * these sentinel paths and intercept the open — no /dev/media0 on the host
- * means we must provide our own fake device.
- */
+ * means we must provide our own fake device. Path sentinels stay here
+ * (only intercept_device uses them). FAKE_FD_V4L2_* constants are in spi_shim.h. */
 #define FAKE_V4L2_MEDIA_PATH  "/dev/shim-v4l2-media"
 #define FAKE_V4L2_VIDEO_PATH  "/dev/shim-v4l2-video"
-#define FAKE_FD_V4L2_MEDIA    1021
-#define FAKE_FD_V4L2_VIDEO    1020
-static int v4l2_media_active = 0;
-static int v4l2_video_active = 0;
-static uint32_t v4l2_ioctl_count = 0;
+int      v4l2_media_active = 0;
+int      v4l2_video_active = 0;
+uint32_t v4l2_ioctl_count = 0;
 
 /* ---- GPIO sysfs stubs (Step 63) ----
  * The game uses legacy /sys/class/gpio/{export,gpio25/direction,gpio25/value}
@@ -277,20 +232,21 @@ static uint32_t v4l2_ioctl_count = 0;
 
 /* ---- Device state ---- */
 
-static int spi_active = 0;
-static int i2c_active = 0;
-static int uart_game_fd = -1;   /* returned from open(); real socketpair end */
-int uart_shim_fd = -1;          /* held by the shim for pushing responses;
-                                   read by shim_nodebus.c via extern */
-static int drm_game_fd  = -1;   /* returned from open(/dev/dri/card1) */
-static int drm_shim_fd  = -1;   /* shim end; we write synthetic flip events here */
-static uint32_t spi_transfer_count = 0;
-static uint32_t i2c_ioctl_count = 0;
-static uint32_t uart_read_count = 0;
-static uint32_t uart_write_count = 0;
+int      spi_active = 0;
+int      i2c_active = 0;
+int      uart_game_fd = -1;      /* returned from open(); real socketpair end */
+int      uart_shim_fd = -1;      /* held by the shim for pushing responses;
+                                    read by shim_nodebus.c via extern */
+int      drm_game_fd  = -1;      /* returned from open(/dev/dri/card1) */
+int      drm_shim_fd  = -1;      /* shim end; we write synthetic flip events here */
+uint32_t spi_transfer_count = 0;
+uint32_t i2c_ioctl_count = 0;
+uint32_t uart_read_count = 0;
+uint32_t uart_write_count = 0;
 
-/* uart_is_active() was here — never called; removed in Phase 3. */
-static int is_drm_fd(int fd) { return drm_game_fd >= 0 && fd == drm_game_fd; }
+/* Predicates exported via spi_shim.h — called from shim_io.c, shim_ioctl.c,
+ * and the termios hooks still in this file. */
+int is_drm_fd(int fd) { return drm_game_fd >= 0 && fd == drm_game_fd; }
 
 /* SHIM_LOG moved up to just after the macros — see the early definition. */
 
@@ -302,13 +258,11 @@ typedef int (*real_ioctl_t)(int, unsigned long, ...);
 typedef ssize_t (*real_read_t)(int, void *, size_t);
 typedef ssize_t (*real_write_t)(int, const void *, size_t);
 
-real_open_t real_open = NULL;    /* resolved in resolve_all(); used by the
-                                    open() hook in shim_fs.c via extern */
-static real_close_t real_close = NULL;
-static real_ioctl_t real_ioctl = NULL;
-static real_read_t real_read = NULL;
-real_write_t real_write = NULL;  /* resolved in resolve_all(); used by
-                                    shim_nodebus.c for raw socketpair writes */
+real_open_t  real_open  = NULL;   /* used by open() hook in shim_fs.c */
+real_close_t real_close = NULL;   /* used by close() hook in shim_io.c */
+real_ioctl_t real_ioctl = NULL;   /* used by ioctl() hook in shim_ioctl.c */
+real_read_t  real_read  = NULL;   /* used by read() hook in shim_io.c */
+real_write_t real_write = NULL;   /* used by shim_nodebus.c + shim_io.c write() + shim_ioctl.c flip event */
 
 /* ---- Shim directory init ----
  *
@@ -1295,43 +1249,6 @@ static void shim_install_crash_handler(void) {
     }
 }
 
-/* Synthesize a page-flip completion event on the shim side of the DRM
- * socketpair. Format matches `struct drm_event_vblank` from <drm/drm.h>
- * (32 bytes; libdrm reads the length field to know how much to consume,
- * so forward-compat across libdrm versions). DRM_EVENT_FLIP_COMPLETE = 2. */
-struct shim_drm_event_vblank {
-    uint32_t type;
-    uint32_t length;
-    uint64_t user_data;
-    uint32_t tv_sec;
-    uint32_t tv_usec;
-    uint32_t sequence;
-    uint32_t crtc_id;
-};
-
-static uint32_t drm_flip_sequence = 0;
-
-static void drm_synthesize_flip_event(uint32_t crtc_id, uint64_t user_data) {
-    if (drm_shim_fd < 0) return;
-    struct shim_drm_event_vblank ev;
-    ev.type = 2;                    /* DRM_EVENT_FLIP_COMPLETE */
-    ev.length = sizeof(ev);
-    ev.user_data = user_data;
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    ev.tv_sec = (uint32_t)ts.tv_sec;
-    ev.tv_usec = (uint32_t)(ts.tv_nsec / 1000);
-    ev.sequence = __atomic_fetch_add(&drm_flip_sequence, 1, __ATOMIC_SEQ_CST);
-    ev.crtc_id = crtc_id;
-    /* ioctl() calls resolve_all() first, so real_write is set by the time
-     * this helper runs. Fall back to libc write() just in case. */
-    ssize_t n = real_write ? real_write(drm_shim_fd, &ev, sizeof(ev))
-                           : write(drm_shim_fd, &ev, sizeof(ev));
-    if (n != (ssize_t)sizeof(ev)) {
-        SHIM_LOG("DRM flip-event write short: n=%zd err=%s",
-                 n, strerror(errno));
-    }
-}
 
 void resolve_all(void) {
     if (!real_open)  real_open  = (real_open_t)dlsym(RTLD_NEXT, "open");
@@ -1421,7 +1338,7 @@ int intercept_device(const char *pathname) {
     return 0;
 }
 
-static int is_fake_fd(int fd) {
+int is_fake_fd(int fd) {
     /* UART and DRM are NOT fake — both are real socketpair fds; callers
      * that need to check for "any intercepted device" should call both
      * this and uart_game_fd / drm_game_fd explicitly. */
@@ -1431,12 +1348,12 @@ static int is_fake_fd(int fd) {
            (fd == FAKE_FD_V4L2_VIDEO && v4l2_video_active);
 }
 
-static int is_v4l2_fd(int fd) {
+int is_v4l2_fd(int fd) {
     return (fd == FAKE_FD_V4L2_MEDIA && v4l2_media_active) ||
            (fd == FAKE_FD_V4L2_VIDEO && v4l2_video_active);
 }
 
-static int is_uart_fd(int fd) {
+int is_uart_fd(int fd) {
     return uart_game_fd >= 0 && fd == uart_game_fd;
 }
 
@@ -1740,582 +1657,7 @@ int tcsendbreak(int fd, int duration) {
  * they modify the termios struct in memory and do not make syscalls.
  * No hook needed. */
 
-/* ---- Hooked: close ---- */
 
-int close(int fd) {
-    resolve_all();
-    if (is_gpio_fake_fd(fd)) {
-        free_gpio_fake_fd(fd);
-        return 0;
-    }
-    if (fd == FAKE_FD_SPI && spi_active) {
-        SHIM_LOG("CLOSE SPI (fd %d) after %u transfers", fd, spi_transfer_count);
-        spi_active = 0;
-        return 0;
-    }
-    if (fd == FAKE_FD_I2C && i2c_active) {
-        SHIM_LOG("CLOSE I2C (fd %d) after %u ioctls", fd, i2c_ioctl_count);
-        i2c_active = 0;
-        return 0;
-    }
-    if (fd == FAKE_FD_V4L2_MEDIA && v4l2_media_active) {
-        SHIM_LOG("CLOSE V4L2 media (fd %d) after %u ioctls", fd, v4l2_ioctl_count);
-        v4l2_media_active = 0;
-        return 0;
-    }
-    if (fd == FAKE_FD_V4L2_VIDEO && v4l2_video_active) {
-        SHIM_LOG("CLOSE V4L2 video (fd %d)", fd);
-        v4l2_video_active = 0;
-        return 0;
-    }
-    if (is_uart_fd(fd)) {
-        SHIM_LOG("CLOSE UART (game=%d shim=%d) after %u reads, %u writes",
-                 uart_game_fd, uart_shim_fd, uart_read_count, uart_write_count);
-        int shim_fd = uart_shim_fd;
-        int game_fd = uart_game_fd;
-        uart_game_fd = -1;
-        uart_shim_fd = -1;
-        real_close(shim_fd);
-        return real_close(game_fd);
-    }
-    if (is_drm_fd(fd)) {
-        SHIM_LOG("CLOSE DRM (game=%d shim=%d)", drm_game_fd, drm_shim_fd);
-        int shim_fd = drm_shim_fd;
-        int game_fd = drm_game_fd;
-        drm_game_fd = -1;
-        drm_shim_fd = -1;
-        real_close(shim_fd);
-        return real_close(game_fd);
-    }
-    return real_close(fd);
-}
-
-/* ---- Hooked: read ----
- *
- * UART reads go through to the real socketpair fd — they block until the
- * shim pushes bytes via uart_shim_fd (or forever, which is fine; the game
- * has its own pthread_cond_timedwait around these reads). We log a tally
- * when bytes actually arrive.
- */
-
-ssize_t read(int fd, void *buf, size_t count) {
-    resolve_all();
-
-    if (is_gpio_fake_fd(fd)) {
-        int idx = fd - FAKE_FD_GPIO_BASE;
-        if (gpio_fake_read_done[idx]) return 0;  /* EOF on 2nd read (real sysfs behavior) */
-        const char *p = gpio_fake_paths[idx];
-        const char *resp = "";
-        if (strstr(p, "/value"))          resp = "0\n";
-        else if (strstr(p, "/direction")) resp = "out\n";
-        else if (strstr(p, "/edge"))      resp = "none\n";
-        else if (strstr(p, "/active_low")) resp = "0\n";
-        size_t resp_len = strlen(resp);
-        size_t n = count < resp_len ? count : resp_len;
-        if (n) memcpy(buf, resp, n);
-        gpio_fake_read_done[idx] = 1;
-        return (ssize_t)n;
-    }
-
-    if (is_uart_fd(fd)) {
-        ssize_t n = real_read(fd, buf, count);
-        uart_read_count++;
-        if (n > 0 && (uart_read_count <= 10 || (uart_read_count % 1000) == 0)) {
-            const uint8_t *data = (const uint8_t *)buf;
-            fprintf(stderr, "[shim] UART read #%u got %zd bytes:", uart_read_count, n);
-            for (ssize_t i = 0; i < n && i < 32; i++) fprintf(stderr, " %02x", data[i]);
-            if (n > 32) fprintf(stderr, " ...");
-            fprintf(stderr, "\n");
-        }
-        return n;
-    }
-
-    if (is_drm_fd(fd)) {
-        /* drmHandleEvent reads here after select() wakes — it will get the
-         * synthesized drm_event_vblank we pushed from PAGE_FLIP. */
-        ssize_t n = real_read(fd, buf, count);
-        static uint32_t drm_read_count = 0;
-        drm_read_count++;
-        if (n > 0 && drm_read_count <= 8) {
-            SHIM_LOG("DRM read #%u got %zd bytes", drm_read_count, n);
-        }
-        return n;
-    }
-
-    if (is_fake_fd(fd)) {
-        /* SPI/I2C shouldn't be read() directly */
-        SHIM_LOG("read(fd=%d, %zu bytes) on fake device — returning 0", fd, count);
-        return 0;
-    }
-
-    return real_read(fd, buf, count);
-}
-
-/* ---- Hooked: lseek (GPIO polling only) ----
- * Some GPIO pollers keep one fd open and lseek(0) between reads. Clear the
- * once-read flag so the next read() re-emits the value. All other fds fall
- * through to libc. */
-
-typedef off_t (*real_lseek_t)(int, off_t, int);
-off_t lseek(int fd, off_t offset, int whence) {
-    if (is_gpio_fake_fd(fd)) {
-        if (whence == SEEK_SET && offset == 0) {
-            gpio_fake_read_done[fd - FAKE_FD_GPIO_BASE] = 0;
-        }
-        return 0;
-    }
-    static real_lseek_t real_fn = NULL;
-    if (!real_fn) real_fn = (real_lseek_t)dlsym(RTLD_NEXT, "lseek");
-    return real_fn(fd, offset, whence);
-}
-
-/* ---- Hooked: write ---- */
-
-
-ssize_t write(int fd, const void *buf, size_t count) {
-    resolve_all();
-
-    if (is_gpio_fake_fd(fd)) {
-        /* Swallow writes to export / direction / value / unexport. */
-        return (ssize_t)count;
-    }
-
-    if (is_uart_fd(fd)) {
-        uart_write_count++;
-        /* Log every bridge frame. Unlike SPI these are low-volume (~a few
-         * hundred per run during init), and knowing each request payload
-         * matters for diagnosing polling loops on cmd 0x16 / 0x27 / etc. */
-        const uint8_t *data = (const uint8_t *)buf;
-        fprintf(stderr, "[shim] UART write #%u (%zu bytes):", uart_write_count, count);
-        for (size_t i = 0; i < count && i < 32; i++)
-            fprintf(stderr, " %02x", data[i]);
-        if (count > 32) fprintf(stderr, " ...");
-        fprintf(stderr, "\n");
-        ssize_t ret = real_write(fd, buf, count);
-        /* Save/restore errno around response synthesis so our extra
-         * real_write() into uart_shim_fd can't pollute the game's view of
-         * the primary write(). (The previous drain-via-real_read also had
-         * this problem because non-blocking read on an empty socket sets
-         * errno=EAGAIN, which leaked out as "failed to initialize bridge:
-         * Resource temporarily unavailable".) */
-        int saved_errno = errno;
-        synthesize_bridge_response((const uint8_t *)buf, count);
-        errno = saved_errno;
-        return ret;
-    }
-
-    if (fd == FAKE_FD_SPI && spi_active) {
-        /* SPI shouldn't use write() directly (uses ioctl), but just in case */
-        return (ssize_t)count;
-    }
-
-    return real_write(fd, buf, count);
-}
-
-/* ---- Hooked: ioctl ---- */
-
-int ioctl(int fd, unsigned long request, ...) {
-    resolve_all();
-
-    /* Step 52: prime the cached game_base from a guest-thread context.
-     * This hook is called constantly (SPI poll loop) so the cache gets
-     * populated very early — before the sweep timer thread needs it.
-     * shim_resolve_game_base() itself early-returns if already cached. */
-    (void)shim_resolve_game_base();
-
-    va_list args;
-    va_start(args, request);
-    void *arg = va_arg(args, void *);
-    va_end(args);
-
-    /* ---- UART (real socketpair fd) — intercept the termios ioctls that
-     *      glibc tcXXX functions issue, plus FIONREAD/TIOCOUTQ which the
-     *      game calls directly; pass anything else through to the real fd. */
-    if (is_uart_fd(fd)) {
-        switch (request) {
-        case TCGETS: {
-            struct termios *t = (struct termios *)arg;
-            if (t) memset(t, 0, sizeof(*t));
-            SHIM_LOG("UART ioctl TCGETS");
-            return 0;
-        }
-        case TCSETS:
-        case TCSETSW:
-        case TCSETSF:
-            SHIM_LOG("UART ioctl TCSETS/W/F (configure serial)");
-            return 0;
-        case TIOCMGET: {
-            int *bits = (int *)arg;
-            if (bits) *bits = 0x60;  /* TIOCM_CAR | TIOCM_CTS */
-            SHIM_LOG("UART ioctl TIOCMGET -> 0x60");
-            return 0;
-        }
-        case TIOCMSET:
-            SHIM_LOG("UART ioctl TIOCMSET");
-            return 0;
-        case 0x541e: { /* FIONREAD */
-            int *n = (int *)arg;
-            if (n) *n = 0;
-            SHIM_LOG("UART ioctl FIONREAD -> 0");
-            return 0;
-        }
-        case 0x541f: { /* TIOCOUTQ */
-            int *n = (int *)arg;
-            if (n) *n = 0;
-            SHIM_LOG("UART ioctl TIOCOUTQ -> 0");
-            return 0;
-        }
-        default:
-            SHIM_LOG("UART ioctl 0x%lx (passthrough)", request);
-            return real_ioctl(fd, request, arg);
-        }
-    }
-
-    /* ---- Pass through non-fake, non-DRM fds ---- */
-    if (!is_fake_fd(fd) && !is_drm_fd(fd)) {
-        return real_ioctl(fd, request, arg);
-    }
-
-    /* ---- SPI ioctls ---- */
-    if (fd == FAKE_FD_SPI) {
-        switch (request) {
-        case SPI_IOC_WR_MAX_SPEED_HZ: {
-            uint32_t speed = *(uint32_t *)arg;
-            SHIM_LOG("SPI ioctl WR_MAX_SPEED_HZ = %u Hz", speed);
-            return 0;
-        }
-        case SPI_IOC_WR_MODE: {
-            uint8_t mode = *(uint8_t *)arg;
-            SHIM_LOG("SPI ioctl WR_MODE = %u", mode);
-            return 0;
-        }
-        case SPI_IOC_MESSAGE_1: {
-            struct spi_ioc_transfer *xfer = (struct spi_ioc_transfer *)arg;
-            uint8_t *tx = (uint8_t *)(uintptr_t)xfer->tx_buf;
-            uint8_t *rx = (uint8_t *)(uintptr_t)xfer->rx_buf;
-            uint32_t len = xfer->len;
-
-            spi_transfer_count++;
-
-            /* Log TX data (first 20, then every 1000th) */
-            if (spi_transfer_count <= 20 || (spi_transfer_count % 1000) == 0) {
-                fprintf(stderr, "[shim] SPI #%u TX:", spi_transfer_count);
-                for (uint32_t i = 0; i < len && i < 16; i++)
-                    fprintf(stderr, " %02x", tx[i]);
-                fprintf(stderr, "\n");
-            }
-
-            /* Craft RX response */
-            if (rx && len > 0) {
-                memset(rx, 0, len);
-                if (len > 2) {
-                    rx[2] = 0x04;  /* bit 2 set — advances state machine */
-                }
-            }
-            return 0;
-        }
-        default:
-            SHIM_LOG("SPI ioctl unknown 0x%lx", request);
-            return 0;
-        }
-    }
-
-    /* ---- DRM ioctls ---- */
-    if (is_drm_fd(fd)) {
-        switch (request) {
-
-        case DRM_IOCTL_VERSION: {
-            struct drm_version *v = (struct drm_version *)arg;
-            v->version_major = 1;
-            v->version_minor = 6;
-            v->version_patchlevel = 0;
-            /* Caller passes buffers and length; on the two-call pattern we
-             * write the string up to the provided length and report the
-             * actual lengths. Use harmless fake names. */
-            const char *name = "stub", *date = "20260418", *desc = "shim-drm";
-            if (v->name && v->name_len >= strlen(name) + 1)
-                strcpy(v->name, name);
-            v->name_len = strlen(name);
-            if (v->date && v->date_len >= strlen(date) + 1)
-                strcpy(v->date, date);
-            v->date_len = strlen(date);
-            if (v->desc && v->desc_len >= strlen(desc) + 1)
-                strcpy(v->desc, desc);
-            v->desc_len = strlen(desc);
-            SHIM_LOG("DRM ioctl VERSION -> 1.6.0 stub");
-            return 0;
-        }
-
-        case DRM_IOCTL_SET_CLIENT_CAP: {
-            struct drm_set_client_cap *c = (struct drm_set_client_cap *)arg;
-            SHIM_LOG("DRM ioctl SET_CLIENT_CAP cap=%llu val=%llu",
-                     (unsigned long long)c->capability,
-                     (unsigned long long)c->value);
-            return 0;
-        }
-
-        case DRM_IOCTL_GET_CAP: {
-            struct drm_get_cap *c = (struct drm_get_cap *)arg;
-            /* Claim support for dumb buffers + addfb2 modifiers; deny the
-             * rest (prime / vblank / cursor). Game uses gbm_bo_create which
-             * in dumb-fallback mode needs DRM_CAP_DUMB_BUFFER. */
-            switch (c->capability) {
-            case DRM_CAP_DUMB_BUFFER:          c->value = 1; break;
-            case DRM_CAP_ADDFB2_MODIFIERS:     c->value = 1; break;
-            case DRM_CAP_DUMB_PREFERRED_DEPTH: c->value = 24; break;
-            case DRM_CAP_DUMB_PREFER_SHADOW:   c->value = 0; break;
-            default:                           c->value = 0; break;
-            }
-            SHIM_LOG("DRM ioctl GET_CAP cap=%llu -> %llu",
-                     (unsigned long long)c->capability,
-                     (unsigned long long)c->value);
-            return 0;
-        }
-
-        case DRM_IOCTL_MODE_GETRESOURCES: {
-            struct drm_mode_card_res *r = (struct drm_mode_card_res *)arg;
-            /* Two-call pattern: first call passes zero counts to get sizes,
-             * second call passes allocated arrays to populate. Always tell
-             * the caller what the real counts are. If arrays are big
-             * enough we populate them. */
-            uint32_t want_crtc = 1, want_conn = 2, want_enc = 1, want_fb = 0;
-            if (r->crtc_id_ptr && r->count_crtcs >= want_crtc) {
-                uint32_t *ids = (uint32_t *)(uintptr_t)r->crtc_id_ptr;
-                ids[0] = FAKE_CRTC_ID;
-            }
-            if (r->connector_id_ptr && r->count_connectors >= want_conn) {
-                uint32_t *ids = (uint32_t *)(uintptr_t)r->connector_id_ptr;
-                ids[0] = FAKE_CONNECTOR_A;
-                ids[1] = FAKE_CONNECTOR_B;
-            }
-            if (r->encoder_id_ptr && r->count_encoders >= want_enc) {
-                uint32_t *ids = (uint32_t *)(uintptr_t)r->encoder_id_ptr;
-                ids[0] = FAKE_ENCODER_ID;
-            }
-            r->count_fbs        = want_fb;
-            r->count_crtcs      = want_crtc;
-            r->count_connectors = want_conn;
-            r->count_encoders   = want_enc;
-            r->min_width = 320;  r->max_width = 3840;
-            r->min_height = 200; r->max_height = 2160;
-            SHIM_LOG("DRM ioctl MODE_GETRESOURCES -> crtc=%u conn=%u enc=%u",
-                     want_crtc, want_conn, want_enc);
-            return 0;
-        }
-
-        case DRM_IOCTL_MODE_GETCONNECTOR: {
-            struct drm_mode_get_connector *c = (struct drm_mode_get_connector *)arg;
-            /* Both connectors present the same HDMI-A 1920x1080@60 mode.
-             * We don't know which connector the game will iterate to first;
-             * returning "connected" on both simplifies acceptance. */
-            c->encoder_id = FAKE_ENCODER_ID;
-            c->connector_type = 11;         /* DRM_MODE_CONNECTOR_HDMIA */
-            c->connector_type_id = (c->connector_id == FAKE_CONNECTOR_A) ? 1 : 2;
-            c->connection = 1;              /* 1=connected */
-            c->mm_width = 477;
-            c->mm_height = 268;
-            c->subpixel = 1;                /* SubPixelHorizontalRGB */
-
-            uint32_t want_modes = 1;
-            uint32_t want_props = 0;
-            uint32_t want_encoders = 1;
-
-            if (c->modes_ptr && c->count_modes >= want_modes) {
-                struct drm_mode_modeinfo *modes =
-                    (struct drm_mode_modeinfo *)(uintptr_t)c->modes_ptr;
-                memset(&modes[0], 0, sizeof(modes[0]));
-                modes[0].clock = 148500;    /* kHz, 1080p60 */
-                modes[0].hdisplay    = FAKE_MODE_HDISPLAY;
-                modes[0].hsync_start = FAKE_MODE_HDISPLAY + 88;
-                modes[0].hsync_end   = FAKE_MODE_HDISPLAY + 88 + 44;
-                modes[0].htotal      = FAKE_MODE_HDISPLAY + 280;
-                modes[0].vdisplay    = FAKE_MODE_VDISPLAY;
-                modes[0].vsync_start = FAKE_MODE_VDISPLAY + 4;
-                modes[0].vsync_end   = FAKE_MODE_VDISPLAY + 4 + 5;
-                modes[0].vtotal      = FAKE_MODE_VDISPLAY + 45;
-                modes[0].vrefresh    = 60;
-                modes[0].flags       = 0x5; /* PHSYNC|PVSYNC */
-                modes[0].type        = 0x48; /* PREFERRED | DRIVER */
-                strncpy(modes[0].name, "1920x1080", sizeof(modes[0].name) - 1);
-            }
-            if (c->encoders_ptr && c->count_encoders >= want_encoders) {
-                uint32_t *e = (uint32_t *)(uintptr_t)c->encoders_ptr;
-                e[0] = FAKE_ENCODER_ID;
-            }
-
-            c->count_modes    = want_modes;
-            c->count_props    = want_props;
-            c->count_encoders = want_encoders;
-            SHIM_LOG("DRM ioctl MODE_GETCONNECTOR id=%u -> connected, %u mode(s)",
-                     c->connector_id, want_modes);
-            return 0;
-        }
-
-        case DRM_IOCTL_MODE_GETENCODER: {
-            struct drm_mode_get_encoder *e = (struct drm_mode_get_encoder *)arg;
-            e->encoder_type     = 2;   /* DRM_MODE_ENCODER_TMDS */
-            e->crtc_id          = FAKE_CRTC_ID;
-            e->possible_crtcs   = 1;   /* only CRTC 0 */
-            e->possible_clones  = 0;
-            SHIM_LOG("DRM ioctl MODE_GETENCODER id=%u -> crtc=%u",
-                     e->encoder_id, FAKE_CRTC_ID);
-            return 0;
-        }
-
-        case DRM_IOCTL_MODE_GETCRTC: {
-            struct drm_mode_crtc *c = (struct drm_mode_crtc *)arg;
-            c->x = 0; c->y = 0;
-            c->fb_id = 0;
-            c->gamma_size = 256;
-            c->mode_valid = 0;
-            memset(&c->mode, 0, sizeof(c->mode));
-            SHIM_LOG("DRM ioctl MODE_GETCRTC id=%u", c->crtc_id);
-            return 0;
-        }
-
-        case DRM_IOCTL_MODE_SETCRTC: {
-            struct drm_mode_crtc *c = (struct drm_mode_crtc *)arg;
-            SHIM_LOG("DRM ioctl MODE_SETCRTC crtc=%u fb=%u mode=%s",
-                     c->crtc_id, c->fb_id,
-                     c->mode_valid ? c->mode.name : "(none)");
-            return 0;
-        }
-
-        case DRM_IOCTL_MODE_CREATE_DUMB: {
-            struct drm_mode_create_dumb *d = (struct drm_mode_create_dumb *)arg;
-            d->handle = drm_next_dumb_handle++;
-            d->pitch  = d->width * ((d->bpp + 7) / 8);
-            d->size   = (uint64_t)d->pitch * d->height;
-            SHIM_LOG("DRM ioctl MODE_CREATE_DUMB %ux%u bpp=%u -> handle=%u size=%llu",
-                     d->width, d->height, d->bpp, d->handle,
-                     (unsigned long long)d->size);
-            return 0;
-        }
-
-        case DRM_IOCTL_MODE_DESTROY_DUMB: {
-            struct drm_mode_destroy_dumb *d = (struct drm_mode_destroy_dumb *)arg;
-            SHIM_LOG("DRM ioctl MODE_DESTROY_DUMB handle=%u", d->handle);
-            return 0;
-        }
-
-        case DRM_IOCTL_MODE_MAP_DUMB: {
-            /* Not implementable under QEMU without a backing mappable fd.
-             * Returning ENOTSUP causes GBM to fall back; if the game
-             * actually depends on mmap() of the DRM fd, we'll see a crash
-             * later and revisit. */
-            struct drm_mode_map_dumb *d = (struct drm_mode_map_dumb *)arg;
-            d->offset = 0;
-            SHIM_LOG("DRM ioctl MODE_MAP_DUMB handle=%u -> ENOTSUP", d->handle);
-            errno = ENOTSUP;
-            return -1;
-        }
-
-        case DRM_IOCTL_MODE_ADDFB:
-        case DRM_IOCTL_MODE_ADDFB2: {
-            /* drm_mode_fb_cmd and drm_mode_fb_cmd2 both start with fb_id. */
-            uint32_t *fb_id = (uint32_t *)arg;
-            *fb_id = drm_next_fb_id++;
-            SHIM_LOG("DRM ioctl MODE_ADDFB%s -> fb_id=%u",
-                     request == DRM_IOCTL_MODE_ADDFB2 ? "2" : "", *fb_id);
-            return 0;
-        }
-
-        case DRM_IOCTL_MODE_RMFB: {
-            uint32_t *fb_id = (uint32_t *)arg;
-            SHIM_LOG("DRM ioctl MODE_RMFB fb_id=%u", *fb_id);
-            return 0;
-        }
-
-        case DRM_IOCTL_MODE_PAGE_FLIP: {
-            struct drm_mode_crtc_page_flip *p =
-                (struct drm_mode_crtc_page_flip *)arg;
-            /* If the caller requested an event (DRM_MODE_PAGE_FLIP_EVENT = 1),
-             * synthesize a drm_event_vblank on the shim side of the socketpair.
-             * The game's select() on drm_fd wakes, drmHandleEvent reads the
-             * event, and the page-flip callback fires — driving the next
-             * render-loop iteration (see _emulation/JOURNAL.md Step 23.3). */
-            if (p->flags & 1 /* DRM_MODE_PAGE_FLIP_EVENT */) {
-                drm_synthesize_flip_event(p->crtc_id, p->user_data);
-            }
-            static uint32_t flip_count = 0;
-            flip_count++;
-            if (flip_count <= 4 || (flip_count % 60) == 0) {
-                SHIM_LOG("DRM ioctl MODE_PAGE_FLIP #%u crtc=%u fb=%u flags=0x%x",
-                         flip_count, p->crtc_id, p->fb_id, p->flags);
-            }
-            /* Step 58.2: capture frame to the frame bridge at the present
-             * boundary. Runs in the game's thread, so the GL context the
-             * game made current is live — we can glReadPixels directly. */
-            shim_frame_capture_at_page_flip();
-            return 0;
-        }
-
-        case DRM_IOCTL_GEM_CLOSE: {
-            struct drm_gem_close *g = (struct drm_gem_close *)arg;
-            SHIM_LOG("DRM ioctl GEM_CLOSE handle=%u", g->handle);
-            return 0;
-        }
-
-        default:
-            SHIM_LOG("DRM ioctl 0x%lx (unknown, returning 0)", request);
-            return 0;
-        }
-    }
-
-    /* ---- V4L2 media controller + video device ioctls (Step 46 probe) ----
-     *
-     * First-pass probe: log every ioctl request number with arg pointer,
-     * return -1 with errno=ENOTTY. This tells libavcodec "this device does
-     * not support this ioctl" (the canonical response for an unsupported
-     * command) and should produce a deterministic error trail we can follow.
-     *
-     * ioctl request numbers follow the standard _IOR/_IOWR encoding:
-     *   bits [0..7]   = command nr
-     *   bits [8..15]  = magic letter ('V' = 0x56 for V4L2, '|' = 0x7c for MC)
-     *   bits [16..29] = arg size in bytes
-     *   bits [30..31] = direction (_IOC_READ=2, _IOC_WRITE=1)
-     * We print all four fields so we can decode without a header. */
-    if (is_v4l2_fd(fd)) {
-        v4l2_ioctl_count++;
-        unsigned long type = (request >> 8) & 0xff;
-        unsigned long nr   = request & 0xff;
-        unsigned long size = (request >> 16) & 0x3fff;
-        unsigned long dir  = (request >> 30) & 0x3;
-        const char *dev = (fd == FAKE_FD_V4L2_MEDIA) ? "media" : "video";
-        SHIM_LOG("V4L2 %s ioctl #%u: req=0x%lx dir=%lu type='%c' nr=0x%02lx size=%lu arg=%p  -> ENOTTY",
-                 dev, v4l2_ioctl_count, request, dir, (char)type, nr, size, arg);
-        errno = 25;  /* ENOTTY = inappropriate ioctl for device */
-        return -1;
-    }
-
-    /* ---- I2C ioctls ---- */
-    if (fd == FAKE_FD_I2C) {
-        i2c_ioctl_count++;
-        switch (request) {
-        case I2C_SLAVE:
-        case I2C_SLAVE_FORCE: {
-            unsigned long addr = (unsigned long)(uintptr_t)arg;
-            SHIM_LOG("I2C ioctl SET_SLAVE addr=0x%02lx", addr);
-            return 0;
-        }
-        case I2C_RDWR:
-            if (i2c_ioctl_count <= 10) {
-                SHIM_LOG("I2C ioctl RDWR (transfer #%u)", i2c_ioctl_count);
-            }
-            return 0;
-        case I2C_SMBUS:
-            if (i2c_ioctl_count <= 10) {
-                SHIM_LOG("I2C ioctl SMBUS (transfer #%u)", i2c_ioctl_count);
-            }
-            return 0;
-        default:
-            SHIM_LOG("I2C ioctl 0x%lx (#%u)", request, i2c_ioctl_count);
-            return 0;
-        }
-    }
-
-    return 0;
-}
 
 /* ---- memcpy NULL-guard (Step 45) ----
  *

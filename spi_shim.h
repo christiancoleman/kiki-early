@@ -9,12 +9,13 @@
 #ifndef SPI_SHIM_H
 #define SPI_SHIM_H
 
-#include <stdio.h>    /* fprintf, stderr — for SHIM_LOG */
-#include <stddef.h>   /* size_t */
-#include <stdint.h>   /* uintptr_t, uint32_t, uint8_t */
-#include <dlfcn.h>    /* dlsym, RTLD_NEXT — for FWD_* */
-#include <signal.h>   /* sig_atomic_t, siginfo_t — for handler decls below */
-#include <setjmp.h>   /* sigjmp_buf */
+#include <stdio.h>     /* fprintf, stderr — for SHIM_LOG */
+#include <stddef.h>    /* size_t */
+#include <stdint.h>    /* uintptr_t, uint32_t, uint8_t */
+#include <dlfcn.h>     /* dlsym, RTLD_NEXT — for FWD_* */
+#include <signal.h>    /* sig_atomic_t, siginfo_t — for handler decls below */
+#include <setjmp.h>    /* sigjmp_buf */
+#include <sys/types.h> /* ssize_t — for real_read / real_write typedefs */
 
 /* Real-GL gate: when 1, FWD_* macros forward to the real Mesa/libGLES
  * implementation via dlsym(RTLD_NEXT, ...); when 0, the stub body runs.
@@ -60,9 +61,54 @@ extern volatile int          shim_current_sweep_event_id;
 void shim_event_sweep(void);
 
 /* ---- Netbridge UART protocol (defined in shim_nodebus.c) ----
- * Called from the write() hook in spi_shim.c when the game sends a frame on
+ * Called from the write() hook in shim_io.c when the game sends a frame on
  * the UART socketpair; synthesizes a response back to the shim side. */
 void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len);
+
+/* ---- Fake-fd constants (cross-TU) ----
+ * SPI / I2C / V4L2 use pure fake fds (no backing socketpair). DRM and UART
+ * use real socketpair fds and check via is_drm_fd() / is_uart_fd(). */
+#define FAKE_FD_SPI          1023
+#define FAKE_FD_I2C          1022
+#define FAKE_FD_V4L2_MEDIA   1021
+#define FAKE_FD_V4L2_VIDEO   1020
+
+/* ---- Device-layer state (defined in spi_shim.c) ----
+ * intercept_device() writes these on open; the I/O and ioctl hooks in
+ * shim_io.c / shim_ioctl.c read them to dispatch per-device. */
+extern int      spi_active;
+extern int      i2c_active;
+extern int      v4l2_media_active;
+extern int      v4l2_video_active;
+extern int      uart_game_fd;
+extern int      uart_shim_fd;   /* shim side of the socketpair — used by shim_io.c close and shim_nodebus.c response synth */
+extern int      drm_game_fd;
+extern int      drm_shim_fd;
+extern uint32_t spi_transfer_count;
+extern uint32_t i2c_ioctl_count;
+extern uint32_t v4l2_ioctl_count;
+extern uint32_t uart_read_count;
+extern uint32_t uart_write_count;
+
+/* fd predicates (defined in spi_shim.c). Used by shim_io.c + shim_ioctl.c +
+ * termios hooks still in spi_shim.c. */
+int is_fake_fd(int fd);
+int is_uart_fd(int fd);
+int is_drm_fd(int fd);
+int is_v4l2_fd(int fd);
+
+/* Real libc function pointers — resolved by resolve_all() and referenced
+ * across the I/O / ioctl / fs / nodebus TUs. */
+typedef int     (*real_open_t)(const char *, int, ...);
+typedef int     (*real_close_t)(int);
+typedef int     (*real_ioctl_t)(int, unsigned long, ...);
+typedef ssize_t (*real_read_t)(int, void *, size_t);
+typedef ssize_t (*real_write_t)(int, const void *, size_t);
+extern real_open_t   real_open;    /* used by shim_fs.c open() */
+extern real_close_t  real_close;   /* used by shim_io.c close() */
+extern real_ioctl_t  real_ioctl;   /* used by shim_ioctl.c ioctl() */
+extern real_read_t   real_read;    /* used by shim_io.c read() */
+extern real_write_t  real_write;   /* used by shim_io.c write() + shim_nodebus.c + shim_ioctl.c */
 
 /* ---- Filesystem layer (defined in shim_fs.c) ---- */
 
