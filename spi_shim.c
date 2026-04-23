@@ -1876,7 +1876,11 @@ static void shim_patch_spi_video_vtable(void) {
  * take software decode end-to-end until Radium's downstream code (which
  * expects DRM_PRIME descriptors in AVFrame->data[0]) hits a new wall.
  */
-#define GET_FORMAT_BNE_BN_VA   0x920cf0
+/* BN VA = ELF VA + 0x400000; objdump showed the b.ne at ELF VA 0x920cf0,
+ * so BN VA = 0xd20cf0. The shim's patch formula subtracts 0x400000 to
+ * recover ELF VA before adding game_base (same convention as Step 62's
+ * vtable patch at 0x46cc9c8). */
+#define GET_FORMAT_BNE_BN_VA   0xd20cf0
 #define AARCH64_NOP            0xd503201fu
 
 static int shim_sw_hevc_enabled(void) {
@@ -1908,6 +1912,15 @@ static void shim_patch_get_format_callback(void) {
     }
 
     uint32_t old = *instr;
+    /* Safety: expect `b.ne 0x920ce0` (backward 3 instructions) encoded as
+     * 0x54ffff81. Refuse to patch if we see anything else — prior bug had
+     * us subtracting 0x400000 twice (objdump VAs ARE BN VAs) and writing
+     * a NOP over an innocent STP in an unrelated function. */
+    if (old != 0x54ffff81u) {
+        SHIM_LOG("[sw_hevc] REFUSED to patch @ %p: expected 0x54ffff81 (b.ne), got 0x%08x",
+                 (void *)instr, old);
+        return;
+    }
     *instr = AARCH64_NOP;
     __builtin___clear_cache((char *)instr, (char *)instr + 4);
     SHIM_LOG("[sw_hevc] patched get_format b.ne @ %p: 0x%08x -> 0x%08x (NOP)",
