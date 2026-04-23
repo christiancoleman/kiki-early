@@ -210,24 +210,39 @@ ssize_t write(int fd, const void *buf, size_t count) {
 
 /* ---- LFS variants: lseek64 / pread64 / pwrite64 (defensive coverage) ----
  *
- * These glibc LFS (Large File Support) entry points are distinct PLT symbols
- * from their plain counterparts. On 64-bit aarch64 Linux they're functionally
- * identical — off_t is already 64-bit, so off64_t is the same width — but the
- * SYMBOL resolution is separate, so a game that links to lseek64 bypasses our
- * plain lseek hook entirely.
+ * glibc's LFS (Large File Support) entry points are distinct PLT symbols from
+ * their plain counterparts. On 64-bit aarch64 Linux they're functionally
+ * identical (off_t is already 64-bit, so off64_t is the same width), but
+ * SYMBOL resolution is separate, so code linked to the 64-bit variant bypasses
+ * our plain-variant hooks entirely.
  *
- * Historically we only hooked plain lseek (the GPIO-pool re-read-flag reset).
- * These hooks were added proactively to close the gap: each first call emits a
- * very visible SHIM_LOG banner so we notice if the game exercises them; then
- * a quieter per-1000 counter tracks volume. GPIO branch semantics mirror the
- * plain lseek hook. Everything else passes through to real libc.
+ * ---- The pattern: "when you hook one variant, hook both" ----
+ *
+ * Any libc function with a 32/64 pair (`*64` suffix) can silently leak traffic
+ * through the non-hooked variant. Before Phase 7.post we hooked only plain
+ * `lseek`; `lseek64` / `pread64` / `pwrite64` were all invisible. Adding the
+ * 64-bit hooks with a FIRST-CALL banner immediately caught `pread64` in use
+ * (we'd been missing whatever file reads it was doing for the whole refactor).
+ *
+ * Remaining asymmetries worth closing later (listed in README "Known gaps"):
+ *   - `pread`   — paired with `pread64` (hooked here); plain variant not hooked
+ *   - `pwrite`  — paired with `pwrite64` (hooked here); plain variant not hooked
+ *   - `fopen`   — paired with `fopen64` (hooked in shim_fs.c); plain variant
+ *                 not hooked. This one's a path-taking function so the
+ *                 asymmetry can leak un-remapped paths — highest priority of
+ *                 the three to fix.
+ *
+ * When closing an asymmetry, keep the defensive first-call banner for the
+ * newly-added variant for at least one smoke run so we observe whether it
+ * fires. If it doesn't, the banner cost is essentially zero.
  */
 
 typedef off_t  (*real_lseek64_t)(int, off_t, int);
 typedef ssize_t (*real_pread64_t)(int, void *, size_t, off_t);
 typedef ssize_t (*real_pwrite64_t)(int, const void *, size_t, off_t);
 
-/* First-call banner + counting helper — shared across the three hooks. */
+/* First-call banner + counting helper — shared across the three hooks.
+ * `_count` is per-callsite (static inside the macro expansion). */
 #define SHIM_LFS_FIRST_CALL(NAME) do {                                      \
     static uint32_t _count = 0;                                             \
     uint32_t _n = __atomic_add_fetch(&_count, 1, __ATOMIC_RELAXED);         \
@@ -254,7 +269,17 @@ off_t lseek64(int fd, off_t offset, int whence) {
 }
 
 ssize_t pread64(int fd, void *buf, size_t count, off_t offset) {
-    SHIM_LFS_FIRST_CALL("pread64");
+    /* pread64 DID fire under Pokémon LE (surfaced by the first-call banner
+     * the first time this hook was wired). We don't yet know which fd(s) or
+     * what the game is reading — emit detailed fd/offset/count for the first
+     * 8 calls, plus every 500th after that, to map the usage pattern. Follow
+     * up separately when someone has cycles to investigate the fd provenance. */
+    static uint32_t _pread_count = 0;
+    uint32_t _n = __atomic_add_fetch(&_pread_count, 1, __ATOMIC_RELAXED);
+    if (_n <= 8 || (_n % 500) == 0) {
+        SHIM_LOG("[lfs] pread64 #%u: fd=%d offset=%lld count=%zu",
+                 _n, fd, (long long)offset, count);
+    }
 
     /* GPIO sysfs files are ordinary 1-byte-ish reads; a pread(offset=0) on
      * one should behave like read(). For any non-zero offset we return 0

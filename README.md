@@ -115,9 +115,12 @@ to the real libc.
 ### `shim_io.c` — byte-level I/O hooks (Phase 7)
 
 `close`, `read`, `write`, `lseek` plus the LFS variants `lseek64` /
-`pread64` / `pwrite64` (added defensively in Phase 7.post — they were
-never hooked before, and while we don't believe the game calls them, a
-first-call log banner makes it visible immediately if anything does).
+`pread64` / `pwrite64` (added defensively in Phase 7.post). The first run
+with the LFS hooks wired caught **`pread64` actually in use** — a real
+blind spot we'd been silently missing. `lseek64` and `pwrite64` have stayed
+dormant. The `pread64` hook now emits `fd=N offset=M count=K` for its first
+8 calls plus every 500th after that, so future investigation can map where
+those reads are actually coming from.
 
 Dispatch order mirrors `intercept_device()`'s contract: GPIO fake fds →
 SPI/I2C/V4L2 fake fds → UART socketpair (with bridge-response synth on
@@ -200,6 +203,36 @@ count ±30) on all 22 error classes + all 7 hook-fired log lines.
 Planned remaining phases: **shim_patches.c** (memcpy NULL-guard + Step 62
 vtable + Step 64 NOP + libavcodec hooks + dummy-frame injection) and
 **shim_inject.c** (switch manifest + event sweep + poke threads).
+
+## Defensive-hook pattern: 32/64-bit variants
+
+glibc's Large File Support (LFS) APIs exist as distinct PLT symbols from
+their plain counterparts — e.g. `open` vs `open64`, `lseek` vs `lseek64`,
+`pread` vs `pread64`, `fopen` vs `fopen64`. On 64-bit aarch64 they're
+functionally identical (`off_t` is already 64-bit, so `off64_t` is the same
+width), **but the symbol resolution is separate**. A game that's linked
+against the 64-bit variant will silently bypass a shim hook on the plain
+variant, and vice versa.
+
+**Rule of thumb: when you hook one variant, hook both.** A hook added on the
+previously-unhooked variant should carry a `FIRST CALL` banner for at least
+one smoke-run so we observe whether it fires at all. The proactive
+`lseek64` / `pread64` / `pwrite64` additions in Phase 7.post caught
+`pread64` in active use the moment they were wired — a whole category of
+file reads we'd been missing across the refactor.
+
+**Current asymmetries worth closing later** (all low effort — ~15 lines
+each — but each may or may not surface new behavior):
+
+| Plain | 64-bit | Status |
+|---|---|---|
+| `pread` | `pread64` | Hook the plain variant; mirror the 64-bit semantics + same `FIRST CALL` banner |
+| `pwrite` | `pwrite64` | Same as pread |
+| `fopen` | `fopen64` (shim_fs.c) | **Highest priority** — path-taking function. An un-hooked `fopen` can leak un-remapped absolute paths through to libc. |
+
+The all-hooked pairs for reference (don't re-open these):
+`open` / `open64`, `openat` / `openat64`, `lseek` / `lseek64`, the whole
+stat/xstat/lxstat/fstatat family with `*64` cousins.
 
 ## Other documents in this directory
 
