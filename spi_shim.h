@@ -13,6 +13,8 @@
 #include <stddef.h>   /* size_t */
 #include <stdint.h>   /* uintptr_t, uint32_t, uint8_t */
 #include <dlfcn.h>    /* dlsym, RTLD_NEXT — for FWD_* */
+#include <signal.h>   /* sig_atomic_t, siginfo_t — for handler decls below */
+#include <setjmp.h>   /* sigjmp_buf */
 
 /* Real-GL gate: when 1, FWD_* macros forward to the real Mesa/libGLES
  * implementation via dlsym(RTLD_NEXT, ...); when 0, the stub body runs.
@@ -39,8 +41,23 @@ struct shim_cmode_entry {
 extern const struct shim_cmode_entry shim_cmode_table[];
 extern const size_t                  shim_cmode_table_count;
 
-/* ---- Runtime helpers (defined in spi_shim.c) ---- */
+/* ---- Runtime helpers (defined in shim_diagnostics.c) ---- */
 uintptr_t shim_resolve_game_base(void);
+
+/* ---- Signal handlers (defined in shim_diagnostics.c; registered by
+ *      shim_install_crash_handler in spi_shim.c) ---- */
+void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext);
+void shim_term_dump_handler(int sig);
+
+/* ---- Event-sweep globals (defined in spi_shim.c; read by
+ *      shim_sigsegv_handler in shim_diagnostics.c to siglongjmp back out
+ *      of a faulting sweep iteration). ---- */
+extern sigjmp_buf            shim_event_sweep_jmp;
+extern volatile sig_atomic_t shim_event_fire_in_progress;
+extern volatile int          shim_current_sweep_event_id;
+
+/* Called from shim_term_dump_handler on SIGUSR2 (defined in spi_shim.c). */
+void shim_event_sweep(void);
 
 /* ---- Bridge lifecycle (defined in shim_bridges.c) ---- */
 void shim_bridge_start(void);             /* state bridge; no-op unless SPIKE3_BRIDGE=1 */
