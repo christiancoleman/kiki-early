@@ -141,6 +141,14 @@ void shim_bridge_start(void);             /* state bridge; no-op unless SPIKE3_B
 void shim_frame_start(void);              /* frame bridge; no-op unless SPIKE3_FRAME_BRIDGE=1 */
 void shim_frame_capture_at_page_flip(void); /* called from the DRM PAGE_FLIP ioctl handler */
 
+/* ---- Runtime patches (defined in shim_patches.c) ----
+ * Both are self-gating via env vars (SPIKE3_PATCH_SPI_VIDEO=1 and
+ * SPIKE3_SW_HEVC=1 respectively); safe to call unconditionally.
+ * Called from shim_vp_patch_thread (currently still in spi_shim.c; moves
+ * to shim_inject.c in Phase 9). */
+void shim_patch_spi_video_vtable(void);
+void shim_patch_get_format_callback(void);
+
 /* Uniform log prefix so shim output is trivially grep-filterable. */
 #define SHIM_LOG(fmt, ...) fprintf(stderr, "[shim] " fmt "\n", ##__VA_ARGS__)
 

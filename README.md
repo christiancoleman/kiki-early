@@ -18,7 +18,7 @@ workstation, and synthesizes whatever the game expects.
 ## Module guide
 
 The shim started life as a single `spi_shim.c` monolith (~6400 lines). We've
-been splitting it into subsystem-scoped source files — as of Phase 7, **65 %
+been splitting it into subsystem-scoped source files — as of Phase 8, **73 %
 of the original code now lives in dedicated subsystem files**, with
 `spi_shim.c` acting as the small nucleus that holds the constructor, device-
 state globals, and the intercepts that haven't landed their own file yet.
@@ -50,9 +50,9 @@ The only thing that crosses the source-file boundary. Holds:
   signal handlers, netbridge response synth, intercept dispatcher, fd
   predicates, GPIO fake-fd pool operations.
 
-### `spi_shim.c` — main shim body (~2200 lines, down from 6400)
+### `spi_shim.c` — main shim body (~1700 lines, down from 6400)
 
-The small nucleus that remains after seven phases of carving. Owns:
+The small nucleus that remains after eight phases of carving. Owns:
 
 - `__attribute__((constructor))` entry points: directory setup
   (`shim_init_dirs`) and the main `shim_install_crash_handler` that
@@ -71,11 +71,13 @@ The small nucleus that remains after seven phases of carving. Owns:
 - `resolve_all()` — binds the five `real_*` libc function pointers.
 - Switch manifest (Pokémon LE 105-switch table with node addresses) +
   `shim_fire_switch` + `shim_fire_event` trampoline + event sweep
-  machinery (Step 52).
+  machinery (Step 52). Moves to `shim_inject.c` in Phase 9.
 - Poke threads: `SPIKE3_POKE_CMODE`, `SPIKE3_POKE_STATE_FLAG`,
-  `SPIKE3_FIRE_SWITCH`, `SPIKE3_FORCE_GSTREAMER`.
-- Step 62 `SpiDecoder::Play` vtable patch + Step 64 `get_format` NOP
-  patch + `shim_vp_patch_thread` that applies them after a 2-sec settle.
+  `SPIKE3_FIRE_SWITCH`, `SPIKE3_FORCE_GSTREAMER`. Also Phase-9-bound.
+- `shim_vp_patch_thread` that sleeps 2 s then calls into
+  `shim_patch_spi_video_vtable` / `shim_patch_get_format_callback` in
+  `shim_patches.c`. The thread stays here through Phase 8; the patch
+  functions themselves already moved.
 - termios wrappers (`tcsetattr` / `tcgetattr` / `tcflush` / etc.) —
   glibc uses INLINE_SYSCALL for these, bypassing our ioctl hook.
 - `system` hook that blocks `openocd` / `/games/spike3/` shell-outs.
@@ -83,9 +85,6 @@ The small nucleus that remains after seven phases of carving. Owns:
 - `snd_pcm_*` ALSA stubs + paced writei capture to
   `_emulation/audio/stream.s16le`.
 - `perror` diagnostic wrapper.
-- `memcpy` NULL-guard (Step 45).
-- libavcodec HW-accel bypass (Step 47) + software HEVC redirect (Step 64)
-  + dummy-frame injection (Step 47b, gated by `SPIKE3_INJECT_VIDEO=1`).
 - GStreamer passthrough + logging.
 
 ### `shim_fs.c` — filesystem intercept layer (Phase 5)
@@ -183,6 +182,46 @@ Concentrates all *observe-the-game* machinery:
 - `shim_term_dump_handler` — SIGTERM / SIGINT / SIGUSR1 / SIGUSR2 handler
   (dumps on the first three; runs `shim_event_sweep` on SIGUSR2).
 
+### `shim_patches.c` — runtime patches to the game (Phase 8)
+
+The "surgery" bucket — hooks and byte-level patches that alter game
+behavior at runtime:
+
+- **`memcpy` NULL-guard** (Step 45): the Godot error-logger path on the
+  DisplayRenderer thread hits `memcpy(dst=NULL, src=NULL)` because Godot
+  TLS singletons aren't registered on that thread. The hook returns
+  unchanged for NULL args, forwards to real libc `memcpy` otherwise.
+  Counted and logged (first 8, then every 1000th).
+- **Step 62 `SpiDecoder::Play` vtable patch**
+  (`shim_patch_spi_video_vtable`): replaces vtable slot `+0x28` with a
+  stub that sets `update_thread_running=1` and `state=PLAYING` instead
+  of polling for 250 ms on a flag that never sets under our shim. Gated
+  by `SPIKE3_PATCH_SPI_VIDEO=1`.
+- **Step 64 `get_format` callback NOP patch**
+  (`shim_patch_get_format_callback`): NOPs the `b.ne 0x920ce0` at BN VA
+  0xd20cf0 so the callback accepts the first pix_fmt libavcodec offers
+  instead of insisting on DRM_PRIME. Safety check: refuses to patch
+  unless the instruction is exactly the expected `0x54ffff81`. Gated by
+  `SPIKE3_SW_HEVC=1`.
+- **libavcodec HW-accel bypass** (Step 47): hooks
+  `avcodec_find_decoder_by_name` (to swap `hevc_v4l2request` → `hevc`
+  when `SPIKE3_SW_HEVC=1`), `avcodec_get_hw_config`,
+  `av_hwdevice_ctx_create`, `avcodec_send_packet`, and
+  `avcodec_receive_frame` — currently passthrough + logging except for
+  the name swap.
+- **Dummy-frame injection** (Step 47b, `SPIKE3_INJECT_VIDEO=1`): when
+  the real decoder returns EAGAIN and a packet is pending,
+  `avcodec_receive_frame` returns a shim-managed NV12 1920×1080 AVFrame
+  (black Y/neutral UV) with a monotonic PTS so the downstream
+  video path doesn't stall. `shim_init_dummy_frame` uses
+  `av_frame_alloc` / `av_frame_get_buffer` / `av_frame_ref` resolved
+  via `dlvsym(..., "LIBAVUTIL_57")`.
+
+Both Step 62 and Step 64 patches translate BN VA → runtime address via
+`shim_resolve_game_base()` (defined in `shim_diagnostics.c`) and
+`mprotect` the page to PROT_READ|WRITE|EXEC before writing. They're
+called from `shim_vp_patch_thread` in `spi_shim.c`.
+
 ## Refactor progress at a glance
 
 | Phase | Carve | Lines moved |
@@ -194,15 +233,15 @@ Concentrates all *observe-the-game* machinery:
 | 5 | `shim_fs.c` (path/open/stat/access + GPIO pool) | 441 |
 | 6 | `shim_gl.c` (GBM + EGL + GLES + KHR image + eglGetProcAddress) | 1735 |
 | 7 | `shim_io.c` + `shim_ioctl.c` (fd I/O + ioctl dispatch + DRM events) | 654 |
+| 8 | `shim_patches.c` (memcpy NULL-guard + Step 62 vtable + Step 64 NOP + libavcodec hooks + dummy-frame injection) | 501 |
 
 Each phase was regression-tested against `REFACTOR_BASELINE.txt` — the
 post-Phase-6 run log captured before any carving. Every phase has matched
 the baseline within timing-variance noise (`gpio` retry count ±4, frame
 count ±30) on all 22 error classes + all 7 hook-fired log lines.
 
-Planned remaining phases: **shim_patches.c** (memcpy NULL-guard + Step 62
-vtable + Step 64 NOP + libavcodec hooks + dummy-frame injection) and
-**shim_inject.c** (switch manifest + event sweep + poke threads).
+Planned remaining phase: **shim_inject.c** (switch manifest + event
+sweep + poke threads + vp-patch thread).
 
 ## Defensive-hook pattern: 32/64-bit variants
 
