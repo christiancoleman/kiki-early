@@ -59,6 +59,37 @@ extern volatile int          shim_current_sweep_event_id;
 /* Called from shim_term_dump_handler on SIGUSR2 (defined in spi_shim.c). */
 void shim_event_sweep(void);
 
+/* ---- Netbridge UART protocol (defined in shim_nodebus.c) ----
+ * Called from the write() hook in spi_shim.c when the game sends a frame on
+ * the UART socketpair; synthesizes a response back to the shim side. */
+void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len);
+
+/* ---- Filesystem layer (defined in shim_fs.c) ---- */
+
+/* GPIO sysfs fake-fd pool — each open("/sys/class/gpio/...") allocates one
+ * of these slots. Pool size and base are exposed here because the I/O hooks
+ * in spi_shim.c (read/write/close/lseek) check fds against this range. */
+#define FAKE_FD_GPIO_BASE   1000
+#define FAKE_FD_GPIO_COUNT  16
+extern char     *gpio_fake_paths[FAKE_FD_GPIO_COUNT];
+extern uint8_t   gpio_fake_read_done[FAKE_FD_GPIO_COUNT];
+int  is_gpio_fake_fd(int fd);
+int  is_gpio_sysfs_path(const char *p);
+int  alloc_gpio_fake_fd(const char *path);
+void free_gpio_fake_fd(int fd);
+
+/* ---- Device intercept dispatcher (defined in spi_shim.c) ----
+ * Called from the open family in shim_fs.c. Returns a fake-fd (or a real
+ * socketpair fd for DRM/UART) if pathname matches a known device node,
+ * or 0 to fall through to real open(). */
+int intercept_device(const char *pathname);
+
+/* Lazy-resolve all libc function pointers (real_open / real_close / real_ioctl
+ * / real_read / real_write). Idempotent — cheap to call repeatedly.
+ * Defined in spi_shim.c; called from the open() hook at the top of shim_fs.c
+ * so the first file open has real_open ready. */
+void resolve_all(void);
+
 /* ---- Bridge lifecycle (defined in shim_bridges.c) ---- */
 void shim_bridge_start(void);             /* state bridge; no-op unless SPIKE3_BRIDGE=1 */
 void shim_frame_start(void);              /* frame bridge; no-op unless SPIKE3_FRAME_BRIDGE=1 */

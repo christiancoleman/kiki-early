@@ -1,28 +1,21 @@
 /*
- * spike3_shim.c - LD_PRELOAD shim for Spike 3 hardware emulation
+ * spi_shim.c — LD_PRELOAD shim for Spike 3 hardware emulation.
  *
- * Intercepts open/close/ioctl/read/write on hardware device files to emulate
- * Spike 3 peripherals when running the game binary under QEMU user-mode.
+ * This is the main source file of the shim. Subsystem-specific code lives in
+ * sibling files (shim_bridges.c, shim_diagnostics.c, shim_nodebus.c, ...);
+ * cross-file declarations are in spi_shim.h. All source files compile into
+ * a single spi_shim.so via ./build.sh.
  *
- * Currently intercepts:
- *   /dev/spidev4.0  — SPI node bus (coils, switches, LEDs, motors)
- *   /dev/i2c-10     — I2C bus (likely LCD backlight, NUK, power management)
- *   /dev/ttyAMA5    — UART bridge (netbridge communication)
+ * See _emulation/README.md for the module guide and this file's role, and
+ * _emulation/SETUP.md for environment setup.
  *
- * Build (cross-compile for aarch64):
- *   aarch64-linux-gnu-gcc -shared -fPIC -o spi_shim.so spi_shim.c -ldl
+ * Build:  ./build.sh
+ * Run:    ./run_game.sh    (auto-detects sysroot from script location)
  *
- * Run:
- *   cd games/pokemon_le && qemu-aarch64 -L /path/to/sysroot \
- *     -E LD_PRELOAD=/path/to/spi_shim.so ./game
-
-        qemu-aarch64 -L /mnt/c/Workspace/pokemon-le-0.81.0 \
-            -E LD_PRELOAD=$(pwd)/_emulation/spi_shim.so \
-            -E SPIKE3_SYSROOT=/mnt/c/Workspace/pokemon-le-0.81.0 \
-            -E SPIKE3_BRIDGE=1 \
-            -E "SPIKE3_POKE_CMODE=story_charmander_1:0x700:35" \
-            ./game
-
+ * Intercepts include /dev/spidev4.0 (SPI node bus), /dev/i2c-10 (I2C bus),
+ * /dev/ttyAMA5 (UART netbridge), /dev/dri/card1 (DRM), plus the game's
+ * EGL/GLES/GBM/libavcodec/ALSA/GPIO-sysfs surface. See README.md for the
+ * full env-var list that gates individual patches.
  */
 
 #define _GNU_SOURCE
@@ -55,36 +48,7 @@ extern int mkdir(const char *, unsigned int);
 
 #include "spi_shim.h"
 
-/* ---- Path remapping ----
- * QEMU user-mode's -L only affects the dynamic linker, not regular file ops.
- * We remap absolute paths so the game's filesystem references resolve against
- * the sysroot. Set SPIKE3_SYSROOT env var, or it defaults to empty (no remap).
- */
-static const char *sysroot = NULL;
-static int sysroot_len = 0;
-
-static void init_sysroot(void) {
-    if (sysroot) return;
-    sysroot = getenv("SPIKE3_SYSROOT");
-    if (!sysroot) sysroot = "";
-    sysroot_len = strlen(sysroot);
-}
-
-/* Remap an absolute path through the sysroot. Returns static buffer. */
-static char remapped_buf[4096];
-static const char *remap_path(const char *path) {
-    if (!path || !path[0]) return path;
-    init_sysroot();
-    if (sysroot_len == 0) return path;
-    /* Only remap absolute paths (not /dev/, /proc/, /sys/, /tmp/) */
-    if (path[0] != '/') return path;
-    if (strncmp(path, "/dev/", 5) == 0) return path;
-    if (strncmp(path, "/proc/", 6) == 0) return path;
-    if (strncmp(path, "/sys/", 5) == 0) return path;
-    if (strncmp(path, "/tmp/", 5) == 0) return path;
-    snprintf(remapped_buf, sizeof(remapped_buf), "%s%s", sysroot, path);
-    return remapped_buf;
-}
+/* ---- Path remapping: moved to shim_fs.c in Phase 5. ---- */
 
 /* ---- SPIKE3_REAL_GL env gate (Step 56) ----
  *
@@ -310,18 +274,14 @@ static uint32_t v4l2_ioctl_count = 0;
  * in a 185s run). We present each sysfs path as a small fake fd that swallows
  * writes and feeds back plausible reads ("0\n" for value, "out\n" for
  * direction). One fd per open() — the game re-opens on every poll. */
-#define FAKE_FD_GPIO_BASE   1000
-#define FAKE_FD_GPIO_COUNT  16
-static char     *gpio_fake_paths[FAKE_FD_GPIO_COUNT];
-static uint8_t   gpio_fake_read_done[FAKE_FD_GPIO_COUNT];
-static pthread_mutex_t gpio_fake_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---- Device state ---- */
 
 static int spi_active = 0;
 static int i2c_active = 0;
 static int uart_game_fd = -1;   /* returned from open(); real socketpair end */
-static int uart_shim_fd = -1;   /* held by the shim for pushing responses */
+int uart_shim_fd = -1;          /* held by the shim for pushing responses;
+                                   read by shim_nodebus.c via extern */
 static int drm_game_fd  = -1;   /* returned from open(/dev/dri/card1) */
 static int drm_shim_fd  = -1;   /* shim end; we write synthetic flip events here */
 static uint32_t spi_transfer_count = 0;
@@ -342,11 +302,13 @@ typedef int (*real_ioctl_t)(int, unsigned long, ...);
 typedef ssize_t (*real_read_t)(int, void *, size_t);
 typedef ssize_t (*real_write_t)(int, const void *, size_t);
 
-static real_open_t real_open = NULL;
+real_open_t real_open = NULL;    /* resolved in resolve_all(); used by the
+                                    open() hook in shim_fs.c via extern */
 static real_close_t real_close = NULL;
 static real_ioctl_t real_ioctl = NULL;
 static real_read_t real_read = NULL;
-static real_write_t real_write = NULL;
+real_write_t real_write = NULL;  /* resolved in resolve_all(); used by
+                                    shim_nodebus.c for raw socketpair writes */
 
 /* ---- Shim directory init ----
  *
@@ -1435,7 +1397,7 @@ static void drm_synthesize_flip_event(uint32_t crtc_id, uint64_t user_data) {
     }
 }
 
-static void resolve_all(void) {
+void resolve_all(void) {
     if (!real_open)  real_open  = (real_open_t)dlsym(RTLD_NEXT, "open");
     if (!real_close) real_close = (real_close_t)dlsym(RTLD_NEXT, "close");
     if (!real_ioctl) real_ioctl = (real_ioctl_t)dlsym(RTLD_NEXT, "ioctl");
@@ -1443,44 +1405,10 @@ static void resolve_all(void) {
     if (!real_write) real_write = (real_write_t)dlsym(RTLD_NEXT, "write");
 }
 
-/* ---- GPIO sysfs fake-fd pool ---- */
-
-static int is_gpio_sysfs_path(const char *p) {
-    return p && strncmp(p, "/sys/class/gpio/", 16) == 0;
-}
-
-static int alloc_gpio_fake_fd(const char *path) {
-    pthread_mutex_lock(&gpio_fake_lock);
-    for (int i = 0; i < FAKE_FD_GPIO_COUNT; i++) {
-        if (!gpio_fake_paths[i]) {
-            gpio_fake_paths[i] = strdup(path);
-            gpio_fake_read_done[i] = 0;
-            pthread_mutex_unlock(&gpio_fake_lock);
-            return FAKE_FD_GPIO_BASE + i;
-        }
-    }
-    pthread_mutex_unlock(&gpio_fake_lock);
-    return 0;
-}
-
-static int is_gpio_fake_fd(int fd) {
-    if (fd < FAKE_FD_GPIO_BASE || fd >= FAKE_FD_GPIO_BASE + FAKE_FD_GPIO_COUNT)
-        return 0;
-    return gpio_fake_paths[fd - FAKE_FD_GPIO_BASE] != NULL;
-}
-
-static void free_gpio_fake_fd(int fd) {
-    int idx = fd - FAKE_FD_GPIO_BASE;
-    pthread_mutex_lock(&gpio_fake_lock);
-    free(gpio_fake_paths[idx]);
-    gpio_fake_paths[idx] = NULL;
-    gpio_fake_read_done[idx] = 0;
-    pthread_mutex_unlock(&gpio_fake_lock);
-}
 
 /* ---- Check if path is a device we intercept, return fake fd or 0 ---- */
 
-static int intercept_device(const char *pathname) {
+int intercept_device(const char *pathname) {
     if (!pathname) return 0;
 
     if (is_gpio_sysfs_path(pathname)) {
@@ -1576,315 +1504,6 @@ static int is_uart_fd(int fd) {
     return uart_game_fd >= 0 && fd == uart_game_fd;
 }
 
-/* ---- Hooked: open / openat ---- */
-
-/* Log interesting opens: device nodes, sysfs/procfs, and anything under
- * /games/ that isn't plain-file library loading. Ignore noisy common paths
- * (shared libraries, locale, tzdata) and already-covered devices. */
-static int should_log_open(const char *pathname) {
-    if (!pathname) return 0;
-    if (strncmp(pathname, "/dev/", 5) == 0) return 1;
-    if (strncmp(pathname, "/sys/", 5) == 0) return 1;
-    if (strncmp(pathname, "/proc/", 6) == 0) return 1;
-    if (strncmp(pathname, "/games/", 7) == 0) return 1;
-    if (strncmp(pathname, "/run/", 5) == 0) return 1;
-    if (strncmp(pathname, "/tmp/", 5) == 0) return 1;
-    if (strncmp(pathname, "/var/", 5) == 0) return 1;
-    if (strncmp(pathname, "/etc/", 5) == 0) {
-        /* Skip /etc/ld.so.*, /etc/nsswitch.conf, /etc/localtime — these are
-         * libc bootstrap and don't tell us anything about game state. */
-        if (strstr(pathname, "ld.so")) return 0;
-        if (strstr(pathname, "nsswitch")) return 0;
-        if (strstr(pathname, "localtime")) return 0;
-        return 1;
-    }
-    /* Step 62.b: catch Godot-resource opens regardless of prefix. Relative
-     * paths (./assets/...) and absolute /mnt/c/... paths fall through all
-     * the /dev/games/etc checks above. These tell us whether the game
-     * actually finds main.pck, .tscn/.scn resources, .gd scripts, etc. */
-    if (strstr(pathname, ".pck")) return 1;
-    if (strstr(pathname, ".tscn")) return 1;
-    if (strstr(pathname, ".scn"))  return 1;
-    if (strstr(pathname, ".remap")) return 1;
-    if (strstr(pathname, ".import")) return 1;
-    if (strstr(pathname, "godot"))  return 1;
-    return 0;
-}
-
-int open(const char *pathname, int flags, ...) {
-    resolve_all();
-    int fake = intercept_device(pathname);
-    if (fake) return fake;
-
-    const char *actual = remap_path(pathname);
-
-    int ret;
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        int mode = va_arg(args, int);
-        va_end(args);
-        ret = real_open(actual, flags, mode);
-    } else {
-        ret = real_open(actual, flags);
-    }
-
-    if (should_log_open(pathname)) {
-        if (ret < 0) {
-            SHIM_LOG("OPEN FAIL: %s (flags=0x%x, errno=%d %s)",
-                     pathname, flags, errno, strerror(errno));
-        } else {
-            SHIM_LOG("OPEN OK:   %s -> fd %d (flags=0x%x)",
-                     pathname, ret, flags);
-        }
-    }
-    return ret;
-}
-
-typedef int (*real_openat_t)(int, const char *, int, ...);
-static real_openat_t real_openat = NULL;
-
-int openat(int dirfd, const char *pathname, int flags, ...) {
-    if (!real_openat) real_openat = (real_openat_t)dlsym(RTLD_NEXT, "openat");
-
-    int fake = intercept_device(pathname);
-    if (fake) return fake;
-
-    const char *actual = remap_path(pathname);
-
-    int ret;
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        int mode = va_arg(args, int);
-        va_end(args);
-        ret = real_openat(dirfd, actual, flags, mode);
-    } else {
-        ret = real_openat(dirfd, actual, flags);
-    }
-
-    if (should_log_open(pathname)) {
-        if (ret < 0) {
-            SHIM_LOG("OPENAT FAIL: %s (dirfd=%d flags=0x%x, errno=%d %s)",
-                     pathname, dirfd, flags, errno, strerror(errno));
-        } else {
-            SHIM_LOG("OPENAT OK:   %s -> fd %d (dirfd=%d flags=0x%x)",
-                     pathname, ret, dirfd, flags);
-        }
-    }
-    return ret;
-}
-
-/* ---- Step 62.b: LFS variants (open64/openat64/fopen64) ----
- * The Pokemon LE binary imports open64@GLIBC_2.17 and fopen64@GLIBC_2.17
- * (per readelf --dyn-syms). Our open() hook only catches calls to the
- * 32-bit-off_t variant; the game's Godot resource loader actually uses
- * open64 (the LFS family), so main.pck access was invisible to us. Mirror
- * the existing open/openat semantics here so path-remap + logging cover
- * those calls too. On 64-bit aarch64 Linux, open64 and open are functionally
- * identical (off_t is already 64-bit), but the SYMBOL resolution is distinct. */
-
-typedef int (*real_open64_t)(const char *, int, ...);
-static real_open64_t real_open64 = NULL;
-
-int open64(const char *pathname, int flags, ...) {
-    if (!real_open64) real_open64 = (real_open64_t)dlsym(RTLD_NEXT, "open64");
-    int fake = intercept_device(pathname);
-    if (fake) return fake;
-    const char *actual = remap_path(pathname);
-    int ret;
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        int mode = va_arg(args, int);
-        va_end(args);
-        ret = real_open64(actual, flags, mode);
-    } else {
-        ret = real_open64(actual, flags);
-    }
-    if (should_log_open(pathname)) {
-        if (ret < 0) {
-            SHIM_LOG("OPEN64 FAIL: %s (flags=0x%x, errno=%d %s)",
-                     pathname, flags, errno, strerror(errno));
-        } else {
-            SHIM_LOG("OPEN64 OK:   %s -> fd %d (flags=0x%x)",
-                     pathname, ret, flags);
-        }
-    }
-    return ret;
-}
-
-typedef int (*real_openat64_t)(int, const char *, int, ...);
-static real_openat64_t real_openat64 = NULL;
-
-int openat64(int dirfd, const char *pathname, int flags, ...) {
-    if (!real_openat64) real_openat64 = (real_openat64_t)dlsym(RTLD_NEXT, "openat64");
-    int fake = intercept_device(pathname);
-    if (fake) return fake;
-    const char *actual = remap_path(pathname);
-    int ret;
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        int mode = va_arg(args, int);
-        va_end(args);
-        ret = real_openat64(dirfd, actual, flags, mode);
-    } else {
-        ret = real_openat64(dirfd, actual, flags);
-    }
-    if (should_log_open(pathname)) {
-        if (ret < 0) {
-            SHIM_LOG("OPENAT64 FAIL: %s (dirfd=%d flags=0x%x, errno=%d %s)",
-                     pathname, dirfd, flags, errno, strerror(errno));
-        } else {
-            SHIM_LOG("OPENAT64 OK:   %s -> fd %d (dirfd=%d flags=0x%x)",
-                     pathname, ret, dirfd, flags);
-        }
-    }
-    return ret;
-}
-
-typedef FILE* (*real_fopen64_t)(const char *, const char *);
-static real_fopen64_t real_fopen64 = NULL;
-
-FILE *fopen64(const char *pathname, const char *mode) {
-    if (!real_fopen64) real_fopen64 = (real_fopen64_t)dlsym(RTLD_NEXT, "fopen64");
-    /* fopen64 returns FILE* not an fd — device-interception path doesn't fit.
-     * Path-remap still applies. */
-    const char *actual = remap_path(pathname);
-    FILE *ret = real_fopen64(actual, mode);
-    if (should_log_open(pathname)) {
-        if (!ret) {
-            SHIM_LOG("FOPEN64 FAIL: %s (mode=%s, errno=%d %s)",
-                     pathname, mode, errno, strerror(errno));
-        } else {
-            SHIM_LOG("FOPEN64 OK:   %s -> FILE* %p (mode=%s)",
-                     pathname, (void*)ret, mode);
-        }
-    }
-    return ret;
-}
-
-/* ---- Hooked: faccessat ---- */
-
-typedef int (*real_faccessat_t)(int, const char *, int, int);
-static real_faccessat_t real_faccessat = NULL;
-
-int faccessat(int dirfd, const char *pathname, int mode, int flags) {
-    if (!real_faccessat) real_faccessat = (real_faccessat_t)dlsym(RTLD_NEXT, "faccessat");
-    const char *actual = remap_path(pathname);
-    if (actual != pathname) {
-        SHIM_LOG("faccessat REMAP: %s -> %s", pathname, actual);
-    }
-    int ret = real_faccessat(dirfd, actual, mode, flags);
-    if (ret != 0 && pathname[0] == '/') {
-        SHIM_LOG("faccessat FAILED: %s (errno=%d)", actual, errno);
-    }
-    return ret;
-}
-
-/* ---- Hooked: newfstatat / fstatat ---- */
-
-typedef int (*real_fstatat_t)(int, const char *, void *, int);
-typedef int (*real_fxstatat_t)(int, int, const char *, void *, int);
-
-int fstatat(int dirfd, const char *pathname, void *statbuf, int flags) {
-    static real_fstatat_t real_fn = NULL;
-    if (!real_fn) real_fn = (real_fstatat_t)dlsym(RTLD_NEXT, "fstatat");
-    const char *actual = remap_path(pathname);
-    return real_fn(dirfd, actual, statbuf, flags);
-}
-
-int __fxstatat(int ver, int dirfd, const char *pathname, void *statbuf, int flags) {
-    static real_fxstatat_t real_fn = NULL;
-    if (!real_fn) real_fn = (real_fxstatat_t)dlsym(RTLD_NEXT, "__fxstatat");
-    const char *actual = remap_path(pathname);
-    return real_fn(ver, dirfd, actual, statbuf, flags);
-}
-
-int __fxstatat64(int ver, int dirfd, const char *pathname, void *statbuf, int flags) {
-    static real_fxstatat_t real_fn = NULL;
-    if (!real_fn) real_fn = (real_fxstatat_t)dlsym(RTLD_NEXT, "__fxstatat64");
-    const char *actual = remap_path(pathname);
-    return real_fn(ver, dirfd, actual, statbuf, flags);
-}
-
-/* ---- Hooked: access ----
- * glibc's access() goes straight to the faccessat syscall via INLINE_SYSCALL_CALL,
- * bypassing the libc faccessat() wrapper. So hooking faccessat() alone misses
- * every access() call. We must hook access() directly.
- */
-
-typedef int (*real_access_t)(const char *, int);
-
-int access(const char *pathname, int mode) {
-    static real_access_t real_fn = NULL;
-    if (!real_fn) real_fn = (real_access_t)dlsym(RTLD_NEXT, "access");
-
-    /* GPIO sysfs: pretend the pin directory + attribute files always exist
-     * (mode ignored — the game uses F_OK to check export state). */
-    if (is_gpio_sysfs_path(pathname)) {
-        (void)mode;
-        return 0;
-    }
-
-    const char *actual = remap_path(pathname);
-    if (actual != pathname) {
-        SHIM_LOG("access REMAP: %s -> %s", pathname, actual);
-    }
-    int ret = real_fn(actual, mode);
-    if (ret != 0 && pathname[0] == '/') {
-        SHIM_LOG("access FAILED: %s (errno=%d)", actual, errno);
-    }
-    return ret;
-}
-
-/* ---- Hooked: stat / lstat (and __xstat/__lxstat glibc compat) ---- */
-
-typedef int (*real_stat_t)(const char *, void *);
-typedef int (*real_xstat_t)(int, const char *, void *);
-
-int stat(const char *pathname, void *statbuf) {
-    static real_stat_t real_fn = NULL;
-    if (!real_fn) real_fn = (real_stat_t)dlsym(RTLD_NEXT, "stat");
-    const char *actual = remap_path(pathname);
-    return real_fn(actual, statbuf);
-}
-
-int lstat(const char *pathname, void *statbuf) {
-    static real_stat_t real_fn = NULL;
-    if (!real_fn) real_fn = (real_stat_t)dlsym(RTLD_NEXT, "lstat");
-    const char *actual = remap_path(pathname);
-    return real_fn(actual, statbuf);
-}
-
-int __xstat(int ver, const char *pathname, void *statbuf) {
-    static real_xstat_t real_fn = NULL;
-    if (!real_fn) real_fn = (real_xstat_t)dlsym(RTLD_NEXT, "__xstat");
-    const char *actual = remap_path(pathname);
-    return real_fn(ver, actual, statbuf);
-}
-
-int __lxstat(int ver, const char *pathname, void *statbuf) {
-    static real_xstat_t real_fn = NULL;
-    if (!real_fn) real_fn = (real_xstat_t)dlsym(RTLD_NEXT, "__lxstat");
-    const char *actual = remap_path(pathname);
-    return real_fn(ver, actual, statbuf);
-}
-
-int __xstat64(int ver, const char *pathname, void *statbuf) {
-    static real_xstat_t real_fn = NULL;
-    if (!real_fn) real_fn = (real_xstat_t)dlsym(RTLD_NEXT, "__xstat64");
-    const char *actual = remap_path(pathname);
-    return real_fn(ver, actual, statbuf);
-}
-
-int __lxstat64(int ver, const char *pathname, void *statbuf) {
-    static real_xstat_t real_fn = NULL;
-    if (!real_fn) real_fn = (real_xstat_t)dlsym(RTLD_NEXT, "__lxstat64");
-    const char *actual = remap_path(pathname);
-    return real_fn(ver, actual, statbuf);
-}
 
 /* ---- Hooked: system ----
  * sub_d19580 shells out to `openocd ...` to flash the RP2040 netbridge if the
@@ -3895,341 +3514,6 @@ off_t lseek(int fd, off_t offset, int whence) {
 
 /* ---- Hooked: write ---- */
 
-/* ---- Bridge protocol response synthesis ----
- *
- * Per Sidekick Round 4 RE of sub_d164a0 (send_bridge_message_with_response)
- * and the parser in sub_d15aa8:
- *
- *   Request frame:  [0x02][CMD][ID][payload...][CKSUM][0x03]
- *   Response frame: [0x02][RESP_CMD][ID][payload...][CKSUM][0x03]
- *   Checksum:       CMD + ID + payload... + CKSUM == 0 (mod 256)
- *   ID:             Channel ID; response MUST echo the request's ID
- *
- * Request-to-response CMD mapping and payload size:
- *   0x10 (pwrdist version query) -> 0x00 (7 payload bytes)
- *   0x20 (hw version query)      -> 0x10 (4 payload bytes)
- *   0x30 (expected CRC query)    -> 0x20 (4 payload bytes)
- *
- * For 0x30 we return the zlib CRC32 of netbridge.elf's .text+.rodata+
- * .binary_info sections, computed offline in Step 13.5 (journal).
- *
- * For 0x10 we return seven zero bytes. sub_d19580 interprets a zero
- * version as "Spike 1/2 board — use fallback, don't flash powerdist" —
- * which is exactly what we want in emulation (no real powerdist to flash).
- *
- * For 0x20 we return four zero bytes; the game stores the value into
- * data_490e644/data_490e648 without (as far as we've seen) validating.
- */
-
-#define NETBRIDGE_CRC32  0x357f5327u
-
-static uint8_t bridge_checksum(const uint8_t *bytes, size_t len) {
-    uint32_t sum = 0;
-    for (size_t i = 0; i < len; i++) sum += bytes[i];
-    return (uint8_t)(-(int32_t)sum);
-}
-
-/* ---- Bridge frame escape encoding ----
- *
- * The Spike 3 bridge protocol reserves three byte values for framing:
- *   0x02 = STX (start of frame)
- *   0x03 = ETX (end of frame)
- *   0x1b = ESC (next data byte has bit 7 cleared)
- *
- * Any CMD/ID/PAYLOAD/CKSUM byte that equals one of these three values is
- * transmitted as `0x1b (byte | 0x80)`. The receiver's byte-by-byte parser
- * in sub_d15aa8 (see file 0x915c38 — the `cmp w0, #0x1b` and the
- * `bic w0, w0, w26` at 0x915c10) un-escapes by AND-ing with ~0x80.
- *
- * We discovered this via cmd 0x18 responses where id=0x02 (channel 2) was
- * sent by the game as `02 18 1b 82 cksum 03` (escape-encoded). Our naive
- * req[2] extraction read 0x1b as the channel and sent back a malformed
- * frame, which the receiver then rejected with "bridge rx checksum error".
- */
-
-/* Decode an incoming escape-encoded frame into its logical bytes. Returns
- * decoded length including STX/ETX, or -1 on malformed input. */
-static int bridge_decode_escape(const uint8_t *raw, size_t raw_len,
-                                uint8_t *out, size_t out_cap) {
-    if (raw_len < 5 || raw[0] != 0x02 || raw[raw_len - 1] != 0x03) return -1;
-    if (out_cap < 2) return -1;
-    out[0] = 0x02;
-    size_t o = 1;
-    for (size_t i = 1; i < raw_len - 1; i++) {
-        if (o >= out_cap - 1) return -1;
-        if (raw[i] == 0x1b && i + 1 < raw_len - 1) {
-            out[o++] = raw[i + 1] & 0x7f;
-            i++;
-        } else {
-            out[o++] = raw[i];
-        }
-    }
-    out[o++] = 0x03;
-    return (int)o;
-}
-
-/* Encode a logical frame into its on-wire (escape-encoded) form. Returns
- * encoded length. STX (byte 0) and ETX (last byte) are emitted literally;
- * any 0x02/0x03/0x1b byte between them is prefixed with 0x1b. */
-static int bridge_encode_escape(const uint8_t *logical, size_t logical_len,
-                                uint8_t *out, size_t out_cap) {
-    if (logical_len < 2 || logical[0] != 0x02 ||
-        logical[logical_len - 1] != 0x03 || out_cap < 1) return -1;
-    out[0] = 0x02;
-    size_t o = 1;
-    for (size_t i = 1; i < logical_len - 1; i++) {
-        uint8_t b = logical[i];
-        if (b == 0x02 || b == 0x03 || b == 0x1b) {
-            if (o + 2 >= out_cap) return -1;
-            out[o++] = 0x1b;
-            out[o++] = b | 0x80;
-        } else {
-            if (o + 1 >= out_cap) return -1;
-            out[o++] = b;
-        }
-    }
-    if (o + 1 > out_cap) return -1;
-    out[o++] = 0x03;
-    return (int)o;
-}
-
-static void bridge_send_response(const uint8_t *resp, size_t resp_len,
-                                 uint8_t req_cmd, uint8_t id) {
-    if (uart_shim_fd < 0) return;
-    fprintf(stderr, "[shim] bridge RESP to cmd=0x%02x id=0x%02x (%zu logical bytes):",
-            req_cmd, id, resp_len);
-    for (size_t i = 0; i < resp_len; i++) fprintf(stderr, " %02x", resp[i]);
-    fprintf(stderr, "\n");
-    uint8_t wire[64];
-    int wire_len = bridge_encode_escape(resp, resp_len, wire, sizeof(wire));
-    if (wire_len < 0) {
-        SHIM_LOG("bridge: encode_escape failed");
-        return;
-    }
-    if ((size_t)wire_len != resp_len) {
-        fprintf(stderr, "[shim]   (escape-encoded to %d bytes:", wire_len);
-        for (int i = 0; i < wire_len; i++) fprintf(stderr, " %02x", wire[i]);
-        fprintf(stderr, ")\n");
-    }
-    ssize_t n = real_write(uart_shim_fd, wire, wire_len);
-    if (n < 0) SHIM_LOG("bridge: real_write response failed: %s", strerror(errno));
-}
-
-static void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
-    uint8_t req[64];
-    int req_len = bridge_decode_escape(raw_req, raw_len, req, sizeof(req));
-    if (req_len < 5) return;
-    uint8_t cmd = req[1];
-    uint8_t id  = req[2];
-
-    uint8_t resp[16];
-
-    switch (cmd) {
-    case 0x30: {
-        /* Response 0x20 with 4-byte expected CRC (little-endian). */
-        resp[0] = 0x02;
-        resp[1] = 0x20;
-        resp[2] = id;
-        resp[3] = (uint8_t)(NETBRIDGE_CRC32 >>  0);
-        resp[4] = (uint8_t)(NETBRIDGE_CRC32 >>  8);
-        resp[5] = (uint8_t)(NETBRIDGE_CRC32 >> 16);
-        resp[6] = (uint8_t)(NETBRIDGE_CRC32 >> 24);
-        resp[7] = bridge_checksum(resp + 1, 6);
-        resp[8] = 0x03;
-        bridge_send_response(resp, 9, cmd, id);
-        return;
-    }
-    case 0x20: {
-        /* Response 0x10 with 4-byte hardware version (all zeros for now). */
-        resp[0] = 0x02;
-        resp[1] = 0x10;
-        resp[2] = id;
-        resp[3] = 0x00; resp[4] = 0x00; resp[5] = 0x00; resp[6] = 0x00;
-        resp[7] = bridge_checksum(resp + 1, 6);
-        resp[8] = 0x03;
-        bridge_send_response(resp, 9, cmd, id);
-        return;
-    }
-    case 0x10: {
-        /* Response cmd 0x10 with 7-byte pwrdist version payload.
-         *
-         * IMPORTANT: the response cmd must be in range [0x10, 0x41]. The
-         * dispatch in sub_d15aa8 checks (cmd - 0x10) <= 0x31; anything
-         * outside that range falls through to "BRIDGE_ProcessMessage
-         * unknown command" which still signals the waiting channel (so
-         * send_bridge_message_with_response returns 0) but the dispatch
-         * handler that writes data_490e61c never runs. Sidekick's earlier
-         * "0x10 -> 0x00" mapping turned out to be off; the actual response
-         * cmd for pwrdist version is 0x10 (matches the request cmd).
-         *
-         * data_490e61c is set by the dispatch handler as roughly
-         * (payload[0] << 16) | (payload[1] << 8). Non-zero value puts the
-         * game on the "has Spike 3 pwrdist board" path, which calls
-         * sub_d18c20("powerdist_ext.hex", 0). If sub_d18c20 shells out to
-         * openocd, our system() hook returns 0 and the flash "succeeds",
-         * then the game re-queries (we return the same response), ver
-         * stays non-zero, sub_d19580 returns 0 (x19 untouched from its
-         * initial 0). */
-        resp[0]  = 0x02;
-        resp[1]  = 0x10;
-        resp[2]  = id;
-        resp[3]  = 0x01;
-        resp[4]  = 0x00;
-        resp[5]  = 0x00;
-        resp[6]  = 0x00;
-        resp[7]  = 0x00;
-        resp[8]  = 0x00;
-        resp[9]  = 0x00;
-        resp[10] = bridge_checksum(resp + 1, 9);
-        resp[11] = 0x03;
-        bridge_send_response(resp, 12, cmd, id);
-        return;
-    }
-    case 0x15: {
-        /* Pwrdist status (follow-up after 0x10). Handler at file 0x9160a0
-         * requires exactly 1 payload byte; OR/XORs it into state word at
-         * data_490e5b0+128. First guess: 0x00 = "all clear, no faults". */
-        resp[0] = 0x02;
-        resp[1] = 0x15;
-        resp[2] = id;
-        resp[3] = 0x00;
-        resp[4] = bridge_checksum(resp + 1, 3);
-        resp[5] = 0x03;
-        bridge_send_response(resp, 6, cmd, id);
-        return;
-    }
-    case 0x18: {
-        /* Pwrdist followup #2. Handler at file 0x91607c records min(existing,
-         * payload_len) into a halfword table at data_490e5b0+0x88[id]; the
-         * value isn't read. Send minimal 1-byte payload with value 0x00. */
-        resp[0] = 0x02;
-        resp[1] = 0x18;
-        resp[2] = id;
-        resp[3] = 0x00;
-        resp[4] = bridge_checksum(resp + 1, 3);
-        resp[5] = 0x03;
-        bridge_send_response(resp, 6, cmd, id);
-        return;
-    }
-    case 0x1c: {
-        /* Pwrdist firmware flash chunk write. Jump table routes cmd 0x1c to
-         * the generic "silent no-op + ACK" handler at file 0x915d28 (shared
-         * with cmds 0x11/0x13/0x16/0x17/0x19/0x21/0x23–0x25/0x30/0x31). A
-         * zero-payload frame takes the cbnz-w27 path and signals the waiting
-         * channel, which is what send_bridge_message_with_response wants to
-         * unblock. Game treats that as "chunk write acknowledged." */
-        resp[0] = 0x02;
-        resp[1] = 0x1c;
-        resp[2] = id;
-        resp[3] = bridge_checksum(resp + 1, 2);
-        resp[4] = 0x03;
-        bridge_send_response(resp, 5, cmd, id);
-        return;
-    }
-    case 0x11: {
-        /* Jump table routes cmd 0x11 to the generic silent-ACK fallback at
-         * 0x915d28 (same family as 0x1c). Zero-payload frame unblocks the
-         * channel; no state is written. */
-        resp[0] = 0x02;
-        resp[1] = 0x11;
-        resp[2] = id;
-        resp[3] = bridge_checksum(resp + 1, 2);
-        resp[4] = 0x03;
-        bridge_send_response(resp, 5, cmd, id);
-        return;
-    }
-    case 0x16: {
-        /* Cmd 0x16 routes to the shared handler path at 0x915d28. That path
-         * has two branches:
-         *   - payload_len == 0 AND id == 0: pure ACK, no buffer write.
-         *   - payload_len > 0: falls to 0x915e8c which memcpys the payload
-         *     into the channel's rx_buf registered at
-         *     data_490e5b0+0xa0+id*8.
-         * The caller at 0x675c20 (wrapper sub_917b60) sends cmd 0x16 with a
-         * 1-byte tx payload (0x00) and expects a 4-byte response. It then
-         * polls up to 1000×1ms waiting for:
-         *   return value (rx[0]) > 0  AND  rx[2] == 0x02
-         * Values for rx[1] and rx[3] are stored to caller out-ptrs but not
-         * tested. Send `01 00 02 00` so the poll exits immediately. */
-        resp[0] = 0x02;
-        resp[1] = 0x16;
-        resp[2] = id;
-        resp[3] = 0x01;
-        resp[4] = 0x00;
-        resp[5] = 0x02;
-        resp[6] = 0x00;
-        resp[7] = bridge_checksum(resp + 1, 6);
-        resp[8] = 0x03;
-        bridge_send_response(resp, 9, cmd, id);
-        return;
-    }
-    case 0x1d: {
-        /* Dedicated handler at 0x916028: `cmp w27,#4 / b.eq 0x915e88`. If
-         * payload_len == 4 it memcpys into the per-id buffer at
-         * data_490e5b0+0xa0+id*8; otherwise it falls through to the silent-
-         * ACK fallback at 0x915d28. Sending 0-byte payload takes the else
-         * path — unblocks the waiting channel without writing stale data
-         * into a buffer whose semantics we haven't yet verified (plausibly
-         * pwrdist status bits + rail state + ADC reading, per FotE §4.16). */
-        resp[0] = 0x02;
-        resp[1] = 0x1d;
-        resp[2] = id;
-        resp[3] = bridge_checksum(resp + 1, 2);
-        resp[4] = 0x03;
-        bridge_send_response(resp, 5, cmd, id);
-        return;
-    }
-    case 0x27: {
-        /* Four game-side callsites polling a 1-byte response byte:
-         *   0x916828 one-shot getter (stores resp[0] to caller out-ptr)
-         *   0x916fe0 loop: spin until bit 2 == 1
-         *   0x917020 loop: spin until bit 2 == 0  (paired with 916fe0)
-         *   0x917264 loop: spin (100ms × ≤100) until (resp & 3) == 2
-         * The paired loop at 916fe0/917020 requires bit 2 to toggle 1→0
-         * within the same function call, so a static response stalls one
-         * of the two halves. Alternate odd/even calls:
-         *   odd  -> 0x06 (bits 1,2 set; resp&3 == 2)
-         *   even -> 0x02 (bit 1 set only; resp&3 == 2)
-         * Both values satisfy 917264; alternation resolves the pair. */
-        static unsigned int cmd27_count = 0;
-        cmd27_count++;
-        uint8_t status = (cmd27_count & 1) ? 0x06 : 0x02;
-        resp[0] = 0x02;
-        resp[1] = 0x27;
-        resp[2] = id;
-        resp[3] = status;
-        resp[4] = bridge_checksum(resp + 1, 3);
-        resp[5] = 0x03;
-        bridge_send_response(resp, 6, cmd, id);
-        SHIM_LOG("bridge: cmd 0x27 #%u -> status 0x%02x (id=0x%02x)",
-                 cmd27_count, status, id);
-        return;
-    }
-    /* Step 45: cmd 0x25 / 0x41 silent-ACK reverted.
-     *
-     * ATTEMPTED: zero-payload ACK for both. Unblocked the send-side channel
-     * wait, but progress REGRESSED — the crashing run reached Godot init +
-     * Radium + pokemon_battle_scene + texture 400 before SEGV. With ACKs
-     * enabled, the game never reached Godot at all in 90 s (stdout stopped
-     * at the /data/ mkdir errors; no Godot Engine banner; texture/shader
-     * counts unchanged from pre-init steady state).
-     *
-     * Interpretation: the previous timeout path WAS the progress path. Game
-     * sends cmd 0x41, waits 1000 ms, times out, logs "Connection timed out",
-     * falls back to default/null state, proceeds to Godot. Our fast zero-
-     * payload ACK arrives before the timeout fires; game interprets "ACK
-     * without the expected status payload" as "keep polling", and spins.
-     *
-     * cmd 0x41 dispatches to dedicated handler 0x915f88 (PROTOCOL.md) with
-     * payload contract unknown. Resolving it properly needs a BN dig we
-     * don't want to spend budget on today. For now: let the timeout fire,
-     * memcpy NULL-guard catches the downstream PopupMenu SEGV.
-     */
-    default:
-        SHIM_LOG("bridge: no synthetic response for cmd 0x%02x", cmd);
-        return;
-    }
-}
 
 ssize_t write(int fd, const void *buf, size_t count) {
     resolve_all();
