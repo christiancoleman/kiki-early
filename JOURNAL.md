@@ -5173,6 +5173,32 @@ The Step-58.post plan (`glFramebufferTexture2D` intercept to swap `EXTERNAL_OES`
 
 Verification is one run with the existing shim and an expanded `eglGetProcAddress` logger — effectively free. Worth doing before committing to either fix.
 
+## Step 62: LFS open() family hooks — main.pck was invisible to us (2026-04-22)
+
+After Step 62's SpiDecoder::Play vtable patch, the game still SIGABRT'd at shutdown with `pure virtual method called` / `terminate called without an active exception`. The patch fired (`[vp] fake_spi_play` logged twice, ***** banner gone), but the game reached the same destructor cascade and aborted.
+
+Looking at what the game was actually doing, I noticed our shim logged **zero** opens for `.pck`, `.tscn`, or anything Godot-resource-looking. The game binary references `./assets/godot/main.pck` as an embedded relative path — so either the pck was embedded in the binary (no `GDPC` magic, ruled out) or we weren't seeing the open.
+
+`readelf --dyn-syms` showed the game links against **`open64@GLIBC_2.17`**, **`openat64@GLIBC_2.17`**, **`fopen64@GLIBC_2.17`**, **`popen@GLIBC_2.17`** — the Large File Support family. On 64-bit aarch64 Linux, `open64` is functionally identical to `open` (off_t is already 64-bit), but the symbols are distinct. Our shim was only hooking `open` and `openat`, so `open64`/`fopen64` calls fell through to real libc without path-remap or logging. The game's Godot resource loader uses `fopen64` — so we were blind to every single Godot-side file open, including `main.pck` itself.
+
+Added `open64`, `openat64`, `fopen64` hooks mirroring the existing `open`/`openat` semantics (device interception + sysroot path remap + logger). Widened `should_log_open` to match `*.pck`, `*.tscn`, `*.scn`, `*.remap`, `*.import`, `godot` patterns regardless of path prefix.
+
+**Result — game no longer crashes.** Exit code changed from 134 (SIGABRT) to 124 (timeout). The game runs the full 185 seconds stable. 622 successful `fopen64` calls, 660 successful `open64` calls, game actively loads main.pck (multiple times — probably re-mapped for different resource queries). Godot banner prints, scripts load, and MODE_PAGE_FLIP fires **40 times** per 185 s (up from 4-5). Viewer captures 215 frames, each with a unique hash — Pokemon logo now has live "Startup in Progress..." dot animation.
+
+**Remaining issues (not blocking, but open):**
+- `/root/Main` still not found when GDScripts reach for it (`$"/root/Main"` in capture_battle, discover) — the shipping binary's custom init bypasses main.tscn load per BN [81]
+- Game is still in boot-splash steady state, not advancing to attract mode
+- `Condition "!is_inside_tree()" at play (video_player_spi.cpp:376)` still fires — orphaned VideoStreamPlayer nodes being play()'d outside the tree
+- 127 `FOPEN64 FAIL` and 135 `OPEN64 FAIL` — missing resource files (mostly Godot cache dirs, override.cfg, .godot/scene_groups_cache.cfg). Non-fatal.
+
+**What this changes about our earlier conclusions:**
+- Step 60's "game aborts at ~180s deterministically" → actually, the abort was caused by the unresolved fopen64 paths corrupting enough state to trip destructor sequencing during shutdown. Without those failures, no abort.
+- The `pure virtual method called` was a SYMPTOM of the `open64`-hiding problem, not a root-cause destructor bug.
+- BN entry [81]'s "custom Stern init bypasses standard SceneTree::init" is still true, but Godot is clearly far more alive than we thought — main.pck is loaded, scripts run, scenes instantiate.
+
+**Next:** investigate why `/root/Main` isn't loaded despite `main.tscn.remap` being present in the pck. Is there a missing `ResourceLoader::load("res://scenes/main.tscn")` + `add_child` in the C++ init path? Could the game be waiting on a specific event to kick off Main's load? The shipping init's custom path loads `pokemon_battle_scene`, `capture_battle_scene`, `Discover` directly but Main never shows up.
+
+
 ## Step 59: fallback pbuffer unblocks the render — real pixels out, boot-splash is drawing (2026-04-22)
 
 User's strategic pivot (Step 58.post.3) of ignoring Godot paid off in one session. Traced the real blocker cleanly: the game calls `eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)` — a surfaceless context binding — but still draws to `fb=0` (the default framebuffer). On real hardware the game's GBM→DRM render chain apparently provides an implicit drawable that we don't reproduce; on our shim, Mesa's default framebuffer for a surfaceless context is `GL_FRAMEBUFFER_UNDEFINED (0x8219)`, so every `glDrawArrays` / `glUseProgram` returned `GL_INVALID_FRAMEBUFFER_OPERATION (0x506)` by spec. Those were the `SpriteRenderer.cpp:143` and `Shader.cpp:17` errors we'd been chasing all of Step 58 — never an FBO-completeness problem on a user framebuffer, always the *default* framebuffer failing because no surface was bound.

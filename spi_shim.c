@@ -344,6 +344,20 @@ static int v4l2_media_active = 0;
 static int v4l2_video_active = 0;
 static uint32_t v4l2_ioctl_count = 0;
 
+/* ---- GPIO sysfs stubs (Step 63) ----
+ * The game uses legacy /sys/class/gpio/{export,gpio25/direction,gpio25/value}
+ * to bit-bang chip-select (or an interrupt line) for a SPI peripheral. Under
+ * qemu-user the host's sysfs either has no gpio class or is not writable,
+ * so the game sees EACCES on export and spins in a retry loop (687 failures
+ * in a 185s run). We present each sysfs path as a small fake fd that swallows
+ * writes and feeds back plausible reads ("0\n" for value, "out\n" for
+ * direction). One fd per open() — the game re-opens on every poll. */
+#define FAKE_FD_GPIO_BASE   1000
+#define FAKE_FD_GPIO_COUNT  16
+static char     *gpio_fake_paths[FAKE_FD_GPIO_COUNT];
+static uint8_t   gpio_fake_read_done[FAKE_FD_GPIO_COUNT];
+static pthread_mutex_t gpio_fake_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* ---- Device state ---- */
 
 static int spi_active = 0;
@@ -1764,6 +1778,152 @@ static void *shim_poke_state_flag_thread(void *arg) {
     return NULL;
 }
 
+/* ---- Step 62: SpiVideoStreamDecoderBase::Play vtable patch ----
+ *
+ * BN analysis: vtable at 0x46cc9c8 (22 slots, 384 bytes), slot +0x28 is Play
+ * at sub_d24360. Play polls *(this+8) [update_thread_running flag] every 1ms
+ * for up to 250 iterations. The flag is set by DecodeFrame (sub_d227d0) only
+ * after avcodec_receive_frame successfully decodes a frame. In our shim the
+ * V4L2 HEVC hwaccel is unavailable so decoder always returns EAGAIN/EOF →
+ * flag never set → Play's 250ms timeout fires, prints the ****** banner,
+ * returns 1 (success) anyway. Queue at *(this+0xa0) stays empty. Downstream
+ * consumer gets nothing, state wedges, eventual pure-virtual-method abort
+ * during the VideoPlayerSpi destructor chain.
+ *
+ * Fix: vtable-patch slot +0x28 to a function that immediately sets
+ * update_thread_running=1 and state=PLAYING, then returns 1. Skips the
+ * FFmpeg wait entirely. Gated by SPIKE3_PATCH_SPI_VIDEO=1. Three expected
+ * outcomes per HANDOFF.md: (a) game advances to a new specific failure,
+ * (b) game reaches attract with missing video (still useful), (c) same
+ * abort — meaning it's a dtor-order bug not play-timeout.
+ *
+ * Object layout for Play's caller args (see reference_video_player_spi.md):
+ *   *(self+0x08)  u8   update_thread_running (the flag)
+ *   *(self+0x179) u8   loop_flag
+ *   *(self+0x17c) u32  start_frame (-1 = from beginning)
+ *   *(self+0x180) u64  seek_pending
+ *   *(self+0x18c) u32  decoder state (2=PLAYING)
+ */
+#define SPI_DECODER_VTABLE_BN_VA   0x46cc9c8
+#define SPI_DECODER_PLAY_SLOT      0x28
+
+static int64_t shim_fake_spi_play(void *self, char loop_flag, int32_t start_frame) {
+    /* Preserve real Play's state-guard: if (state & 0xfffffffd) != 1 it returns
+     * 0 unchanged. Keeps us from unblocking a genuinely-errored Play path. */
+    int32_t state = *(uint32_t*)((char*)self + 0x18c);
+    if ((state & 0xfffffffd) != 1) return 0;
+
+    *(uint8_t  *)((char*)self + 0x179) = loop_flag;
+    if (start_frame != -1)
+        *(uint32_t*)((char*)self + 0x17c) = start_frame;
+    *(uint64_t *)((char*)self + 0x180) = 0;      /* clear seek_pending */
+    *(uint32_t *)((char*)self + 0x18c) = 2;      /* PLAYING */
+    __atomic_store_n((uint8_t*)((char*)self + 8), 1, __ATOMIC_SEQ_CST);
+    SHIM_LOG("[vp] fake_spi_play(self=%p, loop=%d, start=%d) -> 1 [skipped FFmpeg]",
+             self, (int)loop_flag, start_frame);
+    return 1;
+}
+
+static void shim_patch_spi_video_vtable(void) {
+    if (!is_real_gl()) return;
+    const char *en = getenv("SPIKE3_PATCH_SPI_VIDEO");
+    if (!en || en[0] != '1') return;
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[vp] game_base unresolved; patch aborted");
+        return;
+    }
+
+    void **slot = (void**)(game_base +
+        (SPI_DECODER_VTABLE_BN_VA - 0x400000) + SPI_DECODER_PLAY_SLOT);
+    uintptr_t page = (uintptr_t)slot & ~(uintptr_t)4095;
+    /* Spans two pages in case the slot is near a page boundary. */
+    if (mprotect((void*)page, 8192, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        SHIM_LOG("[vp] mprotect RWX failed: %s", strerror(errno));
+        return;
+    }
+    void *old = *slot;
+    *slot = (void*)shim_fake_spi_play;
+    SHIM_LOG("[vp] patched SpiDecoder::Play vtable slot @ %p: %p -> %p",
+             (void*)slot, old, (void*)shim_fake_spi_play);
+}
+
+/* ---- Step 64: software HEVC path ----
+ *
+ * Two pieces: (1) swap the decoder name "hevc_v4l2request" → "hevc" at
+ * avcodec_find_decoder_by_name; handled in that hook's body. (2) NOP the
+ * b.ne in the game's get_format callback so it accepts the first pix_fmt
+ * libavcodec offers, instead of insisting on DRM_PRIME (0xb3).
+ *
+ * Callback layout at BN VA 0x920cd0 (extracted via objdump):
+ *   920cd0  ldr  w0, [x1]          ; fmt = list[0]
+ *   920cd4  cmn  w0, #1             ; AV_PIX_FMT_NONE?
+ *   920cd8  b.ne 0x920cec           ; not sentinel → compare
+ *   920cdc  b    0x920cf8           ; empty list → error
+ *   920ce0  ldr  w0, [x1, #4]!      ; LOOP: advance, load
+ *   920ce4  cmn  w0, #1
+ *   920ce8  b.eq 0x920cf8           ; end → error
+ *   920cec  cmp  w0, #0xb3          ; DRM_PRIME?
+ *   920cf0  b.ne 0x920ce0           ; no → loop
+ *   920cf4  ret                     ; yes → return 0xb3
+ *
+ * Patching 920cf0 to NOP makes the callback always fall through to `ret`
+ * with w0 holding whatever format was just loaded — i.e. the first
+ * non-sentinel entry. For software hevc that's YUV420P (0) or NV12 (23).
+ *
+ * Gated by SPIKE3_SW_HEVC=1. When paired with the name-swap above it should
+ * take software decode end-to-end until Radium's downstream code (which
+ * expects DRM_PRIME descriptors in AVFrame->data[0]) hits a new wall.
+ */
+#define GET_FORMAT_BNE_BN_VA   0x920cf0
+#define AARCH64_NOP            0xd503201fu
+
+static int shim_sw_hevc_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("SPIKE3_SW_HEVC");
+        cached = (s && s[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+static void shim_patch_get_format_callback(void) {
+    if (!shim_sw_hevc_enabled()) return;
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[sw_hevc] game_base unresolved; get_format patch aborted");
+        return;
+    }
+
+    uint32_t *instr = (uint32_t *)(game_base +
+        (GET_FORMAT_BNE_BN_VA - 0x400000));
+    uintptr_t page = (uintptr_t)instr & ~(uintptr_t)4095;
+    if (mprotect((void *)page, 8192,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        SHIM_LOG("[sw_hevc] mprotect RWX @ %p failed: %s",
+                 (void *)page, strerror(errno));
+        return;
+    }
+
+    uint32_t old = *instr;
+    *instr = AARCH64_NOP;
+    __builtin___clear_cache((char *)instr, (char *)instr + 4);
+    SHIM_LOG("[sw_hevc] patched get_format b.ne @ %p: 0x%08x -> 0x%08x (NOP)",
+             (void *)instr, old, (unsigned)AARCH64_NOP);
+}
+
+static void *shim_vp_patch_thread(void *arg) {
+    (void)arg;
+    /* Wait for game's C++ static initializers to complete before patching.
+     * 2 seconds is generous; could shrink later once we know it's stable. */
+    sleep(2);
+    shim_patch_spi_video_vtable();
+    shim_patch_get_format_callback();
+    return NULL;
+}
+
 /* Start the bridge: create listener socket, spawn accept + poll threads.
  * Called from the constructor; no-op unless SPIKE3_BRIDGE=1. */
 static void shim_bridge_start(void) {
@@ -2348,6 +2508,16 @@ static void shim_install_crash_handler(void) {
             }
         }
     }
+
+    /* Step 62: optional SpiDecoder::Play vtable patch — bypasses FFmpeg wait. */
+    {
+        const char *pv = getenv("SPIKE3_PATCH_SPI_VIDEO");
+        if (pv && pv[0] == '1') {
+            pthread_t t;
+            if (pthread_create(&t, NULL, shim_vp_patch_thread, NULL) == 0)
+                pthread_detach(t);
+        }
+    }
 }
 
 /* Synthesize a page-flip completion event on the shim side of the DRM
@@ -2396,10 +2566,55 @@ static void resolve_all(void) {
     if (!real_write) real_write = (real_write_t)dlsym(RTLD_NEXT, "write");
 }
 
+/* ---- GPIO sysfs fake-fd pool ---- */
+
+static int is_gpio_sysfs_path(const char *p) {
+    return p && strncmp(p, "/sys/class/gpio/", 16) == 0;
+}
+
+static int alloc_gpio_fake_fd(const char *path) {
+    pthread_mutex_lock(&gpio_fake_lock);
+    for (int i = 0; i < FAKE_FD_GPIO_COUNT; i++) {
+        if (!gpio_fake_paths[i]) {
+            gpio_fake_paths[i] = strdup(path);
+            gpio_fake_read_done[i] = 0;
+            pthread_mutex_unlock(&gpio_fake_lock);
+            return FAKE_FD_GPIO_BASE + i;
+        }
+    }
+    pthread_mutex_unlock(&gpio_fake_lock);
+    return 0;
+}
+
+static int is_gpio_fake_fd(int fd) {
+    if (fd < FAKE_FD_GPIO_BASE || fd >= FAKE_FD_GPIO_BASE + FAKE_FD_GPIO_COUNT)
+        return 0;
+    return gpio_fake_paths[fd - FAKE_FD_GPIO_BASE] != NULL;
+}
+
+static void free_gpio_fake_fd(int fd) {
+    int idx = fd - FAKE_FD_GPIO_BASE;
+    pthread_mutex_lock(&gpio_fake_lock);
+    free(gpio_fake_paths[idx]);
+    gpio_fake_paths[idx] = NULL;
+    gpio_fake_read_done[idx] = 0;
+    pthread_mutex_unlock(&gpio_fake_lock);
+}
+
 /* ---- Check if path is a device we intercept, return fake fd or 0 ---- */
 
 static int intercept_device(const char *pathname) {
     if (!pathname) return 0;
+
+    if (is_gpio_sysfs_path(pathname)) {
+        int fd = alloc_gpio_fake_fd(pathname);
+        if (fd) {
+            SHIM_LOG("OPEN %s -> fake GPIO fd %d", pathname, fd);
+            return fd;
+        }
+        /* pool exhausted — leak to real open which will fail; not fatal */
+        SHIM_LOG("GPIO fake-fd pool exhausted for %s", pathname);
+    }
 
     if (strcmp(pathname, "/dev/spidev4.0") == 0) {
         spi_active = 1;
@@ -2506,6 +2721,16 @@ static int should_log_open(const char *pathname) {
         if (strstr(pathname, "localtime")) return 0;
         return 1;
     }
+    /* Step 62.b: catch Godot-resource opens regardless of prefix. Relative
+     * paths (./assets/...) and absolute /mnt/c/... paths fall through all
+     * the /dev/games/etc checks above. These tell us whether the game
+     * actually finds main.pck, .tscn/.scn resources, .gd scripts, etc. */
+    if (strstr(pathname, ".pck")) return 1;
+    if (strstr(pathname, ".tscn")) return 1;
+    if (strstr(pathname, ".scn"))  return 1;
+    if (strstr(pathname, ".remap")) return 1;
+    if (strstr(pathname, ".import")) return 1;
+    if (strstr(pathname, "godot"))  return 1;
     return 0;
 }
 
@@ -2573,6 +2798,96 @@ int openat(int dirfd, const char *pathname, int flags, ...) {
     return ret;
 }
 
+/* ---- Step 62.b: LFS variants (open64/openat64/fopen64) ----
+ * The Pokemon LE binary imports open64@GLIBC_2.17 and fopen64@GLIBC_2.17
+ * (per readelf --dyn-syms). Our open() hook only catches calls to the
+ * 32-bit-off_t variant; the game's Godot resource loader actually uses
+ * open64 (the LFS family), so main.pck access was invisible to us. Mirror
+ * the existing open/openat semantics here so path-remap + logging cover
+ * those calls too. On 64-bit aarch64 Linux, open64 and open are functionally
+ * identical (off_t is already 64-bit), but the SYMBOL resolution is distinct. */
+
+typedef int (*real_open64_t)(const char *, int, ...);
+static real_open64_t real_open64 = NULL;
+
+int open64(const char *pathname, int flags, ...) {
+    if (!real_open64) real_open64 = (real_open64_t)dlsym(RTLD_NEXT, "open64");
+    int fake = intercept_device(pathname);
+    if (fake) return fake;
+    const char *actual = remap_path(pathname);
+    int ret;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        int mode = va_arg(args, int);
+        va_end(args);
+        ret = real_open64(actual, flags, mode);
+    } else {
+        ret = real_open64(actual, flags);
+    }
+    if (should_log_open(pathname)) {
+        if (ret < 0) {
+            SHIM_LOG("OPEN64 FAIL: %s (flags=0x%x, errno=%d %s)",
+                     pathname, flags, errno, strerror(errno));
+        } else {
+            SHIM_LOG("OPEN64 OK:   %s -> fd %d (flags=0x%x)",
+                     pathname, ret, flags);
+        }
+    }
+    return ret;
+}
+
+typedef int (*real_openat64_t)(int, const char *, int, ...);
+static real_openat64_t real_openat64 = NULL;
+
+int openat64(int dirfd, const char *pathname, int flags, ...) {
+    if (!real_openat64) real_openat64 = (real_openat64_t)dlsym(RTLD_NEXT, "openat64");
+    int fake = intercept_device(pathname);
+    if (fake) return fake;
+    const char *actual = remap_path(pathname);
+    int ret;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        int mode = va_arg(args, int);
+        va_end(args);
+        ret = real_openat64(dirfd, actual, flags, mode);
+    } else {
+        ret = real_openat64(dirfd, actual, flags);
+    }
+    if (should_log_open(pathname)) {
+        if (ret < 0) {
+            SHIM_LOG("OPENAT64 FAIL: %s (dirfd=%d flags=0x%x, errno=%d %s)",
+                     pathname, dirfd, flags, errno, strerror(errno));
+        } else {
+            SHIM_LOG("OPENAT64 OK:   %s -> fd %d (dirfd=%d flags=0x%x)",
+                     pathname, ret, dirfd, flags);
+        }
+    }
+    return ret;
+}
+
+typedef FILE* (*real_fopen64_t)(const char *, const char *);
+static real_fopen64_t real_fopen64 = NULL;
+
+FILE *fopen64(const char *pathname, const char *mode) {
+    if (!real_fopen64) real_fopen64 = (real_fopen64_t)dlsym(RTLD_NEXT, "fopen64");
+    /* fopen64 returns FILE* not an fd — device-interception path doesn't fit.
+     * Path-remap still applies. */
+    const char *actual = remap_path(pathname);
+    FILE *ret = real_fopen64(actual, mode);
+    if (should_log_open(pathname)) {
+        if (!ret) {
+            SHIM_LOG("FOPEN64 FAIL: %s (mode=%s, errno=%d %s)",
+                     pathname, mode, errno, strerror(errno));
+        } else {
+            SHIM_LOG("FOPEN64 OK:   %s -> FILE* %p (mode=%s)",
+                     pathname, (void*)ret, mode);
+        }
+    }
+    return ret;
+}
+
 /* ---- Hooked: faccessat ---- */
 
 typedef int (*real_faccessat_t)(int, const char *, int, int);
@@ -2628,6 +2943,14 @@ typedef int (*real_access_t)(const char *, int);
 int access(const char *pathname, int mode) {
     static real_access_t real_fn = NULL;
     if (!real_fn) real_fn = (real_access_t)dlsym(RTLD_NEXT, "access");
+
+    /* GPIO sysfs: pretend the pin directory + attribute files always exist
+     * (mode ignored — the game uses F_OK to check export state). */
+    if (is_gpio_sysfs_path(pathname)) {
+        (void)mode;
+        return 0;
+    }
+
     const char *actual = remap_path(pathname);
     if (actual != pathname) {
         SHIM_LOG("access REMAP: %s -> %s", pathname, actual);
@@ -4568,6 +4891,10 @@ int tcsendbreak(int fd, int duration) {
 
 int close(int fd) {
     resolve_all();
+    if (is_gpio_fake_fd(fd)) {
+        free_gpio_fake_fd(fd);
+        return 0;
+    }
     if (fd == FAKE_FD_SPI && spi_active) {
         SHIM_LOG("CLOSE SPI (fd %d) after %u transfers", fd, spi_transfer_count);
         spi_active = 0;
@@ -4621,6 +4948,22 @@ int close(int fd) {
 ssize_t read(int fd, void *buf, size_t count) {
     resolve_all();
 
+    if (is_gpio_fake_fd(fd)) {
+        int idx = fd - FAKE_FD_GPIO_BASE;
+        if (gpio_fake_read_done[idx]) return 0;  /* EOF on 2nd read (real sysfs behavior) */
+        const char *p = gpio_fake_paths[idx];
+        const char *resp = "";
+        if (strstr(p, "/value"))          resp = "0\n";
+        else if (strstr(p, "/direction")) resp = "out\n";
+        else if (strstr(p, "/edge"))      resp = "none\n";
+        else if (strstr(p, "/active_low")) resp = "0\n";
+        size_t resp_len = strlen(resp);
+        size_t n = count < resp_len ? count : resp_len;
+        if (n) memcpy(buf, resp, n);
+        gpio_fake_read_done[idx] = 1;
+        return (ssize_t)n;
+    }
+
     if (is_uart_fd(fd)) {
         ssize_t n = real_read(fd, buf, count);
         uart_read_count++;
@@ -4653,6 +4996,24 @@ ssize_t read(int fd, void *buf, size_t count) {
     }
 
     return real_read(fd, buf, count);
+}
+
+/* ---- Hooked: lseek (GPIO polling only) ----
+ * Some GPIO pollers keep one fd open and lseek(0) between reads. Clear the
+ * once-read flag so the next read() re-emits the value. All other fds fall
+ * through to libc. */
+
+typedef off_t (*real_lseek_t)(int, off_t, int);
+off_t lseek(int fd, off_t offset, int whence) {
+    if (is_gpio_fake_fd(fd)) {
+        if (whence == SEEK_SET && offset == 0) {
+            gpio_fake_read_done[fd - FAKE_FD_GPIO_BASE] = 0;
+        }
+        return 0;
+    }
+    static real_lseek_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_lseek_t)dlsym(RTLD_NEXT, "lseek");
+    return real_fn(fd, offset, whence);
 }
 
 /* ---- Hooked: write ---- */
@@ -4995,6 +5356,11 @@ static void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
 
 ssize_t write(int fd, const void *buf, size_t count) {
     resolve_all();
+
+    if (is_gpio_fake_fd(fd)) {
+        /* Swallow writes to export / direction / value / unexport. */
+        return (ssize_t)count;
+    }
 
     if (is_uart_fd(fd)) {
         uart_write_count++;
@@ -5584,12 +5950,21 @@ const void *avcodec_find_decoder_by_name(const char *name) {
                  (void *)real_avcodec_find_decoder_by_name);
     }
     if (!real_avcodec_find_decoder_by_name) return NULL;
-    /* Passthrough — do NOT fallback to SW. The game hardcodes HW decode and
-     * asserts(hw_decoder) at SpiVideoStreamDecoderBase.cpp:1830 if we
-     * return NULL. Let the real HW decoder through; we'll intervene later
-     * in the pipeline. */
-    const void *ret = real_avcodec_find_decoder_by_name(name);
-    SHIM_LOG("  -> %p (name='%s')", ret, name ? name : "(null)");
+
+    /* Step 64 (SPIKE3_SW_HEVC=1): redirect hardware HEVC decoder names to
+     * libavcodec's software "hevc". Paired with the get_format-callback
+     * NOP patch in shim_patch_get_format_callback. */
+    const char *lookup = name;
+    if (shim_sw_hevc_enabled() && name &&
+        (strcmp(name, "hevc_v4l2request") == 0 ||
+         strcmp(name, "hevc_v4l2m2m")    == 0)) {
+        SHIM_LOG("[sw_hevc] remapping decoder name '%s' -> 'hevc'", name);
+        lookup = "hevc";
+    }
+
+    const void *ret = real_avcodec_find_decoder_by_name(lookup);
+    SHIM_LOG("  -> %p (name='%s', lookup='%s')", ret,
+             name ? name : "(null)", lookup);
     return ret;
 }
 
