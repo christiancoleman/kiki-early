@@ -17,11 +17,12 @@ workstation, and synthesizes whatever the game expects.
 
 ## Module guide
 
-The shim started life as a single `spi_shim.c` monolith (~6400 lines). We've
-been splitting it into subsystem-scoped source files — as of Phase 8, **73 %
-of the original code now lives in dedicated subsystem files**, with
-`spi_shim.c` acting as the small nucleus that holds the constructor, device-
-state globals, and the intercepts that haven't landed their own file yet.
+The shim started life as a single `spi_shim.c` monolith (~6400 lines). We
+split it into subsystem-scoped source files across nine phases — **85 % of
+the original code now lives in dedicated subsystem files**, with `spi_shim.c`
+acting as the small nucleus that holds the constructor, device-state globals,
+`intercept_device`, and the remaining INLINE_SYSCALL-dodging hooks (termios,
+ALSA, gstreamer, pthread_create, system).
 
 > **Terminology:** "source file" here means a C compilation unit — one `.c`
 > file that the compiler processes into one object, all of which the linker
@@ -50,15 +51,15 @@ The only thing that crosses the source-file boundary. Holds:
   signal handlers, netbridge response synth, intercept dispatcher, fd
   predicates, GPIO fake-fd pool operations.
 
-### `spi_shim.c` — main shim body (~1700 lines, down from 6400)
+### `spi_shim.c` — main shim body (~960 lines, down from 6400)
 
-The small nucleus that remains after eight phases of carving. Owns:
+The small nucleus that remains after nine phases of carving. Owns:
 
 - `__attribute__((constructor))` entry points: directory setup
   (`shim_init_dirs`) and the main `shim_install_crash_handler` that
-  registers all signal handlers + spawns the various env-gated threads
-  (state bridge, frame bridge, event sweep, switch firing, force-gstreamer,
-  cmode poke, state-flag poke, vp-patch).
+  registers SIGSEGV/SIGBUS/SIGTERM/SIGINT/SIGUSR1/SIGUSR2 handlers, then
+  delegates to `shim_bridge_start()`, `shim_frame_start()`, and
+  `shim_inject_start()` for the rest of the bring-up.
 - `dlopen` / `dlsym` interceptions for dynamically-loaded libEGL/GLES/GBM
   handles (Step 59): the game `dlopen`s these libs and looks up symbols
   against the returned handles, which normal LD_PRELOAD misses; we route
@@ -69,15 +70,6 @@ The small nucleus that remains after eight phases of carving. Owns:
 - fd predicates (`is_fake_fd` / `is_uart_fd` / `is_drm_fd` / `is_v4l2_fd`)
   plus all the device-layer state globals they read.
 - `resolve_all()` — binds the five `real_*` libc function pointers.
-- Switch manifest (Pokémon LE 105-switch table with node addresses) +
-  `shim_fire_switch` + `shim_fire_event` trampoline + event sweep
-  machinery (Step 52). Moves to `shim_inject.c` in Phase 9.
-- Poke threads: `SPIKE3_POKE_CMODE`, `SPIKE3_POKE_STATE_FLAG`,
-  `SPIKE3_FIRE_SWITCH`, `SPIKE3_FORCE_GSTREAMER`. Also Phase-9-bound.
-- `shim_vp_patch_thread` that sleeps 2 s then calls into
-  `shim_patch_spi_video_vtable` / `shim_patch_get_format_callback` in
-  `shim_patches.c`. The thread stays here through Phase 8; the patch
-  functions themselves already moved.
 - termios wrappers (`tcsetattr` / `tcgetattr` / `tcflush` / etc.) —
   glibc uses INLINE_SYSCALL for these, bypassing our ioctl hook.
 - `system` hook that blocks `openocd` / `/games/spike3/` shell-outs.
@@ -182,6 +174,42 @@ Concentrates all *observe-the-game* machinery:
 - `shim_term_dump_handler` — SIGTERM / SIGINT / SIGUSR1 / SIGUSR2 handler
   (dumps on the first three; runs `shim_event_sweep` on SIGUSR2).
 
+### `shim_inject.c` — active injection + scheduled probing (Phase 9)
+
+Everything the shim pushes *into* the running game, as opposed to code
+that merely intercepts calls coming out. Ends up being the biggest of the
+late-phase carves:
+
+- Pokémon LE 105-switch manifest (transcribed from manual 500-55AJ-01)
+  plus `shim_find_switch` / `shim_fire_switch` — fires a simulated
+  switch closure by poking the game's in-memory switch state array
+  (`data_4880220 + id*0x30 + 0x28`) and diffs cmode state before/after.
+- Event-sweep machinery (Step 52): `shim_fire_event` trampoline to the
+  game's in-binary `fire_event` at BN VA `0x9c12a0`, `shim_event_sweep`
+  that blind-fires every event ID 0..0xce with `event_data=0`, and per-
+  event SIGALRM timeout + SEGV recovery via `sigsetjmp`/`siglongjmp`.
+- The three event-sweep globals whose `extern`s live in `spi_shim.h`
+  (`shim_event_sweep_jmp`, `shim_event_fire_in_progress`,
+  `shim_current_sweep_event_id`) — read by `shim_sigsegv_handler` in
+  `shim_diagnostics.c` to longjmp out of a faulting sweep iteration.
+- Six env-gated worker threads:
+  - `SPIKE3_SWEEP_EVENTS=1` + `SPIKE3_SWEEP_AFTER=<sec>` — delayed sweep.
+  - `SPIKE3_FIRE_SWITCH=<id[:id:...]>` — fire one or more switches.
+  - `SPIKE3_FORCE_GSTREAMER=<sec>` — trampoline into `gstreamer_init`.
+  - `SPIKE3_POKE_CMODE=<name>:<hex>:<delay_s>` — force a cmode field.
+  - `SPIKE3_POKE_STATE_FLAG=<mask>:<delay_ms>` — OR bits into
+    `system_state_flags`.
+  - `SPIKE3_PATCH_SPI_VIDEO=1` — after a 2 s settle, call into
+    `shim_patches.c` to install the Step 62 vtable patch and Step 64
+    `get_format` NOP.
+- The SIGALRM handler used by the sweep to break out of hung event
+  handlers (installed by `shim_inject_start`, blocked on the main
+  thread so only the sweep-timer thread receives it).
+- `shim_inject_start()` — the single public entry point called from
+  `shim_install_crash_handler`. Registers SIGALRM, blocks it on the
+  main thread, and spawns each env-gated worker thread. All six env
+  vars are independent; any subset can be set on a given run.
+
 ### `shim_patches.c` — runtime patches to the game (Phase 8)
 
 The "surgery" bucket — hooks and byte-level patches that alter game
@@ -234,14 +262,16 @@ called from `shim_vp_patch_thread` in `spi_shim.c`.
 | 6 | `shim_gl.c` (GBM + EGL + GLES + KHR image + eglGetProcAddress) | 1735 |
 | 7 | `shim_io.c` + `shim_ioctl.c` (fd I/O + ioctl dispatch + DRM events) | 654 |
 | 8 | `shim_patches.c` (memcpy NULL-guard + Step 62 vtable + Step 64 NOP + libavcodec hooks + dummy-frame injection) | 501 |
+| 9 | `shim_inject.c` (switch manifest + event sweep + 6 env-gated worker threads + SIGALRM handler) | 770 |
 
 Each phase was regression-tested against `REFACTOR_BASELINE.txt` — the
 post-Phase-6 run log captured before any carving. Every phase has matched
 the baseline within timing-variance noise (`gpio` retry count ±4, frame
 count ±30) on all 22 error classes + all 7 hook-fired log lines.
 
-Planned remaining phase: **shim_inject.c** (switch manifest + event
-sweep + poke threads + vp-patch thread).
+**The refactor is complete.** `spi_shim.c` is down to ~960 lines of
+device-state + device-intercept dispatcher + INLINE_SYSCALL-dodging
+termios/ALSA/gstreamer/pthread/system hooks.
 
 ## Defensive-hook pattern: 32/64-bit variants
 

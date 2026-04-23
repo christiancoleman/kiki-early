@@ -36,6 +36,7 @@ SOURCES=(
     shim_io.c
     shim_ioctl.c
     shim_patches.c
+    shim_inject.c
 )
 
 echo "[build] $CC $CFLAGS"

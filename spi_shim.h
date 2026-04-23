@@ -50,14 +50,14 @@ uintptr_t shim_resolve_game_base(void);
 void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext);
 void shim_term_dump_handler(int sig);
 
-/* ---- Event-sweep globals (defined in spi_shim.c; read by
+/* ---- Event-sweep globals (defined in shim_inject.c; read by
  *      shim_sigsegv_handler in shim_diagnostics.c to siglongjmp back out
  *      of a faulting sweep iteration). ---- */
 extern sigjmp_buf            shim_event_sweep_jmp;
 extern volatile sig_atomic_t shim_event_fire_in_progress;
 extern volatile int          shim_current_sweep_event_id;
 
-/* Called from shim_term_dump_handler on SIGUSR2 (defined in spi_shim.c). */
+/* Called from shim_term_dump_handler on SIGUSR2 (defined in shim_inject.c). */
 void shim_event_sweep(void);
 
 /* ---- Netbridge UART protocol (defined in shim_nodebus.c) ----
@@ -144,10 +144,16 @@ void shim_frame_capture_at_page_flip(void); /* called from the DRM PAGE_FLIP ioc
 /* ---- Runtime patches (defined in shim_patches.c) ----
  * Both are self-gating via env vars (SPIKE3_PATCH_SPI_VIDEO=1 and
  * SPIKE3_SW_HEVC=1 respectively); safe to call unconditionally.
- * Called from shim_vp_patch_thread (currently still in spi_shim.c; moves
- * to shim_inject.c in Phase 9). */
+ * Called from shim_vp_patch_thread in shim_inject.c after a 2 s settle. */
 void shim_patch_spi_video_vtable(void);
 void shim_patch_get_format_callback(void);
+
+/* ---- Injection layer (defined in shim_inject.c) ----
+ * Sets up the SIGALRM handler, blocks SIGALRM on the main thread, and
+ * spawns the six env-gated worker threads (sweep timer, switch firer,
+ * gstreamer force-init, cmode poke, state-flag poke, vp-patch). Called
+ * from shim_install_crash_handler at __attribute__((constructor)) time. */
+void shim_inject_start(void);
 
 /* Uniform log prefix so shim output is trivially grep-filterable. */
 #define SHIM_LOG(fmt, ...) fprintf(stderr, "[shim] " fmt "\n", ##__VA_ARGS__)
