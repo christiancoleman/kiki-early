@@ -1,37 +1,28 @@
 #!/usr/bin/env bash
-# run_game.sh — launch Pokémon LE under qemu-aarch64 with the shim preloaded,
-# plus the live frame viewer and audio player by default.
 #
 # The repo layout is the Spike 3 SD-card filesystem used as a sysroot. This
 # script auto-detects everything from its own location — no env setup needed
 # in the normal case. Clone the repo anywhere, run ./run_game.sh.
 #
-# USAGE:
-#   ./run_game.sh                         # play: shim + frame viewer + audio,
-#                                           no timeout. Press Ctrl+C to stop.
-#   TIMEOUT=185 ./run_game.sh             # cap at 185 s (useful for smoke runs)
-#   VIEWER=0 ./run_game.sh                # game only, no Tk viewer window
-#   AUDIO_PLAYER=0 ./run_game.sh          # game only, no ffplay audio
-#   LOGFILE=myrun.log ./run_game.sh       # capture game stdout+stderr to file
-#   REAL_GL=0 ./run_game.sh               # use stub EGL (old Step 54 mode)
-#   ./run_game.sh --help                  # pass --help through to qemu-aarch64
-#   ./run_game.sh -strace 2>trace.txt     # pass extra flags straight to qemu
 #
 # TUNABLE ENV OVERRIDES (defaults in []):
 #   TIMEOUT=<sec>           [0]     cap run duration; 0 = no limit (default play)
 #   VIEWER=<0|1>            [1]     auto-launch python3 frame_viewer.py
+#   VIEWER_FULLSCREEN=<0|1> [0]     open the viewer fullscreen rather than
+#                                   in a 1920×1080 window
 #   AUDIO_PLAYER=<0|1>      [1]     auto-launch audio_subscriber.py | ffplay
 #   STALE_KILL=<0|1>        [1]     reap leftover qemu/helpers from prior runs
-#                                   before starting; disable if you want to
-#                                   attach to an existing qemu intentionally
+#                                   before starting.
 #   REAL_GL=<0|1>           [1]     forward EGL/GLES to Mesa vs return stubs
 #   FRAME_BRIDGE=<0|1>      [1]     emit RGBA frames on /tmp/spike3_frame.sock
 #   AUDIO_BRIDGE=<0|1>      [1]     emit S16_LE PCM on /tmp/spike3_audio.sock
 #   PATCH_SPI_VIDEO=<0|1>   [1]     vtable-patch SpiDecoder::Play (Step 62)
 #   SW_HEVC=<0|1>           [1]     NOP-patch get_format + accept SW pix_fmt
 #   STATE_BRIDGE=<0|1>      [0]     emit cmode JSON on /tmp/spike3_bridge.sock
-#   LOGFILE=<path>          []      redirect game stdout+stderr; empty = inherit
+#   LOGFILE=<path>          []      redirect game stdout+stderr to a file
+#                                   (separate from --debug; only affects game)
 #   QEMU=<bin>              [qemu-aarch64]     override qemu binary
+#
 #
 # PREREQS (see docs/SETUP.md for details):
 #   - qemu-user (provides qemu-aarch64 + binfmt_misc)
@@ -44,11 +35,23 @@
 # is normal and shouldn't tear down the script.
 set -uo pipefail
 
+# ---- Parse script-level flags (everything else falls through to qemu) ----
+DEBUG=0
+POSITIONAL=()
+for a in "$@"; do
+    case "$a" in
+        --debug) DEBUG=1 ;;
+        *)       POSITIONAL+=("$a") ;;
+    esac
+done
+set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
 # ---- Auto-detect paths ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # _emulation → pokemon_le → games → sysroot
 SYSROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 GAME_DIR="$SYSROOT/games/pokemon_le"
+LATEST_DIR="$SCRIPT_DIR/runs/latest"
 
 # ---- Defaults (override via env) ----
 TIMEOUT="${TIMEOUT:-0}"
@@ -59,6 +62,7 @@ PATCH_SPI_VIDEO="${PATCH_SPI_VIDEO:-1}"
 SW_HEVC="${SW_HEVC:-1}"
 STATE_BRIDGE="${STATE_BRIDGE:-0}"
 VIEWER="${VIEWER:-1}"
+VIEWER_FULLSCREEN="${VIEWER_FULLSCREEN:-0}"
 AUDIO_PLAYER="${AUDIO_PLAYER:-1}"
 STALE_KILL="${STALE_KILL:-1}"
 LOGFILE="${LOGFILE:-}"
@@ -68,6 +72,13 @@ QEMU="${QEMU:-qemu-aarch64}"
 SHIM="$SCRIPT_DIR/spi_shim.so"
 OVERLAY="$SCRIPT_DIR/mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu"
 DRIVERS="$OVERLAY/dri"
+
+# Debug-mode per-subsystem log paths. Computed here so variables exist even
+# when --debug is off (so the rest of the script can reference them
+# unconditionally — redirections only activate if $DEBUG==1).
+GAME_DBG_LOG="$LATEST_DIR/game.log"
+VIEWER_DBG_LOG="$LATEST_DIR/viewer.log"
+AUDIO_DBG_LOG="$LATEST_DIR/audio.log"
 
 # ---- Preflight ----
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -79,10 +90,16 @@ if [[ "$REAL_GL" == "1" && ! -d "$OVERLAY" ]]; then
     die "Mesa overlay not built at $OVERLAY. Run: (cd mesa_sw_overlay && ./build_overlay.sh)"
 fi
 
-# ---- Reap leftover processes from prior runs ----
-# The shim's SIGTERM handler does a state dump but doesn't always cleanly
-# exit — so a previous Ctrl+C can leave qemu + helpers behind, holding
-# socket endpoints and the audio file handle. Purge them before starting.
+
+# Debug-mode: ensure log dir exists.
+if [[ "$DEBUG" == "1" ]]; then
+    mkdir -p "$LATEST_DIR"
+    : > "$GAME_DBG_LOG"
+    : > "$VIEWER_DBG_LOG"
+    : > "$AUDIO_DBG_LOG"
+    printf '[run_game] --debug on: logs in %s\n' "$LATEST_DIR" >&2
+fi
+
 if [[ "$STALE_KILL" == "1" ]]; then
     stale_qemu=$(pgrep -f "qemu-aarch64.*LD_PRELOAD=$SHIM" 2>/dev/null || true)
     stale_help=$(pgrep -f "$SCRIPT_DIR/(frame_viewer|audio_subscriber)\.py" 2>/dev/null || true)
@@ -90,63 +107,61 @@ if [[ "$STALE_KILL" == "1" ]]; then
     stale_all="$stale_qemu $stale_help $stale_fplay"
     if [[ -n "${stale_all// }" ]]; then
         printf '[run_game] reaping stale processes from prior runs: %s\n' "$stale_all" >&2
-        # SIGTERM first (lets shim dump cleanly if it wants), then SIGKILL.
         for pid in $stale_all; do kill -TERM "$pid" 2>/dev/null || true; done
         sleep 0.5
         for pid in $stale_all; do kill -KILL "$pid" 2>/dev/null || true; done
     fi
-    # Clean stale socket files (shim does this itself on fresh bind, but
-    # belt-and-suspenders for the case where the stale qemu is still holding
-    # them at the kernel level).
     rm -f /tmp/spike3_frame.sock /tmp/spike3_audio.sock /tmp/spike3_bridge.sock
 fi
 
-# ---- Background-process bookkeeping ----
-# The game (qemu) plus the helpers are all backgrounded so the trap can tear
-# them down on Ctrl+C. Trap priorities: kill qemu first (it holds the file
-# handles + sockets), SIGTERM with a grace period, then SIGKILL if unresponsive.
 QEMU_PID=""
 declare -a HELPER_PIDS=()
 declare -a HELPER_LABELS=()
 
-cleanup_all() {
-    # 1) qemu
-    if [[ -n "$QEMU_PID" ]] && kill -0 "$QEMU_PID" 2>/dev/null; then
-        printf '[run_game] stopping qemu (pid %d)\n' "$QEMU_PID" >&2
-        kill -TERM "$QEMU_PID" 2>/dev/null || true
-        # Short grace period so the shim's SIGTERM handler can run its dump.
-        for _ in 1 2 3; do
-            kill -0 "$QEMU_PID" 2>/dev/null || break
-            sleep 0.5
-        done
-        if kill -0 "$QEMU_PID" 2>/dev/null; then
-            printf '[run_game] qemu unresponsive to SIGTERM, sending SIGKILL\n' >&2
-            kill -KILL "$QEMU_PID" 2>/dev/null || true
-        fi
+kill_with_grace() {
+    # $1 = pid, $2 = label, $3 = grace_ticks (each tick = 0.5s)
+    local pid="$1" lbl="$2" ticks="$3"
+    kill -0 "$pid" 2>/dev/null || return 0
+    printf '[run_game] stopping %s (pid %d)\n' "$lbl" "$pid" >&2
+    kill -TERM "$pid" 2>/dev/null || true
+    pkill -TERM -P "$pid" 2>/dev/null || true
+    local _i
+    for ((_i=0; _i<ticks; _i++)); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        printf '[run_game] %s unresponsive to SIGTERM, sending SIGKILL\n' "$lbl" >&2
+        pkill -KILL -P "$pid" 2>/dev/null || true
+        kill -KILL "$pid" 2>/dev/null || true
     fi
+}
 
-    # 2) helpers (if still alive after qemu dropped their sockets)
+cleanup_all() {
+    # 1) the game's qemu
+    [[ -n "$QEMU_PID" ]] && kill_with_grace "$QEMU_PID" "qemu" 3
     if (( ${#HELPER_PIDS[@]} > 0 )); then
         for i in "${!HELPER_PIDS[@]}"; do
-            local pid="${HELPER_PIDS[$i]}"
-            local lbl="${HELPER_LABELS[$i]}"
-            if kill -0 "$pid" 2>/dev/null; then
-                printf '[run_game] stopping %s (pid %d)\n' "$lbl" "$pid" >&2
-                pkill -P "$pid" 2>/dev/null || true
-                kill "$pid" 2>/dev/null || true
-            fi
+            kill_with_grace "${HELPER_PIDS[$i]}" "${HELPER_LABELS[$i]}" 2
         done
     fi
+    pkill -KILL -f "qemu-aarch64.*LD_PRELOAD=$SHIM" 2>/dev/null || true
     wait 2>/dev/null || true
 }
 trap cleanup_all EXIT INT TERM
+
 
 # ---- Launch helpers BEFORE the game ----
 # Both subscribers have internal retry loops so it doesn't matter that the
 # shim hasn't opened its sockets yet.
 if [[ "$VIEWER" == "1" && "$FRAME_BRIDGE" == "1" ]]; then
     if command -v python3 >/dev/null; then
-        python3 "$SCRIPT_DIR/frame_viewer.py" >/dev/null 2>&1 &
+        viewer_log_target=/dev/null
+        [[ "$DEBUG" == "1" ]] && viewer_log_target="$VIEWER_DBG_LOG"
+        viewer_args=()
+        [[ "$VIEWER_FULLSCREEN" == "1" ]] && viewer_args+=("--fullscreen")
+        python3 "$SCRIPT_DIR/frame_viewer.py" "${viewer_args[@]+"${viewer_args[@]}"}" \
+            >"$viewer_log_target" 2>&1 &
         HELPER_PIDS+=("$!"); HELPER_LABELS+=("frame viewer")
         printf '[run_game] spawned frame viewer (pid %d)\n' "$!" >&2
     else
@@ -156,10 +171,15 @@ fi
 
 if [[ "$AUDIO_PLAYER" == "1" && "$AUDIO_BRIDGE" == "1" ]]; then
     if command -v python3 >/dev/null && command -v ffplay >/dev/null; then
-        # Subshell groups the python | ffplay pipe so cleanup_helpers' pkill -P
-        # reaps both halves.
-        ( python3 "$SCRIPT_DIR/audio_subscriber.py" 2>/dev/null | \
-          ffplay -f s16le -ar 44100 -ac 2 -nodisp -autoexit -loglevel error -i - 2>/dev/null ) &
+        audio_log_target=/dev/null
+        [[ "$DEBUG" == "1" ]] && audio_log_target="$AUDIO_DBG_LOG"
+        # Subshell groups the python | ffplay pipe so cleanup_all's pkill -P
+        # reaps both halves. Stderr of both goes to the same audio log.
+        (
+            python3 "$SCRIPT_DIR/audio_subscriber.py" 2>>"$audio_log_target" | \
+            ffplay -f s16le -ar 44100 -ch_layout stereo -nodisp -autoexit \
+                   -loglevel error -i - 2>>"$audio_log_target"
+        ) &
         HELPER_PIDS+=("$!"); HELPER_LABELS+=("audio player (subscriber | ffplay)")
         printf '[run_game] spawned audio player (subshell pid %d)\n' "$!" >&2
     else
@@ -167,7 +187,8 @@ if [[ "$AUDIO_PLAYER" == "1" && "$AUDIO_BRIDGE" == "1" ]]; then
     fi
 fi
 
-# ---- Compose command ----
+
+# ---- Compose game command ----
 args=(
     "$QEMU" -L "$SYSROOT"
     -E "LD_PRELOAD=$SHIM"
@@ -189,12 +210,21 @@ fi
 [[ "$SW_HEVC"         == "1" ]] && args+=(-E "SPIKE3_SW_HEVC=1")
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")
 
-# Append any caller-supplied flags and the game binary last.
-args+=("$@" ./game)
+# Append any caller-supplied flags (post --debug-strip) and the game binary last.
+args+=("${POSITIONAL[@]+"${POSITIONAL[@]}"}" ./game)
 
 # Wrap in `timeout` unless TIMEOUT=0
 if [[ "$TIMEOUT" != "0" ]]; then
     args=(timeout "$TIMEOUT" "${args[@]}")
+fi
+
+# Resolve the destination for the game's stdout+stderr. Precedence:
+#   LOGFILE env (explicit) > --debug ($GAME_DBG_LOG) > terminal inherit
+game_redirect=""
+if [[ -n "$LOGFILE" ]]; then
+    game_redirect="$LOGFILE"
+elif [[ "$DEBUG" == "1" ]]; then
+    game_redirect="$GAME_DBG_LOG"
 fi
 
 # Echo the command so the user can see what's about to run.
@@ -208,8 +238,8 @@ cd "$GAME_DIR"
 # Background qemu + wait so the trap can kill it directly on Ctrl+C (bash
 # doesn't forward signals to foreground children reliably, and the shim's
 # SIGINT handler doesn't always terminate — see cleanup_all's SIGKILL path).
-if [[ -n "$LOGFILE" ]]; then
-    "${args[@]}" >"$LOGFILE" 2>&1 &
+if [[ -n "$game_redirect" ]]; then
+    "${args[@]}" >"$game_redirect" 2>&1 &
 else
     "${args[@]}" &
 fi

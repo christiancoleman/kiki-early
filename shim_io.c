@@ -310,3 +310,132 @@ ssize_t pwrite64(int fd, const void *buf, size_t count, off_t offset) {
     return real_fn(fd, buf, count, offset);
 }
 
+/* ---- Hooked: pread / pwrite (plain — Phase-7 asymmetries closed 2026-04-24) ----
+ *
+ * On 64-bit aarch64 these are ABI-identical to pread64/pwrite64 (off_t is
+ * already 64-bit), but PLT symbols are distinct so a caller using the
+ * plain variant would bypass our pread64/pwrite64 hook. Mirror the
+ * 64-bit bodies exactly so both paths land the same. */
+typedef ssize_t (*real_pread_t)(int, void *, size_t, off_t);
+typedef ssize_t (*real_pwrite_t)(int, const void *, size_t, off_t);
+
+ssize_t pread(int fd, void *buf, size_t count, off_t offset) {
+    static uint32_t _pread_count = 0;
+    uint32_t _n = __atomic_add_fetch(&_pread_count, 1, __ATOMIC_RELAXED);
+    if (_n == 1) {
+        SHIM_LOG("[lfs] FIRST CALL: pread — hook now wired "
+                 "(was previously untracked)");
+    }
+    if (_n <= 8 || (_n % 500) == 0) {
+        SHIM_LOG("[lfs] pread #%u: fd=%d offset=%lld count=%zu",
+                 _n, fd, (long long)offset, count);
+    }
+    if (is_gpio_fake_fd(fd)) {
+        if (offset != 0) return 0;
+        gpio_fake_read_done[fd - FAKE_FD_GPIO_BASE] = 0;
+        return read(fd, buf, count);
+    }
+    static real_pread_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_pread_t)dlsym(RTLD_NEXT, "pread");
+    return real_fn(fd, buf, count, offset);
+}
+
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
+    SHIM_LFS_FIRST_CALL("pwrite");
+    (void)offset;
+    if (is_gpio_fake_fd(fd)) return (ssize_t)count;
+    static real_pwrite_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_pwrite_t)dlsym(RTLD_NEXT, "pwrite");
+    return real_fn(fd, buf, count, offset);
+}
+
+/* ---- Observation hooks: mmap / mmap64 / munmap (2026-04-24) ----
+ *
+ * The GAME BINARY doesn't import mmap in its dynsym — its code (if it uses
+ * mmap at all) resolves the syscall inside glibc via INLINE_SYSCALL and
+ * bypasses LD_PRELOAD. But other libraries in the process (Mesa's shader
+ * cache, libavcodec, libcurl, dlopen's .so-loader) import mmap normally
+ * and their calls DO go through the PLT → our override.
+ *
+ * So this hook's diagnostic value is: "what libs are doing mmap at
+ * runtime," not "what the game is doing with main.pck." We filter out
+ * anonymous mappings (malloc arenas, stack growth — pure noise) and log
+ * only file-backed mappings (fd != -1) where the interesting activity
+ * lives. First 8 + every 500th sampled, same pattern as pread64.
+ *
+ * All three functions pass through to real libc; we never intercept the
+ * actual mapping. */
+
+#include <sys/mman.h>  /* MAP_ANONYMOUS, off64_t-via-_GNU_SOURCE */
+
+typedef void * (*real_mmap_t)(void *, size_t, int, int, int, off_t);
+typedef void * (*real_mmap64_t)(void *, size_t, int, int, int, off64_t);
+typedef int    (*real_munmap_t)(void *, size_t);
+
+static const char *mmap_flag_summary(int flags) {
+    /* Return a short, non-allocating label for the most common cases. */
+    if (flags & MAP_ANONYMOUS) return "ANON";
+    if ((flags & MAP_PRIVATE) && (flags & MAP_FIXED)) return "PRIV|FIXED";
+    if (flags & MAP_PRIVATE) return "PRIV";
+    if (flags & MAP_SHARED)  return "SHARED";
+    return "other";
+}
+
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    static real_mmap_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_mmap_t)dlsym(RTLD_NEXT, "mmap");
+    void *ret = real_fn(addr, length, prot, flags, fd, offset);
+
+    /* Skip anonymous mappings (malloc / stack) — pure noise. Only observe
+     * file-backed mappings, which are where the interesting activity lives. */
+    if (!(flags & MAP_ANONYMOUS) && fd >= 0) {
+        static uint32_t _n = 0;
+        uint32_t n = __atomic_add_fetch(&_n, 1, __ATOMIC_RELAXED);
+        if (n == 1) {
+            SHIM_LOG("[mm] FIRST CALL: mmap (file-backed) — hook wired");
+        }
+        if (n <= 8 || (n % 500) == 0) {
+            SHIM_LOG("[mm] mmap #%u: fd=%d len=%zu prot=0x%x flags=%s(0x%x) off=%lld -> %p",
+                     n, fd, length, prot, mmap_flag_summary(flags), flags,
+                     (long long)offset, ret);
+        }
+    }
+    return ret;
+}
+
+void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t offset) {
+    static real_mmap64_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_mmap64_t)dlsym(RTLD_NEXT, "mmap64");
+    void *ret = real_fn(addr, length, prot, flags, fd, offset);
+    if (!(flags & MAP_ANONYMOUS) && fd >= 0) {
+        static uint32_t _n = 0;
+        uint32_t n = __atomic_add_fetch(&_n, 1, __ATOMIC_RELAXED);
+        if (n == 1) {
+            SHIM_LOG("[mm] FIRST CALL: mmap64 (file-backed) — hook wired");
+        }
+        if (n <= 8 || (n % 500) == 0) {
+            SHIM_LOG("[mm] mmap64 #%u: fd=%d len=%zu prot=0x%x flags=%s(0x%x) off=%lld -> %p",
+                     n, fd, length, prot, mmap_flag_summary(flags), flags,
+                     (long long)offset, ret);
+        }
+    }
+    return ret;
+}
+
+int munmap(void *addr, size_t length) {
+    static real_munmap_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_munmap_t)dlsym(RTLD_NEXT, "munmap");
+    int ret = real_fn(addr, length);
+    /* munmap doesn't carry an fd, so we can't filter anon vs file-backed.
+     * Log sparsely — first 8 + every 1000th. If it proves noisy, tighten. */
+    static uint32_t _n = 0;
+    uint32_t n = __atomic_add_fetch(&_n, 1, __ATOMIC_RELAXED);
+    if (n == 1) {
+        SHIM_LOG("[mm] FIRST CALL: munmap — hook wired");
+    }
+    if (n <= 8 || (n % 1000) == 0) {
+        SHIM_LOG("[mm] munmap #%u: addr=%p len=%zu -> %d", n, addr, length, ret);
+    }
+    return ret;
+}
+

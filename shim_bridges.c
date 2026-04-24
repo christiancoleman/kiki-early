@@ -347,7 +347,11 @@ static void shim_frame_send(int w, int h, const uint8_t *rgba) {
     memcpy(hdr + 8,  &w16, 2);
     memcpy(hdr + 10, &h16, 2);
     hdr[12] = 0;      /* format = RGBA8 */
-    hdr[13] = 1;      /* flags: y_flipped (GL origin bottom-left) */
+    hdr[13] = 0;      /* flags: 0 — Pokémon LE / Radium renders top-down into
+                       * the FBO we read (confirmed 2026-04-24 by empirical
+                       * orientation match). If a future build truly needs
+                       * bottom-up handling, set bit 0 and the subscriber will
+                       * Y-flip. */
     memset(hdr + 14, 0, 2);
 
     pthread_mutex_lock(&shim_frame_lock);

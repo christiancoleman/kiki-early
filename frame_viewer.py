@@ -90,16 +90,15 @@ def recv_loop(sock, out_queue, stop_event):
         out_queue.put((seq, w, h, fmt, flags, payload))
 
 
-def decode_frame(frame, orient="rot180"):
+def decode_frame(frame, orient="none"):
     seq, w, h, fmt, flags, payload = frame
     arr = np.frombuffer(payload, dtype=np.uint8).reshape((h, w, 4))
     if flags & 1:
-        arr = arr[::-1, :, :]  # Y-flip (shim advertises GL bottom-up origin)
-    # The shim's advertised orientation doesn't match what Radium/Stern actually
-    # puts in the framebuffer — observed output after the flag-gated Y-flip is
-    # still 180°-rotated relative to the expected image. `--orient rot180`
-    # (default) corrects that; other options are available if a future build
-    # shifts the convention.
+        arr = arr[::-1, :, :]  # Y-flip if shim advertises GL bottom-up origin
+    # The shim reports `flags=0` for the current Pokémon LE build because the
+    # Radium renderer fills the FBO top-down and in correct X-orientation, so
+    # the raw buffer is display-ready. `--orient` is kept as an escape hatch
+    # for future builds or debugging.
     if orient == "rot180":
         arr = arr[::-1, ::-1, :]
     elif orient == "rot90":
@@ -126,6 +125,15 @@ def run_display(args, sock):
 
     root = tk.Tk()
     root.title("Spike 3 frame viewer")
+    # Size the window up-front so it doesn't start tiny and grow as frames
+    # arrive. The shim advertises 1920×1080 (FAKE_MODE_HDISPLAY/VDISPLAY);
+    # scale it by args.scale for the window. Fullscreen overrides both.
+    if args.fullscreen:
+        root.attributes("-fullscreen", True)
+    else:
+        init_w = max(1, int(1920 * args.scale))
+        init_h = max(1, int(1080 * args.scale))
+        root.geometry(f"{init_w}x{init_h}")
     label = tk.Label(root, bg="black")
     label.pack(fill=tk.BOTH, expand=True)
 
@@ -220,11 +228,15 @@ def main():
                             "_emulation/captures/frames")
     ap.add_argument("--no-display", action="store_true",
                     help="headless mode — save frames only, no Tk window")
+    ap.add_argument("--fullscreen", action="store_true",
+                    help="open the viewer window fullscreen "
+                         "(otherwise sized 1920×1080 × --scale at start)")
     ap.add_argument("--orient",
-                    default="rot180",
+                    default="none",
                     choices=["none", "rot90", "rot180", "rot270", "flip-h", "flip-v"],
                     help="orientation correction applied after the shim's "
-                         "y_flipped flag handling (default rot180)")
+                         "y_flipped flag handling (default none — the current "
+                         "Pokémon LE build needs no correction)")
     args = ap.parse_args()
 
     print(f"[viewer] starting (socket={args.socket}, scale={args.scale}, "

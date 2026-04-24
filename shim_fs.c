@@ -319,6 +319,42 @@ FILE *fopen64(const char *pathname, const char *mode) {
     return ret;
 }
 
+/* ---- Hooked: fopen (plain — Phase-7 asymmetry closed 2026-04-24) ----
+ *
+ * The game binary imports `fopen@GLIBC_2.17` directly (verified via readelf
+ * --dyn-syms). If Godot was compiled with `_FILE_OFFSET_BITS=64` the
+ * compiler probably redirects some calls to `fopen64`, but any remaining
+ * plain-fopen call would bypass our path-remap + logging entirely.
+ * Semantics match fopen64 exactly on 64-bit aarch64 (off_t is already
+ * 64-bit). */
+typedef FILE* (*real_fopen_t)(const char *, const char *);
+static real_fopen_t real_fopen = NULL;
+
+FILE *fopen(const char *pathname, const char *mode) {
+    if (!real_fopen) real_fopen = (real_fopen_t)dlsym(RTLD_NEXT, "fopen");
+
+    /* FIRST CALL banner so we notice when a plain-fopen path first fires. */
+    static uint32_t _fopen_count = 0;
+    uint32_t _n = __atomic_add_fetch(&_fopen_count, 1, __ATOMIC_RELAXED);
+    if (_n == 1) {
+        SHIM_LOG("[lfs] FIRST CALL: fopen — hook now wired "
+                 "(was previously falling through to libc untracked)");
+    }
+
+    const char *actual = remap_path(pathname);
+    FILE *ret = real_fopen(actual, mode);
+    if (should_log_open(pathname)) {
+        if (!ret) {
+            SHIM_LOG("FOPEN FAIL:   %s (mode=%s, errno=%d %s)",
+                     pathname, mode, errno, strerror(errno));
+        } else {
+            SHIM_LOG("FOPEN OK:     %s -> FILE* %p (mode=%s)",
+                     pathname, (void*)ret, mode);
+        }
+    }
+    return ret;
+}
+
 /* ---- Hooked: faccessat ---- */
 
 typedef int (*real_faccessat_t)(int, const char *, int, int);

@@ -6,19 +6,6 @@ The core artifact is `spi_shim.so` — an `LD_PRELOAD` shim that intercepts the
 game's calls to hardware devices, libraries, and files it can't reach on a
 workstation, and synthesizes whatever the game expects.
 
-## Get started
-
-1. One-time environment setup: see [`docs/SETUP.md`](docs/SETUP.md).
-2. Build the shim: `./build.sh`
-3. Run the game: `./run_game.sh` — launches the game, opens a live frame
-   viewer window, and pipes live audio to `ffplay`. Plays until you Ctrl+C.
-4. Advanced knobs are at the top of `run_game.sh`. Common ones:
-   - `TIMEOUT=185 ./run_game.sh` — cap the run at 185 s (useful for smokes)
-   - `VIEWER=0 ./run_game.sh` — game only, no Tk frame window
-   - `AUDIO_PLAYER=0 ./run_game.sh` — game only, no `ffplay` audio
-   - `LOGFILE=/tmp/run.log ./run_game.sh` — capture game stdout+stderr
-5. Daily log of what each step was trying + what we learned: [`docs/JOURNAL.md`](docs/JOURNAL.md).
-
 ## Module guide
 
 The shim started life as a single `spi_shim.c` monolith (~6400 lines). We
