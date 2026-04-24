@@ -576,6 +576,26 @@ int ioctl(int fd, unsigned long request, ...) {
         return -1;
     }
 
+    /* ---- boot_display ioctls ---- */
+    /* Inert stub: log every ioctl with full request decode, return 0 (success).
+     * Unlike the V4L2 probe which deliberately returns ENOTTY, boot_display
+     * may be issuing real config ioctls it expects to succeed; returning 0
+     * is the safer first cut. If the log shows DRM-style mode-set ioctls
+     * (large request numbers in the 0x40xx_xxxx range with struct-shaped
+     * sizes) it suggests /dev/boot_display IS a render surface and we
+     * should escalate the stub to track surface state. */
+    if (is_boot_display_fd(fd)) {
+        static uint32_t _bd_ioctl_count = 0;
+        unsigned long type = (request >> 8) & 0xff;
+        unsigned long nr   = request & 0xff;
+        unsigned long size = (request >> 16) & 0x3fff;
+        unsigned long dir  = (request >> 30) & 0x3;
+        _bd_ioctl_count++;
+        SHIM_LOG("boot_display ioctl #%u: req=0x%lx dir=%lu type='%c' nr=0x%02lx size=%lu arg=%p  -> 0 (fake OK)",
+                 _bd_ioctl_count, request, dir, (char)type, nr, size, arg);
+        return 0;
+    }
+
     /* ---- I2C ioctls ---- */
     if (fd == FAKE_FD_I2C) {
         i2c_ioctl_count++;

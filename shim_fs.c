@@ -75,10 +75,16 @@ static const char *remap_path(const char *path) {
     if (!path || !path[0]) return path;
     init_sysroot();
     if (sysroot_len == 0) return path;
-    /* Only remap absolute paths (not /dev/, /proc/, /sys/, /tmp/) */
+    /* Only absolute paths participate in remapping. Any path starting at /
+     * is either a Spike 3 path (we want it under $SYSROOT) or a host path
+     * (we want it left alone). The skip list captures the latter. */
     if (path[0] != '/') return path;
+    /* --- Live kernel + IPC interfaces. Never remap; the host kernel owns
+     *     these and a sysroot overlay would either be wrong or empty. --- */
     if (strncmp(path, "/dev/", 5) == 0) return path;
     if (strncmp(path, "/proc/", 6) == 0) return path;
+    if (strncmp(path, "/tmp/", 5) == 0) return path;
+    if (strncmp(path, "/run/", 5) == 0) return path;
     /* Carve-out: /sys/firmware/* IS remapped even though /sys/ generally isn't.
      * Kernel /sys is a live sysfs interface we shouldn't rewrite, but
      * /sys/firmware/ is firmware identity (devicetree, DMI) — plausible for
@@ -86,7 +92,15 @@ static const char *remap_path(const char *path) {
      * by dropping a file at $SYSROOT/sys/firmware/... */
     if (strncmp(path, "/sys/firmware/", 14) == 0) goto do_remap;
     if (strncmp(path, "/sys/", 5) == 0) return path;
-    if (strncmp(path, "/tmp/", 5) == 0) return path;
+    /* --- Host user/system state. The aarch64 process inherits HOME and
+     *     other env from the host launcher, so glibc/fontconfig/etc. probe
+     *     these paths. We must NOT remap them — leave them on the host so
+     *     fontconfig finds the host's font cache, $HOME points at a real
+     *     dir, and so on. (Earlier omission caused fontconfig to fail
+     *     silently and the game to fall back to bundled defaults.) --- */
+    if (strncmp(path, "/home/", 6) == 0) return path;
+    if (strncmp(path, "/root/", 6) == 0) return path;
+    if (strncmp(path, "/var/", 5) == 0) return path;
 do_remap:
     snprintf(remapped_buf, sizeof(remapped_buf), "%s%s", sysroot, path);
     return remapped_buf;

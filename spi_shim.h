@@ -72,6 +72,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len);
 #define FAKE_FD_I2C          1022
 #define FAKE_FD_V4L2_MEDIA   1021
 #define FAKE_FD_V4L2_VIDEO   1020
+#define FAKE_FD_BOOT_DISPLAY 1019  /* /dev/boot_display — Stern char device */
 
 /* ---- Device-layer state (defined in spi_shim.c) ----
  * intercept_device() writes these on open; the I/O and ioctl hooks in
@@ -80,6 +81,7 @@ extern int      spi_active;
 extern int      i2c_active;
 extern int      v4l2_media_active;
 extern int      v4l2_video_active;
+extern int      boot_display_active;
 extern int      uart_game_fd;
 extern int      uart_shim_fd;   /* shim side of the socketpair — used by shim_io.c close and shim_nodebus.c response synth */
 extern int      drm_game_fd;
@@ -96,6 +98,7 @@ int is_fake_fd(int fd);
 int is_uart_fd(int fd);
 int is_drm_fd(int fd);
 int is_v4l2_fd(int fd);
+int is_boot_display_fd(int fd);
 
 /* Real libc function pointers — resolved by resolve_all() and referenced
  * across the I/O / ioctl / fs / nodebus TUs. */

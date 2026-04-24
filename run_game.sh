@@ -81,6 +81,35 @@ SHIM="$SCRIPT_DIR/spi_shim.so"
 OVERLAY="$SCRIPT_DIR/mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu"
 DRIVERS="$OVERLAY/dri"
 
+declare -a INIT_SHARED_ENV=()
+if [[ -f "$SYSROOT/etc/init.d/shared" ]]; then
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        INIT_SHARED_ENV+=(-E "$line")
+    done < <(
+        source "$SYSROOT/etc/init.d/shared" 2>/dev/null
+        # The shared script does:
+        #   BOOT_DISPLAY=$GAMES_PATH/spike3/bin/boot_display
+        #   if [ ! -x "$BOOT_DISPLAY" ]; then BOOT_DISPLAY=/usr/local/spike/...; fi
+        # The [ -x ] check runs on the HOST filesystem (where /games/... doesn't
+        # exist), so the fallback fires and we'd export the wrong path.
+        # Override to the sysroot-absolute path real hardware would use.
+        BOOT_DISPLAY="$GAMES_PATH/spike3/bin/boot_display"
+        DPRINT="$GAMES_PATH/spike3/bin/dprint"
+        for v in GAMES_PATH SPIKE_MENU_PATH OS_UPDATE_PATH \
+                 DOWNLOADED_SPK_PATH MACHINE_REBOOTS_PATH \
+                 CORE_FILE_PATH GAME_RESTARTS_PATH \
+                 BOOT_DISPLAY DPRINT  GAME \
+                 DOWNLOADED_SPK_AVAILABLE \
+                 CONNECTIVITY_CACHE_CLEARED; do
+            # Only emit if defined and non-empty
+            if [[ -n "${!v:-}" ]]; then
+                printf '%s=%s\n' "$v" "${!v}"
+            fi
+        done
+    )
+fi
+
 # Debug-mode per-subsystem log paths. Computed here so variables exist even
 # when --debug is off (so the rest of the script can reference them
 # unconditionally — redirections only activate if $DEBUG==1).
@@ -183,7 +212,10 @@ trap cleanup_all EXIT INT TERM
 if [[ "$BOOT_DISPLAY" == "1" ]]; then
     boot_display_log_target=/dev/null
     [[ "$DEBUG" == "1" ]] && boot_display_log_target="$BOOT_DISPLAY_DBG_LOG"
-    printf '[run_game] starting boot_display for %s s\n' "$BOOT_DISPLAY_DURATION" >&2
+    # Mirror etc/init.d/S12lvds_panel "start" — that script just echoes this
+    # message and execs $BOOT_DISPLAY in background.
+    printf '[run_game] Starting LVDS panel boot_display\n' >&2
+    printf '[run_game] (boot_display gets up to %s s before kill)\n' "$BOOT_DISPLAY_DURATION" >&2
     (
         cd "$GAME_DIR"
         "$QEMU" -L "$SYSROOT" \
@@ -194,7 +226,10 @@ if [[ "$BOOT_DISPLAY" == "1" ]]; then
             -E "LIBGL_DRIVERS_PATH=$DRIVERS" \
             -E "MESA_LOADER_DRIVER_OVERRIDE=swrast" \
             -E "LIBGL_ALWAYS_SOFTWARE=1" \
-            "$BOOT_DISPLAY_BIN"
+            "${INIT_SHARED_ENV[@]+"${INIT_SHARED_ENV[@]}"}" \
+            "$BOOT_DISPLAY_BIN" \
+                -background_stretch \
+                -background_image spike3/bin/SternLogo_1920x1080.png
     ) >"$boot_display_log_target" 2>&1 &
     BOOT_DISPLAY_PID=$!
     # Wait up to BOOT_DISPLAY_DURATION seconds; if it exits early, proceed.
@@ -263,6 +298,10 @@ args=(
     -E "LD_LIBRARY_PATH=$OVERLAY:$SYSROOT/usr/lib64:$SYSROOT/usr/lib:$SYSROOT/lib64:$SYSROOT/lib"
     -E "SPIKE3_SYSROOT=$SYSROOT"
 )
+# Inherit /etc/init.d/shared env (GAMES_PATH, BOOT_DISPLAY, GAME, etc.)
+if (( ${#INIT_SHARED_ENV[@]} > 0 )); then
+    args+=("${INIT_SHARED_ENV[@]}")
+fi
 
 if [[ "$REAL_GL" == "1" ]]; then
     args+=(

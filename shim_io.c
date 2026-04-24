@@ -64,6 +64,11 @@ int close(int fd) {
         v4l2_video_active = 0;
         return 0;
     }
+    if (fd == FAKE_FD_BOOT_DISPLAY && boot_display_active) {
+        SHIM_LOG("CLOSE boot_display (fd %d)", fd);
+        boot_display_active = 0;
+        return 0;
+    }
     if (is_uart_fd(fd)) {
         SHIM_LOG("CLOSE UART (game=%d shim=%d) after %u reads, %u writes",
                  uart_game_fd, uart_shim_fd, uart_read_count, uart_write_count);
@@ -202,6 +207,22 @@ ssize_t write(int fd, const void *buf, size_t count) {
 
     if (fd == FAKE_FD_SPI && spi_active) {
         /* SPI shouldn't use write() directly (uses ioctl), but just in case */
+        return (ssize_t)count;
+    }
+
+    if (is_boot_display_fd(fd)) {
+        /* Swallow the write, but log size + cumulative volume. The traffic
+         * shape (small text-y writes vs huge fragmented frame writes) tells
+         * us whether /dev/boot_display is a command channel or a render
+         * surface — see _emulation runs/latest/boot_display.log analysis. */
+        static uint32_t _bd_write_count = 0;
+        static uint64_t _bd_write_bytes = 0;
+        uint32_t n = ++_bd_write_count;
+        _bd_write_bytes += count;
+        if (n <= 8 || (n % 100) == 0) {
+            SHIM_LOG("[boot_display] write #%u: %zu bytes (cumulative=%lu)",
+                     n, count, (unsigned long)_bd_write_bytes);
+        }
         return (ssize_t)count;
     }
 

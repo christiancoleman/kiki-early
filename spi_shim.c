@@ -219,6 +219,7 @@ void *dlsym(void *handle, const char *symbol) {
 #define FAKE_V4L2_VIDEO_PATH  "/dev/shim-v4l2-video"
 int      v4l2_media_active = 0;
 int      v4l2_video_active = 0;
+int      boot_display_active = 0;
 uint32_t v4l2_ioctl_count = 0;
 
 /* ---- GPIO sysfs stubs (Step 63) ----
@@ -403,6 +404,12 @@ int intercept_device(const char *pathname) {
                  pathname, FAKE_FD_V4L2_VIDEO);
         return FAKE_FD_V4L2_VIDEO;
     }
+    if (strcmp(pathname, "/dev/boot_display") == 0) {
+        boot_display_active = 1;
+        SHIM_LOG("OPEN %s -> fake fd %d (boot_display char device — inert stub)",
+                 pathname, FAKE_FD_BOOT_DISPLAY);
+        return FAKE_FD_BOOT_DISPLAY;
+    }
     if (strcmp(pathname, "/dev/ttyAMA5") == 0 ||
         strcmp(pathname, "/dev/ttyAMA2") == 0) {
         if (uart_game_fd < 0) {
@@ -434,12 +441,17 @@ int is_fake_fd(int fd) {
     return (fd == FAKE_FD_SPI && spi_active) ||
            (fd == FAKE_FD_I2C && i2c_active) ||
            (fd == FAKE_FD_V4L2_MEDIA && v4l2_media_active) ||
-           (fd == FAKE_FD_V4L2_VIDEO && v4l2_video_active);
+           (fd == FAKE_FD_V4L2_VIDEO && v4l2_video_active) ||
+           (fd == FAKE_FD_BOOT_DISPLAY && boot_display_active);
 }
 
 int is_v4l2_fd(int fd) {
     return (fd == FAKE_FD_V4L2_MEDIA && v4l2_media_active) ||
            (fd == FAKE_FD_V4L2_VIDEO && v4l2_video_active);
+}
+
+int is_boot_display_fd(int fd) {
+    return fd == FAKE_FD_BOOT_DISPLAY && boot_display_active;
 }
 
 int is_uart_fd(int fd) {
