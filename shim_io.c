@@ -381,6 +381,20 @@ static const char *mmap_flag_summary(int flags) {
     return "other";
 }
 
+/* Resolve a live file descriptor to its path via /proc/self/fd/<N>.
+ * Returns the input `out` buffer on success, "?" on failure. Always
+ * NUL-terminates. Used by the mmap hooks so the log line tells us
+ * *what file* was mapped instead of just an opaque fd number. */
+static const char *mmap_fd_to_path(int fd, char *out, size_t outsz) {
+    if (outsz == 0) return "?";
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, out, outsz - 1);
+    if (n <= 0) { out[0] = '?'; out[1] = 0; return out; }
+    out[n] = 0;
+    return out;
+}
+
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
     static real_mmap_t real_fn = NULL;
     if (!real_fn) real_fn = (real_mmap_t)dlsym(RTLD_NEXT, "mmap");
@@ -395,8 +409,10 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
             SHIM_LOG("[mm] FIRST CALL: mmap (file-backed) — hook wired");
         }
         if (n <= 8 || (n % 500) == 0) {
-            SHIM_LOG("[mm] mmap #%u: fd=%d len=%zu prot=0x%x flags=%s(0x%x) off=%lld -> %p",
-                     n, fd, length, prot, mmap_flag_summary(flags), flags,
+            char path[512];
+            mmap_fd_to_path(fd, path, sizeof(path));
+            SHIM_LOG("[mm] mmap #%u: fd=%d(%s) len=%zu prot=0x%x flags=%s(0x%x) off=%lld -> %p",
+                     n, fd, path, length, prot, mmap_flag_summary(flags), flags,
                      (long long)offset, ret);
         }
     }
@@ -414,8 +430,10 @@ void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t off
             SHIM_LOG("[mm] FIRST CALL: mmap64 (file-backed) — hook wired");
         }
         if (n <= 8 || (n % 500) == 0) {
-            SHIM_LOG("[mm] mmap64 #%u: fd=%d len=%zu prot=0x%x flags=%s(0x%x) off=%lld -> %p",
-                     n, fd, length, prot, mmap_flag_summary(flags), flags,
+            char path[512];
+            mmap_fd_to_path(fd, path, sizeof(path));
+            SHIM_LOG("[mm] mmap64 #%u: fd=%d(%s) len=%zu prot=0x%x flags=%s(0x%x) off=%lld -> %p",
+                     n, fd, path, length, prot, mmap_flag_summary(flags), flags,
                      (long long)offset, ret);
         }
     }

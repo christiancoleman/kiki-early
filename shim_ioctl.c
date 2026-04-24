@@ -208,27 +208,97 @@ int ioctl(int fd, unsigned long request, ...) {
             return 0;
         }
         case SPI_IOC_MESSAGE_1: {
+            /* Per-command RX response table + env-var overrides (2026-04-24).
+             *
+             * The game's nodebus SPI loop sends 8-byte packets whose last byte
+             * is a command/node-address code (empirically 0x00, 0x2c, 0x40,
+             * 0x6c dominate in captured runs). Historically the shim replied
+             * identically to every command (rx[2]=0x04). That's almost
+             * certainly why the game's state machine never advances — it
+             * expects different RX bytes per command.
+             *
+             * New behavior:
+             *   • Lazy-init a per-byte override table from env vars
+             *     SPIKE3_SPI_RX_XX=<hex-bytes> where XX is 00..FF.
+             *     Example: SPIKE3_SPI_RX_6C=0000110000000000 to try rx[2]=0x11
+             *              for the 0x6c query.
+             *     Separators in the value (colons/dashes/spaces) are stripped.
+             *   • Per-command counter so summary logs show the distribution.
+             *   • Log line now shows BOTH TX and RX plus the command tag so
+             *     reverse-engineering the protocol is observable live.
+             *   • Defaults preserved: no override → rx[2]=0x04 (old behavior).
+             *   • Banner prints once per command byte the first time we see
+             *     it, independent of the sampled-log cadence. */
+            static uint8_t  spi_rx_override[256][16];
+            static uint8_t  spi_rx_override_len[256];  /* 0 = no override */
+            static uint32_t spi_cmd_count[256];
+            static int      spi_override_loaded = 0;
+
+            if (!spi_override_loaded) {
+                spi_override_loaded = 1;
+                for (int c = 0; c < 256; c++) {
+                    char name[32];
+                    snprintf(name, sizeof(name), "SPIKE3_SPI_RX_%02X", c);
+                    const char *v = getenv(name);
+                    if (!v || !v[0]) continue;
+                    int nb = 0;
+                    const char *p = v;
+                    while (*p && nb < 16) {
+                        while (*p && !((*p >= '0' && *p <= '9') ||
+                                       (*p >= 'a' && *p <= 'f') ||
+                                       (*p >= 'A' && *p <= 'F'))) p++;
+                        if (!*p) break;
+                        unsigned b = 0;
+                        if (sscanf(p, "%2x", &b) != 1) break;
+                        spi_rx_override[c][nb++] = (uint8_t)b;
+                        p += 2;
+                    }
+                    if (nb > 0) {
+                        spi_rx_override_len[c] = (uint8_t)nb;
+                        SHIM_LOG("[spi] override for cmd 0x%02x loaded: %d bytes", c, nb);
+                    }
+                }
+            }
+
             struct spi_ioc_transfer *xfer = (struct spi_ioc_transfer *)arg;
             uint8_t *tx = (uint8_t *)(uintptr_t)xfer->tx_buf;
             uint8_t *rx = (uint8_t *)(uintptr_t)xfer->rx_buf;
             uint32_t len = xfer->len;
 
             spi_transfer_count++;
+            uint8_t cmd = (tx && len > 0) ? tx[len - 1] : 0;
+            uint32_t cmd_seen = ++spi_cmd_count[cmd];
 
-            /* Log TX data (first 20, then every 1000th) */
-            if (spi_transfer_count <= 20 || (spi_transfer_count % 1000) == 0) {
-                fprintf(stderr, "[shim] SPI #%u TX:", spi_transfer_count);
-                for (uint32_t i = 0; i < len && i < 16; i++)
-                    fprintf(stderr, " %02x", tx[i]);
-                fprintf(stderr, "\n");
-            }
-
-            /* Craft RX response */
+            /* Craft RX response BEFORE logging so the log reflects what we
+             * actually returned. */
             if (rx && len > 0) {
                 memset(rx, 0, len);
-                if (len > 2) {
-                    rx[2] = 0x04;  /* bit 2 set — advances state machine */
+                if (spi_rx_override_len[cmd] > 0) {
+                    uint32_t n = spi_rx_override_len[cmd];
+                    if (n > len) n = len;
+                    memcpy(rx, spi_rx_override[cmd], n);
+                } else if (len > 2) {
+                    rx[2] = 0x04;  /* historical default — keeps old behavior */
                 }
+            }
+
+            /* Log cadence: first 20 transactions overall (boot visibility) +
+             * every 1000th + FIRST sighting of each distinct command byte
+             * (so we never silently miss a new nodebus query in long runs). */
+            int is_first_of_cmd = (cmd_seen == 1);
+            int is_sample = (spi_transfer_count <= 20) ||
+                            (spi_transfer_count % 1000 == 0);
+            if (is_first_of_cmd || is_sample) {
+                fprintf(stderr, "[shim] SPI #%u cmd=0x%02x%s  TX:",
+                        spi_transfer_count, cmd,
+                        spi_rx_override_len[cmd] > 0 ? " (override)" : "");
+                for (uint32_t i = 0; i < len && i < 16; i++)
+                    fprintf(stderr, " %02x", tx[i]);
+                fprintf(stderr, "  RX:");
+                for (uint32_t i = 0; i < len && i < 16; i++)
+                    fprintf(stderr, " %02x", rx ? rx[i] : 0);
+                if (is_first_of_cmd) fprintf(stderr, "  [FIRST]");
+                fprintf(stderr, "\n");
             }
             return 0;
         }

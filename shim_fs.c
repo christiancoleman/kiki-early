@@ -79,8 +79,15 @@ static const char *remap_path(const char *path) {
     if (path[0] != '/') return path;
     if (strncmp(path, "/dev/", 5) == 0) return path;
     if (strncmp(path, "/proc/", 6) == 0) return path;
+    /* Carve-out: /sys/firmware/* IS remapped even though /sys/ generally isn't.
+     * Kernel /sys is a live sysfs interface we shouldn't rewrite, but
+     * /sys/firmware/ is firmware identity (devicetree, DMI) — plausible for
+     * a sysroot overlay to provide. Lets us fake machine-id / serial-number
+     * by dropping a file at $SYSROOT/sys/firmware/... */
+    if (strncmp(path, "/sys/firmware/", 14) == 0) goto do_remap;
     if (strncmp(path, "/sys/", 5) == 0) return path;
     if (strncmp(path, "/tmp/", 5) == 0) return path;
+do_remap:
     snprintf(remapped_buf, sizeof(remapped_buf), "%s%s", sysroot, path);
     return remapped_buf;
 }
@@ -474,5 +481,90 @@ int __lxstat64(int ver, const char *pathname, void *statbuf) {
     if (!real_fn) real_fn = (real_xstat_t)dlsym(RTLD_NEXT, "__lxstat64");
     const char *actual = remap_path(pathname);
     return real_fn(ver, actual, statbuf);
+}
+
+/* ========== libgpiod chardev stubs (2026-04-24) ==========
+ * The game imports six symbols from libgpiod (the modern /dev/gpiochipN
+ * character-device API). Known-gap: our shim only faked the legacy
+ * /sys/class/gpio/ sysfs interface, so calls through libgpiod silently
+ * fell through to real libgpiod, which then opened /dev/gpiochip* — that
+ * doesn't exist on this host, so the opens errored and the game's
+ * chip-select / interrupt-line logic never got its handshake.
+ *
+ * Stubs return opaque non-NULL handles (dynamically allocated tracking
+ * structs) so pointer identity between open and close works naturally.
+ * The game uses GPIO as output-only (only `gpiod_line_request_output` is
+ * imported — no `_request_input` / `_get_value`) so we log value writes
+ * but don't have to invent a read semantic.
+ *
+ * The opaque `struct gpiod_chip` and `struct gpiod_line` in libgpiod's
+ * public headers are ABI-compatible with our plain pointer return types.
+ */
+
+struct shim_gpiod_chip { char name[32]; };
+struct shim_gpiod_line { struct shim_gpiod_chip *chip; unsigned offset;
+                         int direction; int value; };
+
+void *gpiod_chip_open_by_name(const char *name) {
+    struct shim_gpiod_chip *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    if (name) {
+        strncpy(c->name, name, sizeof(c->name) - 1);
+        c->name[sizeof(c->name) - 1] = 0;
+    } else {
+        strcpy(c->name, "?");
+    }
+    SHIM_LOG("[gpiod] chip_open_by_name(\"%s\") -> %p (fake)", c->name, (void*)c);
+    return c;
+}
+
+void *gpiod_chip_get_line(void *chip, unsigned offset) {
+    if (!chip) return NULL;
+    struct shim_gpiod_chip *c = chip;
+    struct shim_gpiod_line *l = calloc(1, sizeof(*l));
+    if (!l) return NULL;
+    l->chip = c;
+    l->offset = offset;
+    SHIM_LOG("[gpiod] chip_get_line(%s, %u) -> %p (fake)", c->name, offset, (void*)l);
+    return l;
+}
+
+int gpiod_line_request_output(void *line, const char *consumer, int default_val) {
+    if (!line) return -1;
+    struct shim_gpiod_line *l = line;
+    l->direction = 1;
+    l->value = default_val;
+    SHIM_LOG("[gpiod] line_request_output(%s:%u, consumer=\"%s\", default=%d) -> 0 (fake)",
+             l->chip ? l->chip->name : "?", l->offset,
+             consumer ? consumer : "?", default_val);
+    return 0;
+}
+
+int gpiod_line_set_value(void *line, int value) {
+    if (!line) return -1;
+    struct shim_gpiod_line *l = line;
+    l->value = value;
+    static uint32_t _n = 0;
+    uint32_t n = __atomic_add_fetch(&_n, 1, __ATOMIC_RELAXED);
+    /* Toggle-heavy bit-bang could overwhelm the log; sample like other hooks. */
+    if (n <= 8 || (n % 500) == 0) {
+        SHIM_LOG("[gpiod] line_set_value #%u (%s:%u) = %d",
+                 n, l->chip ? l->chip->name : "?", l->offset, value);
+    }
+    return 0;
+}
+
+void gpiod_line_release(void *line) {
+    if (!line) return;
+    struct shim_gpiod_line *l = line;
+    SHIM_LOG("[gpiod] line_release(%s:%u)", l->chip ? l->chip->name : "?", l->offset);
+    free(l);
+}
+
+void gpiod_chip_close(void *chip) {
+    if (!chip) return;
+    struct shim_gpiod_chip *c = chip;
+    SHIM_LOG("[gpiod] chip_close(%s)", c->name);
+    free(c);
 }
 

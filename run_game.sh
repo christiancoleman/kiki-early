@@ -11,6 +11,12 @@
 #   VIEWER_FULLSCREEN=<0|1> [0]     open the viewer fullscreen rather than
 #                                   in a 1920×1080 window
 #   AUDIO_PLAYER=<0|1>      [1]     auto-launch audio_subscriber.py | ffplay
+#   BOOT_DISPLAY=<0|1>      [1]     run spike3/bin/boot_display for ~1.5 s
+#                                   pre-game, then kill it (mimics
+#                                   etc/init.d/game_monitor). Lets boot_display
+#                                   write /games/data/boot_display_cmd which the
+#                                   game reads at startup.
+#   BOOT_DISPLAY_DURATION=<s> [1.5]  how long to leave boot_display alive.
 #   STALE_KILL=<0|1>        [1]     reap leftover qemu/helpers from prior runs
 #                                   before starting.
 #   REAL_GL=<0|1>           [1]     forward EGL/GLES to Mesa vs return stubs
@@ -64,6 +70,8 @@ STATE_BRIDGE="${STATE_BRIDGE:-0}"
 VIEWER="${VIEWER:-1}"
 VIEWER_FULLSCREEN="${VIEWER_FULLSCREEN:-0}"
 AUDIO_PLAYER="${AUDIO_PLAYER:-1}"
+BOOT_DISPLAY="${BOOT_DISPLAY:-1}"
+BOOT_DISPLAY_DURATION="${BOOT_DISPLAY_DURATION:-3}"
 STALE_KILL="${STALE_KILL:-1}"
 LOGFILE="${LOGFILE:-}"
 QEMU="${QEMU:-qemu-aarch64}"
@@ -79,6 +87,8 @@ DRIVERS="$OVERLAY/dri"
 GAME_DBG_LOG="$LATEST_DIR/game.log"
 VIEWER_DBG_LOG="$LATEST_DIR/viewer.log"
 AUDIO_DBG_LOG="$LATEST_DIR/audio.log"
+BOOT_DISPLAY_DBG_LOG="$LATEST_DIR/boot_display.log"
+BOOT_DISPLAY_BIN="$GAME_DIR/spike3/bin/boot_display"
 
 # ---- Preflight ----
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -88,6 +98,15 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 command -v "$QEMU" >/dev/null || die "$QEMU not in PATH. Install qemu-user."
 if [[ "$REAL_GL" == "1" && ! -d "$OVERLAY" ]]; then
     die "Mesa overlay not built at $OVERLAY. Run: (cd mesa_sw_overlay && ./build_overlay.sh)"
+fi
+if [[ "$BOOT_DISPLAY" == "1" && ! -x "$BOOT_DISPLAY_BIN" ]]; then
+    printf '[run_game] BOOT_DISPLAY=1 but %s not found/executable; disabling\n' "$BOOT_DISPLAY_BIN" >&2
+    BOOT_DISPLAY=0
+fi
+# boot_display writes /games/data/boot_display_cmd; ensure the directory exists
+# in the sysroot so the write succeeds (then later the game reads from it).
+if [[ "$BOOT_DISPLAY" == "1" ]]; then
+    mkdir -p "$SYSROOT/games/data" 2>/dev/null || true
 fi
 
 
@@ -149,6 +168,55 @@ cleanup_all() {
     wait 2>/dev/null || true
 }
 trap cleanup_all EXIT INT TERM
+
+# ---- Run boot_display briefly before everything else ----
+# Mirrors etc/init.d/game_monitor: start the splash, wait, kill it. We give
+# it $BOOT_DISPLAY_DURATION seconds (default 3 — qemu-user is slow on the
+# render-init path, so 1 s isn't always enough). boot_display is a pure
+# OpenGL splash program; it goes through the same shim hooks the game
+# does, so its EGL/GBM/DRM init exercises every code path the game will
+# also exercise.
+#
+# We do NOT pass SPIKE3_FRAME_BRIDGE / SPIKE3_AUDIO_BRIDGE to boot_display
+# — those bridges belong to the game process; if boot_display also bound
+# them it would race against the game.
+if [[ "$BOOT_DISPLAY" == "1" ]]; then
+    boot_display_log_target=/dev/null
+    [[ "$DEBUG" == "1" ]] && boot_display_log_target="$BOOT_DISPLAY_DBG_LOG"
+    printf '[run_game] starting boot_display for %s s\n' "$BOOT_DISPLAY_DURATION" >&2
+    (
+        cd "$GAME_DIR"
+        "$QEMU" -L "$SYSROOT" \
+            -E "LD_PRELOAD=$SHIM" \
+            -E "LD_LIBRARY_PATH=$OVERLAY:$SYSROOT/usr/lib64:$SYSROOT/usr/lib:$SYSROOT/lib64:$SYSROOT/lib" \
+            -E "SPIKE3_SYSROOT=$SYSROOT" \
+            -E "SPIKE3_REAL_GL=$REAL_GL" \
+            -E "LIBGL_DRIVERS_PATH=$DRIVERS" \
+            -E "MESA_LOADER_DRIVER_OVERRIDE=swrast" \
+            -E "LIBGL_ALWAYS_SOFTWARE=1" \
+            "$BOOT_DISPLAY_BIN"
+    ) >"$boot_display_log_target" 2>&1 &
+    BOOT_DISPLAY_PID=$!
+    # Wait up to BOOT_DISPLAY_DURATION seconds; if it exits early, proceed.
+    # Slept-then-checked rather than a `wait -t` to keep bash-portable.
+    end_ts=$(awk -v d="$BOOT_DISPLAY_DURATION" 'BEGIN{print systime()+d}')
+    while [ "$(date +%s)" -lt "$end_ts" ] && kill -0 "$BOOT_DISPLAY_PID" 2>/dev/null; do
+        sleep 0.2
+    done
+    if kill -0 "$BOOT_DISPLAY_PID" 2>/dev/null; then
+        # Still running after timeout — kill it like init.d/game_monitor does.
+        printf '[run_game] killing boot_display (pid %d) before game launch\n' "$BOOT_DISPLAY_PID" >&2
+        pkill -P "$BOOT_DISPLAY_PID" 2>/dev/null || true
+        kill -TERM "$BOOT_DISPLAY_PID" 2>/dev/null || true
+        sleep 0.3
+        kill -KILL "$BOOT_DISPLAY_PID" 2>/dev/null || true
+        # Plus belt-and-suspenders: nuke any qemu-aarch64 still running boot_display
+        pkill -KILL -f "qemu-aarch64.*$BOOT_DISPLAY_BIN" 2>/dev/null || true
+    else
+        printf '[run_game] boot_display exited on its own before timeout\n' >&2
+    fi
+    wait "$BOOT_DISPLAY_PID" 2>/dev/null || true
+fi
 
 
 # ---- Launch helpers BEFORE the game ----
@@ -249,7 +317,36 @@ QEMU_PID=$!
 wait "$QEMU_PID" 2>/dev/null
 GAME_EXIT=$?
 
-printf '[run_game] game exited (status %d)\n' "$GAME_EXIT" >&2
+# Translate the exit code per etc/init.d/game_monitor's GAME_EXIT_REASON map.
+# Hardware game_monitor decides whether to restart, reboot, or hang based on
+# this; for us it's the most useful single line in the run output. Anything
+# >= 128 is "uncaught signal SIGNUM = code - 128" (e.g. 134 → SIGABRT,
+# 139 → SIGSEGV, 124 → timeout's SIGTERM via the `timeout` wrapper).
+exit_reason=""
+case "$GAME_EXIT" in
+    0)   exit_reason="RESTART REQUESTED (Service Menu reset)" ;;
+    1)   exit_reason="REBOOT REQUESTED (post-update)" ;;
+    2)   exit_reason="EXIT REQUESTED (dev Ctrl+C / debugger)" ;;
+    3)   exit_reason="POWER LOSS (power switch off)" ;;
+    4)   exit_reason="FATAL ERROR (sys_debug_log_fatal_error)" ;;
+    5)   exit_reason="DISPATCH TIMEOUT (proc system deadlock)" ;;
+    6)   exit_reason="DEEP SLEEP" ;;
+    124) exit_reason="timeout(1) killed it (SIGTERM via run_game.sh's TIMEOUT)" ;;
+    129) exit_reason="uncaught SIGHUP" ;;
+    130) exit_reason="uncaught SIGINT (Ctrl+C reached the game)" ;;
+    134) exit_reason="uncaught SIGABRT (assertion / pure-virtual / abort())" ;;
+    137) exit_reason="uncaught SIGKILL (force-killed)" ;;
+    139) exit_reason="uncaught SIGSEGV (NULL deref / bad address)" ;;
+    143) exit_reason="uncaught SIGTERM" ;;
+    *)
+        if [[ "$GAME_EXIT" -ge 128 ]]; then
+            exit_reason="uncaught signal $((GAME_EXIT - 128))"
+        else
+            exit_reason="unknown"
+        fi
+        ;;
+esac
+printf '[run_game] game exited (status %d — %s)\n' "$GAME_EXIT" "$exit_reason" >&2
 # cleanup_all runs via the EXIT trap; exit with the game's status so
 # callers can still detect timeout (124) or crash.
 exit "$GAME_EXIT"
