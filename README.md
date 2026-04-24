@@ -10,9 +10,13 @@ workstation, and synthesizes whatever the game expects.
 
 1. One-time environment setup: see [`docs/SETUP.md`](docs/SETUP.md).
 2. Build the shim: `./build.sh`
-3. Run the game: `./run_game.sh` (defaults to a 185 s real-GL run with all
-   patches enabled; knobs documented at the top of the script).
-4. Optional live frame viewer (second terminal): `python3 frame_viewer.py`
+3. Run the game: `./run_game.sh` — launches the game, opens a live frame
+   viewer window, and pipes live audio to `ffplay`. Plays until you Ctrl+C.
+4. Advanced knobs are at the top of `run_game.sh`. Common ones:
+   - `TIMEOUT=185 ./run_game.sh` — cap the run at 185 s (useful for smokes)
+   - `VIEWER=0 ./run_game.sh` — game only, no Tk frame window
+   - `AUDIO_PLAYER=0 ./run_game.sh` — game only, no `ffplay` audio
+   - `LOGFILE=/tmp/run.log ./run_game.sh` — capture game stdout+stderr
 5. Daily log of what each step was trying + what we learned: [`docs/JOURNAL.md`](docs/JOURNAL.md).
 
 ## Module guide
@@ -356,6 +360,7 @@ Defaults baked into `run_game.sh`; override with `VAR=value ./run_game.sh`.
 | `SPIKE3_SYSROOT` | Absolute path the shim remaps `/data/...` etc. against. Set automatically by the runner. |
 | `SPIKE3_REAL_GL=1` | Forward EGL/GLES/GBM to real Mesa (requires the overlay built). Default on. |
 | `SPIKE3_FRAME_BRIDGE=1` | Expose `/tmp/spike3_frame.sock`. Default on. |
+| `SPIKE3_AUDIO_BRIDGE=1` | Expose `/tmp/spike3_audio.sock` (raw S16_LE 2ch 44.1 kHz PCM). Default on. |
 | `SPIKE3_BRIDGE=1` | Expose cmode-state JSON bridge on `/tmp/spike3_bridge.sock`. Default off. |
 | `SPIKE3_PATCH_SPI_VIDEO=1` | Apply the Step 62 `SpiDecoder::Play` vtable patch. Default on. |
 | `SPIKE3_SW_HEVC=1` | Apply Step 64 get_format NOP so software HEVC decode proceeds. Default on. |

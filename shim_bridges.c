@@ -460,3 +460,97 @@ void shim_frame_start(void) {
     SHIM_LOG("[frame] listening on %s (AF_UNIX)", sock_path);
 }
 
+/* ========== Audio bridge (post-refactor addition, 2026-04-24) ==========
+ * Mirrors the frame bridge: AF_UNIX SOCK_STREAM listener, one subscriber at
+ * a time, blocking send-all with drop-on-hard-error. Subscriber receives
+ * raw S16_LE interleaved stereo @ 44.1 kHz — no headers, no sequence
+ * numbers. Format is fixed by the ALSA stub's configuration, so there's
+ * nothing dynamic to communicate.
+ *
+ * shim_audio_emit is called from snd_pcm_writei in spi_shim.c once per
+ * ALSA buffer (~46 ms at 44.1 kHz / 2048 frames). End-to-end latency is
+ * buffer-granular (~46 ms) plus aplay's internal buffering (~100 ms).
+ *
+ * Gated by SPIKE3_AUDIO_BRIDGE=1. Typical invocation from a second terminal:
+ *     python3 audio_subscriber.py | aplay -f S16_LE -c 2 -r 44100 -t raw -
+ */
+
+static int  shim_audio_listen_fd = -1;
+static int  shim_audio_client_fd = -1;
+static pthread_mutex_t shim_audio_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void *shim_audio_accept_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct sockaddr_un addr;
+        socklen_t addrlen = sizeof(addr);
+        int fd = accept(shim_audio_listen_fd, (struct sockaddr*)&addr, &addrlen);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            SHIM_LOG("[audio] accept() failed: %s — listener terminating", strerror(errno));
+            return NULL;
+        }
+        pthread_mutex_lock(&shim_audio_lock);
+        if (shim_audio_client_fd >= 0) {
+            close(shim_audio_client_fd);
+            SHIM_LOG("[audio] evicted prior subscriber");
+        }
+        shim_audio_client_fd = fd;
+        pthread_mutex_unlock(&shim_audio_lock);
+        SHIM_LOG("[audio] subscriber connected on fd %d", fd);
+    }
+    return NULL;
+}
+
+/* Blocking full-send; same rationale as shim_frame_send_all (kernel
+ * wmem_max is small, subscriber may briefly stall). Returns 0 on full
+ * send, -1 on hard socket error. */
+static int shim_audio_send_all(int fd, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+void shim_audio_emit(const uint8_t *buf, size_t bytes) {
+    if (!buf || bytes == 0) return;
+    pthread_mutex_lock(&shim_audio_lock);
+    if (shim_audio_client_fd < 0) { pthread_mutex_unlock(&shim_audio_lock); return; }
+    int fd = shim_audio_client_fd;
+    if (shim_audio_send_all(fd, buf, bytes) != 0) {
+        close(shim_audio_client_fd);
+        shim_audio_client_fd = -1;
+        SHIM_LOG("[audio] subscriber disconnected: %s", strerror(errno));
+    }
+    pthread_mutex_unlock(&shim_audio_lock);
+}
+
+void shim_audio_start(void) {
+    const char *enabled = getenv("SPIKE3_AUDIO_BRIDGE");
+    if (!enabled || enabled[0] != '1') return;
+    const char *sock_path = getenv("SPIKE3_AUDIO_SOCKET");
+    if (!sock_path || !sock_path[0]) sock_path = "/tmp/spike3_audio.sock";
+
+    unlink(sock_path);
+    shim_audio_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (shim_audio_listen_fd < 0) {
+        SHIM_LOG("[audio] socket() failed: %s", strerror(errno));
+        return;
+    }
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+    if (bind(shim_audio_listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+        listen(shim_audio_listen_fd, 1) < 0) {
+        SHIM_LOG("[audio] bind/listen(%s) failed: %s", sock_path, strerror(errno));
+        close(shim_audio_listen_fd); shim_audio_listen_fd = -1; return;
+    }
+    pthread_t t;
+    if (pthread_create(&t, NULL, shim_audio_accept_thread, NULL) == 0) pthread_detach(t);
+    SHIM_LOG("[audio] listening on %s (AF_UNIX, S16_LE 2ch 44.1 kHz raw)", sock_path);
+}

@@ -140,6 +140,8 @@ void resolve_all(void);
 void shim_bridge_start(void);             /* state bridge; no-op unless SPIKE3_BRIDGE=1 */
 void shim_frame_start(void);              /* frame bridge; no-op unless SPIKE3_FRAME_BRIDGE=1 */
 void shim_frame_capture_at_page_flip(void); /* called from the DRM PAGE_FLIP ioctl handler */
+void shim_audio_start(void);              /* audio bridge; no-op unless SPIKE3_AUDIO_BRIDGE=1 */
+void shim_audio_emit(const uint8_t *buf, size_t bytes); /* called from snd_pcm_writei */
 
 /* ---- Runtime patches (defined in shim_patches.c) ----
  * Both are self-gating via env vars (SPIKE3_PATCH_SPI_VIDEO=1 and

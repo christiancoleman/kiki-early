@@ -329,6 +329,9 @@ static void shim_install_crash_handler(void) {
     /* Optional frame bridge — glReadPixels → AF_UNIX stream (SPIKE3_FRAME_BRIDGE=1). */
     shim_frame_start();
 
+    /* Optional audio bridge — snd_pcm_writei → AF_UNIX raw stream (SPIKE3_AUDIO_BRIDGE=1). */
+    shim_audio_start();
+
     /* SIGALRM handler, main-thread SIGALRM block, and the six env-gated
      * worker threads (sweep timer, switch firing, gstreamer force-init,
      * cmode poke, state-flag poke, vp-patch) — all live in shim_inject.c. */
@@ -618,6 +621,10 @@ long snd_pcm_writei(void *pcm, const void *buffer, unsigned long size) {
         }
         uint32_t n = ++alsa_writei_count;
         pthread_mutex_unlock(&alsa_capture_lock);
+        /* Tee to the audio bridge socket (no-op if SPIKE3_AUDIO_BRIDGE
+         * isn't set or no subscriber is connected). Outside the mutex
+         * so a stalled subscriber can't back-pressure the file write. */
+        shim_audio_emit((const uint8_t *)buffer, bytes);
         if (n <= 4 || (n % 500) == 0) {
             SHIM_LOG("snd_pcm_writei #%u frames=%lu bytes=%zu",
                      n, size, bytes);

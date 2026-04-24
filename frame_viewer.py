@@ -90,11 +90,27 @@ def recv_loop(sock, out_queue, stop_event):
         out_queue.put((seq, w, h, fmt, flags, payload))
 
 
-def decode_frame(frame):
+def decode_frame(frame, orient="rot180"):
     seq, w, h, fmt, flags, payload = frame
     arr = np.frombuffer(payload, dtype=np.uint8).reshape((h, w, 4))
     if flags & 1:
-        arr = arr[::-1, :, :]  # Y-flip to image-convention top-down
+        arr = arr[::-1, :, :]  # Y-flip (shim advertises GL bottom-up origin)
+    # The shim's advertised orientation doesn't match what Radium/Stern actually
+    # puts in the framebuffer — observed output after the flag-gated Y-flip is
+    # still 180°-rotated relative to the expected image. `--orient rot180`
+    # (default) corrects that; other options are available if a future build
+    # shifts the convention.
+    if orient == "rot180":
+        arr = arr[::-1, ::-1, :]
+    elif orient == "rot90":
+        arr = np.rot90(arr, k=1)
+    elif orient == "rot270":
+        arr = np.rot90(arr, k=3)
+    elif orient == "flip-h":
+        arr = arr[:, ::-1, :]
+    elif orient == "flip-v":
+        arr = arr[::-1, :, :]
+    # orient == "none" falls through untouched.
     mode = "RGBA" if fmt == 0 else "BGRA"
     return seq, Image.fromarray(arr, mode)
 
@@ -132,7 +148,7 @@ def run_display(args, sock):
             root.after(16, pump)
             return
 
-        seq, img = decode_frame(frame)
+        seq, img = decode_frame(frame, orient=args.orient)
         show = img
         if args.scale != 1.0:
             new_w = max(1, int(img.width  * args.scale))
@@ -175,7 +191,7 @@ def run_headless(args, sock):
                 frame = q.get(timeout=1.0)
             except queue.Empty:
                 continue
-            seq, img = decode_frame(frame)
+            seq, img = decode_frame(frame, orient=args.orient)
             frames += 1
             if args.save_every > 0 and seq % args.save_every == 0:
                 path = os.path.join(args.save_dir, f"frame_{seq:06d}.png")
@@ -204,6 +220,11 @@ def main():
                             "_emulation/captures/frames")
     ap.add_argument("--no-display", action="store_true",
                     help="headless mode — save frames only, no Tk window")
+    ap.add_argument("--orient",
+                    default="rot180",
+                    choices=["none", "rot90", "rot180", "rot270", "flip-h", "flip-v"],
+                    help="orientation correction applied after the shim's "
+                         "y_flipped flag handling (default rot180)")
     args = ap.parse_args()
 
     print(f"[viewer] starting (socket={args.socket}, scale={args.scale}, "
