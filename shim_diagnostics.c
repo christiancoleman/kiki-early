@@ -766,6 +766,51 @@ void shim_sigabrt_handler(int sig, siginfo_t *info, void *ucontext) {
         u = write(STDERR_FILENO, line, (size_t)ln);
     }
 
+    /* Step 65: dump audio-server singleton state. The audio mixer thread's
+     * call into AudioServer::_driver_process inlines a virtual call:
+     *   `*(*data_451ac48 + 0x28)()`  (vtable slot 5 of *data_451ac48).
+     * That call is currently aborting because vtable[5] resolves to
+     * __cxa_pure_virtual at runtime. Dumping the singleton pointer + the
+     * first 8 vtable slots tells us what class is actually at *data_451ac48
+     * at the moment of abort (likely a parent-class vtable due to a
+     * destructor race). The slot 5 contents tell us the function we'd
+     * patch to no-op. */
+    if (game_base) {
+        uintptr_t singleton_addr = game_base + 0x451ac48;
+        uint64_t singleton_ptr = 0;
+        memcpy(&singleton_ptr, (void*)singleton_addr, 8);
+        char dump[256];
+        int dn = snprintf(dump, sizeof(dump),
+            "\n--- audio singleton dump ---\n"
+            "  data_451ac48 @ %p = 0x%016lx (= the object pointer)\n",
+            (void*)singleton_addr, (unsigned long)singleton_ptr);
+        u = write(STDERR_FILENO, dump, (size_t)dn);
+        if (singleton_ptr != 0) {
+            uint64_t vtable_ptr = 0;
+            memcpy(&vtable_ptr, (void*)(uintptr_t)singleton_ptr, 8);
+            unsigned long vtable_elf = (vtable_ptr >= game_base)
+                ? (unsigned long)(vtable_ptr - game_base) : 0;
+            dn = snprintf(dump, sizeof(dump),
+                "  *data_451ac48 (object) @ 0x%lx; first 8 bytes = vtable = 0x%016lx (ELF_VA=0x%lx)\n",
+                (unsigned long)singleton_ptr,
+                (unsigned long)vtable_ptr, vtable_elf);
+            u = write(STDERR_FILENO, dump, (size_t)dn);
+            if (vtable_ptr != 0) {
+                uint64_t slots[8] = {0};
+                memcpy(slots, (void*)(uintptr_t)vtable_ptr, 64);
+                for (int s = 0; s < 8; s++) {
+                    unsigned long slot_elf = (slots[s] >= game_base)
+                        ? (unsigned long)(slots[s] - game_base) : 0;
+                    dn = snprintf(dump, sizeof(dump),
+                        "    vtable[%d] (offset 0x%02x) = 0x%016lx  ELF_VA=0x%lx%s\n",
+                        s, s * 8, (unsigned long)slots[s], slot_elf,
+                        s == 5 ? "  ★ slot 5 — the failing virtual" : "");
+                    u = write(STDERR_FILENO, dump, (size_t)dn);
+                }
+            }
+        }
+    }
+
     /* Chain to default so the process dies with exit code 134. */
     signal(sig, SIG_DFL);
     raise(sig);

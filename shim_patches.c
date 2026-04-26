@@ -230,8 +230,35 @@ void shim_patch_spi_video_vtable(void) {
  * `- 0x400000` correction; the math works out the same either way.
  */
 #define AUDIO_DRIVER_VTABLE_VA       0x4324a28   /* AudioDriver vtable, BN post-rebase */
-#define AUDIO_DRIVER_SLOT7_OFF       0x40        /* typeinfo(+0x00) + slot7(+0x40) */
-#define AUDIO_DRIVER_NOOP_FN_VA      0x2560ac0   /* sub_2560ac0 — the safe no-op default */
+#define AUDIO_DRIVER_VPTR_OFF        0x08        /* skip typeinfo to first vfunc */
+#define AUDIO_DRIVER_SLOT7_NOOP_VA   0x2560ac0   /* sub_2560ac0 — AudioDriverDummy slot 7 default */
+#define AUDIO_DRIVER_RET_ZERO_VA     0x23725d0   /* sub_23725d0 — `return 0` (AudioServer slot 5 default) */
+
+/* Slots in the AudioDriver abstract vtable that are __cxa_pure_virtual at
+ * static-link time but get resolved to libstdc++ __cxa_pure_virtual at runtime,
+ * causing aborts whenever the audio thread or AudioServer dispatches through
+ * a partly-constructed/destructed driver instance.
+ *
+ * Slots 0 & 1 are virtual destructors (D1, D0 in Itanium ABI) — leaving those
+ * alone; replacing them would skip member cleanup. The remaining pure slots
+ * we replace with safe defaults: slot 7 with sub_2560ac0 (matches
+ * AudioDriverDummy's value, hits the existing safety check elsewhere); the
+ * rest with sub_23725d0 (literal `return 0`) which produces a sane default
+ * for any int-returning method (channel count, sample rate, latency, etc.).
+ *
+ * Discovered via Step 65 SIGABRT dump showing *data_451ac48's vtable was the
+ * AudioDriver abstract vtable. After patching slot 7, slot 5 was the next to
+ * fire. Pre-emptively covering 2, 3, 5, 8 in one pass to avoid iterating.
+ */
+struct shim_audio_slot_patch { uint32_t off; uintptr_t target_va; const char *desc; };
+static const struct shim_audio_slot_patch shim_audio_slots[] = {
+    /* offsets are from the vtable base; vfunc[N] is at base + 8 + N*8. */
+    { 0x08 + 2 * 8, 0x23725d0, "slot 2 -> return 0" },
+    { 0x08 + 3 * 8, 0x23725d0, "slot 3 -> return 0" },
+    { 0x08 + 5 * 8, 0x23725d0, "slot 5 -> return 0" },
+    { 0x08 + 7 * 8, 0x2560ac0, "slot 7 -> sub_2560ac0 (AudioDriverDummy default)" },
+    { 0x08 + 8 * 8, 0x23725d0, "slot 8 -> return 0" },
+};
 
 void shim_patch_audio_driver_vtable(void) {
     if (!is_real_gl()) return;
@@ -244,20 +271,26 @@ void shim_patch_audio_driver_vtable(void) {
         return;
     }
 
-    void **slot = (void**)(game_base + AUDIO_DRIVER_VTABLE_VA + AUDIO_DRIVER_SLOT7_OFF);
-    uintptr_t page = (uintptr_t)slot & ~(uintptr_t)4095;
+    /* Open the page once for the whole vtable region. */
+    void **first = (void**)(game_base + AUDIO_DRIVER_VTABLE_VA);
+    uintptr_t page = (uintptr_t)first & ~(uintptr_t)4095;
     if (mprotect((void*)page, 8192,
                  PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
         SHIM_LOG("[audio] mprotect RWX @ %p failed: %s",
                  (void*)page, strerror(errno));
         return;
     }
-    void *old = *slot;
-    void *new_target = (void*)(game_base + AUDIO_DRIVER_NOOP_FN_VA);
-    *slot = new_target;
-    SHIM_LOG("[audio] patched AudioDriver vtable slot 7 @ %p: %p -> %p "
-             "(was pure-virtual .got.plt; now sub_2560ac0 no-op)",
-             (void*)slot, old, new_target);
+
+    size_t n = sizeof(shim_audio_slots) / sizeof(shim_audio_slots[0]);
+    for (size_t i = 0; i < n; i++) {
+        const struct shim_audio_slot_patch *p = &shim_audio_slots[i];
+        void **slot = (void**)(game_base + AUDIO_DRIVER_VTABLE_VA + p->off);
+        void *old = *slot;
+        void *new_target = (void*)(game_base + p->target_va);
+        *slot = new_target;
+        SHIM_LOG("[audio] AudioDriver vtable %s @ %p: %p -> %p",
+                 p->desc, (void*)slot, old, new_target);
+    }
 }
 
 /* ========== moved from spi_shim.c (890-966): Step 64 get_format NOP patch ========== */
