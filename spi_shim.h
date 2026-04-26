@@ -148,11 +148,12 @@ void shim_audio_start(void);              /* audio bridge; no-op unless SPIKE3_A
 void shim_audio_emit(const uint8_t *buf, size_t bytes); /* called from snd_pcm_writei */
 
 /* ---- Runtime patches (defined in shim_patches.c) ----
- * Both are self-gating via env vars (SPIKE3_PATCH_SPI_VIDEO=1 and
- * SPIKE3_SW_HEVC=1 respectively); safe to call unconditionally.
+ * All three are self-gating via env vars (SPIKE3_PATCH_SPI_VIDEO=1,
+ * SPIKE3_SW_HEVC=1, SPIKE3_PATCH_AUDIO_ABRT=1); safe to call unconditionally.
  * Called from shim_vp_patch_thread in shim_inject.c after a 2 s settle. */
 void shim_patch_spi_video_vtable(void);
 void shim_patch_get_format_callback(void);
+void shim_patch_audio_driver_vtable(void);
 
 /* ---- Injection layer (defined in shim_inject.c) ----
  * Sets up the SIGALRM handler, blocks SIGALRM on the main thread, and

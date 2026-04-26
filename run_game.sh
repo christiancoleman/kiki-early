@@ -24,6 +24,9 @@
 #   AUDIO_BRIDGE=<0|1>      [1]     emit S16_LE PCM on /tmp/spike3_audio.sock
 #   PATCH_SPI_VIDEO=<0|1>   [1]     vtable-patch SpiDecoder::Play (Step 62)
 #   SW_HEVC=<0|1>           [1]     NOP-patch get_format + accept SW pix_fmt
+#   PATCH_AUDIO_ABRT=<0|1>  [1]     patch AudioDriver vtable slot 7 to no-op
+#                                   (Step 65) — fixes pure-virtual abort during
+#                                   teardown race in audio mixer thread
 #   STATE_BRIDGE=<0|1>      [0]     emit cmode JSON on /tmp/spike3_bridge.sock
 #   LOGFILE=<path>          []      redirect game stdout+stderr to a file
 #                                   (separate from --debug; only affects game)
@@ -66,6 +69,7 @@ FRAME_BRIDGE="${FRAME_BRIDGE:-1}"
 AUDIO_BRIDGE="${AUDIO_BRIDGE:-1}"
 PATCH_SPI_VIDEO="${PATCH_SPI_VIDEO:-1}"
 SW_HEVC="${SW_HEVC:-1}"
+PATCH_AUDIO_ABRT="${PATCH_AUDIO_ABRT:-1}"
 STATE_BRIDGE="${STATE_BRIDGE:-0}"
 VIEWER="${VIEWER:-1}"
 VIEWER_FULLSCREEN="${VIEWER_FULLSCREEN:-0}"
@@ -313,8 +317,9 @@ if [[ "$REAL_GL" == "1" ]]; then
 fi
 [[ "$FRAME_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_FRAME_BRIDGE=1")
 [[ "$AUDIO_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_AUDIO_BRIDGE=1")
-[[ "$PATCH_SPI_VIDEO" == "1" ]] && args+=(-E "SPIKE3_PATCH_SPI_VIDEO=1")
-[[ "$SW_HEVC"         == "1" ]] && args+=(-E "SPIKE3_SW_HEVC=1")
+[[ "$PATCH_SPI_VIDEO"  == "1" ]] && args+=(-E "SPIKE3_PATCH_SPI_VIDEO=1")
+[[ "$SW_HEVC"          == "1" ]] && args+=(-E "SPIKE3_SW_HEVC=1")
+[[ "$PATCH_AUDIO_ABRT" == "1" ]] && args+=(-E "SPIKE3_PATCH_AUDIO_ABRT=1")
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")
 
 # Append any caller-supplied flags (post --debug-strip) and the game binary last.

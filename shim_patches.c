@@ -189,6 +189,77 @@ void shim_patch_spi_video_vtable(void) {
              (void*)slot, old, (void*)shim_fake_spi_play);
 }
 
+/* ========== Step 65 (2026-04-26): AudioDriver abstract vtable slot 7 patch ========== */
+/* ---- Audio mixer thread pure-virtual abort fix ----
+ *
+ * The audio mixer thread (BN: sub_25609b4 = AudioDriverDummy::thread_func)
+ * calls a virtual via `*(*arg1 + 0x38)` (slot 7) on its own this-pointer
+ * once per mix cycle. The concrete AudioDriverDummy vtable has sub_2560ac0
+ * (a no-op) at slot 7 and the calling code has a safety check
+ * `if (slot7 != sub_2560ac0)` to skip the call entirely. Normal mixing
+ * runs fine — the safety check is hit and the thread proceeds to the real
+ * mix call (sub_2372390).
+ *
+ * During engine teardown, the destructor chain resets the vptr to the
+ * abstract `AudioDriver` vtable BEFORE the audio thread has noticed the
+ * exit_thread flag. The abstract vtable (at BN VA 0x4324a28 post-rebase)
+ * has slot 7 = __cxa_pure_virtual (via .got.plt entry at 0x46ab5c0). The
+ * safety check passes (slot7 != sub_2560ac0 IS true), the call proceeds,
+ * we get "pure virtual method called" → terminate → SIGABRT.
+ *
+ * Discovery path: Step 65 SIGABRT handler captured backtrace; frame [09]
+ * was inside sub_25609b4 at 0x2560ab4 calling vtable slot 7. AudioDriver
+ * typeinfo at 0x43247c0; xref → vtable at 0x4324a28; slot 7 at +0x40.
+ *
+ * Fix: at startup, overwrite slot 7 of the abstract AudioDriver vtable
+ * with sub_2560ac0. Then during teardown, when vptr resets to the abstract
+ * vtable, the audio thread still sees sub_2560ac0, the safety check skips
+ * the call, and the thread cleanly observes exit_thread and terminates.
+ *
+ * The author of Step 62 hypothesized this exact abort but blamed
+ * VideoPlayerSpi destruction. Their patch defused a video-side symptom
+ * (Play timeout) but the actual abort was always in audio.
+ *
+ * Gated by SPIKE3_PATCH_AUDIO_ABRT=1 so we can A/B compare. Safe to leave
+ * on long-term once verified — the patched value matches the AudioDriver-
+ * Dummy concrete vtable's slot 7 exactly.
+ *
+ * NOTE on address convention: the constants below are POST-rebase BN VAs
+ * (= ELF VAs, since the BN database is now rebased to 0x0 base). Older
+ * patches in this file (Step 62/64) use pre-rebase BN VAs with a
+ * `- 0x400000` correction; the math works out the same either way.
+ */
+#define AUDIO_DRIVER_VTABLE_VA       0x4324a28   /* AudioDriver vtable, BN post-rebase */
+#define AUDIO_DRIVER_SLOT7_OFF       0x40        /* typeinfo(+0x00) + slot7(+0x40) */
+#define AUDIO_DRIVER_NOOP_FN_VA      0x2560ac0   /* sub_2560ac0 — the safe no-op default */
+
+void shim_patch_audio_driver_vtable(void) {
+    if (!is_real_gl()) return;
+    const char *en = getenv("SPIKE3_PATCH_AUDIO_ABRT");
+    if (!en || en[0] != '1') return;
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[audio] game_base unresolved; AudioDriver vtable patch aborted");
+        return;
+    }
+
+    void **slot = (void**)(game_base + AUDIO_DRIVER_VTABLE_VA + AUDIO_DRIVER_SLOT7_OFF);
+    uintptr_t page = (uintptr_t)slot & ~(uintptr_t)4095;
+    if (mprotect((void*)page, 8192,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        SHIM_LOG("[audio] mprotect RWX @ %p failed: %s",
+                 (void*)page, strerror(errno));
+        return;
+    }
+    void *old = *slot;
+    void *new_target = (void*)(game_base + AUDIO_DRIVER_NOOP_FN_VA);
+    *slot = new_target;
+    SHIM_LOG("[audio] patched AudioDriver vtable slot 7 @ %p: %p -> %p "
+             "(was pure-virtual .got.plt; now sub_2560ac0 no-op)",
+             (void*)slot, old, new_target);
+}
+
 /* ========== moved from spi_shim.c (890-966): Step 64 get_format NOP patch ========== */
 /* ---- Step 64: software HEVC path ----
  *
