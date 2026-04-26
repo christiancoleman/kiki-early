@@ -48,6 +48,7 @@ uintptr_t shim_resolve_game_base(void);
 /* ---- Signal handlers (defined in shim_diagnostics.c; registered by
  *      shim_install_crash_handler in spi_shim.c) ---- */
 void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext);
+void shim_sigabrt_handler(int sig, siginfo_t *info, void *ucontext);
 void shim_term_dump_handler(int sig);
 
 /* ---- Event-sweep globals (defined in shim_inject.c; read by

@@ -690,6 +690,87 @@ void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
     raise(sig);
 }
 
+/* SIGABRT handler — catches __cxa_pure_virtual / std::terminate paths.
+ *
+ * When a pure-virtual call fires (e.g. during a destructor on a partially-
+ * constructed object), libstdc++'s default terminate handler calls abort()
+ * which raises SIGABRT. Without this handler, qemu just prints
+ * "uncaught target signal 6" and we get no information about WHERE the
+ * abort happened — useless for diagnosing dtor-order bugs in the
+ * VideoPlayerSpi chain.
+ *
+ * The handler does the minimum: dump the backtrace with dladdr resolution
+ * AND an ELF VA for any frame inside the game binary (so we can map the
+ * address directly to a BN function without subtracting the load base by
+ * hand). For game-binary frames the ELF VA can be plugged directly into
+ * mcp__binary-ninja__function_at to identify the offending call site.
+ *
+ * No sound-globals / cmode / dispatch dumps — those are heavy and
+ * irrelevant for a pure-virtual abort. The stack trace is the prize.
+ *
+ * Re-raises with SIG_DFL so the process still terminates with exit code 134
+ * and qemu's behavior is preserved. */
+void shim_sigabrt_handler(int sig, siginfo_t *info, void *ucontext) {
+    (void)ucontext;
+
+    char hdr[256];
+    int hn = snprintf(hdr, sizeof(hdr),
+        "\n=== SHIM SIGABRT: sig=%d si_code=%d ===\n"
+        "(__cxa_pure_virtual / std::terminate path — backtrace follows)\n",
+        sig, info ? info->si_code : 0);
+    ssize_t u = write(STDERR_FILENO, hdr, (size_t)hn);
+    (void)u;
+
+    uintptr_t game_base = shim_resolve_game_base();
+    char base_line[192];
+    int bln;
+    if (game_base) {
+        bln = snprintf(base_line, sizeof(base_line),
+            "(game load base = 0x%lx; ELF_VA shown for game frames — "
+            "feed directly to BN function_at)\n", game_base);
+    } else {
+        bln = snprintf(base_line, sizeof(base_line),
+            "(game load base unresolved — could not compute ELF VAs)\n");
+    }
+    u = write(STDERR_FILENO, base_line, (size_t)bln);
+
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    for (int i = 0; i < n; i++) {
+        Dl_info di;
+        char line[640];
+        int ln;
+        if (dladdr(frames[i], &di) && di.dli_fname) {
+            unsigned long off_module =
+                (unsigned long)((uintptr_t)frames[i] - (uintptr_t)di.dli_fbase);
+            int is_game = strstr(di.dli_fname, "/game") &&
+                          !strstr(di.dli_fname, ".so");
+            unsigned long elf_va = is_game && game_base
+                ? (unsigned long)((uintptr_t)frames[i] - game_base) : 0;
+            if (elf_va) {
+                ln = snprintf(line, sizeof(line),
+                    "[%02d] %p  %s+0x%lx  %s  ELF_VA=0x%lx\n",
+                    i, frames[i], di.dli_fname, off_module,
+                    di.dli_sname ? di.dli_sname : "(no symbol)",
+                    elf_va);
+            } else {
+                ln = snprintf(line, sizeof(line),
+                    "[%02d] %p  %s+0x%lx  %s\n",
+                    i, frames[i], di.dli_fname, off_module,
+                    di.dli_sname ? di.dli_sname : "(no symbol)");
+            }
+        } else {
+            ln = snprintf(line, sizeof(line),
+                "[%02d] %p  (no dladdr)\n", i, frames[i]);
+        }
+        u = write(STDERR_FILENO, line, (size_t)ln);
+    }
+
+    /* Chain to default so the process dies with exit code 134. */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 /* SIGTERM / SIGUSR1 / SIGUSR2 handler:
  *   SIGTERM/SIGINT — dump state and exit cleanly.
  *   SIGUSR1        — dump state and keep running.

@@ -315,6 +315,17 @@ static void shim_install_crash_handler(void) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS,  &sa, NULL);
 
+    /* SIGABRT — separate handler so the message header doesn't say
+     * "SHIM SIGSEGV" and so we can keep the abort dump light (just
+     * backtrace; no sound/cmode/dispatch dumps). Triggered by
+     * __cxa_pure_virtual and std::terminate. */
+    struct sigaction sa_abrt;
+    memset(&sa_abrt, 0, sizeof(sa_abrt));
+    sa_abrt.sa_sigaction = shim_sigabrt_handler;
+    sa_abrt.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa_abrt.sa_mask);
+    sigaction(SIGABRT, &sa_abrt, NULL);
+
     struct sigaction sa2;
     memset(&sa2, 0, sizeof(sa2));
     sa2.sa_handler = shim_term_dump_handler;
