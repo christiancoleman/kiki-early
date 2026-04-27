@@ -5381,3 +5381,89 @@ Cumulative across all nine phases (including Step 63's findings):
   - `VideoStreamPlayer::play()` trips `is_inside_tree() == false` on orphaned nodes at destruct. Either these nodes shouldn't exist, or they need parenting to a fake root before `play()`. The Step 62 vtable patch silences the downstream abort but doesn't fix the orphan-construction.
 
 
+## Step 65: NODEBUS_Hash polynomial — constants corrected, CPU-inline absent in this build (2026-04-27)
+
+**Trigger.** External observations from Researchers A, C and D suggested
+looking for a CPU-side implementation of the node-bus hash. The investigation
+tested that hypothesis in this game rather than assuming it transferred from
+another title.
+
+> [Redacted: private source wording and the identifying comparison example.]
+
+User's framing: find the inlined hash in `games/pokemon_le/game`, enumerate **every** call site, look for sneaky uses (Stern has historically used innocuous file names like `screen_timing` for update decryption — any consumer chain is in scope, not just audio).
+
+**Finding 1 — the doc's polynomial constants were wrong.**
+
+`BRIDGE_PROTOCOL.md` had previously stated:
+```
+m1 = ((x * 0x80008001) ^ ((x * 0x80008001) >> 10)) * 9
+m2 = (m1 >> 6) ^ m1
+hash(x) = ((m2 * 0xfffff801) >> 16) ^ (m2 * 0xfffff801)
+```
+
+Direct disassembly of `HOST_Update` in `netbridge.elf` (Thumb-1, ARM Cortex-M0+, debug_info present) at VA `0x1000161a..0x10001634` shows the actual implementation:
+```
+0x10001618: 0x404b   EORS r3, r1                  ; r3 ^= r1 (input ^ seed)
+0x1000161a: 0x1e59   SUBS r1, r3, #1              ; r1 = r3 - 1
+0x1000161c: 0x03db   LSLS r3, r3, #15             ; r3 = r3 << 15
+0x1000161e: 0x1acb   SUBS r3, r1, r3              ; r3 = (r3-1) - (r3<<15)  =  r3 * -0x7FFF - 1
+0x10001620: 0x0a99   LSRS r1, r3, #10             ; r1 = r3 >> 10
+0x10001622: 0x404b   EORS r3, r1                  ; r3 ^= r1
+0x10001624: 0x2109   MOVS r1, #9                  ; r1 = 9
+0x10001626: 0x4359   MUL  r1, r3                  ; r1 = 9 * r3                = m1
+0x10001628: 0x098b   LSRS r3, r1, #6              ; r3 = m1 >> 6
+0x1000162a: 0x404b   EORS r3, r1                  ; r3 = m1 ^ (m1>>6)          = m2
+0x1000162c: 0x1e59   SUBS r1, r3, #1              ; r1 = m2 - 1
+0x1000162e: 0x02db   LSLS r3, r3, #11             ; r3 = m2 << 11
+0x10001630: 0x1ac9   SUBS r1, r1, r3              ; r1 = (m2-1) - (m2<<11) = m2 * -0x7FF - 1 = z
+0x10001632: 0x0c0b   LSRS r3, r1, #16             ; r3 = z >> 16
+0x10001634: 0x404b   EORS r3, r1                  ; r3 = z ^ (z>>16)           = hash
+```
+
+So the correct multiplicands are **0x7FFF and 0x7FF**, with `NOT` (one's-complement) applied:
+```
+y       = ~(x * 0x7FFF)         ≡ (x * 0xFFFF8001) - 1   (mod 2^32)
+m1      = (y ^ (y >> 10)) * 9
+m2      = (m1 >> 6) ^ m1
+z       = ~(m2 * 0x7FF)         ≡ (m2 * 0xFFFFF801) - 1  (mod 2^32)
+hash(x) = (z >> 16) ^ z
+```
+
+`x * 0xFFFF8001 ≢ x * 0x80008001` (differ by `0x7FFF0000 * x`), so the doc's polynomial would have produced different output for any `x ≠ 0`. The fix is recorded in `BRIDGE_PROTOCOL.md` § "Cmd `0x40` sub `0x0d` — NODEBUS_Hash".
+
+**Finding 2 — the polynomial is not inlined in `games/pokemon_le/game`.**
+
+Exhaustive scan of `.text` (file offset 0x460000, size 0x03167100, 12.95M instructions) for every plausible ARM64 lowering of the polynomial's two multiplies:
+
+| Lowering | Encoding pattern | Hits |
+|---|---|---:|
+| `SUB Wd, Wn, Wn, LSL #15` (single-insn `x * -0x7FFF`, self-shift) | `0x4B003C00`, mask `0xFFE0FC00`, Rn==Rm | **0** |
+| `SUB Wd, Wn, Wn, LSL #11` (single-insn `x * -0x7FF`, self-shift) | `0x4B002C00`, mask `0xFFE0FC00`, Rn==Rm | 1 (in `sub_1042214`, audio saturation) |
+| `SUB Wd, WZR, Wm, LSL #15` (`-(x << 15)`) followed by `ADD Wd, Wd, Wm` | structural pair search | 0 polynomial-shaped (6 SUB-WZR-LSL-#15 hits exist, all in audio decoders `sub_9b7590` / `sub_9b9820`, used for sample-bit-width clamping with rounding bias `0x4000`) |
+| `LSL Wt, Wm, #15` followed within ±8 insns by `SUB Wd, Wp, Wt` (split form) | structural pair search | 0 |
+| `MOVZ Wn, #0x7FFF` (loads multiplicand) near `MUL`/`MNEG` | proximity scan | 7 incidental hits, none clustered with the polynomial's distinctive shifts |
+| `MOVN Wn, #0x7FFE` (loads `0xFFFF8001`) | `0x1280FFC0`, mask `0xFFFFFFE0` | 7 hits — 6 in `sub_9b7590`/`sub_9b9820` clusters, all loading `-0x7FFF` as audio saturation min, paired with `MOVZ #0x7FFF` (saturation max) |
+| `MOVN Wn, #0x07FE` (loads `0xFFFFF801`) | `0x1280FFCE`-class | 1 (at `0x01042234` in audio saturation `sub_1042214`) |
+| `MNEG W,W,W` (entire binary) | `0x1B00FC00`, mask `0xFFE0FC00` | 3, none near `MOVZ #0x7FFF` or `#0x7FF` |
+| Polynomial signature: `LSR W #10` AND `LSR W #6` AND `LSR W #16` AND `LSL W #11`, all within ±256 bytes | structural pair search | **0 W-reg clusters** (X-reg cluster of 4 sites at `0x009b8a0c`, `0x009bacb4`, `0x009bd380`, `0x009bfe4c` are all in 128-bit audio decoders `sub_9b7590` family, GF(2^8)-shaped with `0x1b` constants) |
+
+Each candidate I followed up bottoms out as something else:
+- `sub_11f172c` / `sub_11ed6f0` — libpng `png_compose` / channel-loss-check (`0x80008001` is the magic-number divider for `x / 0xffff` lowering; `png_error`/`png_get_channels` strings are the giveaway).
+- `sub_1042214` — signed Q-format audio sample saturation. The `x - (x << 11)` arithmetic and `0xf801` halfword stores are bit-pack endpoints of the +/-0x7FF saturation range. The `MOVN #0x07FE` is loading `0xFFFFF801` for the sample-floor clamp, not for a polynomial multiply.
+- `sub_9b7590` / `sub_9b9820` — audio decoder rounds with `(1 << (width-1)) - 1` overflow check and `(-(x << 15) + 0x4000) >> (width-1)` rounding-and-shift normalization. The `0x1b` constants are GF(2^8) reduction (AES-like in shape). The MOVZ/MOVN pairs are saturation clamps, not polynomial multipliers.
+
+This is consistent with our earlier negative result on static cmd-byte senders for cmd `0x40`/`0x41`: the game does not call the bridge's NODEBUS_Hash, and it also does not compute the polynomial on the CPU side.
+
+**Conclusion.** Pokemon LE 0.81 does **not** use NODEBUS_Hash anywhere we can detect. the externally suggested CPU-inline pattern is **not** observed in this build. If Stern uses any audio/asset/network/NV decryption keyed off this polynomial, it must be done in a form that defeats every plausible compiler lowering we tested — possible but unlikely without contradicting the `image.bin`-extracts-clean evidence (all 2452 records are confirmed audio per user, no encryption stripped during extraction).
+
+**Open questions / next moves (paused for user direction).**
+- Is there a different mixer in Spike 3? The external observation concerned Spike 2; transferring it between generations remained an open question.
+- Any value in cross-checking `service_s_worker` (the Service S daemon) for crypto primitives — it's the network-facing side and may be the actual home of any sneaky-use crypto.
+- The audio decoders at `sub_9b7590` are independently interesting (they look like Stern's bespoke audio codec). Worth a separate trace if assets that *aren't* in `image.bin` (e.g. anything in `main.pck`) might pass through them encrypted.
+
+**Artifacts produced.**
+- `BRIDGE_PROTOCOL.md` § NODEBUS_Hash — polynomial corrected with verified Thumb-1 disassembly cite.
+- `BRIDGE_PROTOCOL.md` TODO — "Spec out cmd `0x40 / 0x0d` NODEBUS_Hash usage" moved to Resolved (negative result).
+- This entry.
+
+No BN renames performed (no function to rename — there is no inlined hash to label). No memory file claims about polynomial constants need surgery beyond a small note that the older `reference_nodebus_protocol.md` summary may have inherited the wrong constants from the doc.
