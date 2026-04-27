@@ -5467,3 +5467,71 @@ This is consistent with our earlier negative result on static cmd-byte senders f
 - This entry.
 
 No BN renames performed (no function to rename — there is no inlined hash to label). No memory file claims about polynomial constants need surgery beyond a small note that the older `reference_nodebus_protocol.md` summary may have inherited the wrong constants from the doc.
+
+
+## Step 66: encrypted nodebus channel discovered — cmd 0x41 is alive (2026-04-27)
+
+**Trigger.** User asked to look at `sub_8ec410`. That walk cracked open the part of Step 48 that was wrong: cmd 0x40 / 0x41 ARE sent at runtime, just not via static `mov w0, #0x40` immediates that our earlier scan was looking for.
+
+**Sender chain.**
+
+```
+caller wrapper (1 of ~160 templated per (slot, inner_cmd))
+    ↓
+mcp_nodebus_send_with_retry @ 0x8ed4a0  (status-byte retry wrapper, gates encrypted path)
+    ↓
+mcp_nodebus_send_encrypted @ 0x8ec410   (the cipher lives here; three branches depending on arg1[0])
+    ↓
+mcp_nodebus_send_raw @ 0x9166c0          (computes cmd byte = (arg1[0] >> 7) + 0x40)
+    ↓
+send_bridge_message_with_response @ 0x9164a0  (UART)
+```
+
+The cmd byte being **runtime-computed** is why the static-immediate scan in Step 48 returned zero senders. Lesson for future RE: don't conclude "dead code" from absence of immediate-load patterns alone — Stern uses runtime-computed cmd bytes for the channels they want guarded.
+
+**Cipher (per-slot XOR stream, outbound only).**
+
+```
+mask = (slot << 4) | ((inner_len + 1) & 0x0F)
+for i in [0 .. inner_len-1]:
+    out[i] = orig[i]
+           ^ mcp_nodebus_cipher_keys[slot*16 + (i & 0xF)]
+           ^ ((i & 1) ? ~mask : mask)
+# trailing byte = -sum(frame) mod 256
+```
+
+Self-inverse (XOR), validated against BN HLIL byte-for-byte. The boot-time first-ever frame for slot 5 cmd 0xfc fetch is `85 01 ae cc` (verified in Python).
+
+**Per-slot tables (32 slots, all BSS-resident).**
+
+| Symbol | Address | Stride | Total |
+|---|---|---:|---:|
+| `mcp_nodebus_cipher_keys` | 0x44fcfb8 | 16 | 512 |
+| `mcp_nodebus_per_slot_status` | 0x44fce38 | 12 | 384 |
+| `mcp_nodebus_send_counters` | 0x44fd1c0 | 4 | 128 |
+| `mcp_nodebus_last_error` | 0x44fce30 | – | 4 |
+
+Layout fully resolved by `mcp_nodebus_reset_all_slots @ 0x8f61f0` (single function with three `memset`s of the right sizes).
+
+**Key provisioning.**
+
+> [Redacted: the boot-time procedure for obtaining per-slot keys and the
+> associated security observation. The investigation distinguished initialization
+> from subsequent traffic; later steps revisited which traffic was encrypted.]
+
+**Use cases identified.**
+- Bridge-level cleartext cmd-0x40 sub-cmds: `mcp_nodebus_query_bridge_status @ 0x8ed410` (sub-cmd 0x05), `mcp_nodebus_factory_test_trap @ 0x8f5f4c` (sub-cmd 0x0c — also resolves the BRIDGE_PROTOCOL.md TODO about that path).
+- Encrypted cmd-0x41 traffic: 160+ wrappers around `mcp_nodebus_send_with_retry`. Confirmed user: `mcp_nodebus_flash_node_firmware @ 0x8f5484` — the **node firmware programmer** (writes `coil4node-LPC1124_303-*.hex` and friends onto remote node MCUs via inner cmds 0xf603 = boot mode, 0xf311 = bootloader cmd, 0xf482 = flash write).
+- Hypothesis (not yet confirmed): switch-state writes flow through response handling of these wrappers. Tracing that is the natural next move.
+
+**BN renames applied (with `mcp_` prefix per workflow).** 10 functions + 4 data labels + 9 comments. User saved DB after these.
+
+**Open questions.**
+- Inbound decryption: responses appear cleartext on the wire to the game side, but this needs runtime confirmation.
+- Inner cmd `0xf9` semantics (used by the two-probes fetcher with two different 4-byte arguments).
+- Bit `0x40` OR-gating in `mcp_nodebus_send_encrypted` (inner cmd in `[0x10, 0xEF]` or `0xF2` queries `mcp_nodebus_per_slot_status[slot] + 11` — privilege flag of some kind).
+
+**Artifacts.**
+- New standalone reference: `_emulation/docs/NODEBUS_CIPHER.md` (~340 lines: algorithm, wire frame, Python impl, hunting checklist for other Spike 3 builds, open questions).
+- `BRIDGE_PROTOCOL.md` updated in 8 places to retract the "cmd 0x40/0x41 dead code" claim with cross-references to `NODEBUS_CIPHER.md`. Step 48's "surprising negative result" entry marked superseded.
+- Memory: new `polynomial_nodebus_hash.md` correction note + new `project_nodebus_cipher.md`; `reference_nodebus_protocol.md` cmd-0x41 entry updated.

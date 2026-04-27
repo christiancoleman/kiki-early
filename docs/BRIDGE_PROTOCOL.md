@@ -51,6 +51,23 @@ STX | cmd | id | data... | csum | ETX
 ```
 where `csum = -sum(cmd, id, data...)` modulo 256.
 
+## Game's outbound cmd usage (latest run log)
+
+From `_emulation/runs/latest/game.log` distinct cmd codes:
+
+`0x10  0x11  0x15  0x16  0x18  0x1c  0x1d  0x27  0x30`
+
+(9 unique. Most are POWERDIST-range; LCD `0x27` for the LCD-node setup;
+CRC32 `0x30` for the bridge firmware integrity check.)
+
+**Cmd `0x40` and `0x41` are sent at runtime** via `mcp_nodebus_send_raw @ 0x9166c0`,
+which computes the cmd byte as `(arg1[0] >> 7) + 0x40`. The encrypted variant
+(cmd 0x41 path) carries the node firmware-flash channel and 160+ per-(slot, cmd)
+wrappers — see [`NODEBUS_CIPHER.md`](NODEBUS_CIPHER.md). Earlier "never observed"
+note for cmd 0x40 was based on a static `mov w0, #0x40` immediate scan that the
+runtime-computed senders bypass; it stood for less than a day before being
+superseded.
+
 ## Bridge dispatch matrix
 
 `HOST_Update @ 0x10001210` reads frames via `HOSTUART_GetMessage`, then:
@@ -91,8 +108,8 @@ Legend for **Status**: ✅ = handled with deliberate engineered shape; ⚠️ = 
 | `0x29` / `0x2A` / `0x2B` / `0x2F` | WS2812 ops | varies | ❌ never observed |
 | `0x2C` | `I2S_Enable(arg & 1)` | none | ❌ never observed |
 | `0x30` | `CRC32(0, &__VECTOR_TABLE, 0x12a40)` over bridge firmware | `SendMessage(0x30, id, 4 bytes)` | ✅ shim returns precomputed CRC32 of `netbridge.elf` `.text+.rodata` — only handler that returns the *actually-correct* runtime value |
-| `0x40` | nodebus-passthrough subprotocol (9 sub-cmds) — see below | varies | ❌ never observed |
-| `0x41` | `UART_NodeGetMessageBlock` then forward | varies | ❓ inline shim note: silent-ACK was tried + reverted. Likely the path that surfaces node-bus events to the host (switch state, coil ack, etc.). |
+| `0x40` | nodebus-passthrough subprotocol (cleartext path: bridge sub-cmds, see below) | varies | ✅ **sent at runtime** via `mcp_nodebus_send_raw @ 0x9166c0` — cmd byte computed as `(arg1[0] >> 7) + 0x40`, so the static-immediate scan that called it "dead" missed it. Senders include `mcp_nodebus_query_bridge_status` (sub-cmd 0x05) and `mcp_nodebus_factory_test_trap` (sub-cmd 0x0c). |
+| `0x41` | node-bus query, encrypted transport — see [`NODEBUS_CIPHER.md`](NODEBUS_CIPHER.md) | varies | ✅ **sent at runtime, encrypted**, via `mcp_nodebus_send_encrypted @ 0x8ec410` → `mcp_nodebus_send_raw`. 160+ wrappers around `mcp_nodebus_send_with_retry @ 0x8ed4a0` cover every (slot, inner_cmd) pair the game sends — node firmware flashing, key fetching, normal node communication. Shim's "timeout-is-progress" still works because the senders tolerate timeouts. |
 
 ### Cmd `0x27` — LCD subprotocol
 
@@ -246,8 +263,8 @@ Tracked here so we don't lose the thread between sessions. Roughly priority-orde
 ### High value (path to "switch N was triggered")
 - [x] ~~Decompile cmd `0x41` handler~~ — DONE. In netbridge: cmd 0x41 is the node-bus wrapper; bridge transparently relays payload bytes to NODEUART while parsing the host frame, then reads back via `UART_NodeGetMessageBlock`. In the game-side dispatcher (`sub_915aa8` case 0x41): memcpys the response into the caller's per-id buffer.
 - [x] ~~Decompile `NODEBUS_Poll`~~ — DONE. Flow-control probe (binary-search of free TX buffer space), not switch state.
-- [x] ~~Find game-side cmd `0x41` senders~~ — **DONE — surprising negative result.** A full-binary scan for `mov w0, #0x41` followed within 20 instructions by `bl send_bridge_message_with_response (0x9164a0)` returned **zero matches**. Same for cmd `0x40`. In this game build, **the node-bus passthrough wrapper is never sent**; cases 0x40/0x41 in both the netbridge firmware and the game-side dispatcher are dead code paths.
-- [ ] **New direction: find the actual switch-state update path.** Since cmd 0x41 is dead, switch state must flow through a different cmd. Reference points:
+- [x] ~~Find game-side cmd `0x41` senders~~ — **DONE.** ~~Surprising negative result~~ — that conclusion was **wrong**. The static `mov w0, #0x41` immediate scan missed the senders because the cmd byte is **runtime-computed**: `mcp_nodebus_send_raw @ 0x9166c0` builds it as `(arg1[0] >> 7) + 0x40`. The actual sender chain is `mcp_nodebus_send_encrypted @ 0x8ec410` → `mcp_nodebus_send_raw @ 0x9166c0` → `send_bridge_message_with_response @ 0x9164a0`. The encrypted path has 160+ templated callers via `mcp_nodebus_send_with_retry @ 0x8ed4a0`, including the node firmware flasher (`mcp_nodebus_flash_node_firmware @ 0x8f5484`) and the per-slot cipher-key fetchers (`mcp_nodebus_fetch_key_basic/_with_serial/_two_probes`). See [`NODEBUS_CIPHER.md`](NODEBUS_CIPHER.md).
+- [ ] **Switch-state update path** — Now that we know cmd 0x41 IS the live encrypted node-bus channel, switch state may travel here. Trace the response side: where do callers of `mcp_nodebus_send_with_retry` write into `g_switch_state_array @ 0x4480220`? Original reference points still apply for the writer hunt in the `0x650xxx` "switch driver" cluster.
   - Switch state lives at `g_switch_state_array @ 0x4480220` (BN-named); 40+ xrefs all in `0x650xxx` (the "switch driver" cluster).
   - `read_switch_state @ 0x650884` is a pure reader (`*(arr + sw*0x30 + 0x28)`); we need the WRITER.
   - The writer is presumably called from a polling loop that reads bridge responses out of a per-id buffer (`data_450e650[id]`) and decodes them into individual switch slots.
@@ -290,11 +307,11 @@ Cmds with `mov w0, #N` callsites in `0x916xxx-0x919xxx` (the bridge-caller clust
 | 0x2f | 1 | |
 | 0x30 | 1 | (bridge firmware CRC) |
 | 0x31 | 1 | |
-| **0x40** | **0** | **DEAD in this build** |
-| **0x41** | **0** | **DEAD in this build** |
+| **0x40** | **runtime** | ✅ live — cmd byte built dynamically by `mcp_nodebus_send_raw`, missed by static-immediate scan |
+| **0x41** | **runtime** | ✅ live — same path, encrypted; see `NODEBUS_CIPHER.md` |
 
 **Implications for the shim:**
-- Don't try to handle cmd 0x40/0x41 — they're never sent.
+- Cmd 0x40/0x41 ARE sent (corrected). The shim's current "timeout-is-progress" path still works because the encrypted senders tolerate timeouts, but properly handling them is a follow-up — see `NODEBUS_CIPHER.md` for the wire format and the cipher recipe.
 - The "timeout-is-progress" theory definitively holds for cmds outside the game's static-load set; for cmds inside it (28 of the 33 dispatchable values) the response shape matters and the shim does have engineered handlers for the 9 actually-observed ones.
 - "Switch 57 was triggered" goes through a non-0x41 path. Best lead: trace the writer side of `g_switch_state_array` in the `0x650xxx` cluster.
 
@@ -307,7 +324,7 @@ Cmds with `mov w0, #N` callsites in `0x916xxx-0x919xxx` (the bridge-caller clust
 - [ ] **Implement unsolicited boot `0x22` notification** at shim init. Mimics the bridge's "I just rebooted, here's why" message that the host expects on first connection. May matter for a feature path we haven't reached.
 - [ ] **Decompile what `POWERDIST_SendCmd` would produce for `0x11`/`0x16`/`0x18`/`0x1c`/`0x1d` response-wise.** The bridge forwards transparently to the powerdist board; we'd need a powerdist firmware dump (not currently in this repo) to know its replies. Game seems happy with current ACK shapes — only chase if we find a feature that needs powerdist-shaped data.
 - [x] ~~**Spec out cmd `0x40 / 0x0d` NODEBUS_Hash usage** in the game.~~ **Resolved (Step 65, 2026-04-27).** The polynomial is **not** inlined in the Pokemon LE 0.81 game binary in any form we can detect: zero co-located `LSL #15` + `SUB` shift-pair signatures, zero `SUB Wd, Wn, Wn, LSL #15` self-shifts, only one `SUB-LSL-#11` self-shift (in an unrelated audio saturation routine `sub_1042214`). Combined with the existing static-cmd-byte negative result for cmd `0x40` senders, this game build does **not** call the bridge's NODEBUS_Hash and does **not** compute the polynomial on the CPU side either. The hash machinery is effectively dormant in this title. (Side note: the doc's stated polynomial constants were also wrong — see polynomial subsection above.)
-- [ ] **Identify the cmd `0x40 / 0x0c` infinite-loop test path** — bridge enters an infinite loop here. Probably intentional (factory test); make sure we never trigger it from the shim.
+- [x] ~~**Identify the cmd `0x40 / 0x0c` infinite-loop test path**~~ — **Resolved.** Caller is `mcp_nodebus_factory_test_trap @ 0x8f5f4c`; sends frame `{0x0c, 0x00, 0x00}` (cleartext, no response expected). Should be guarded by a factory-mode predicate before being relied on as benign — verify before any new shim work that hooks cmd 0x40.
 - [ ] **Implement async `0x2D` flow-control notification** if/when XOFF backpressure becomes relevant. Currently the shim sends responses synchronously and uses unbounded buffers, so flow control isn't observed.
 
 ## Sources
@@ -322,4 +339,5 @@ Cmds with `mov w0, #N` callsites in `0x916xxx-0x919xxx` (the bridge-caller clust
 - 2026-04-27 — Initial draft. Captured full dispatch matrix from `HOST_Update`, `POWERDIST_SendCmd` passthrough behavior, `POWERDIST_IsSpike3` predicate, NODEBUS_Hash mechanism. Open TODOs queued.
 - 2026-04-27 — Reconciled shim coverage status — earlier "9 cmds unsynthesized" claim was wrong; all 9 game-observed cmds are handled with carefully-engineered shapes that target game-side poll loops. Added async (unsolicited) notification table (`0x22` boot, `0x2D` flow control). Added two specific divergences: `0x20` reply uses response cmd `0x10` (suspicious), `0x25`/`0x41` silent-ACK was tried + reverted.
 - 2026-04-27 — **Cracked cmd `0x41` semantics.** It's the node-bus wrapper: `HOSTUART_GetMessage` parses host frames inline and transparently relays payload bytes to `NODEUART_Write` when cmd is `0x41`. Bridge is just a UART relay for node-bus traffic; switch/coil/sensor encodings live in the node-MCU firmware. `NODEBUS_Poll` is a flow-control probe, not a switch-state query.
-- 2026-04-27 — **Surprising negative result: game never sends cmd `0x40` or `0x41`.** Full-binary scan: zero `mov w0, #0x40/#0x41` instructions immediately followed by `bl send_bridge_message_with_response`. The node-bus wrapper exists in both the netbridge firmware AND the game-side dispatcher, but is unused in this game build. Switch state must flow through a different cmd. New investigation direction: trace writers of `g_switch_state_array @ 0x4480220` (40+ xrefs in the `0x650xxx` "switch driver" cluster) backward to identify the actual update channel. Catalogued all 28 cmds the game does send via static loads.
+- 2026-04-27 — ~~Surprising negative result: game never sends cmd `0x40` or `0x41`.~~ **SUPERSEDED — see entry below.** Original conclusion based on a static `mov w0, #0x4{0,1}` immediate scan; it missed the senders because the cmd byte is runtime-computed.
+- 2026-04-27 — **Cmd 0x40 and 0x41 are alive — encrypted nodebus channel discovered.** `mcp_nodebus_send_raw @ 0x9166c0` builds the cmd byte as `(arg1[0] >> 7) + 0x40`, so 0x40 (cleartext) or 0x41 (encrypted node-bus traffic) depending on the high bit of the input frame. The encrypted side is gated by `mcp_nodebus_send_encrypted @ 0x8ec410` which stream-ciphers the payload with per-slot 16-byte keys at `mcp_nodebus_cipher_keys @ 0x44fcfb8` (32 slots × 16 bytes), an alternating-parity header-derived mask, and a sum checksum. **Keys are fetched from each node at runtime via inner cmd 0xfc** (after a 12-byte preamble query via inner cmd 0xfd) — at boot the table is zero, so the very first key-fetch goes out with effective key=0 (cipher reduces to position-mask XOR), and the response key bytes travel cleartext on the wire. The cipher is outbound-only as far as we can see. Per-slot bookkeeping at `mcp_nodebus_per_slot_status @ 0x44fce38` (12-byte stride × 32) and `mcp_nodebus_send_counters @ 0x44fd1c0` (4-byte stride × 32). The encrypted channel is used for the node firmware flasher (`mcp_nodebus_flash_node_firmware @ 0x8f5484`) and 160+ other (slot, inner_cmd) wrappers. Full algorithm and hunting checklist in [`NODEBUS_CIPHER.md`](NODEBUS_CIPHER.md).
