@@ -587,6 +587,7 @@ static void *shim_vp_patch_thread(void *arg) {
     shim_patch_spi_video_vtable();
     shim_patch_get_format_callback();
     shim_patch_audio_driver_vtable();
+
     return NULL;
 }
 

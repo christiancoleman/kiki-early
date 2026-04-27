@@ -71,6 +71,7 @@ PATCH_SPI_VIDEO="${PATCH_SPI_VIDEO:-1}"
 SW_HEVC="${SW_HEVC:-1}"
 PATCH_AUDIO_ABRT="${PATCH_AUDIO_ABRT:-1}"
 STATE_BRIDGE="${STATE_BRIDGE:-0}"
+OFFLINE_MODE="${OFFLINE_MODE:-1}"
 VIEWER="${VIEWER:-1}"
 VIEWER_FULLSCREEN="${VIEWER_FULLSCREEN:-0}"
 AUDIO_PLAYER="${AUDIO_PLAYER:-1}"
@@ -321,6 +322,7 @@ fi
 [[ "$SW_HEVC"          == "1" ]] && args+=(-E "SPIKE3_SW_HEVC=1")
 [[ "$PATCH_AUDIO_ABRT" == "1" ]] && args+=(-E "SPIKE3_PATCH_AUDIO_ABRT=1")
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")
+[[ "$OFFLINE_MODE"    == "1" ]] && args+=(-E "SPIKE3_OFFLINE=1")
 
 # Append any caller-supplied flags (post --debug-strip) and the game binary last.
 args+=("${POSITIONAL[@]+"${POSITIONAL[@]}"}" ./game)
