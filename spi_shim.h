@@ -9,9 +9,10 @@
 #ifndef SPI_SHIM_H
 #define SPI_SHIM_H
 
-#include <stdio.h>     /* fprintf, stderr — for SHIM_LOG */
+#include <stdio.h>     /* snprintf — for SHIM_LOG */
 #include <stddef.h>    /* size_t */
 #include <stdint.h>    /* uintptr_t, uint32_t, uint8_t */
+#include <unistd.h>    /* write, STDERR_FILENO — for SHIM_LOG single-syscall path */
 #include <dlfcn.h>     /* dlsym, RTLD_NEXT — for FWD_* */
 #include <signal.h>    /* sig_atomic_t, siginfo_t — for handler decls below */
 #include <setjmp.h>    /* sigjmp_buf */
@@ -164,8 +165,33 @@ void shim_patch_audio_driver_vtable(void);
  * from shim_install_crash_handler at __attribute__((constructor)) time. */
 void shim_inject_start(void);
 
-/* Uniform log prefix so shim output is trivially grep-filterable. */
-#define SHIM_LOG(fmt, ...) fprintf(stderr, "[shim] " fmt "\n", ##__VA_ARGS__)
+/* Uniform log prefix so shim output is trivially grep-filterable.
+ *
+ * Atomicity: builds the whole line into a stack buffer and ships it to
+ * STDERR_FILENO with one write() syscall. Without this, fprintf() on
+ * unbuffered stderr issues a write() per format chunk, so concurrent
+ * threads can interleave (we've seen one log line spliced into the
+ * middle of another). For lines under PIPE_BUF (4096 on Linux) a
+ * single write() is atomic against pipes/sockets/terminals; for
+ * regular files atomicity isn't guaranteed by POSIX but is observed
+ * in practice for sub-page writes.
+ *
+ * The 1024-byte buffer is generous for any current call site; lines
+ * that would exceed it are truncated rather than split — preserving
+ * line atomicity. Subprocess stderr (e.g. from system() calls) still
+ * interleaves; that's outside our control.
+ */
+#define SHIM_LOG(fmt, ...) do {                                              \
+    char _shim_log_buf[1024];                                                \
+    int  _shim_log_n = snprintf(_shim_log_buf, sizeof(_shim_log_buf),        \
+                                "[shim] " fmt "\n", ##__VA_ARGS__);          \
+    if (_shim_log_n > 0) {                                                   \
+        size_t _shim_log_w = (size_t)_shim_log_n < sizeof(_shim_log_buf)     \
+                             ? (size_t)_shim_log_n                            \
+                             : sizeof(_shim_log_buf) - 1;                     \
+        (void)write(STDERR_FILENO, _shim_log_buf, _shim_log_w);              \
+    }                                                                        \
+} while (0)
 
 /* FWD_RET(RET, FN, SIG, CALL) — return-typed forward.
  * FWD_VOID(FN, SIG, CALL)     — void forward.

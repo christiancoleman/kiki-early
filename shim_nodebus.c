@@ -147,10 +147,20 @@ static int bridge_encode_escape(const uint8_t *logical, size_t logical_len,
 static void bridge_send_response(const uint8_t *resp, size_t resp_len,
                                  uint8_t req_cmd, uint8_t id) {
     if (uart_shim_fd < 0) return;
-    fprintf(stderr, "[shim] bridge RESP to cmd=0x%02x id=0x%02x (%zu logical bytes):",
-            req_cmd, id, resp_len);
-    for (size_t i = 0; i < resp_len; i++) fprintf(stderr, " %02x", resp[i]);
-    fprintf(stderr, "\n");
+    /* Build the response log into a single buffer + one write() so it
+     * stays atomic against concurrent SHIM_LOG calls from other threads. */
+    {
+        char line[512];
+        int n = snprintf(line, sizeof(line),
+                         "[shim] bridge RESP to cmd=0x%02x id=0x%02x (%zu logical bytes):",
+                         req_cmd, id, resp_len);
+        for (size_t i = 0; i < resp_len && n < (int)sizeof(line); i++)
+            n += snprintf(line + n, sizeof(line) - n, " %02x", resp[i]);
+        if (n < (int)sizeof(line))
+            n += snprintf(line + n, sizeof(line) - n, "\n");
+        if (n > (int)sizeof(line)) n = (int)sizeof(line);
+        (void)write(STDERR_FILENO, line, (size_t)n);
+    }
     uint8_t wire[64];
     int wire_len = bridge_encode_escape(resp, resp_len, wire, sizeof(wire));
     if (wire_len < 0) {
@@ -158,9 +168,15 @@ static void bridge_send_response(const uint8_t *resp, size_t resp_len,
         return;
     }
     if ((size_t)wire_len != resp_len) {
-        fprintf(stderr, "[shim]   (escape-encoded to %d bytes:", wire_len);
-        for (int i = 0; i < wire_len; i++) fprintf(stderr, " %02x", wire[i]);
-        fprintf(stderr, ")\n");
+        char line[512];
+        int n = snprintf(line, sizeof(line),
+                         "[shim]   (escape-encoded to %d bytes:", wire_len);
+        for (int i = 0; i < wire_len && n < (int)sizeof(line); i++)
+            n += snprintf(line + n, sizeof(line) - n, " %02x", wire[i]);
+        if (n < (int)sizeof(line))
+            n += snprintf(line + n, sizeof(line) - n, ")\n");
+        if (n > (int)sizeof(line)) n = (int)sizeof(line);
+        (void)write(STDERR_FILENO, line, (size_t)n);
     }
     ssize_t n = real_write(uart_shim_fd, wire, wire_len);
     if (n < 0) SHIM_LOG("bridge: real_write response failed: %s", strerror(errno));

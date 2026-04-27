@@ -289,16 +289,26 @@ int ioctl(int fd, unsigned long request, ...) {
             int is_sample = (spi_transfer_count <= 20) ||
                             (spi_transfer_count % 1000 == 0);
             if (is_first_of_cmd || is_sample) {
-                fprintf(stderr, "[shim] SPI #%u cmd=0x%02x%s  TX:",
-                        spi_transfer_count, cmd,
-                        spi_rx_override_len[cmd] > 0 ? " (override)" : "");
-                for (uint32_t i = 0; i < len && i < 16; i++)
-                    fprintf(stderr, " %02x", tx[i]);
-                fprintf(stderr, "  RX:");
-                for (uint32_t i = 0; i < len && i < 16; i++)
-                    fprintf(stderr, " %02x", rx ? rx[i] : 0);
-                if (is_first_of_cmd) fprintf(stderr, "  [FIRST]");
-                fprintf(stderr, "\n");
+                /* Build the whole line in one buffer + single write() so
+                 * concurrent threads (e.g. I2C ioctls firing from another
+                 * thread) can't splice into the middle of an SPI log. */
+                char line[256];
+                int n = snprintf(line, sizeof(line),
+                                 "[shim] SPI #%u cmd=0x%02x%s  TX:",
+                                 spi_transfer_count, cmd,
+                                 spi_rx_override_len[cmd] > 0 ? " (override)" : "");
+                for (uint32_t i = 0; i < len && i < 16 && n < (int)sizeof(line); i++)
+                    n += snprintf(line + n, sizeof(line) - n, " %02x", tx[i]);
+                if (n < (int)sizeof(line))
+                    n += snprintf(line + n, sizeof(line) - n, "  RX:");
+                for (uint32_t i = 0; i < len && i < 16 && n < (int)sizeof(line); i++)
+                    n += snprintf(line + n, sizeof(line) - n, " %02x", rx ? rx[i] : 0);
+                if (is_first_of_cmd && n < (int)sizeof(line))
+                    n += snprintf(line + n, sizeof(line) - n, "  [FIRST]");
+                if (n < (int)sizeof(line))
+                    n += snprintf(line + n, sizeof(line) - n, "\n");
+                if (n > (int)sizeof(line)) n = (int)sizeof(line);
+                (void)write(STDERR_FILENO, line, (size_t)n);
             }
             return 0;
         }
