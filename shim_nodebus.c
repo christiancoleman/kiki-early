@@ -45,6 +45,22 @@ extern int uart_shim_fd;
 typedef ssize_t (*real_write_t)(int, const void *, size_t);
 extern real_write_t real_write;
 
+/* Per-slot 16-byte cipher key blocks for the encrypted cmd-0x41 channel.
+ * Mirrors the game binary's mcp_nodebus_cipher_keys @ 0x44fcfb8 (32 slots ×
+ * 16 bytes). Zero at init = the boot state. The shim doesn't synthesize
+ * responses to the key-fetch commands (inner cmds 0xfc / 0xfd / 0xf9), so the
+ * game's per-slot keys also stay zero — meaning every cmd-0x41 frame the
+ * game emits is encrypted under a zero key block. We reproduce that here so
+ * decryption matches.
+ *
+ * Algorithm and full RE notes: docs/NODEBUS_CIPHER.md.
+ *
+ * If we ever start synthesizing key-fetch responses, this table is where we
+ * record the (fake) key bytes we hand out, so subsequent traffic decrypts
+ * with those keys instead.
+ */
+static uint8_t nodebus_cipher_keys[32][16] = {{0}};
+
 /* ========== moved from spi_shim.c (3898-4232): netbridge protocol: CRC32 + checksum + escape codec + send_response + synthesize_bridge_response ========== */
 /* ---- Bridge protocol response synthesis ----
  *
@@ -142,6 +158,29 @@ static int bridge_encode_escape(const uint8_t *logical, size_t logical_len,
     if (o + 1 > out_cap) return -1;
     out[o++] = 0x03;
     return (int)o;
+}
+
+/* Decrypt the inner_cmd + payload portion of a cmd-0x41 frame in place.
+ *
+ * Mirrors mcp_nodebus_send_encrypted's encryption loop in the game binary
+ * (sub_8ec410, the "high bit set" path, BN HLIL line 0x8ec5dc). The cipher
+ * is involutive (XOR with key + alternating mask), so the same operation
+ * undoes encryption.
+ *
+ * `slot` is arg1[0] & 0x1F from the cipher frame. `inner_len` is the cipher
+ * frame's arg1[1] (count of bytes to encrypt: inner_cmd + payload). `buf`
+ * points at the first encrypted byte (inner_cmd), and is overwritten with
+ * the decrypted bytes.
+ *
+ * See docs/NODEBUS_CIPHER.md § 1.2 for the algorithm.
+ */
+static void nodebus_cipher_decrypt(uint8_t slot, uint8_t inner_len, uint8_t *buf) {
+    uint8_t mask = (uint8_t)(((slot & 0x1F) << 4) | ((inner_len + 1) & 0x0F));
+    for (int i = 0; i < inner_len; i++) {
+        uint8_t k_table = nodebus_cipher_keys[slot & 0x1F][i & 0x0F];
+        uint8_t k_mask  = (i & 1) ? (uint8_t)(~mask) : mask;
+        buf[i] ^= (uint8_t)(k_table ^ k_mask);
+    }
 }
 
 static void bridge_send_response(const uint8_t *resp, size_t resp_len,
@@ -391,7 +430,97 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
      * payload contract unknown. Resolving it properly needs a BN dig we
      * don't want to spend budget on today. For now: let the timeout fire,
      * memcpy NULL-guard catches the downstream PopupMenu SEGV.
+     *
+     * Step 67 update: cmd 0x40 / 0x41 senders identified. Cmd 0x41 is the
+     * encrypted node-bus channel (sub_8ec410 → sub_9166c0); cmd byte is
+     * runtime-computed. We don't synthesize responses, but we DO decrypt the
+     * outbound payload here for visibility — see cases below + NODEBUS_CIPHER.md.
      */
+    case 0x40: {
+        /* Cleartext bridge sub-protocol. payload[0] is the sub-cmd byte.
+         * Today known: 0x05 = snapshot+clear bridgeStatus,
+         *              0x0c = factory test trap (NEVER respond — bridge enters
+         *              an infinite loop intentionally),
+         *              0x0d = NODEBUS_Hash (not currently sent by this game).
+         * No synthetic response — game tolerates the timeout (Step 45 lesson).
+         */
+        if (req_len >= 5) {
+            uint8_t sub = req[3];
+            SHIM_LOG("bridge: cmd 0x40 sub_cmd=0x%02x payload_len=%d (no synth response)",
+                     sub, req_len - 5);
+        } else {
+            SHIM_LOG("bridge: cmd 0x40 (req too short, no sub-cmd byte)");
+        }
+        return;
+    }
+    case 0x41: {
+        /* Encrypted node-bus channel. Decrypt inner_cmd + payload for log
+         * visibility. We still don't synthesize a response — keys-stay-zero
+         * boot state (Step 45 lesson stands).
+         *
+         * Bridge frame layout after escape decode:
+         *   req[0]=STX  req[1]=cmd  req[2]=id
+         *   req[3..req_len-3] = bridge payload (= cipher frame)
+         *   req[req_len-2]=bridge-csum  req[req_len-1]=ETX
+         *
+         * Cipher frame layout inside that bridge payload:
+         *   payload[0]            = (slot & 0x1F) | 0x80
+         *   payload[1]            = inner_len  (count of bytes after this)
+         *   payload[2..2+ilen-1]  = encrypted bytes (inner_cmd then payload)
+         *   payload[2+inner_len]  = cipher sum-checksum
+         */
+        if (req_len < 6 /* STX cmd id slot ilen ETX is the bare minimum */) {
+            SHIM_LOG("bridge: cmd 0x41 frame too short (req_len=%d)", req_len);
+            return;
+        }
+        const uint8_t *payload = &req[3];
+        int payload_len = req_len - 5;  /* minus STX, cmd, id, csum, ETX */
+        if (payload_len < 3) {
+            SHIM_LOG("bridge: cmd 0x41 payload too short (%d bytes)", payload_len);
+            return;
+        }
+        uint8_t slot_byte = payload[0];
+        uint8_t slot      = slot_byte & 0x1F;
+        int     enc_flag  = (slot_byte & 0x80) ? 1 : 0;
+        uint8_t inner_len = payload[1];
+        if (2 + (int)inner_len + 1 > payload_len) {
+            SHIM_LOG("bridge: cmd 0x41 slot=%u inner_len=%u doesn't fit in payload (%d)",
+                     slot, inner_len, payload_len);
+            return;
+        }
+        if (inner_len == 0) {
+            /* Special: zero-length inner means this is a 1-byte zero-ping
+             * (sub_8ec410 first branch). Should never carry the encrypt flag,
+             * but log it cleanly either way. */
+            SHIM_LOG("bridge: cmd 0x41 slot=%u zero-ping (no inner_cmd)", slot);
+            return;
+        }
+        uint8_t scratch[64];
+        if (inner_len > sizeof(scratch)) {
+            SHIM_LOG("bridge: cmd 0x41 slot=%u inner_len=%u exceeds scratch buffer",
+                     slot, inner_len);
+            return;
+        }
+        memcpy(scratch, &payload[2], inner_len);
+        if (enc_flag) {
+            nodebus_cipher_decrypt(slot, inner_len, scratch);
+        }
+        /* scratch[0] = decoded inner_cmd, scratch[1..inner_len-1] = decoded payload bytes */
+        char line[512];
+        int n = snprintf(line, sizeof(line),
+                         "[shim] bridge: cmd 0x41 slot=%u %s inner_cmd=0x%02x payload=[",
+                         slot, enc_flag ? "ENC" : "CLR", scratch[0]);
+        for (int i = 1; i < inner_len && n < (int)sizeof(line) - 4; i++)
+            n += snprintf(line + n, sizeof(line) - n,
+                          (i == 1 ? "%02x" : " %02x"), scratch[i]);
+        if (n < (int)sizeof(line) - 2) {
+            line[n++] = ']';
+            line[n++] = '\n';
+        }
+        if (n > (int)sizeof(line)) n = (int)sizeof(line);
+        (void)write(STDERR_FILENO, line, (size_t)n);
+        return;
+    }
     default:
         SHIM_LOG("bridge: no synthetic response for cmd 0x%02x", cmd);
         return;

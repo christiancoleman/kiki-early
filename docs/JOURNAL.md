@@ -5535,3 +5535,59 @@ Layout fully resolved by `mcp_nodebus_reset_all_slots @ 0x8f61f0` (single functi
 - New standalone reference: `_emulation/docs/NODEBUS_CIPHER.md` (~340 lines: algorithm, wire frame, Python impl, hunting checklist for other Spike 3 builds, open questions).
 - `BRIDGE_PROTOCOL.md` updated in 8 places to retract the "cmd 0x40/0x41 dead code" claim with cross-references to `NODEBUS_CIPHER.md`. Step 48's "surprising negative result" entry marked superseded.
 - Memory: new `polynomial_nodebus_hash.md` correction note + new `project_nodebus_cipher.md`; `reference_nodebus_protocol.md` cmd-0x41 entry updated.
+
+
+## Step 67: cipher decoder in shim — boot-time traffic decoded, surface narrowed (2026-04-27)
+
+**Plan.** Phase 1–5 of "Cipher-aware shim logging for cmd 0x41" (`/home/c/.claude/plans/proud-snacking-rocket.md`).
+
+**Finding ahead of the shim work.** `runs/latest/game.log` at the start of this step had the cmd-0x41 frames I wanted to validate against, but every frame was *truncated mid-write* — the existing UART-byte logger interleaves with the SPI logger without an atomic newline, so the bytes never make it into the log. Sample line:
+
+```
+[shim] UART write #13 (11 bytes): 02 41 00 80[shim] SPI #12427000 cmd=0x6c TX: ...
+```
+
+"11 bytes" claimed, only 4 actually printed before SPI thread squeezed in. The SHIM_LOG macro is atomic but the byte logger isn't going through it. Phase 1 (validating cipher against existing log) was therefore impossible — the existing log is corrupted by interleaving. **Skipped to Phase 2.** Side note: this is a separate bug worth fixing in `shim_io.c`, but out of scope for this plan.
+
+**Phase 2: cipher decoder in `shim_nodebus.c`.** Single-file change. Added:
+- `static uint8_t nodebus_cipher_keys[32][16] = {{0}};` mirroring the game's BSS state (zero at init = matches what the game has, since shim never returns key fetches).
+- `static void nodebus_cipher_decrypt(slot, inner_len, buf)` mirroring `mcp_nodebus_send_encrypted`'s loop byte-for-byte (cipher is involutive — same XOR undoes encryption).
+- `case 0x41:` in `synthesize_bridge_response()` — parses cipher frame from bridge payload, decrypts, logs `slot / inner_cmd / payload` via a single atomic `write(STDERR_FILENO, line, n)` call. Still no synthetic response (timeout-is-progress preserved per Step 45 lesson).
+- `case 0x40:` ditto for cleartext bridge sub-cmds (now logs sub-cmd byte and payload length).
+
+Build clean: `spi_shim.so` 231,728 bytes (was ~231 KB).
+
+**Phase 3: capture.** `TIMEOUT=185 VIEWER=0 AUDIO_PLAYER=0 service_s_worker=0 ./run_game.sh --debug`. Game ran ~185 s, exited with status 4 (the expected Pokemon-logo FATAL ERROR — same blocker as before, no regression). New `runs/latest/game.log` is 40,231 lines / 3.5 MB. **29 cleanly decoded `bridge: cmd 0x41 ...` lines.** Zero cmd-0x40 frames in this run.
+
+**Decoded boot traffic — 4 unique (slot, inner_cmd) pairs out of 160+ wrappers:**
+
+| slot | inner_cmd | count | payloads |
+|---:|---|---:|---|
+| 0 | `0xf2` | 1 | `[71]` (one-shot, very first cmd-0x41 frame) |
+| 0 | `0xf4` | 3 | `[d9 6f]`, `[ea 78]`, `[d9 6f]` |
+| 1 | `0xed` | 17 | `[93]` (poll loop) |
+| 1 | `0xee` | 8 | `[ea 95]` (paired with the `0xed` poll) |
+
+Slots 2–31 saw no traffic. Key-fetch family (`0xfc / 0xfd / 0xf9`) did NOT fire — the game must skip provisioning when the bridge is timing out, or sequence those after some other prerequisite the shim doesn't satisfy.
+
+**Cipher recipe is end-to-end correct.** The very first frame the game emitted (`slot=0 inner_cmd=0xf2 payload=[71]`) was independently predictable from the cipher recipe before this run, and the live capture matches byte-for-byte. Confirms encryption HLIL → C decoder → live capture chain.
+
+**Phase 5 documentation.** Added `NODEBUS_CIPHER.md § 3.5 ("Decoded boot-time traffic")` summarizing the table above; updated `§ 7 ("What we have NOT figured out")` to note that all 4 observed inner cmds fall in the bit-`0x40` OR-gating range (likely relevant) and that key-fetch family didn't fire under current shim conditions. JOURNAL: this entry.
+
+**What this unlocks.**
+- Encrypted nodebus traffic is no longer opaque — every cmd-0x41 frame the game sends is logged decoded.
+- The 160-wrapper RE surface is narrowed to 4 wrappers that actually fire at boot. Targeted RE on those is now tractable.
+- Phase 4 decision is open: either chase those 4 wrappers in BN to learn what they semantically do (deeper RE), or extend the shim with synthesized key-fetch responses to advance past the timeout-is-progress phase and see what new traffic surfaces. User-side decision.
+
+**Open / unverified.**
+- Why no key-fetch traffic (`0xfc / 0xfd / 0xf9`)? Possibilities: (a) game sequences key fetches after bridge handshake handlers we currently respond to, and our partial responses make it skip the fetch entirely; (b) key fetches go through a separate path we didn't tag; (c) the encrypted-path entry only fires for nodes that already finished an unencrypted handshake the shim isn't simulating. Worth tracing in BN.
+- The 4 active wrappers' semantics (inner cmds 0xed/0xee/0xf2/0xf4) — name and purpose of each.
+- Fixing the SHIM_LOG byte-logger interleaving in `shim_io.c` is a parallel cleanup item.
+
+**Artifacts produced.**
+- `shim_nodebus.c` — cipher decoder + cmd-0x40/0x41 logging cases (~80 lines added).
+- `NODEBUS_CIPHER.md § 3.5 / § 7` updates.
+- This entry.
+
+No memory updates this round.
+
