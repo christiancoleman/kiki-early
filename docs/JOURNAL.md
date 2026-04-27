@@ -580,13 +580,13 @@ Coming out of Step 13 we had one open mystery — `TCSETS` was never issued on t
 
 **Decision — pause patching, confirm the binary.** Rather than spend cycles verifying each Sidekick claim via objdump, ask the user to run `sha256sum` on both sides (theirs via BN's Python console using `bv.file.raw`, ours on the repo file). If hashes matched, something subtler was happening.
 
-**What we found.** Same hash (`7eaae301bb4491652adb38a84c5d7c3cf8a85071ab9630b299c3f50b47724eaa`), same 71,349,568-byte file. The discrepancy was entirely that **Binary Ninja rebases PIE binaries by +0x400000**, so every address Sidekick cites is `file_offset + 0x400000`. My objdump uses natural ELF VAs (which equal file offsets for this binary). Once we subtracted 0x400000 from Sidekick's addresses, bytes matched perfectly at all four spot-checks. Sidekick's analysis had been correct all along.
+**What we found.** Same hash (`7eaae301bb4491652adb38a84c5d7c3cf8a85071ab9630b299c3f50b47724eaa`), same 71,349,568-byte file. Sidekick's analysis had been correct all along — at the time, Binary Ninja's PIE loader was rebasing the binary so its VAs ran ahead of the file offsets. The BN database has since been rebased to base 0x0; today BN VA == ELF VA == file offset and no translation is required.
 
-**Address translation rule for future sessions:** `file_offset = BN_VA − 0x400000`. Keeping a translation table in Step 14.1 below.
+**Address convention going forward:** BN VA == ELF VA == file offset for this binary. Runtime address is `game_base + va`. The translation table in Step 14.1 still lists the original pre-rebase BN VAs alongside today's values for reference.
 
 ### 14.1: Address translation table
 
-| Symbol (Sidekick name) | BN VA | File offset / natural VA |
+| Symbol (Sidekick name) | BN VA (pre-rebase, historical) | ELF VA / current BN VA |
 |---|---|---|
 | `main` | 0x861270 | 0x461270 |
 | `sub_a78bc0` | 0xa78bc0 | 0x678bc0 |
@@ -766,9 +766,9 @@ b.ls 0x915e00            ; dispatch ONLY if (cmd-0x10) u<= 0x31
 
 ### 16.1: The binary-address confusion episode (and what we learned)
 
-Before landing on the above, we spent a detour verifying Sidekick's addresses. Sidekick claimed specific bytes at `0xd15aa8` / `0xcf7c10` that didn't match what my objdump showed at those file offsets. Hash comparison proved we were both looking at the same binary (`7eaae301...`, 71349568 bytes). The discrepancy was entirely **Binary Ninja rebasing PIE binaries by +0x400000**. Once I subtracted 0x400000 from BN VAs to get file offsets, everything matched.
+Before landing on the above, we spent a detour verifying Sidekick's addresses. Sidekick claimed specific bytes at `0xd15aa8` / `0xcf7c10` that didn't match what my objdump showed at those file offsets. Hash comparison proved we were both looking at the same binary (`7eaae301...`, 71349568 bytes). The cause was that BN's PIE loader was rebasing the binary at the time, so its VAs ran ahead of the file offsets. The BN database has since been rebased to base 0x0; today BN VA == ELF VA == file offset and no translation is needed.
 
-**Convention going forward:** when talking to Sidekick or using BN's Python console, use BN VAs. When doing our own objdump / shim work, use file offsets. `file_offset = BN_VA − 0x400000`. (Full translation table in Step 14.1.)
+**Convention going forward:** BN VA == ELF VA == file offset. Use the same address everywhere.
 
 ### 16.2: Shim changes in this session
 
@@ -848,9 +848,9 @@ The bridge is the **single hardest gate** between "binary loads" and "game logic
 
 Past this gate the character of the work changes. Today was protocol RE and byte-level shim bug fixing. Next it becomes library stubbing (libEGL, libdrm, gstreamer) — different tooling, but the kind of work Researcher A has already proven viable.
 
-### Address translation rule (Binary Ninja ↔ our tools)
-`file_offset = BN_VA − 0x400000`
-Lookup table: Step 14.1.
+### Address convention (Binary Ninja ↔ our tools)
+BN database is rebased to base 0x0; BN VA == ELF VA == file offset.
+(Step 14.1's table lists pre-rebase BN VAs alongside today's values for reference.)
 
 ### Run command (unchanged)
 ```bash
@@ -4311,7 +4311,7 @@ uint64_t fire_event(int32_t event_id, int64_t event_data) {
 
 Five callers identified: `sub_b129f0`, `sub_bd39f0`, `sub_b16f64`, `sub_b82990`, `sub_b12760`. The switch→event translator is one of them (or an indirect). Plan-C BN query in flight.
 
-**Shim addition:** `shim_fire_event(event_id, event_data)` trampoline at `game_base + (0x9c12a0 - 0x400000)`. Relies on a new `shim_cached_game_base` atomic that any guest-thread shim hook (the `ioctl()` wrapper, specifically) primes on first invocation — needed because shim threads spawned via `pthread_create` have no game frames on their backtrace, so `shim_resolve_game_base()` would otherwise return 0 from the timer thread.
+**Shim addition:** `shim_fire_event(event_id, event_data)` trampoline at `game_base + 0x5c12a0`. Relies on a new `shim_cached_game_base` atomic that any guest-thread shim hook (the `ioctl()` wrapper, specifically) primes on first invocation — needed because shim threads spawned via `pthread_create` have no game frames on their backtrace, so `shim_resolve_game_base()` would otherwise return 0 from the timer thread.
 
 ### 52.3: switch state array layout verified
 

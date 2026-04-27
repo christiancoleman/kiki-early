@@ -45,8 +45,8 @@
  *
  * Frame addresses are runtime addresses in the guest's address space.
  * `dladdr()` resolves each frame to module + offset, so we can translate
- * to file offsets by subtracting the module base and map into Binary
- * Ninja via `BN_VA = file_offset + 0x400000` (PROTOCOL.md).
+ * to file offsets by subtracting the module base; those are also the BN
+ * VAs (the BN database is rebased to base 0x0).
  *
  * Async-signal safety: snprintf() isn't strictly async-signal-safe, but
  * in practice it doesn't take locks or allocate, and we only care about
@@ -152,9 +152,9 @@ static void shim_dump_sound_globals(void) {
     /* Find the game binary's load base at runtime by walking backtrace
      * frames for one inside ./game and subtracting its file offset.
      * QEMU user-mode + ASLR puts the game at a randomized base
-     * (~0x7ab...) rather than at ELF VA 0x400000. Filter out .so
-     * frames — the shim path contains the substring "games/" which
-     * would falsely match a bare "/game" strstr. */
+     * (~0x7ab...). Filter out .so frames — the shim path contains the
+     * substring "games/" which would falsely match a bare "/game"
+     * strstr. */
     uintptr_t game_base = 0;
     void *bt[64];
     int nb = backtrace(bt, 64);
@@ -211,7 +211,7 @@ static void shim_dump_sound_globals(void) {
                         game_base + 0x3607900, 0x40);
 
     /* Parse the g_asset_registry _Hashtable header and walk into
-     * the first few nodes. BN VA 0x48ca4d0 → ELF VA 0x44ca4d0. */
+     * the first few nodes (registry head at ELF VA 0x44ca4d0). */
     uintptr_t reg_addr = game_base + 0x44ca4d0;
     uint64_t buckets_ptr = 0, bucket_count = 0, first_node = 0;
     uint64_t element_count = 0, next_resize = 0;
@@ -263,7 +263,7 @@ static void shim_dump_sound_globals(void) {
             uint64_t node_count;       // filled after walk
             uint64_t bucket_count;
             uint64_t element_count;
-        } hdr = {{0}};
+        } hdr = {0};
         memcpy(hdr.magic, "SPK3ASR", 8);
         hdr.game_base = game_base;
         hdr.registry_va = reg_addr;
@@ -330,7 +330,7 @@ static void shim_dump_sound_globals(void) {
  *   +0xb0  timer_obj ptr
  *   +0x308 init_flag        (int — changes from 0 when mode activates)
  *
- * BN VA → runtime address = game_base + (bn_va - 0x400000).
+ * Runtime address = game_base + va.
  *
  * For 42 slots, dump (mode_id, type_flags, scene_ptr, init_flag) to give
  * us a live snapshot of the game's mode state. If static init ran
@@ -344,54 +344,54 @@ static void shim_dump_sound_globals(void) {
 
 const struct shim_cmode_entry shim_cmode_table[] = {
     /* Simple/base modes (type_flags=0x01) — 20 entries */
-    { 0x4856ae0, 0x00, 0x01, "base_00" },
-    { 0x4856be0, 0x01, 0x01, "base_01" },
-    { 0x4856ce0, 0x02, 0x01, "base_02" },
-    { 0x4856df0, 0x03, 0x01, "base_03" },
-    { 0x4856f38, 0x04, 0x01, "base_04" },
-    { 0x4856fb8, 0x05, 0x01, "base_05" },
-    { 0x4857020, 0x06, 0x01, "base_06" },
-    { 0x48570c0, 0x08, 0x01, "base_08" },
-    { 0x48571a0, 0x07, 0x01, "base_07" },
-    { 0x4857288, 0x0b, 0x01, "base_0b" },
-    { 0x4857320, 0x0a, 0x01, "base_0a" },
-    { 0x48573d0, 0x0c, 0x01, "base_0c" },
-    { 0x4857448, 0x1f, 0x01, "base_1f" },
-    { 0x48574b8, 0x0d, 0x01, "base_0d" },
-    { 0x4857548, 0x0e, 0x01, "base_0e" },
-    { 0x4857608, 0x10, 0x01, "base_10" },
-    { 0x48576f8, 0x0f, 0x01, "base_0f" },
-    { 0x4857760, 0x11, 0x01, "base_11" },
-    { 0x48577d0, 0x1e, 0x01, "base_1e" },
-    { 0x4857950, 0x12, 0x01, "base_12" },
+    { 0x4456ae0, 0x00, 0x01, "base_00" },
+    { 0x4456be0, 0x01, 0x01, "base_01" },
+    { 0x4456ce0, 0x02, 0x01, "base_02" },
+    { 0x4456df0, 0x03, 0x01, "base_03" },
+    { 0x4456f38, 0x04, 0x01, "base_04" },
+    { 0x4456fb8, 0x05, 0x01, "base_05" },
+    { 0x4457020, 0x06, 0x01, "base_06" },
+    { 0x44570c0, 0x08, 0x01, "base_08" },
+    { 0x44571a0, 0x07, 0x01, "base_07" },
+    { 0x4457288, 0x0b, 0x01, "base_0b" },
+    { 0x4457320, 0x0a, 0x01, "base_0a" },
+    { 0x44573d0, 0x0c, 0x01, "base_0c" },
+    { 0x4457448, 0x1f, 0x01, "base_1f" },
+    { 0x44574b8, 0x0d, 0x01, "base_0d" },
+    { 0x4457548, 0x0e, 0x01, "base_0e" },
+    { 0x4457608, 0x10, 0x01, "base_10" },
+    { 0x44576f8, 0x0f, 0x01, "base_0f" },
+    { 0x4457760, 0x11, 0x01, "base_11" },
+    { 0x44577d0, 0x1e, 0x01, "base_1e" },
+    { 0x4457950, 0x12, 0x01, "base_12" },
     /* type_flags=0x08 utility modes */
-    { 0x48579d0, 0x25, 0x08, "util_25" },
-    { 0x4858360, 0x24, 0x08, "util_24" },
-    { 0x4859288, 0x1c, 0x08, "util_1c" },
+    { 0x44579d0, 0x25, 0x08, "util_25" },
+    { 0x4458360, 0x24, 0x08, "util_24" },
+    { 0x4459288, 0x1c, 0x08, "util_1c" },
     /* Battle environment modes (type_flags=0x48) */
-    { 0x4857aa0, 0x20, 0x48, "battle_mountain" },
-    { 0x4857cd0, 0x21, 0x48, "battle_forest" },
-    { 0x4857f00, 0x22, 0x48, "battle_desert" },
-    { 0x4858130, 0x23, 0x48, "battle_coast" },
+    { 0x4457aa0, 0x20, 0x48, "battle_mountain" },
+    { 0x4457cd0, 0x21, 0x48, "battle_forest" },
+    { 0x4457f00, 0x22, 0x48, "battle_desert" },
+    { 0x4458130, 0x23, 0x48, "battle_coast" },
     /* Pokemon story modes (type_flags=0x28) */
-    { 0x4858480, 0x13, 0x28, "story_bulbasaur_1" },
-    { 0x48585e0, 0x14, 0x28, "story_bulbasaur_2" },
-    { 0x48586b8, 0x15, 0x28, "story_charmander_1" },  /* CONFIRMED */
-    { 0x48587f8, 0x16, 0x28, "story_charmander_2" },
-    { 0x4858900, 0x19, 0x28, "story_squirtle_1" },
-    { 0x4858a50, 0x1a, 0x28, "story_squirtle_2" },
+    { 0x4458480, 0x13, 0x28, "story_bulbasaur_1" },
+    { 0x44585e0, 0x14, 0x28, "story_bulbasaur_2" },
+    { 0x44586b8, 0x15, 0x28, "story_charmander_1" },  /* CONFIRMED */
+    { 0x44587f8, 0x16, 0x28, "story_charmander_2" },
+    { 0x4458900, 0x19, 0x28, "story_squirtle_1" },
+    { 0x4458a50, 0x1a, 0x28, "story_squirtle_2" },
     /* Pikachu modes (type_flags=0x24) */
-    { 0x4858df0, 0x17, 0x24, "pikachu_1" },
-    { 0x4858f90, 0x18, 0x24, "pikachu_2" },
+    { 0x4458df0, 0x17, 0x24, "pikachu_1" },
+    { 0x4458f90, 0x18, 0x24, "pikachu_2" },
     /* Multiball family (type_flags=0x04) */
-    { 0x4858b28, 0x09, 0x04, "mb_09" },
-    { 0x4858c80, 0x26, 0x04, "mb_26" },
-    { 0x4858d38, 0x27, 0x04, "mb_27" },
+    { 0x4458b28, 0x09, 0x04, "mb_09" },
+    { 0x4458c80, 0x26, 0x04, "mb_26" },
+    { 0x4458d38, 0x27, 0x04, "mb_27" },
     /* Multiball / wizard (type_flags=0x84) */
-    { 0x48590a0, 0x28, 0x84, "rocket_mb_1" },
-    { 0x4859160, 0x1b, 0x84, "rocket_mb_2" },
-    { 0x4859368, 0x1d, 0x84, "rocket_mb_3" },
-    { 0x4859438, 0x29, 0x84, "rocket_wizard" },
+    { 0x44590a0, 0x28, 0x84, "rocket_mb_1" },
+    { 0x4459160, 0x1b, 0x84, "rocket_mb_2" },
+    { 0x4459368, 0x1d, 0x84, "rocket_mb_3" },
+    { 0x4459438, 0x29, 0x84, "rocket_wizard" },
 };
 /* Companion count — external TUs (shim_bridges.c) can't sizeof an extern array. */
 const size_t shim_cmode_table_count =
@@ -432,7 +432,7 @@ static void shim_dump_cmodes(void) {
     }
 
     const char *hdr = "\n--- cmode state dump (42 entries from _INIT_74) ---\n"
-                      "slot  bn_va        rt_va            mode_id  type_flags  "
+                      "slot  va        rt_va            mode_id  type_flags  "
                       "scene_ptr        init_flag  name\n";
     ssize_t u = write(STDERR_FILENO, hdr, strlen(hdr));
     (void)u;
@@ -442,7 +442,7 @@ static void shim_dump_cmodes(void) {
 
     for (size_t i = 0; i < N; i++) {
         const struct shim_cmode_entry *e = &shim_cmode_table[i];
-        uintptr_t rt_va = game_base + (e->bn_va - 0x400000);
+        uintptr_t rt_va = game_base + e->va;
 
         uint32_t mode_id = 0, type_flags = 0, init_flag = 0;
         uintptr_t scene_ptr = 0;
@@ -463,7 +463,7 @@ static void shim_dump_cmodes(void) {
         int ln = snprintf(line, sizeof(line),
             "%4zu  0x%08lx   0x%012lx   0x%02x      0x%02x        "
             "0x%012lx   0x%08x  %s%s\n",
-            i, e->bn_va, (unsigned long)rt_va,
+            i, e->va, (unsigned long)rt_va,
             mode_id, type_flags,
             (unsigned long)scene_ptr, init_flag,
             e->name_hint,
@@ -491,9 +491,9 @@ static void shim_dump_cmodes(void) {
      *     scene SHA-1 "7949bb14a9a21abf5e2885a01eb5ed4f9c3a8eca"
      *   - battle_mountain (mode 0x20, scene_id 0x14) — distinct */
     uintptr_t scene_ptrs[3];
-    memcpy(&scene_ptrs[0], (void*)(game_base + (0x4856ae0 - 0x400000) + 0x58), 8);
-    memcpy(&scene_ptrs[1], (void*)(game_base + (0x48586b8 - 0x400000) + 0x58), 8);
-    memcpy(&scene_ptrs[2], (void*)(game_base + (0x4857aa0 - 0x400000) + 0x58), 8);
+    memcpy(&scene_ptrs[0], (void*)(game_base + 0x4456ae0 + 0x58), 8);
+    memcpy(&scene_ptrs[1], (void*)(game_base + 0x44586b8 + 0x58), 8);
+    memcpy(&scene_ptrs[2], (void*)(game_base + 0x4457aa0 + 0x58), 8);
 
     if (scene_ptrs[0]) shim_hexdump_stderr(
         "scene_data for base_00 (scene_id 0x29, shared attract)",
@@ -529,8 +529,8 @@ static void shim_dump_dispatch_tables(void) {
     }
 
     /* --- cmode registry at data_4767b30 --- */
-    uintptr_t reg_rt = game_base + (0x4767b30 - 0x400000);
-    uintptr_t reg_end_rt = game_base + (0x4767c80 - 0x400000);
+    uintptr_t reg_rt = game_base + 0x4367b30;
+    uintptr_t reg_end_rt = game_base + 0x4367c80;
     size_t reg_entries = (reg_end_rt - reg_rt) / 8;
 
     char hdr[256];
@@ -545,13 +545,13 @@ static void shim_dump_dispatch_tables(void) {
      * order may differ. If the guess is wrong, the "match?" column flags
      * it and we learn what the real order is from the registry itself. */
     static const uintptr_t expected_order[] = {
-        0x4856ae0, 0x4856be0, 0x4856ce0, 0x4856df0, 0x4856f38, 0x4856fb8,
-        0x4857020, 0x48571a0, 0x48570c0, 0x4857288, 0x4857320, 0x48573d0,
-        0x4857448, 0x48574b8, 0x4857548, 0x4857608, 0x48576f8, 0x4857760,
-        0x48577d0, 0x4857950, 0x48579d0, 0x4857aa0, 0x4857cd0, 0x4857f00,
-        0x4858130, 0x4858360, 0x4858480, 0x48585e0, 0x48586b8, 0x48587f8,
-        0x4858900, 0x4858a50, 0x4858b28, 0x4858c80, 0x4858d38, 0x4858df0,
-        0x4858f90, 0x48590a0, 0x4859160, 0x4859288, 0x4859368, 0x4859438,
+        0x4456ae0, 0x4456be0, 0x4456ce0, 0x4456df0, 0x4456f38, 0x4456fb8,
+        0x4457020, 0x44571a0, 0x44570c0, 0x4457288, 0x4457320, 0x44573d0,
+        0x4457448, 0x44574b8, 0x4457548, 0x4457608, 0x44576f8, 0x4457760,
+        0x44577d0, 0x4457950, 0x44579d0, 0x4457aa0, 0x4457cd0, 0x4457f00,
+        0x4458130, 0x4458360, 0x4458480, 0x44585e0, 0x44586b8, 0x44587f8,
+        0x4458900, 0x4458a50, 0x4458b28, 0x4458c80, 0x4458d38, 0x4458df0,
+        0x4458f90, 0x44590a0, 0x4459160, 0x4459288, 0x4459368, 0x4459438,
     };
     size_t N_expected = sizeof(expected_order) / sizeof(expected_order[0]);
 
@@ -559,16 +559,15 @@ static void shim_dump_dispatch_tables(void) {
     for (size_t i = 0; i < reg_entries && i < 64; i++) {
         uintptr_t entry = 0;
         memcpy(&entry, (void*)(reg_rt + i * 8), 8);
-        /* Unmap runtime→BN VA: subtract game_base, add 0x400000 */
-        uintptr_t entry_bn = entry - game_base + 0x400000;
-        uintptr_t expected_bn = (i < N_expected) ? expected_order[i] : 0;
-        int mismatch = (expected_bn == 0 || entry_bn != expected_bn);
+        uintptr_t entry_va = entry - game_base;
+        uintptr_t expected_va = (i < N_expected) ? expected_order[i] : 0;
+        int mismatch = (expected_va == 0 || entry_va != expected_va);
         if (!mismatch) matched++;
 
         char line[200];
         int ln = snprintf(line, sizeof(line),
             " %3zu  0x%014lx  0x%08lx  %s\n",
-            i, (unsigned long)entry, (unsigned long)expected_bn,
+            i, (unsigned long)entry, (unsigned long)expected_va,
             mismatch ? "[differs]" : "ok");
         u = write(STDERR_FILENO, line, (size_t)ln); (void)u;
     }
@@ -579,7 +578,7 @@ static void shim_dump_dispatch_tables(void) {
     u = write(STDERR_FILENO, sum, (size_t)sl); (void)u;
 
     /* --- event handler histogram at data_485ea80 (207 slots) --- */
-    uintptr_t evt_base = game_base + (0x485ea80 - 0x400000);
+    uintptr_t evt_base = game_base + 0x445ea80;
     int populated = 0;
     int total_handlers = 0;
     char evt_detail[16384] = "\n--- event dispatch @ data_485ea80 (207 slots; non-empty shown) ---\n";
@@ -616,7 +615,7 @@ static void shim_dump_dispatch_tables(void) {
     u = write(STDERR_FILENO, esum, (size_t)esl); (void)u;
 
     /* --- update-type dispatch at data_48c52c0 (5 slots) --- */
-    uintptr_t upd_base = game_base + (0x48c52c0 - 0x400000);
+    uintptr_t upd_base = game_base + 0x44c52c0;
     char upd_hdr[128];
     int uhl = snprintf(upd_hdr, sizeof(upd_hdr),
         "\n--- update-type dispatch @ data_48c52c0 (5 slots) ---\n");

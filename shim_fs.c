@@ -85,7 +85,7 @@ static const char *remap_path(const char *path) {
     if (strncmp(path, "/proc/", 6) == 0) return path;
     if (strncmp(path, "/tmp/", 5) == 0) return path;
     if (strncmp(path, "/run/", 5) == 0) return path;
-    /* Carve-out: /sys/firmware/* IS remapped even though /sys/ generally isn't.
+    /* Carve-out: /sys/firmware/ IS remapped even though /sys/ generally isn't.
      * Kernel /sys is a live sysfs interface we shouldn't rewrite, but
      * /sys/firmware/ is firmware identity (devicetree, DMI) — plausible for
      * a sysroot overlay to provide. Lets us fake machine-id / serial-number

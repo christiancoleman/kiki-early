@@ -161,8 +161,11 @@ void *dlsym(void *handle, const char *symbol) {
 
     /* Substitute only for handles we tracked (EGL/GLES/GBM). RTLD_NEXT /
      * RTLD_DEFAULT / unknown handles fall through untouched. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull-compare"
     if (handle != RTLD_DEFAULT && handle != RTLD_NEXT && symbol &&
         shim_dl_handle_is_tracked(handle)) {
+#pragma GCC diagnostic pop
         if (strcmp(symbol, "eglCreateImageKHR") == 0) {
             extern void *eglCreateImageKHR(void*, void*, unsigned, void*, const int*);
             SHIM_LOG("[dlsym intercept] eglCreateImageKHR -> shim override");

@@ -74,7 +74,10 @@ static void *(*real_memcpy)(void *, const void *, size_t) = NULL;
 void *memcpy(void *dst, const void *src, size_t n) {
     static __thread int in_memcpy = 0;
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull-compare"
     if (!dst || !src) {
+#pragma GCC diagnostic pop
         unsigned long n_hit = __atomic_add_fetch(&shim_memcpy_null_count, 1,
                                                   __ATOMIC_RELAXED);
         /* Log first 8, then every 1000th — avoids flooding if this fires
@@ -144,7 +147,7 @@ void *memcpy(void *dst, const void *src, size_t n) {
  *   *(self+0x180) u64  seek_pending
  *   *(self+0x18c) u32  decoder state (2=PLAYING)
  */
-#define SPI_DECODER_VTABLE_BN_VA   0x46cc9c8
+#define SPI_DECODER_VTABLE_VA   0x42cc9c8
 #define SPI_DECODER_PLAY_SLOT      0x28
 
 static int64_t shim_fake_spi_play(void *self, char loop_flag, int32_t start_frame) {
@@ -176,7 +179,7 @@ void shim_patch_spi_video_vtable(void) {
     }
 
     void **slot = (void**)(game_base +
-        (SPI_DECODER_VTABLE_BN_VA - 0x400000) + SPI_DECODER_PLAY_SLOT);
+        SPI_DECODER_VTABLE_VA + SPI_DECODER_PLAY_SLOT);
     uintptr_t page = (uintptr_t)slot & ~(uintptr_t)4095;
     /* Spans two pages in case the slot is near a page boundary. */
     if (mprotect((void*)page, 8192, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
@@ -224,12 +227,11 @@ void shim_patch_spi_video_vtable(void) {
  * on long-term once verified — the patched value matches the AudioDriver-
  * Dummy concrete vtable's slot 7 exactly.
  *
- * NOTE on address convention: the constants below are POST-rebase BN VAs
- * (= ELF VAs, since the BN database is now rebased to 0x0 base). Older
- * patches in this file (Step 62/64) use pre-rebase BN VAs with a
- * `- 0x400000` correction; the math works out the same either way.
+ * Address convention: constants below are ELF VAs (== current BN VAs,
+ * since the BN database is rebased to base 0x0). Add to game_base for
+ * runtime addresses.
  */
-#define AUDIO_DRIVER_VTABLE_VA       0x4324a28   /* AudioDriver vtable, BN post-rebase */
+#define AUDIO_DRIVER_VTABLE_VA       0x4324a28   /* AudioDriver vtable */
 #define AUDIO_DRIVER_VPTR_OFF        0x08        /* skip typeinfo to first vfunc */
 #define AUDIO_DRIVER_SLOT7_NOOP_VA   0x2560ac0   /* sub_2560ac0 — AudioDriverDummy slot 7 default */
 #define AUDIO_DRIVER_RET_ZERO_VA     0x23725d0   /* sub_23725d0 — `return 0` (AudioServer slot 5 default) */
@@ -321,11 +323,8 @@ void shim_patch_audio_driver_vtable(void) {
  * take software decode end-to-end until Radium's downstream code (which
  * expects DRM_PRIME descriptors in AVFrame->data[0]) hits a new wall.
  */
-/* BN VA = ELF VA + 0x400000; objdump showed the b.ne at ELF VA 0x920cf0,
- * so BN VA = 0xd20cf0. The shim's patch formula subtracts 0x400000 to
- * recover ELF VA before adding game_base (same convention as Step 62's
- * vtable patch at 0x46cc9c8). */
-#define GET_FORMAT_BNE_BN_VA   0xd20cf0
+/* objdump shows the b.ne at ELF VA 0x920cf0; we patch game_base + that. */
+#define GET_FORMAT_BNE_VA   0x920cf0
 #define AARCH64_NOP            0xd503201fu
 
 static int shim_sw_hevc_enabled(void) {
@@ -347,7 +346,7 @@ void shim_patch_get_format_callback(void) {
     }
 
     uint32_t *instr = (uint32_t *)(game_base +
-        (GET_FORMAT_BNE_BN_VA - 0x400000));
+        GET_FORMAT_BNE_VA);
     uintptr_t page = (uintptr_t)instr & ~(uintptr_t)4095;
     if (mprotect((void *)page, 8192,
                  PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
@@ -358,9 +357,7 @@ void shim_patch_get_format_callback(void) {
 
     uint32_t old = *instr;
     /* Safety: expect `b.ne 0x920ce0` (backward 3 instructions) encoded as
-     * 0x54ffff81. Refuse to patch if we see anything else — prior bug had
-     * us subtracting 0x400000 twice (objdump VAs ARE BN VAs) and writing
-     * a NOP over an innocent STP in an unrelated function. */
+     * 0x54ffff81. Refuse to patch if we see anything else. */
     if (old != 0x54ffff81u) {
         SHIM_LOG("[sw_hevc] REFUSED to patch @ %p: expected 0x54ffff81 (b.ne), got 0x%08x",
                  (void *)instr, old);

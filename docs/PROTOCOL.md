@@ -6,15 +6,9 @@
 
 ---
 
-## Address translation (Binary Ninja ↔ objdump)
+## Address convention
 
-```
-file_offset = BN_VA − 0x400000
-```
-
-Binary Ninja rebases PIE aarch64 binaries by +0x400000. Sidekick cites addresses as BN VAs; `aarch64-linux-gnu-objdump` uses file offsets (which equal natural VAs for this binary). Always translate before acting on an address.
-
-Verified by: sha256 match of the same binary across both tools, then byte-level spot-checks at four addresses. JOURNAL Step 14.0.
+The BN database is rebased to base 0x0, so BN VA == ELF VA == file offset for this binary. Runtime address is `game_base + va`. No translation between BN and objdump views is required.
 
 ---
 
@@ -267,7 +261,7 @@ uint64_t fire_event(int32_t event_id, int64_t event_data) {
 ```c
 typedef uint64_t (*fire_event_t)(int32_t event_id, int64_t event_data);
 uintptr_t game_base = shim_resolve_game_base();
-fire_event_t fire_event = (fire_event_t)(game_base + (0x9c12a0 - 0x400000));
+fire_event_t fire_event = (fire_event_t)(game_base + 0x5c12a0);
 uint64_t r = fire_event(event_id, event_data);
 ```
 
@@ -303,7 +297,7 @@ The game maintains an in-memory mirror of each physical switch's state. The arra
 - `sub_a50850(sw_num) @ 0xa50850` — returns the state byte with the invert flag applied. Short-circuits to 0 on `sw_num == 0` or `sw_num >= data_48cbaa0`.
 - `sub_a50350(sw_num) @ 0xa50350` — returns 1 if the switch is "OK" (not broken, not stuck, alert count clear); 0 otherwise. Gates event firing.
 
-**Injection target for shim-side VPX bridge:** writing a byte to `game_base + (0x4880220 - 0x400000) + sw_num * 0x30 + 0x28` simulates a switch closure at the state-array level.
+**Injection target for shim-side VPX bridge:** writing a byte to `game_base + 0x4480220 + sw_num * 0x30 + 0x28` simulates a switch closure at the state-array level.
 
 ---
 
@@ -359,7 +353,7 @@ All other event_ids remain semantically unknown. The full mapping lives in the c
 1. **Import analysis**: the game imports exactly TWO gst-prefixed symbols — `gst_init_check` and `gst_deinit`. Zero imports from `libgstapp`, `libgstvideo`, `libgstbase`, `libgstallocators`. No `gst_element_factory_make`, no `gst_parse_launch`, no `gst_pipeline_*`, no `gst_bin_*`, no `gst_pad_*`, no `gst_caps_*`, no `gst_buffer_*`. Compare: **28 libavcodec/libavutil/libavformat imports** that ARE actively used.
 2. **String analysis**: no element-name strings (`"appsink"`, `"kmssink"`, `"decodebin"`, `"playbin"`, `"videoconvert"`, etc.) anywhere in the binary. No `GstElement`/`GstPipeline`/`GstPad`/etc. type-name strings.
 3. **Dynamic loading**: no `dlopen`/`dlsym`/`dlvsym` imports — the game does not runtime-load a gstreamer plugin module.
-4. **Shim force-call test**: trampoline into `game_base + (0xcc1ec0 - 0x400000)` at runtime successfully invokes `gstreamer_init`, which calls `gst_init_check` → returns 1, gstreamer initialises, plugin-scanner warns about missing helper binary, `VideoMessageBus` thread starts. Everything works when explicitly invoked — but the game itself never invokes it.
+4. **Shim force-call test**: trampoline into `game_base + 0x8c1ec0` at runtime successfully invokes `gstreamer_init`, which calls `gst_init_check` → returns 1, gstreamer initialises, plugin-scanner warns about missing helper binary, `VideoMessageBus` thread starts. Everything works when explicitly invoked — but the game itself never invokes it.
 
 **`gstreamer_init`** (`sub_cc1ec0`), **`gstreamer_shutdown`** (`sub_cc2158`), **`gstreamer_message_bus_thread`** (`sub_cc1ea0`) are all defined in the game binary but appear to be leftover framework code from Stern's shared Spike 3 platform. Other Spike 3 titles may use gstreamer; this one does not.
 
@@ -372,7 +366,7 @@ All other event_ids remain semantically unknown. The full mapping lives in the c
 
 ### Shim trampoline (kept as diagnostic)
 
-`SPIKE3_FORCE_GSTREAMER=<seconds>` fires a timer thread that, after N seconds, calls `game_base + (0xcc1ec0 - 0x400000)` — the game's `gstreamer_init`. Useful for confirming the function is callable without the game initiating the call. Not part of the normal run configuration.
+`SPIKE3_FORCE_GSTREAMER=<seconds>` fires a timer thread that, after N seconds, calls `game_base + 0x8c1ec0` — the game's `gstreamer_init`. Useful for confirming the function is callable without the game initiating the call. Not part of the normal run configuration.
 
 ---
 

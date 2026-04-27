@@ -154,7 +154,7 @@ static void *shim_bridge_poll_thread(void *arg) {
     uint64_t last[42];
     /* Prime baseline */
     for (size_t i = 0; i < N; i++) {
-        uintptr_t rt = game_base + (shim_cmode_table[i].bn_va - 0x400000);
+        uintptr_t rt = game_base + shim_cmode_table[i].va;
         memcpy(&last[i], (void*)(rt + 0x308), 8);
     }
 
@@ -167,12 +167,12 @@ static void *shim_bridge_poll_thread(void *arg) {
         nanosleep(&ts, NULL);
 
         for (size_t i = 0; i < N; i++) {
-            uintptr_t rt = game_base + (shim_cmode_table[i].bn_va - 0x400000);
+            uintptr_t rt = game_base + shim_cmode_table[i].va;
             uint64_t now_val;
             memcpy(&now_val, (void*)(rt + 0x308), 8);
             if (now_val != last[i]) {
                 char line[320];
-                int ln = snprintf(line, sizeof(line),
+                snprintf(line, sizeof(line),
                     "{\"t\":\"cmode\",\"id\":%u,\"name\":\"%s\","
                     "\"flags\":%u,\"init\":%lu,\"init_prev\":%lu,"
                     "\"ts_ms\":%lu}\n",

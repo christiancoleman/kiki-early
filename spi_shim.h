@@ -34,7 +34,7 @@ int is_real_gl(void);
  * dumpers in diagnostics. `shim_cmode_table_count` companion is needed
  * because sizeof() can't see an extern array's length. */
 struct shim_cmode_entry {
-    uintptr_t   bn_va;              /* BN-reported .bss address */
+    uintptr_t   va;              /* ELF VA of the .bss object */
     uint32_t    expected_mode_id;
     uint32_t    expected_type_flags;
     const char *name_hint;

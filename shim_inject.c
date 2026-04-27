@@ -182,7 +182,7 @@ static const struct shim_switch_entry *shim_find_switch(int id) {
  *     - calls callback(event_data); short-circuits on !(ret & 1)
  *
  * Trampoline pattern:
- *   fire_event_addr = game_base + (0x9c12a0 - 0x400000)
+ *   fire_event_addr = game_base + 0x5c12a0
  *
  * Event sweep fires every event_id 0..0xce with event_data=0 and diffs
  * cmode state before/after. Events whose handlers dereference event_data
@@ -202,7 +202,7 @@ static uint64_t shim_fire_event(int32_t event_id, int64_t event_data) {
     uintptr_t game_base = shim_resolve_game_base();
     if (!game_base) return (uint64_t)-1;
     typedef uint64_t (*fire_event_t)(int32_t, int64_t);
-    fire_event_t fn = (fire_event_t)(game_base + (0x9c12a0 - 0x400000));
+    fire_event_t fn = (fire_event_t)(game_base + 0x5c12a0);
     return fn(event_id, event_data);
 }
 
@@ -213,7 +213,7 @@ static uint64_t shim_fire_event(int32_t event_id, int64_t event_data) {
 static void shim_capture_cmode_snap(uintptr_t game_base, uint64_t *out) {
     size_t N = shim_cmode_table_count;
     for (size_t i = 0; i < N; i++) {
-        uintptr_t rt = game_base + (shim_cmode_table[i].bn_va - 0x400000);
+        uintptr_t rt = game_base + shim_cmode_table[i].va;
         memcpy(&out[i*2 + 0], (void*)(rt + 0x308), 8);
         memcpy(&out[i*2 + 1], (void*)(rt + 0x60),  8);
     }
@@ -240,8 +240,8 @@ static void shim_capture_cmode_snap(uintptr_t game_base, uint64_t *out) {
  * either call it from shim_fire_switch or fire the right event ourselves.
  * ------------------------------------------------------------------------ */
 
-#define SHIM_SWITCH_STATE_BASE 0x4880220   /* BN VA; stride 0x30, state @ +0x28 */
-#define SHIM_SWITCH_COUNT_ADDR 0x48cbaa0   /* BN VA; dynamic switch count */
+#define SHIM_SWITCH_STATE_BASE 0x4480220   /* stride 0x30, state @ +0x28 */
+#define SHIM_SWITCH_COUNT_ADDR 0x44cbaa0   /* dynamic switch count */
 
 static int shim_fire_switch(int switch_id) {
     const struct shim_switch_entry *sw = shim_find_switch(switch_id);
@@ -264,7 +264,7 @@ static int shim_fire_switch(int switch_id) {
     /* Bounds-check against the game's runtime switch count. */
     uint32_t sw_count = 0;
     memcpy(&sw_count,
-           (void*)(game_base + (SHIM_SWITCH_COUNT_ADDR - 0x400000)),
+           (void*)(game_base + SHIM_SWITCH_COUNT_ADDR),
            4);
     if (sw_count > 0 && (uint32_t)switch_id >= sw_count) {
         char msg[192];
@@ -277,7 +277,7 @@ static int shim_fire_switch(int switch_id) {
     }
 
     uintptr_t state_addr = game_base +
-        (SHIM_SWITCH_STATE_BASE - 0x400000) + (uintptr_t)switch_id * 0x30 + 0x28;
+        SHIM_SWITCH_STATE_BASE + (uintptr_t)switch_id * 0x30 + 0x28;
 
     char hdr[256];
     int hn = snprintf(hdr, sizeof(hdr),
@@ -494,7 +494,7 @@ static void *shim_poke_cmode_thread(void *arg) {
         return NULL;
     }
 
-    uintptr_t addr = game_base + (entry->bn_va - 0x400000) + 0x308;
+    uintptr_t addr = game_base + entry->va + 0x308;
     SHIM_LOG("[poke_cmode] writing 0x%lx to %s @ rt 0x%lx (activation)",
              (unsigned long)value, name, (unsigned long)addr);
     memcpy((void*)addr, &value, 8);
@@ -531,7 +531,7 @@ static void *shim_poke_cmode_thread(void *arg) {
  *   default mask  = 0x10
  *   default delay = 1500 ms (solidly inside the [599, 3599] ms window).
  * Example: SPIKE3_POKE_STATE_FLAG=0x10:1500 */
-#define SYSTEM_STATE_FLAGS_BN_VA 0x4882388
+#define SYSTEM_STATE_FLAGS_VA 0x4482388
 
 static void *shim_poke_state_flag_thread(void *arg) {
     char *spec = (char*)arg;
@@ -550,7 +550,7 @@ static void *shim_poke_state_flag_thread(void *arg) {
         }
     }
     SHIM_LOG("[poke_state_flag] will OR 0x%x into system_state_flags @ 0x%x after %ld ms",
-             mask, SYSTEM_STATE_FLAGS_BN_VA, delay_ms);
+             mask, SYSTEM_STATE_FLAGS_VA, delay_ms);
 
     if (delay_ms > 0) {
         struct timespec ts = {
@@ -567,7 +567,7 @@ static void *shim_poke_state_flag_thread(void *arg) {
         return NULL;
     }
     volatile uint16_t *flag_ptr =
-        (volatile uint16_t *)(game_base + (SYSTEM_STATE_FLAGS_BN_VA - 0x400000));
+        (volatile uint16_t *)(game_base + SYSTEM_STATE_FLAGS_VA);
     uint16_t before = *flag_ptr;
     __atomic_or_fetch(flag_ptr, (uint16_t)mask, __ATOMIC_SEQ_CST);
     uint16_t after = *flag_ptr;
@@ -673,7 +673,7 @@ static void *shim_force_gstreamer_thread(void *arg) {
     }
 
     typedef void (*gstreamer_init_t)(void);
-    uintptr_t addr = game_base + (0xcc1ec0 - 0x400000);
+    uintptr_t addr = game_base + 0x8c1ec0;
     gstreamer_init_t gstreamer_init_fn = (gstreamer_init_t)addr;
 
     char hdr[200];
