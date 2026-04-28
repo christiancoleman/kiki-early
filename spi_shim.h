@@ -157,6 +157,9 @@ void shim_patch_spi_video_vtable(void);
 void shim_patch_get_format_callback(void);
 void shim_patch_audio_driver_vtable(void);
 
+void shim_patch_video_player_assertion(void);
+void shim_patch_video_player_play_entry_brk(void);
+extern volatile uintptr_t shim_vp_play_entry_runtime;
 
 /* ---- Injection layer (defined in shim_inject.c) ----
  * Sets up the SIGALRM handler, blocks SIGALRM on the main thread, and
@@ -181,14 +184,38 @@ void shim_inject_start(void);
  * line atomicity. Subprocess stderr (e.g. from system() calls) still
  * interleaves; that's outside our control.
  */
+/* Timestamp helper for SHIM_LOG. Format: "YYYY/MM/DD - HH:MM:SS.mmm - "
+ * (24 chars + null). gettimeofday + localtime_r are async-signal-safe on
+ * glibc, so this is safe to call from inside the SIGTRAP / SIGSEGV
+ * handlers that also use SHIM_LOG. */
+#include <time.h>
+#include <sys/time.h>
+
+static inline int shim_format_log_timestamp(char *buf, size_t buflen) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tm;
+    localtime_r(&tv.tv_sec, &tm);
+    return snprintf(buf, buflen,
+                    "%04d/%02d/%02d - %02d:%02d:%02d.%03ld - ",
+                    tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                    tm.tm_hour, tm.tm_min, tm.tm_sec,
+                    (long)(tv.tv_usec / 1000));
+}
+
 #define SHIM_LOG(fmt, ...) do {                                              \
     char _shim_log_buf[1024];                                                \
-    int  _shim_log_n = snprintf(_shim_log_buf, sizeof(_shim_log_buf),        \
+    int  _shim_ts_n = shim_format_log_timestamp(_shim_log_buf,               \
+                                                sizeof(_shim_log_buf));      \
+    if (_shim_ts_n < 0 || (size_t)_shim_ts_n >= sizeof(_shim_log_buf))       \
+        _shim_ts_n = 0;                                                      \
+    int  _shim_log_n = snprintf(_shim_log_buf + _shim_ts_n,                  \
+                                sizeof(_shim_log_buf) - (size_t)_shim_ts_n,  \
                                 "[shim] " fmt "\n", ##__VA_ARGS__);          \
     if (_shim_log_n > 0) {                                                   \
-        size_t _shim_log_w = (size_t)_shim_log_n < sizeof(_shim_log_buf)     \
-                             ? (size_t)_shim_log_n                            \
-                             : sizeof(_shim_log_buf) - 1;                     \
+        size_t _shim_log_w = (size_t)_shim_ts_n + (size_t)_shim_log_n;       \
+        if (_shim_log_w >= sizeof(_shim_log_buf))                            \
+            _shim_log_w = sizeof(_shim_log_buf) - 1;                         \
         (void)write(STDERR_FILENO, _shim_log_buf, _shim_log_w);              \
     }                                                                        \
 } while (0)

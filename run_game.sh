@@ -11,6 +11,12 @@
 #   VIEWER_FULLSCREEN=<0|1> [0]     open the viewer fullscreen rather than
 #                                   in a 1920×1080 window
 #   AUDIO_PLAYER=<0|1>      [1]     auto-launch audio_subscriber.py | ffplay
+#   TIMER=<ON|OFF>          [OFF]   auto-launch marker_button.py — a small Tk
+#                                   window with one button that appends a
+#                                   timestamped "[marker] click #N (label)"
+#                                   line to runs/latest/game.log on each press.
+#                                   Lets you correlate "I heard X" with the
+#                                   shim's interleaved log output.
 #   BOOT_DISPLAY=<0|1>      [1]     run spike3/bin/boot_display for ~1.5 s
 #                                   pre-game, then kill it (mimics
 #                                   etc/init.d/game_monitor). Lets boot_display
@@ -75,6 +81,7 @@ OFFLINE_MODE="${OFFLINE_MODE:-1}"
 VIEWER="${VIEWER:-1}"
 VIEWER_FULLSCREEN="${VIEWER_FULLSCREEN:-0}"
 AUDIO_PLAYER="${AUDIO_PLAYER:-1}"
+TIMER="${TIMER:-OFF}"
 BOOT_DISPLAY="${BOOT_DISPLAY:-1}"
 BOOT_DISPLAY_DURATION="${BOOT_DISPLAY_DURATION:-3}"
 STALE_KILL="${STALE_KILL:-1}"
@@ -155,7 +162,7 @@ fi
 
 if [[ "$STALE_KILL" == "1" ]]; then
     stale_qemu=$(pgrep -f "qemu-aarch64.*LD_PRELOAD=$SHIM" 2>/dev/null || true)
-    stale_help=$(pgrep -f "$SCRIPT_DIR/(frame_viewer|audio_subscriber)\.py" 2>/dev/null || true)
+    stale_help=$(pgrep -f "$SCRIPT_DIR/(frame_viewer|audio_subscriber|marker_button)\.py" 2>/dev/null || true)
     stale_fplay=$(pgrep -f "ffplay.*s16le.*44100" 2>/dev/null || true)
     stale_all="$stale_qemu $stale_help $stale_fplay"
     if [[ -n "${stale_all// }" ]]; then
@@ -292,6 +299,20 @@ if [[ "$AUDIO_PLAYER" == "1" && "$AUDIO_BRIDGE" == "1" ]]; then
         printf '[run_game] spawned audio player (subshell pid %d)\n' "$!" >&2
     else
         printf '[run_game] AUDIO_PLAYER=1 but python3 or ffplay not found; skipping\n' >&2
+    fi
+fi
+
+if [[ "$TIMER" == "ON" ]]; then
+    if command -v python3 >/dev/null; then
+        # Marker writes go directly to runs/latest/game.log (raw O_APPEND in
+        # marker_button.py) — no separate timer.log needed. Tk warnings /
+        # script errors silenced; if a write to game.log ever fails, the
+        # marker_button.py logs the error to /tmp/marker_button_errors.log.
+        python3 "$SCRIPT_DIR/marker_button.py" >/dev/null 2>&1 &
+        HELPER_PIDS+=("$!"); HELPER_LABELS+=("marker button")
+        printf '[run_game] spawned marker button (pid %d) — TIMER=ON\n' "$!" >&2
+    else
+        printf '[run_game] TIMER=ON but python3 not found; skipping marker button\n' >&2
     fi
 fi
 

@@ -588,6 +588,8 @@ static void *shim_vp_patch_thread(void *arg) {
     shim_patch_get_format_callback();
     shim_patch_audio_driver_vtable();
 
+    shim_patch_video_player_assertion();
+    shim_patch_video_player_play_entry_brk();
     return NULL;
 }
 

@@ -5712,3 +5712,97 @@ The "timeout-is-progress" insight from Step 45 stands: bridge cmd timeouts are t
 - **Key-fetch synthesis** — to make synth-on actually progress further than synth-off, we'd need to also synthesize cmd 0xF9 / 0xFC / 0xFD responses. The wrappers are `mcp_nodebus_fetch_key_basic @ 0x8f3484`, `mcp_nodebus_fetch_key_with_serial @ 0x8f355c`, `mcp_nodebus_fetch_key_two_probes @ 0x8f36b0`. Hint values and response shapes need similar GDB-BP capture as we did for fe_probe.
 - **"Detected scene" → next blocker** — synth-disabled baseline reaches Godot scene detection but doesn't progress to playable. The actual upstream blocker is in Godot land. `/tmp/godot_log(s)` (user-flagged in `reference_godot_logs.md`) is unread; that's where to look for scene-init / GDScript errors.
 - **Cipher genuinely active path** — still untested in our runs. To exercise it we'd need to set `mcp_nodebus_per_slot_status[slot]+3` non-zero for at least one slot via a synthesized response. Not strictly necessary for current goals.
+
+## Step 70: filesystem remap completion — mkdir/mkdirat hooks, font redirect, /dump symlink fix, system() rewrite (2026-04-28)
+
+Two-phase filesystem-side cleanup that took the game from FATAL exit (status 4) to clean SIGTERM at TIMEOUT, with NV writes landing on disk for the first time.
+
+### 70a — mkdir/mkdirat hook + font carve-out + sysroot pre-creates
+
+**Trigger.** Default-env baseline at start-of-session was exiting with code 4 (`sys_debug_log_fatal_error`) at game.log:38995 after `Detected Capture/Discover scene` and `can't create directory '/connectivity/'`. The shim's `remap_path()` (`shim_fs.c:74`) covered access/stat/open/faccessat/fstatat but **not mkdir/mkdirat** — Godot's `DirAccess::make_dir()` and the game's NV-init both bypass us and try to create dirs on the host root.
+
+**Changes.**
+- `shim_fs.c` — added `mkdir()` + `mkdirat()` hooks immediately after the access wrapper. Same dlsym→remap_path→log→real pattern as access. EEXIST treated as success (mkdir-p semantics) since Godot's DirAccess + Stern's NV layer both flag EEXIST as failure even on existing dirs.
+- `shim_fs.c` — added font carve-out in `remap_path()` BEFORE the `/home/` skip: redirects `/home/c/.fonts.conf{,.d}` and `/home/c/.config/fontconfig/{fonts.conf,conf.d}` onto `$SYSROOT/etc/fonts/{local.conf,conf.d}`. Without this, libfontconfig's per-user probes fall through to WSL-native dirs.
+- Created `$SYSROOT/etc/fonts/local.conf` as a minimal pokemon-side stub (existing remap was correct, file was just missing).
+- Pre-created `$SYSROOT/data/nv/pokemon_le/{FRRAM,LKRAM,NVM,NVRAM,PIN_NVRAM,PTRAM,SYS_NVRAM,node_diag}/` — empty dirs only, no content (game's NV double-buffer logic detects fresh state and starts new).
+
+**Result.** Exit went 4 → **124 (clean SIGTERM via timeout=200)**. game.log went 39k → **94k lines**. mkdir REMAP fired 13 times across `/connectivity/`, `/data/nv/pokemon_le/*`, `/dump/`, `/tmp`, `/`. Frame viewer went 30 → **1,050 frames @ 5.4 fps**. As an unexpected side effect the VideoPlayerSpi `!is_inside_tree()` error count dropped from 1 to 0 in this specific run (turned out to be a timing fluke — see Step 71).
+
+### 70b — /dump symlink fix + system() command rewrite
+
+**Trigger.** 70a's run still had 2 `mkdir FAILED` entries on `/dump/log` and `/dump/log/connectivity` (errno=2). Root cause: `$SYSROOT/dump` was a **dangling absolute symlink** → `/connectivity/dump` (resolved on host root, where /connectivity/ doesn't exist). And the system() hook at `spi_shim.c:487` was forwarding `/bin/sh -c 'echo SPI-POK-000000 > /connectivity/hostname'` and `rm -r -f /connectivity/files/gkpd_{1,2,3}` unmodified — host shell saw paths it can't reach.
+
+**Changes.**
+- Replaced `/mnt/c/Workspace/pokemon-le-0.81.0/dump` with a relative symlink → `connectivity/dump` (preserves the cross-link semantics; resolves correctly on host follow). Pre-created `$SYSROOT/connectivity/dump/log/connectivity/` (`log/` was already there, `log/connectivity/` was the missing leaf).
+- `spi_shim.c:487` system() hook — added substring-rewrite of `/connectivity/` → `$SYSROOT/connectivity/` in cmd strings before forwarding to real_system(). 8KB scratch buffer, only fires when cmd contains the prefix. Limited to `/connectivity/` (the only path prefix actually seen in failing system() commands).
+
+**Result.** mkdir FAILED count → 0. system() REWRITE fired 4 times. `Directory nonexistent` → 0. `connectivity/hostname` actually exists on disk (`SPI-POK-000000`). Frame viewer went 1050 → **1,110 frames @ 5.7 fps**. **Major bonus discovery: NV writes now land on disk** — the game wrote 14 NV blocks + 14 .crc32 across all 8 NV stores during a single run, including PIN_NVRAM rotating through 00000000/00000001/00000002. The `project_persistence_gap.md` memory ("EEPROM and filesystem NV writes both vanish") is at least partly retracted: filesystem writes work; SIGTERM-flush behavior across runs is still untested.
+
+### What's open after Step 70
+
+- The remaining 4 `access FAILED` entries (`/connectivity/files/gkpd_4`, `/connectivity/update/UPDATE_COMPLETED`, `/data/nv/pokemon_le/factory_reset`, `/data/nv/pokemon_le/PIN_NVRAM/00000002`) are all **expected**: state-marker files where absence is meaningful, or transient probes for not-yet-written rotation blocks.
+- Cross-run NV persistence — does the game READ existing NV state on boot 2 and continue, or does it re-init fresh? Step 71 indirectly answered: with NV present, game proceeds further (PIN_NVRAM rotates to 00000005), but takes a different (slower) init path before reaching scene detection.
+- VideoPlayerSpi `!is_inside_tree()` blocker is back to 1 in the next run (70a's "0" was a fluke). Step 71 picks this up.
+
+### Memory updates landed
+
+- `project_emulation_progress.md` — refreshed description with Step 69 cipher retraction and SYNTH-on-deception warning.
+- `feedback_stay_in_shim_and_sysroot.md` — new feedback memory: prefer in-shim hooks + in-sysroot pre-creates over new env vars / run_game.sh args / WSL-native paths. User explicit guidance.
+- `project_godot_engine.md` — clarified that ONLY `assets/godot/main.pck` is authoritative; `main.pck_extracted/` and `pokemon_battle_previs/` are user scratch.
+
+---
+
+## Step 71: VideoPlayerSpi `!is_inside_tree()` assertion bypass + secondary blocker discovery (2026-04-28)
+
+The VideoPlayerSpi → Radium bridge is the breakthrough surface (per user). Step 71 attacks the assertion that fires when GDScript calls `play()` before the player is added to the parent scene tree.
+
+### Static investigation
+
+BN MCP confirmed the error chain:
+
+| BN VA | Runtime VA (base 0x7fffe3940000) | Role |
+|---|---|---|
+| `0x0e3819c` | `0x7fffe477819c` | `sub_e3819c` — VideoPlayerSpi::play() entry. Vtable entry at BN `0x42cc6f8`; no direct code xrefs. |
+| `0x0e381ac` | `0x7fffe47781ac` | `mov x19, x0` — saves `this` to callee-saved x19 |
+| `0x0e381b0` | `0x7fffe47781b0` | `ldr x0, [x0, #0x2c0]` — loads Node base flag (NODE_FLAG_IN_TREE-equivalent at +0x2c0) |
+| `0x0e381b4` | `0x7fffe47781b4` | `tbz w0, #22, +0xb8` (raw `0x36b005c0`) — assertion: branch to error if bit 22 clear |
+| `0x0e381b8` | `0x7fffe47781b8` | `ldr x0, [x19, #0x988]` — playback object (VideoStreamPlaybackSpi) |
+| `0x0e381bc` | — | `cbz x0, +0x90` — skip cast block if playback NULL |
+| `0x0e38298` | `0x7fffe4778298` | tail-call into Godot's `_err_print_error` family |
+
+Per agent investigation: the playback object at `+0x988` is dynamically-cast to `VideoStreamPlaybackSpi` and if successful, vtable+0x110 invoked — that's where Stern's Radium playback engages.
+
+### GDB attempt — too slow
+
+Tried tmux+`mcp__openmcpgdb__` with BPs at `0x7fffe47781b4` (tbz) and `0x7fffe4778298` (error path). qemu-aarch64 with `-g 1234` (passed through run_game.sh as a positional arg, no script changes; `setarch -R bash -lc '...'` for fixed PIE base 0x7fffe3940000). **GDB attach slowed execution ~6-10x** — `Detected Capture scene.` took 16 minutes real-time vs ~150s normal. TIMEOUT=300 was way too short; killed before BP captured. Useful gotchas saved to `reference_tmux_gdb_workflow.md`.
+
+### NODEBUS_SYNTH_FE=1 with NV state — still no Godot init
+
+Tested whether NV state from prior runs changed Step-69's "synth-on traps deeper init" result. **No** — same finding: synth-on eliminates bridge timeouts, but Godot Engine banner never appears. Synth-on is a dead end for play() diagnosis.
+
+### Shim NOP patch — original assertion silenced, secondary one revealed
+
+Added `shim_patch_video_player_assertion()` to `shim_patches.c` (always-on, no env gate per `feedback_stay_in_shim_and_sysroot`):
+- Resolves runtime addr of BN `0xe381b4`
+- Verifies bytes `0x36b005c0` (the tbz)
+- Patches to `AARCH64_NOP` (`0xd503201f`)
+- Wired into `shim_vp_patch_thread` (shim_inject.c:582) after the existing 4 patches
+
+**Result.** Exit 124, 95k log lines, 1110 frames @ 5.6 fps (same as 70b). The `video_player_spi.cpp:376` assertion is GONE. play() proceeds past the NOP'd tbz. **A new error now fires at Godot's core**:
+
+```
+ERROR: Condition "!is_inside_tree()" is true. Returning: false
+   at: can_process (scene/main/node.cpp:867)
+```
+
+This is `Node::can_process()` from Godot itself (not Stern's video_player_spi module). Same root cause (player not in tree), but it's a soft early-return (`Returning: false`) — Godot's main loop sees can_process=false and skips calling `_process()` on the node. Without `_process()` ticks, no video frame dequeue from the decoder.
+
+PIN_NVRAM rotation reached 00000005 (vs 00000002 in 70b) — game progressed deeper, more state writes.
+
+### What's open after Step 71
+
+- **The breakthrough still requires Radium plumbing.** play() being silenced doesn't help if `_process()` never ticks. Either need to (a) get the player into the tree (real Godot fix; requires GDScript modification or runtime add_child intercept), or (b) hook __dynamic_cast / trampoline at sub_e3819c to confirm whether the playback object at `+0x988` is even non-NULL (= Radium IS registered as the playback backend).
+- **Per user direction:** focus more on Radium next. `[REFERENCE_TOOL_A]/` is the semi-replicated player that "wraps Godot and plays videos on top of it". Search that dir for `radium` keyword for related resources before re-attacking the binding side.
+- **Trampoline log** (deferred from this step) — a small in-shim trampoline at sub_e3819c entry that captures `this`, `*(this+0x2c0)`, `*(this+0x988)` per call. Needed for definitive answer on whether Radium backend is registered.
+- The `is_inside_tree() Returning: false at can_process` pattern might appear at other Godot Node call sites (e.g., `_process_internal`, `_notification`, `set_process`) — would surface as more silent skips rather than visible errors.

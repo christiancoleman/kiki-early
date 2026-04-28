@@ -695,3 +695,102 @@ int avcodec_receive_frame(void *avctx, void *frame) {
 
 
 
+
+/* ========== Step 71: VideoPlayerSpi !is_inside_tree() assertion bypass ==========
+ *
+ * VideoPlayerSpi::play() at sub_e3819c contains a tbz at BN VA 0xe381b4 that
+ * branches to an _err_print_error path when bit 22 of the Node base flag at
+ * +0x2c0 (NODE_FLAG_IN_TREE) is clear. Per the Step-71 BN investigation, the
+ * GDScript caller (bkgnd_video_player_manager.gd:86 — extracted scratch HINT
+ * only) fires play() inside an AsyncLoadUtilV2.load_resource() callback,
+ * which can resolve before the player is added to the parent scene tree.
+ *
+ * NOPing the tbz lets play() fall through to the playback object load
+ * (this+0x988 → VideoStreamPlaybackSpi). If the playback object is NULL the
+ * existing cbz at 0xe381bc skips the cast and play() exits cleanly. If
+ * non-NULL, vtable+0x110 is invoked and Radium's playback engages — which
+ * is the breakthrough we want.
+ *
+ * Always-on (no env gate) per feedback_stay_in_shim_and_sysroot. Safe even
+ * if the player IS in the tree: the NOP is functionally identical to the
+ * tbz when bit 22 is set (tbz falls through, NOP falls through).
+ */
+#define VIDEO_PLAYER_TBZ_VA  0xe381b4
+#define EXPECTED_TBZ_BYTES   0x36b005c0u  /* tbz w0, #22, +0xb8 */
+
+void shim_patch_video_player_assertion(void) {
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[vp_assert] game_base unresolved; assertion patch aborted");
+        return;
+    }
+
+    uint32_t *instr = (uint32_t *)(game_base + VIDEO_PLAYER_TBZ_VA);
+    uintptr_t page = (uintptr_t)instr & ~(uintptr_t)4095;
+    if (mprotect((void *)page, 8192,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        SHIM_LOG("[vp_assert] mprotect RWX @ %p failed: %s",
+                 (void *)page, strerror(errno));
+        return;
+    }
+
+    uint32_t old = *instr;
+    if (old != EXPECTED_TBZ_BYTES) {
+        SHIM_LOG("[vp_assert] REFUSED to patch @ %p: expected 0x%08x (tbz w0,#22), got 0x%08x",
+                 (void *)instr, EXPECTED_TBZ_BYTES, old);
+        return;
+    }
+    *instr = AARCH64_NOP;
+    __builtin___clear_cache((char *)instr, (char *)instr + 4);
+    SHIM_LOG("[vp_assert] patched VideoPlayerSpi !is_inside_tree() tbz @ %p: 0x%08x -> 0x%08x (NOP)",
+             (void *)instr, old, (unsigned)AARCH64_NOP);
+}
+
+/* ========== Step 71: VideoPlayerSpi::play() entry probe via brk ==========
+ *
+ * Patches the NOP at sub_e3819c (function entry; BN VA 0xe3819c) with
+ * `brk #0`. When play() is called, qemu delivers SIGTRAP to the guest;
+ * shim_sigtrap_handler in spi_shim.c reads x0 (=this), peeks at this+0x2c0
+ * (the in-tree flag) and this+0x988 (the Radium playback object pointer),
+ * logs them, advances PC past the brk, and returns. The skipped instruction
+ * is a NOP, so no behavior change.
+ *
+ * This is the diagnostic the user requested under "trampoline log" in
+ * Step 71. SIGTRAP is functionally a software-defined breakpoint at the
+ * shim level — no nearby trampoline page allocation needed.
+ */
+#define VIDEO_PLAYER_PLAY_ENTRY_VA  0xe3819c
+#define EXPECTED_PLAY_ENTRY_BYTES   0xd503201fu  /* NOP — confirmed by Step 71 dump */
+#define AARCH64_BRK_0               0xd4200000u
+
+void shim_patch_video_player_play_entry_brk(void) {
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[vp_brk] game_base unresolved; play()-entry probe aborted");
+        return;
+    }
+
+    uint32_t *instr = (uint32_t *)(game_base + VIDEO_PLAYER_PLAY_ENTRY_VA);
+    uintptr_t page = (uintptr_t)instr & ~(uintptr_t)4095;
+    if (mprotect((void *)page, 8192,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        SHIM_LOG("[vp_brk] mprotect RWX @ %p failed: %s",
+                 (void *)page, strerror(errno));
+        return;
+    }
+
+    uint32_t old = *instr;
+    if (old != EXPECTED_PLAY_ENTRY_BYTES) {
+        SHIM_LOG("[vp_brk] REFUSED to patch @ %p: expected NOP 0x%08x, got 0x%08x",
+                 (void *)instr, EXPECTED_PLAY_ENTRY_BYTES, old);
+        return;
+    }
+    /* Set the runtime addr BEFORE writing the brk so the SIGTRAP handler
+     * recognizes the trap site even if the first trap fires immediately. */
+    shim_vp_play_entry_runtime = (uintptr_t)instr;
+    __sync_synchronize();
+    *instr = AARCH64_BRK_0;
+    __builtin___clear_cache((char *)instr, (char *)instr + 4);
+    SHIM_LOG("[vp_brk] patched play() entry @ %p: 0x%08x -> 0x%08x (brk #0)",
+             (void *)instr, old, (unsigned)AARCH64_BRK_0);
+}

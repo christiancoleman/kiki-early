@@ -308,6 +308,9 @@ static void shim_init_dirs(void) {
  * SIGALRM handler live in shim_inject.c. See spi_shim.h for the
  * two public entry points (shim_event_sweep, shim_inject_start). */
 
+/* Forward decl — full definition further down (Step 71 brk probe). */
+static void shim_sigtrap_handler(int sig, siginfo_t *info, void *uc);
+
 __attribute__((constructor))
 static void shim_install_crash_handler(void) {
     struct sigaction sa;
@@ -337,6 +340,15 @@ static void shim_install_crash_handler(void) {
     sigaction(SIGINT,  &sa2, NULL);
     sigaction(SIGUSR1, &sa2, NULL);
     sigaction(SIGUSR2, &sa2, NULL);  /* Step 52: event sweep (signal path, usually swallowed by qemu) */
+
+    /* SIGTRAP — Step 71 VideoPlayerSpi::play() entry probe (brk #0 patched
+     * at sub_e3819c). Handler reads this/flag/playback and resumes. */
+    struct sigaction sa_trap;
+    memset(&sa_trap, 0, sizeof(sa_trap));
+    sa_trap.sa_sigaction = shim_sigtrap_handler;
+    sa_trap.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa_trap.sa_mask);
+    sigaction(SIGTRAP, &sa_trap, NULL);
 
     /* Optional state bridge over Unix socket (SPIKE3_BRIDGE=1). */
     shim_bridge_start();
@@ -491,8 +503,139 @@ int system(const char *cmd) {
         SHIM_LOG("BLOCKED system(): %.160s", cmd);
         return 0;
     }
+    /* /connectivity/ path rewrite — system() forwards to /bin/sh on the host,
+     * which doesn't have /connectivity/ at the root (sysroot lives at
+     * $SPIKE3_SYSROOT). The shim_fs.c remap_path() doesn't apply here because
+     * we're handing a string off to the host shell, not a libc syscall.
+     * Substring-replace /connectivity/ with $SYSROOT/connectivity/ before
+     * forwarding so commands like `echo > /connectivity/hostname` and
+     * `rm -rf /connectivity/files/...` land at the right place on disk. */
+    if (cmd && strstr(cmd, "/connectivity/")) {
+        const char *sr = getenv("SPIKE3_SYSROOT");
+        if (sr && *sr) {
+            static char rewritten[8192];
+            size_t sr_len = strlen(sr);
+            size_t out = 0;
+            const char *p = cmd;
+            while (*p && out + sr_len + 14 < sizeof(rewritten) - 1) {
+                if (strncmp(p, "/connectivity/", 14) == 0) {
+                    memcpy(rewritten + out, sr, sr_len);  out += sr_len;
+                    memcpy(rewritten + out, "/connectivity/", 14);  out += 14;
+                    p += 14;
+                } else {
+                    rewritten[out++] = *p++;
+                }
+            }
+            rewritten[out] = '\0';
+            SHIM_LOG("system() REWRITE: %.120s -> %.120s", cmd, rewritten);
+            return real_fn(rewritten);
+        }
+    }
     SHIM_LOG("system(): %.160s", cmd ? cmd : "(null)");
     return real_fn(cmd);
+}
+
+/* ---- SIGTRAP handler for VideoPlayerSpi::play() entry probe (Step 71) ----
+ * shim_patch_video_player_play_entry_brk patches the NOP at sub_e3819c
+ * (BN VA 0xe3819c — the function entry) with `brk #0`. When the game calls
+ * play(), execution traps here. The handler reads the function's `this`
+ * pointer (x0 by aarch64 calling convention), peeks at the in-tree flag
+ * (this+0x2c0) and the Radium playback object pointer (this+0x988), logs
+ * the values, advances PC past the brk, and returns. The skipped instruction
+ * was a NOP, so no behavior change.
+ *
+ * Limited to first VP_BRK_LOG_MAX traps to avoid log spam if play() is
+ * called every frame. */
+#include <ucontext.h>
+
+volatile uintptr_t shim_vp_play_entry_runtime = 0;
+static int vp_brk_log_count = 0;
+#define VP_BRK_LOG_MAX 8
+
+static void shim_sigtrap_handler(int sig, siginfo_t *info, void *uc) {
+    (void)sig; (void)info;
+    ucontext_t *ctx = (ucontext_t *)uc;
+    mcontext_t *mc = &ctx->uc_mcontext;
+    uintptr_t pc = mc->pc;
+
+    if (shim_vp_play_entry_runtime != 0 && pc == shim_vp_play_entry_runtime) {
+        int seq = __sync_fetch_and_add(&vp_brk_log_count, 1);
+        if (seq < VP_BRK_LOG_MAX) {
+            uintptr_t this_ptr = mc->regs[0];
+            uintptr_t flag = 0, playback = 0;
+            int read_ok = 0;
+            if (this_ptr >= 0x10000) {
+                /* trust the read; if this_ptr is bogus, we'll SEGV which is
+                 * caught by our existing SIGSEGV handler. Acceptable for a
+                 * diagnostic. */
+                flag = *(volatile uintptr_t *)(this_ptr + 0x2c0);
+                playback = *(volatile uintptr_t *)(this_ptr + 0x988);
+                read_ok = 1;
+            }
+            uintptr_t lr = mc->regs[30];
+            SHIM_LOG("[vp_play_entry] #%d: this=%p flag@+0x2c0=0x%lx (bit22=%d) playback@+0x988=%p caller_lr=0x%lx read_ok=%d",
+                     seq, (void *)this_ptr, (unsigned long)flag,
+                     (int)((flag >> 22) & 1), (void *)playback,
+                     (unsigned long)lr, read_ok);
+        }
+        mc->pc += 4;  /* skip the brk; original NOP doesn't need executing */
+        return;
+    }
+
+    /* Unhandled trap — restore default and re-raise so the game crashes
+     * informatively rather than silently hanging. */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* ---- Hooked: __dynamic_cast (Step 71 diagnostic) ----
+ * Logs C++ RTTI casts that originate from the video_player_spi.cpp
+ * neighborhood (BN VAs ~0xe30000–0xe50000). The VideoPlayerSpi::play() impl
+ * (sub_e3819c) calls __dynamic_cast on the playback object at this+0x988
+ * to verify it's a VideoStreamPlaybackSpi — which is where Stern's Radium
+ * backend would be plumbed in.
+ *
+ * After the Step-71 NOP-tbz patch, play() proceeds past its in-tree
+ * assertion and reaches the cast. The log tells us:
+ *   - Was the cast attempted at all? (i.e., was the playback object non-NULL)
+ *   - What's the source type pointer?
+ *   - What's the destination type pointer? (we can grep the binary for that
+ *     address to confirm it's _typeinfo_for_VideoStreamPlaybackSpi)
+ *   - Did the cast succeed (non-NULL result) or fail (NULL)?
+ *
+ * Filter on caller LR keeps the noise down — Godot does thousands of casts
+ * at startup we don't care about. Also log the first 5 calls unconditionally
+ * as a sanity check that the hook is wired. */
+
+#include <stddef.h>  /* ptrdiff_t */
+
+typedef void *(*real_dynamic_cast_t)(const void *, const void *, const void *, ptrdiff_t);
+
+void *__dynamic_cast(const void *src_ptr,
+                     const void *src_type,
+                     const void *dst_type,
+                     ptrdiff_t src2dst) {
+    static real_dynamic_cast_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_dynamic_cast_t)dlsym(RTLD_NEXT, "__dynamic_cast");
+    void *result = real_fn(src_ptr, src_type, dst_type, src2dst);
+
+    /* Caller LR via builtin. NB: gcc's __builtin_return_address(0) is the
+     * direct caller, which is what we want here. */
+    void *lr = __builtin_return_address(0);
+    uintptr_t lr_va = (uintptr_t)lr;
+    /* video_player_spi.cpp neighborhood (BN 0xe30000–0xe50000 → runtime
+     * 0x7fffe4770000–0x7fffe4790000 with PIE base 0x7fffe3940000). */
+    int in_vp_range = (lr_va >= 0x7fffe4770000ull && lr_va < 0x7fffe4790000ull);
+
+    static int dc_total = 0;
+    int seq = __sync_fetch_and_add(&dc_total, 1);
+
+    if (in_vp_range || seq < 5) {
+        const char *tag = in_vp_range ? "VP-RANGE" : "SANITY";
+        SHIM_LOG("[dyncast] %s #%d: src=%p src_t=%p dst_t=%p result=%p caller_lr=%p",
+                 tag, seq, src_ptr, src_type, dst_type, result, lr);
+    }
+    return result;
 }
 
 /* ---- Hooked: pthread_create (force inherit-sched) ----
