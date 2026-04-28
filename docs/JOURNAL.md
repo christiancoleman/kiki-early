@@ -5635,3 +5635,80 @@ Step 67's claim that polling cmds "don't appear ANYWHERE as static immediates or
 ### Where this leaves us
 
 Slot 0 (bridge/CPU node) cipher-cmd traffic is mostly understood — meaningful synthetic responses for cmd 0xF2/0xF4 are within reach. Slot 1+ traffic (for downstream nodes the user doesn't have hardware for) remains opaque and would require deep RE through the chip-vtable handler tree. The cost/benefit favors deferring slot-1 emulation in favor of higher-impact blockers (Pokemon-logo crash, VideoPlayerSpi pure-virtual abort).
+
+## Step 69: cipher decoder retracted — encryption is conditional, polling traffic is fe_probe (2026-04-28)
+
+Two correlated discoveries that retract Steps 67/68's interpretation of the polling traffic, plus a working (but complicated) shim synthesizer for fe_probe.
+
+### What we believed entering this step
+
+After Step 68, we had:
+- Decoded inner_cmds 0xED/0xEE for slot 1 polling (and 0xDD/0xDE for slot 2, 0x8D/0x8E for slot 7, etc.)
+- The pattern `decoded_high_nibble = 0xF - slot` looked suspicious but we rationalized it as different-per-slot wrapper paths
+- Couldn't find any 0xED/0xEE/0xDD wrapper via static MOVZ/MOVN/SUB/ADD scans
+
+### What's actually true
+
+The "decoded" values were ARTIFACTS of the shim's cipher decoder running unconditionally. Encryption isn't actually applied in our shim runs at all.
+
+Verified by GDB BP at `mcp_nodebus_send_encrypted` entry (`0x7fffe422c410` runtime, base `0x7fffe3940000` with `setarch --addr-no-randomize`):
+- Slot 1 frames hit BP with `cmd=0xFE ilen=1` (1st fe_probe call, hint byte at offset 3 = `0x0B`)
+- Then `cmd=0xFA ilen=2` (2nd, hint at offset 4 = `0x01`)
+- Then `cmd=0xFE ilen=1` again (3rd, hint = `0x0A`)
+
+Those exactly match `mcp_nodebus_send_cmd_fe_probe_unsure @ 0x8ed870`'s three call sites. So slot polling is fe_probe — chip identification — across every slot (0–13 active in our run). The 0xED/0xDD/0x8D values were `0xFE ^ ((slot << 4) | ((ilen+1) & 0xF))` — pure cipher-decoder artifacts.
+
+### Why encryption skipped
+
+`mcp_nodebus_send_encrypted` only runs the cipher when:
+- Cmd byte is in [0x10, 0xEF] OR equals 0xF2, AND
+- Per-slot status byte at `mcp_nodebus_per_slot_status[slot] + 3` is non-zero
+
+For cmd 0xFE (fe_probe 1st/3rd) and 0xFA (2nd), the cmd-range check fails (0xFE/0xFA > 0xEF). So encryption is skipped regardless of status flag. For cmd 0xF2 (the 1 frame from `sub_8f2db0` we observed), the cmd-range check passes but the per-slot status flag is zero in our shim (never set by anything we synthesize), so encryption is also skipped.
+
+Net: every cmd 0x41 frame we observe is **cleartext on the wire**. The cipher exists in the binary; we just never trigger the path that turns it on.
+
+### Hint-byte clarification
+
+The "response-length hint" lives in the WRAPPER's input buffer at offset (inner_len + 2), read by `mcp_nodebus_send_encrypted` line `0x8ec4c4` BEFORE the csum/encryption phase. After that phase, the byte at the same offset gets overwritten by the bridge-level checksum (computed on the post-encryption bytes). So **the wire byte at frame[inner_len+2] is the BRIDGE CSUM**, not the hint. The hint is never visible on the wire — to synthesize correctly we have to know each wrapper's hint statically.
+
+### What we built
+
+`shim_nodebus.c` rewrite for cmd 0x41:
+1. Removed the cipher decode (was producing the false 0xED/0xDD/etc.)
+2. Logs wire bytes as cleartext directly (`bridge: cmd 0x41 slot=N inner_cmd=0xXX ilen=Y payload=[…]`)
+3. Added an opt-in fe_probe synthesizer behind `NODEBUS_SYNTH_FE=1` env flag. When set:
+   - Detects cmd 0xFE / 0xFA at frame offset 2
+   - Reads the hint byte from frame offset (2 + ilen) directly (cleartext, since no encryption)
+   - Builds a bridge response: `STX + 0x41 + id + (hint bytes payload) + bridge_csum + ETX`
+   - Payload[0] = 0x80 (high bit set = "node present"), rest = 0 (chip ID zero → falls through to default chip vtable entry)
+
+Forwarded the env var through `run_game.sh` so it actually reaches qemu's guest env.
+
+### What it does
+
+With `NODEBUS_SYNTH_FE=1`:
+- 260 fe_probe responses synthesized across all 10 active slots
+- Game completes fe_probe rounds (1st AND 2nd call — first time we've seen 0xFA frames)
+- ZERO bridge timeouts (vs 27+ in baseline)
+- BUT Godot doesn't initialize at all (no "Godot Engine" banner, no "Detected Capture/Discover scene" lines, no res:// references)
+
+The "timeout-is-progress" insight from Step 45 stands: bridge cmd timeouts are the path that lets the game advance past nodebus init and into Godot. By making fe_probe succeed, we trap the game in a deeper init phase waiting for key-fetch responses (cmd 0xF9 / 0xFC / 0xFD) that we don't synth — so Godot never starts.
+
+### Default behavior preserved
+
+`NODEBUS_SYNTH_FE` is **off by default**. Without the env var, the shim is functionally equivalent to the post-Step-67 build minus the (broken) cipher decode. The default run reaches Godot scene detection same as baseline.
+
+### BN updates landed
+
+- `0x42317a0` renamed → `mcp_lpc_chip_default_vtable_entry_unsure`
+- `mcp_nodebus_send_encrypted` function comment: encryption gating + hint-byte location
+- `mcp_nodebus_send_cmd_fe_probe_unsure` function comment: 3 call sites + buffer layouts + caller's response-byte mapping
+
+(Save the BN database via File → Save Database.)
+
+### What's open
+
+- **Key-fetch synthesis** — to make synth-on actually progress further than synth-off, we'd need to also synthesize cmd 0xF9 / 0xFC / 0xFD responses. The wrappers are `mcp_nodebus_fetch_key_basic @ 0x8f3484`, `mcp_nodebus_fetch_key_with_serial @ 0x8f355c`, `mcp_nodebus_fetch_key_two_probes @ 0x8f36b0`. Hint values and response shapes need similar GDB-BP capture as we did for fe_probe.
+- **"Detected scene" → next blocker** — synth-disabled baseline reaches Godot scene detection but doesn't progress to playable. The actual upstream blocker is in Godot land. `/tmp/godot_log(s)` (user-flagged in `reference_godot_logs.md`) is unread; that's where to look for scene-init / GDScript errors.
+- **Cipher genuinely active path** — still untested in our runs. To exercise it we'd need to set `mcp_nodebus_per_slot_status[slot]+3` non-zero for at least one slot via a synthesized response. Not strictly necessary for current goals.
