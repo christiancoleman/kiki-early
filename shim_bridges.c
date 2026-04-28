@@ -36,8 +36,14 @@
  * the GL state into this TU. */
 extern volatile unsigned shim_last_draw_fbo;
 
-/* shim_sysroot_tmp_path is defined as static inline in spi_shim.h —
- * one source of truth for sysroot-rooted runtime paths. */
+/* shim_unix_abstract_addr is defined as static inline in spi_shim.h —
+ * the canonical AF_UNIX addressing strategy: abstract namespace, no fs
+ * touch. WSL/9P can't bind AF_UNIX on /mnt/c, so this is the only way
+ * to keep both endpoints inside the project (helper Python uses the
+ * same abstract name). */
+#define ABSTRACT_BRIDGE_NAME  "pokemon_spike3_bridge"
+#define ABSTRACT_FRAME_NAME   "pokemon_spike3_frame"
+#define ABSTRACT_AUDIO_NAME   "pokemon_spike3_audio"
 
 /* ========== moved from spi_shim.c (1446-1600): state bridge (comment + includes + globals + now_ms + emit + accept + poll) ========== */
 
@@ -203,34 +209,17 @@ void shim_bridge_start(void) {
     const char *enabled = getenv("SPIKE3_BRIDGE");
     if (!enabled || enabled[0] != '1') return;
 
-    const char *sock_path = getenv("SPIKE3_BRIDGE_SOCKET");
-    if (!sock_path || !sock_path[0]) {
-        static char default_path[1024];
-        sock_path = shim_sysroot_tmp_path(default_path, sizeof(default_path),
-                                          "spike3_bridge.sock");
-    }
-
-    /* Unlink any stale socket. */
-    unlink(sock_path);
-
     shim_bridge_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (shim_bridge_listen_fd < 0) {
         SHIM_LOG("[bridge] socket() failed: %s", strerror(errno));
         return;
     }
 
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    int n = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
-    if (n < 0 || (size_t)n >= sizeof(addr.sun_path)) {
-        SHIM_LOG("[bridge] socket path truncated (>%zu chars): %s",
-                 sizeof(addr.sun_path) - 1, sock_path);
-        close(shim_bridge_listen_fd);
-        shim_bridge_listen_fd = -1;
-        return;
-    }
+    struct sockaddr_un addr;
+    socklen_t addrlen = shim_unix_abstract_addr(&addr, ABSTRACT_BRIDGE_NAME);
 
-    if (bind(shim_bridge_listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        SHIM_LOG("[bridge] bind(%s) failed: %s", sock_path, strerror(errno));
+    if (bind(shim_bridge_listen_fd, (struct sockaddr*)&addr, addrlen) < 0) {
+        SHIM_LOG("[bridge] bind(@%s) failed: %s", ABSTRACT_BRIDGE_NAME, strerror(errno));
         close(shim_bridge_listen_fd);
         shim_bridge_listen_fd = -1;
         return;
@@ -243,7 +232,7 @@ void shim_bridge_start(void) {
         return;
     }
 
-    SHIM_LOG("[bridge] bound + listening on %s", sock_path);
+    SHIM_LOG("[bridge] bound + listening on @%s (abstract)", ABSTRACT_BRIDGE_NAME);
     shim_bridge_start_ms = shim_now_ms();
 
     pthread_t t_accept, t_poll;
@@ -254,7 +243,7 @@ void shim_bridge_start(void) {
         pthread_detach(t_poll);
     }
 
-    SHIM_LOG("[bridge] listening on %s (AF_UNIX)", sock_path);
+    SHIM_LOG("[bridge] threads ready on @%s (abstract AF_UNIX)", ABSTRACT_BRIDGE_NAME);
 }
 
 /* ========== moved from spi_shim.c (1945-2063): frame bridge (comment + globals + accept + drop + send_all + send) ========== */
@@ -458,34 +447,21 @@ restore:
 void shim_frame_start(void) {
     const char *enabled = getenv("SPIKE3_FRAME_BRIDGE");
     if (!enabled || enabled[0] != '1') return;
-    const char *sock_path = getenv("SPIKE3_FRAME_SOCKET");
-    if (!sock_path || !sock_path[0]) {
-        static char default_path[1024];
-        sock_path = shim_sysroot_tmp_path(default_path, sizeof(default_path),
-                                          "spike3_frame.sock");
-    }
-
-    unlink(sock_path);
     shim_frame_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (shim_frame_listen_fd < 0) {
         SHIM_LOG("[frame] socket() failed: %s", strerror(errno));
         return;
     }
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    int n = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
-    if (n < 0 || (size_t)n >= sizeof(addr.sun_path)) {
-        SHIM_LOG("[frame] socket path truncated (>%zu chars): %s",
-                 sizeof(addr.sun_path) - 1, sock_path);
-        close(shim_frame_listen_fd); shim_frame_listen_fd = -1; return;
-    }
-    if (bind(shim_frame_listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+    struct sockaddr_un addr;
+    socklen_t addrlen = shim_unix_abstract_addr(&addr, ABSTRACT_FRAME_NAME);
+    if (bind(shim_frame_listen_fd, (struct sockaddr*)&addr, addrlen) < 0 ||
         listen(shim_frame_listen_fd, 1) < 0) {
-        SHIM_LOG("[frame] bind/listen(%s) failed: %s", sock_path, strerror(errno));
+        SHIM_LOG("[frame] bind/listen(@%s) failed: %s", ABSTRACT_FRAME_NAME, strerror(errno));
         close(shim_frame_listen_fd); shim_frame_listen_fd = -1; return;
     }
     pthread_t t;
     if (pthread_create(&t, NULL, shim_frame_accept_thread, NULL) == 0) pthread_detach(t);
-    SHIM_LOG("[frame] listening on %s (AF_UNIX)", sock_path);
+    SHIM_LOG("[frame] listening on @%s (abstract AF_UNIX)", ABSTRACT_FRAME_NAME);
 }
 
 /* ========== Audio bridge (post-refactor addition, 2026-04-24) ==========
@@ -562,32 +538,19 @@ void shim_audio_emit(const uint8_t *buf, size_t bytes) {
 void shim_audio_start(void) {
     const char *enabled = getenv("SPIKE3_AUDIO_BRIDGE");
     if (!enabled || enabled[0] != '1') return;
-    const char *sock_path = getenv("SPIKE3_AUDIO_SOCKET");
-    if (!sock_path || !sock_path[0]) {
-        static char default_path[1024];
-        sock_path = shim_sysroot_tmp_path(default_path, sizeof(default_path),
-                                          "spike3_audio.sock");
-    }
-
-    unlink(sock_path);
     shim_audio_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (shim_audio_listen_fd < 0) {
         SHIM_LOG("[audio] socket() failed: %s", strerror(errno));
         return;
     }
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    int n = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
-    if (n < 0 || (size_t)n >= sizeof(addr.sun_path)) {
-        SHIM_LOG("[audio] socket path truncated (>%zu chars): %s",
-                 sizeof(addr.sun_path) - 1, sock_path);
-        close(shim_audio_listen_fd); shim_audio_listen_fd = -1; return;
-    }
-    if (bind(shim_audio_listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+    struct sockaddr_un addr;
+    socklen_t addrlen = shim_unix_abstract_addr(&addr, ABSTRACT_AUDIO_NAME);
+    if (bind(shim_audio_listen_fd, (struct sockaddr*)&addr, addrlen) < 0 ||
         listen(shim_audio_listen_fd, 1) < 0) {
-        SHIM_LOG("[audio] bind/listen(%s) failed: %s", sock_path, strerror(errno));
+        SHIM_LOG("[audio] bind/listen(@%s) failed: %s", ABSTRACT_AUDIO_NAME, strerror(errno));
         close(shim_audio_listen_fd); shim_audio_listen_fd = -1; return;
     }
     pthread_t t;
     if (pthread_create(&t, NULL, shim_audio_accept_thread, NULL) == 0) pthread_detach(t);
-    SHIM_LOG("[audio] listening on %s (AF_UNIX, S16_LE 2ch 44.1 kHz raw)", sock_path);
+    SHIM_LOG("[audio] listening on @%s (abstract AF_UNIX, S16_LE 2ch 44.1 kHz raw)", ABSTRACT_AUDIO_NAME);
 }

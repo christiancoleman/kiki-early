@@ -171,11 +171,11 @@ if [[ "$STALE_KILL" == "1" ]]; then
         sleep 0.5
         for pid in $stale_all; do kill -KILL "$pid" 2>/dev/null || true; done
     fi
-    # Sockets live in $SYSROOT/tmp/ now (kept out of WSL's /tmp). Clean both
-     # sysroot and legacy /tmp paths so older sockets from prior installs are
-     # also reaped.
-     rm -f "$SYSROOT/tmp/spike3_frame.sock" "$SYSROOT/tmp/spike3_audio.sock" "$SYSROOT/tmp/spike3_bridge.sock"
-     rm -f /tmp/spike3_frame.sock /tmp/spike3_audio.sock /tmp/spike3_bridge.sock 2>/dev/null || true
+    # Sockets are AF_UNIX abstract namespace now (no filesystem files exist).
+    # Reap any legacy filesystem socket files in case an older shim is still
+    # in use somewhere — harmless no-op when our current shim is loaded.
+    rm -f "$SYSROOT/tmp/spike3_frame.sock" "$SYSROOT/tmp/spike3_audio.sock" "$SYSROOT/tmp/spike3_bridge.sock" 2>/dev/null || true
+    rm -f /tmp/spike3_frame.sock /tmp/spike3_audio.sock /tmp/spike3_bridge.sock 2>/dev/null || true
 fi
 
 QEMU_PID=""

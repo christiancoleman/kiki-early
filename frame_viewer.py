@@ -38,10 +38,14 @@ import sys
 import threading
 import time
 
-# Self-resolve sysroot from script location (sysroot/games/pokemon_le/_emulation/frame_viewer.py).
+# Self-resolve project paths from script location (sysroot/games/pokemon_le/_emulation/frame_viewer.py).
 _HERE = pathlib.Path(__file__).resolve().parent
 _SYSROOT = _HERE.parent.parent.parent
-DEFAULT_SOCKET = str(_SYSROOT / "tmp" / "spike3_frame.sock")
+# Default to abstract AF_UNIX namespace (leading null) — matches the shim
+# bridge's bind. Avoids 9P/WSL bind-on-/mnt/c failures, zero filesystem
+# touch, no cleanup. Override --socket with a filesystem path if you want
+# to debug via `ss -l` or similar.
+DEFAULT_SOCKET = "\0pokemon_spike3_frame"
 DEFAULT_SAVE_DIR = str(_HERE / "captures" / "frames")
 
 import numpy as np

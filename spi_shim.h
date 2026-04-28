@@ -162,27 +162,40 @@ void shim_patch_video_player_assertion(void);
 void shim_patch_video_player_play_entry_brk(void);
 extern volatile uintptr_t shim_vp_play_entry_runtime;
 
-/* ---- Sysroot-rooted runtime paths ----
- * One source of truth for "where do shim runtime files (sockets, caches,
- * sentinels) live?" The convention: $SPIKE3_SYSROOT/tmp/<basename>. With a
- * SPIKE3_SYSROOT in qemu's env (set by run_game.sh), shim runtime files
- * stay inside the project tree and never touch WSL's /tmp.
+/* ---- AF_UNIX abstract-namespace addressing ----
+ * WSL2's 9P mount of /mnt/c/... does NOT support AF_UNIX bind (errno 95
+ * EOPNOTSUPP). Putting sockets under $SYSROOT/tmp/ on /mnt/c is therefore
+ * impossible. Putting them under host /tmp works (real tmpfs) but leaks
+ * transient files into WSL's filesystem.
  *
- * Used by:
- *   - shim_bridges.c   — AF_UNIX socket binds (state/frame/audio bridges)
- *   - spi_shim.c       — system() command-string rewriting (analogous helper)
- *   - any future code  — if you need a runtime-writable path under sysroot/tmp
+ * The Linux abstract namespace (sun_path[0] = '\0', followed by name) lets
+ * the kernel manage the binding name in a private namespace — zero
+ * filesystem touch. This is the canonical IPC strategy for our case:
+ * shim and helpers use the same abstract name, kernel matches them up,
+ * nobody touches WSL or any filesystem.
  *
- * Note: this is for paths the SHIM itself constructs and uses via direct
- * syscalls (socket/bind, mkdir-from-shim-init, etc.) that don't go through
- * shim_fs.c's remap_path(). The GAME's own libc fopen/open of /tmp/...
- * paths is handled transparently by remap_path itself. */
-static inline const char *shim_sysroot_tmp_path(char *buf, size_t buflen,
-                                                const char *basename) {
-    const char *sr = getenv("SPIKE3_SYSROOT");
-    if (sr && *sr) snprintf(buf, buflen, "%s/tmp/%s", sr, basename);
-    else           snprintf(buf, buflen, "/tmp/%s", basename);
-    return buf;
+ * Names are unique system-wide (per network namespace) — collisions would
+ * cause EADDRINUSE if two installations run simultaneously. The
+ * "pokemon_spike3_" prefix avoids collisions with anything else likely.
+ *
+ * Logging convention: prepend "@" to the name when printing (matches
+ * `ss -l` and lsof formatting for abstract sockets). */
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <string.h>
+
+static inline socklen_t shim_unix_abstract_addr(struct sockaddr_un *out,
+                                                const char *name) {
+    memset(out, 0, sizeof(*out));
+    out->sun_family = AF_UNIX;
+    out->sun_path[0] = '\0';  /* the abstract-namespace marker */
+    size_t name_len = strlen(name);
+    if (name_len > sizeof(out->sun_path) - 2)
+        name_len = sizeof(out->sun_path) - 2;
+    memcpy(&out->sun_path[1], name, name_len);
+    /* addrlen = offsetof(sun_path) + 1 (NUL marker) + name length.
+     * Trailing NUL is NOT included — Linux uses the addrlen to delimit. */
+    return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len);
 }
 
 /* ---- Injection layer (defined in shim_inject.c) ----

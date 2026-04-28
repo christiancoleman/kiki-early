@@ -36,7 +36,8 @@ import time
 
 _HERE = pathlib.Path(__file__).resolve().parent
 _SYSROOT = _HERE.parent.parent.parent
-DEFAULT_SOCKET = str(_SYSROOT / "tmp" / "spike3_audio.sock")
+# Abstract AF_UNIX namespace — matches the shim bridge's bind.
+DEFAULT_SOCKET = "\0pokemon_spike3_audio"
 
 
 def main():
