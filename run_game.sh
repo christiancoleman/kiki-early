@@ -312,10 +312,11 @@ fi
 if [[ "$TIMER" == "ON" ]]; then
     if command -v python3 >/dev/null; then
         # Marker writes go directly to runs/latest/game.log (raw O_APPEND in
-        # marker_button.py) — no separate timer.log needed. Tk warnings /
-        # script errors silenced; if a write to game.log ever fails, the
-        # marker_button.py logs the error to /tmp/marker_button_errors.log.
-        python3 "$SCRIPT_DIR/marker_button.py" >/dev/null 2>&1 &
+        # marker_button.py) — no separate timer.log needed. BUT: route
+        # stderr to a sticky log file so any Python exception from the GUI
+        # callback path is captured (was silently lost when /dev/null'd).
+        python3 -u "$SCRIPT_DIR/marker_button.py" \
+            >>"$SYSROOT/tmp/marker_button_errors.log" 2>&1 &
         HELPER_PIDS+=("$!"); HELPER_LABELS+=("marker button")
         printf '[run_game] spawned marker button (pid %d) — TIMER=ON\n' "$!" >&2
     else
@@ -388,8 +389,17 @@ cd "$GAME_DIR"
 # Background qemu + wait so the trap can kill it directly on Ctrl+C (bash
 # doesn't forward signals to foreground children reliably, and the shim's
 # SIGINT handler doesn't always terminate — see cleanup_all's SIGKILL path).
+#
+# IMPORTANT: use `>>` (O_APPEND) for the game.log redirect, with explicit
+# pre-truncation. Reason: when TIMER=ON, marker_button.py also appends to
+# game.log via O_APPEND. With `>` (no O_APPEND), qemu's fd has a fixed
+# position counter; marker's appends advance EOF past qemu's position, then
+# qemu's next write OVERWRITES the marker line. With both writers in
+# O_APPEND mode, every write goes atomically to current EOF — no
+# trampling. Pre-truncate so each run starts fresh.
 if [[ -n "$game_redirect" ]]; then
-    "${args[@]}" >"$game_redirect" 2>&1 &
+    : > "$game_redirect"
+    "${args[@]}" >>"$game_redirect" 2>&1 &
 else
     "${args[@]}" &
 fi

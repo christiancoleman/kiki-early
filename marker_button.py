@@ -68,18 +68,40 @@ def log_error(detail: str):
 
 
 def write_marker(label_var, status_var, count_ref):
-    count_ref[0] += 1
-    label = label_var.get().strip() or "event"
-    line = f"{now_timestamp()} - [marker] click #{count_ref[0]} ({label})\n"
+    """Broad try/except + always-log diagnostic so ANY click activity is
+    visible in the error log. Earlier narrow OSError-only catch + stderr-
+    to-/dev/null was silently eating click failures."""
+    try:
+        count_ref[0] += 1
+        label = label_var.get().strip() or "event"
+        line = f"{now_timestamp()} - [marker] click #{count_ref[0]} ({label})\n"
+    except Exception as e:
+        log_error(f"CLICK #{count_ref[0]} SETUP RAISED: {type(e).__name__}: {e}")
+        try: status_var.set(f"SETUP EXCEPTION: {type(e).__name__}: {e}")
+        except Exception: pass
+        return
+
+    # Always log every click attempt so we know the handler fired.
+    log_error(f"CLICK #{count_ref[0]} fired (label={label!r})")
 
     ok, detail = append_to_game_log(line)
     if ok:
-        status_var.set(f"#{count_ref[0]} @ {line.split(' - ')[1]} → game.log")
-    else:
-        log_error(f"click #{count_ref[0]}: {detail} — line was: {line.rstrip()}")
-        status_var.set(
-            f"#{count_ref[0]} FAILED ({detail}). See {ERROR_LOG_PATH}."
-        )
+        log_error(f"CLICK #{count_ref[0]} wrote OK to game.log")
+        try:
+            status_var.set(f"#{count_ref[0]} @ {line.split(' - ')[1]} → game.log")
+        except Exception:
+            pass  # status display failure should never lose the marker write
+        return
+
+    # Write failed — log every detail.
+    log_error(f"CLICK #{count_ref[0]} APPEND FAILED: {detail} — line: {line.rstrip()}")
+    log_error(f"  GAME_LOG_PATH={GAME_LOG_PATH}")
+    log_error(f"  exists={os.path.exists(GAME_LOG_PATH)} writable={os.access(GAME_LOG_PATH, os.W_OK)}")
+    print(f"[marker] click #{count_ref[0]} FAILED: {detail}", file=sys.stderr, flush=True)
+    try:
+        status_var.set(f"#{count_ref[0]} FAILED ({detail}). See {ERROR_LOG_PATH}.")
+    except Exception:
+        pass
 
 
 def kill_game(root, status_var):
@@ -122,6 +144,14 @@ def _kill_followup(status_var):
 
 
 def main():
+    # Startup diagnostic — proves the script ran. If user reports "no markers"
+    # and this line is absent, marker_button.py never spawned (env / TIMER=ON
+    # / DISPLAY issue). If it's present and click logs are absent, the GUI
+    # isn't receiving click events (focus / Tk issue).
+    log_error(f"STARTED pid={os.getpid()} GAME_LOG_PATH={GAME_LOG_PATH} "
+              f"exists={os.path.exists(GAME_LOG_PATH)} "
+              f"writable={os.access(GAME_LOG_PATH, os.W_OK)}")
+
     root = tk.Tk()
     root.title("Spike 3 Marker")
     root.geometry("420x240")
