@@ -5591,3 +5591,47 @@ Slots 2–31 saw no traffic. Key-fetch family (`0xfc / 0xfd / 0xf9`) did NOT fir
 
 No memory updates this round.
 
+
+## Step 68: polling-cmd byte hunt — slot 0 reconciled, slot 1 remains opaque (2026-04-27)
+
+Continuing from Step 67's decoded boot traffic (4 inner_cmds: 0xed/0xee/0xf2/0xf4). Goal: identify which wrappers emit each cmd byte so the shim can synthesize plausible responses.
+
+### Resolved — slot 0 frames
+
+**Cmd 0xF2** is emitted by 4 sibling wrappers, all packing `inner_len | cmd` as a single 16-bit `MOVZ #0xF202`:
+- `0x8f2db0` → `mcp_nodebus_emit_cmd_f2_short_unsure`
+- `0x8f2c80` → `mcp_nodebus_emit_cmd_f2_short_v2_unsure`
+- `0x8f2e50` → `mcp_nodebus_emit_cmd_f2_dual_path_unsure`
+- `0x8f1934` → `mcp_nodebus_emit_cmd_f2_with_args_unsure`
+
+**Cmd 0xF4** is emitted by `0x8ed7a0` (`mcp_nodebus_emit_cmd_f4_bulk_write_unsure`), using `MOVN W3, #0x000B` to load `0xFFFFFFF4`, then `STRB` the low byte. Variable-length wrapper for chunked data writes. Callers:
+- `0x8f1180` → `mcp_nodebus_emit_cmd_f4_thunk_unsure` (guarded thunk)
+- `0x8f3020` → `mcp_nodebus_emit_cmd_f4_chunked_then_f2_commit_unsure` (loops 0xF4 in ≤0x80-byte chunks, then commits with 0xF2)
+
+Self-consistency check: for slot=0 frame `f1 8d 00 bf` (decoded inner_cmd=0xF2, payload=[71]), reverse-decoding through `mcp_nodebus_emit_cmd_f2_short_unsure(arg2=0x97)` produces wire bytes `0xF1 0x8D`, matching the actual frame. Cipher formula `mask = (slot << 4) | ((inner_len + 1) & 0xF)` is verified correct.
+
+Also renamed surrounding poll-loop infrastructure:
+- `0x589480` → `mcp_nodebus_lamp_poll_loop_unsure` (inner per-board update loop)
+- `0x675efc` → `mcp_nodebus_main_poll_loop_unsure` (outer game-loop polling orchestrator)
+- `0x674680` → `mcp_nodebus_node_probe_5x_unsure` (5× consistency-check probe per slot during init)
+
+### Unresolved — slot 1 frames
+
+**Cmds 0xED, 0xEE** — wrappers NOT found via simple ARM64 immediate-loading patterns (MOVZ / MOVN / SUB / ADD with the cmd byte as immediate) anywhere in the wrapper cluster (0x8ed000–0x8f8000). Hypotheses:
+- (a) Computed via multi-instruction sequence not pattern-matched
+- (b) Loaded from a per-chip-type cmd-byte table
+- (c) Emitted by chip-vtable-dispatched functions outside the wrapper cluster — `mcp_lpc_chip_vtable @ 0x42317c8` has 28 entries × 5 fps each, with pointers into 0x97x000–0x99x000 range; those handlers (e.g., `sub_9777c0` is 88KB) likely contain the per-chip cmd logic.
+
+Slot 1 has a different LPC chip type than slot 0, with chip-specific message-type codes.
+
+### FP-walker reliability note (Step 67)
+
+The shim's caller-chain logging for slot=1 ed frames points at `mcp_nodebus_send_cmd_fe_probe_unsure` as the top intermediate caller. That function emits cmd 0xFE/0xFA, **not** 0xED, and its buffer math (inner_len=1 vs observed inner_len=2) doesn't reconcile. Either qemu's stack-unwinding has a quirk for translated guest code, or there's stale LR data in the deeper frames. **Don't trust the chain past d5/d6 for cipher frames.**
+
+### Reconciliation with Step 67
+
+Step 67's claim that polling cmds "don't appear ANYWHERE as static immediates or raw bytes" was a single-byte-immediate scan only. The 16-bit packed forms (`0xF202` etc.) do exist in the wrapper cluster — the previous search just didn't cover ARM64 16-bit MOVZ encodings.
+
+### Where this leaves us
+
+Slot 0 (bridge/CPU node) cipher-cmd traffic is mostly understood — meaningful synthetic responses for cmd 0xF2/0xF4 are within reach. Slot 1+ traffic (for downstream nodes the user doesn't have hardware for) remains opaque and would require deep RE through the chip-vtable handler tree. The cost/benefit favors deferring slot-1 emulation in favor of higher-impact blockers (Pokemon-logo crash, VideoPlayerSpi pure-virtual abort).

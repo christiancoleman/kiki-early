@@ -160,6 +160,49 @@ static int bridge_encode_escape(const uint8_t *logical, size_t logical_len,
     return (int)o;
 }
 
+/* Walk the ARM64 frame-pointer chain from our own frame, capturing return
+ * addresses up to MAX_DEPTH frames. Both the shim and the game are aarch64
+ * (running under qemu-aarch64 TCG), so they share the same stack discipline:
+ * x29 holds FP; at [FP] is the saved parent FP, at [FP+8] is the saved LR.
+ *
+ * This lets us identify the game-side function that ultimately wrote a
+ * cmd-0x41 frame (callsite of mcp_nodebus_send_raw → bridge → write()).
+ *
+ * Filters: only return addresses inside the game binary's .text range get
+ * logged. (.text @ 0x460000, size 0x03167100 → upper bound 0x35c7100.) Shim-
+ * internal frames and libc frames are skipped.
+ */
+#define GAME_TEXT_LO 0x0000460000ULL
+#define GAME_TEXT_HI 0x00035c7100ULL  /* exclusive */
+
+static void log_caller_chain(const char *prefix) {
+    char line[1024];
+    int n = snprintf(line, sizeof(line), "[shim]   %s caller chain (raw):", prefix);
+    uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
+    n += snprintf(line + n, sizeof(line) - n, " fp_start=0x%lx", fp);
+    for (int depth = 0; depth < 12 && fp; depth++) {
+        if (fp & 0xF) {
+            n += snprintf(line + n, sizeof(line) - n, " [d%d unaligned 0x%lx]", depth, fp);
+            break;
+        }
+        if (fp < 0x1000 || fp > 0x800000000000ULL) {
+            n += snprintf(line + n, sizeof(line) - n, " [d%d out-of-range fp=0x%lx]", depth, fp);
+            break;
+        }
+        uintptr_t next_fp = *(volatile uintptr_t*)fp;
+        uintptr_t ret    = *(volatile uintptr_t*)(fp + 8);
+        const char *zone = (ret >= GAME_TEXT_LO && ret < GAME_TEXT_HI) ? "GAME" : "extn";
+        n += snprintf(line + n, sizeof(line) - n, " d%d=%s:0x%lx(fp->0x%lx)",
+                      depth, zone, ret, next_fp);
+        if (ret == 0) break;
+        if (next_fp == 0 || next_fp <= fp || next_fp - fp > 0x100000) break;
+        fp = next_fp;
+    }
+    n += snprintf(line + n, sizeof(line) - n, "\n");
+    if (n > (int)sizeof(line)) n = (int)sizeof(line);
+    (void)write(STDERR_FILENO, line, (size_t)n);
+}
+
 /* Decrypt the inner_cmd + payload portion of a cmd-0x41 frame in place.
  *
  * Mirrors mcp_nodebus_send_encrypted's encryption loop in the game binary
@@ -519,6 +562,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
         }
         if (n > (int)sizeof(line)) n = (int)sizeof(line);
         (void)write(STDERR_FILENO, line, (size_t)n);
+        log_caller_chain("cmd 0x41");
         return;
     }
     default:
