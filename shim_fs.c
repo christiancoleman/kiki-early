@@ -92,6 +92,23 @@ static const char *remap_path(const char *path) {
      * by dropping a file at $SYSROOT/sys/firmware/... */
     if (strncmp(path, "/sys/firmware/", 14) == 0) goto do_remap;
     if (strncmp(path, "/sys/", 5) == 0) return path;
+    /* Font config redirects: libfontconfig probes the four per-user config
+     * paths below under the host's /home/. Without this carve-out those
+     * probes fall through the /home/ skip and hit the WSL-native filesystem
+     * (where they don't exist). Redirect each onto the sysroot /etc/fonts/
+     * equivalent so fontconfig stays inside the project sysroot. The
+     * pokemon-side stub at $SYSROOT/etc/fonts/local.conf was created with
+     * Step 70 specifically to be the landing point. */
+    if (strcmp(path, "/home/c/.fonts.conf") == 0 ||
+        strcmp(path, "/home/c/.config/fontconfig/fonts.conf") == 0) {
+        snprintf(remapped_buf, sizeof(remapped_buf), "%s/etc/fonts/local.conf", sysroot);
+        return remapped_buf;
+    }
+    if (strcmp(path, "/home/c/.fonts.conf.d") == 0 ||
+        strcmp(path, "/home/c/.config/fontconfig/conf.d") == 0) {
+        snprintf(remapped_buf, sizeof(remapped_buf), "%s/etc/fonts/conf.d", sysroot);
+        return remapped_buf;
+    }
     /* --- Host user/system state. The aarch64 process inherits HOME and
      *     other env from the host launcher, so glibc/fontconfig/etc. probe
      *     these paths. We must NOT remap them — leave them on the host so
@@ -446,6 +463,66 @@ int access(const char *pathname, int mode) {
     int ret = real_fn(actual, mode);
     if (ret != 0 && pathname[0] == '/') {
         SHIM_LOG("access FAILED: %s (errno=%d)", actual, errno);
+    }
+    return ret;
+}
+
+/* ---- Hooked: mkdir / mkdirat ----
+ * Godot's DirAccess::make_dir() and the game's NV-layer init both call
+ * mkdir() / mkdirat() directly via libc. Without our hook these miss the
+ * sysroot remap entirely and try to create directories on the host root
+ * (always fails for /connectivity/, /data/nv/pokemon_le/<store>/, etc.). The
+ * wrapper remaps through the sysroot and treats EEXIST as success
+ * (mkdir-p semantics) — Godot DirAccess and Stern's NV layer both treat
+ * EEXIST as a hard failure even for already-existing directories.
+ *
+ * mode_t is `unsigned int` per the existing extern declaration at the top
+ * of this file (see comment about <sys/stat.h> conflict with the loose-typed
+ * stat wrappers). */
+
+typedef int (*real_mkdir_t)(const char *, unsigned int);
+
+int mkdir(const char *pathname, unsigned int mode) {
+    static real_mkdir_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_mkdir_t)dlsym(RTLD_NEXT, "mkdir");
+    const char *actual = remap_path(pathname);
+    if (actual != pathname) {
+        SHIM_LOG("mkdir REMAP: %s -> %s", pathname, actual);
+    }
+    int ret = real_fn(actual, mode);
+    if (ret == 0) return 0;
+    if (errno == EEXIST) {
+        /* mkdir -p: pre-existing target is success. The risk that `actual`
+         * is a regular file with the same name (also yields EEXIST) is low
+         * — these paths are dirs in our sysroot. */
+        return 0;
+    }
+    if (pathname[0] == '/') {
+        SHIM_LOG("mkdir FAILED: %s (errno=%d)", actual, errno);
+    }
+    return ret;
+}
+
+typedef int (*real_mkdirat_t)(int, const char *, unsigned int);
+
+int mkdirat(int dirfd, const char *pathname, unsigned int mode) {
+    static real_mkdirat_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_mkdirat_t)dlsym(RTLD_NEXT, "mkdirat");
+    /* Only absolute paths participate in remapping; relative paths use
+     * dirfd as the resolution anchor and shouldn't be rewritten. */
+    const char *actual = (pathname && pathname[0] == '/')
+                             ? remap_path(pathname)
+                             : pathname;
+    if (actual != pathname) {
+        SHIM_LOG("mkdirat REMAP: %s -> %s", pathname, actual);
+    }
+    int ret = real_fn(dirfd, actual, mode);
+    if (ret == 0) return 0;
+    if (errno == EEXIST) {
+        return 0;
+    }
+    if (pathname && pathname[0] == '/') {
+        SHIM_LOG("mkdirat FAILED: %s (errno=%d)", actual, errno);
     }
     return ret;
 }
