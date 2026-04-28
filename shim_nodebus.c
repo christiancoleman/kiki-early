@@ -594,66 +594,27 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
         (void)write(STDERR_FILENO, line, (size_t)n);
         log_caller_chain("cmd 0x41");
 
-        /* Optional cmd-0x41 response synthesis. Behind NODEBUS_SYNTH_FE flag.
+        /* Cmd-0x41 synthesis is currently DISABLED.
          *
-         * Wire format from netbridge.elf RE (case 0x21 in HOST_Update):
-         *   request:  [STX][0x41][id][slot|0x80][inner_len][cipher_region][csum][ETX]
-         *   response: [STX][0x41][id][N bytes payload][csum][ETX]
+         * Earlier attempt (2026-04-27) tried to decode a "response-length hint"
+         * from the byte at frame[inner_len+2]. That was wrong: deeper RE of
+         * mcp_nodebus_send_encrypted shows the hint lives in the wrapper's
+         * local buffer pre-encryption, and the byte at frame[inner_len+2] on
+         * the wire is the bridge-level CHECKSUM (computed AFTER encryption,
+         * overwriting the previously-encrypted byte at that offset). The wire
+         * therefore does NOT carry the hint as a recoverable value.
          *
-         * where:
-         *   - cipher_region is (inner_len + 1) encrypted bytes:
-         *       offset 2: inner_cmd
-         *       offset 3..2+inner_len-1: payload bytes
-         *       offset inner_len+2: HINT byte (response-length determinant)
-         *   - N = decoded hint byte (= request[inner_len+2] after decryption)
-         *   - First N-1 response payload bytes come from the node bus on real HW
-         *   - Last response payload byte = bridgeStatus
-         *   - If hint == 0, request is fire-and-forget (no response expected,
-         *     game's `if (x23 != 0)` gate skips the receive path)
+         * To synthesize correctly, we need each emitting wrapper's known hint
+         * value (extracted via static RE). Slot-0 cmds 0xF2/0xF4 come from
+         * sub_8f2db0 / sub_8f2c80 / sub_8f2e50 / sub_8f1934 / sub_8ed7a0 — all
+         * fire-and-forget (hint=0) — so they don't need responses. Slot-1
+         * cmds 0xED/0xEE (the ones actually timing out per game.log) come from
+         * unknown wrappers, likely chip-vtable-dispatched in 0x97-0x99 range.
          *
-         * For "no node present" semantics: fill payload with zeros (incl. final
-         * bridgeStatus = 0). Game's send_encrypted's bridgeStatus check
-         * (`x2_16 & 0xC`) sees 0 → no error path triggered → mcp_nodebus_last_error
-         * stays 0 → caller proceeds normally. Game's caller (e.g. for fe_probe)
-         * sees var_38 = 0 → high-bit clear → "no node" → default vtable entry.
-         * For polling cmds, all-zero response means "no switch state changed",
-         * which is benign for steady state.
-         *
-         * To extract the hint byte we need to decrypt the LAST encrypted byte
-         * (offset 2+inner_len = position i=inner_len). That byte sits at
-         * payload[2 + inner_len] in the bridge request payload. */
-        if (nodebus_synth_fe_enabled() && enc_flag) {
-            int hint_idx_in_payload = 2 + (int)inner_len;
-            if (hint_idx_in_payload < payload_len) {
-                /* Decrypt the hint byte. Position i = inner_len (one past the
-                 * inner_len bytes the shim already decoded into scratch). */
-                uint8_t mask = (uint8_t)(((slot & 0x1F) << 4) |
-                                         ((inner_len + 1) & 0x0F));
-                uint8_t k_mask_h = (inner_len & 1) ? (uint8_t)(~mask) : mask;
-                uint8_t k_table_h = nodebus_cipher_keys[slot & 0x1F][inner_len & 0x0F];
-                uint8_t hint = payload[hint_idx_in_payload] ^ k_table_h ^ k_mask_h;
-
-                if (hint > 0 && hint <= 32 /* sane clamp */) {
-                    uint8_t resp[64];
-                    int o = 0;
-                    resp[o++] = 0x02;             /* STX */
-                    resp[o++] = 0x41;             /* response cmd echoes request */
-                    resp[o++] = id;               /* echo channel id */
-                    /* hint bytes of payload, all zero (last is bridgeStatus=0) */
-                    for (int i = 0; i < hint; i++)
-                        resp[o++] = 0x00;
-                    uint8_t cks = bridge_checksum(resp + 1, (size_t)(o - 1));
-                    resp[o++] = cks;
-                    resp[o++] = 0x03;             /* ETX */
-                    SHIM_LOG("bridge: synth cmd 0x41 RESP slot=%u inner_cmd=0x%02x hint=%u (%d-byte payload + bridgeStatus=0)",
-                             slot, scratch[0], hint, hint);
-                    bridge_send_response(resp, (size_t)o, 0x41, id);
-                } else {
-                    SHIM_LOG("bridge: synth cmd 0x41 SKIP slot=%u inner_cmd=0x%02x hint=%u (out of range or zero)",
-                             slot, scratch[0], hint);
-                }
-            }
-        }
+         * The NODEBUS_SYNTH_FE env flag is left in place; future work will
+         * re-enable a corrected synth once slot-1 wrappers and their hints
+         * are mapped. See docs/NODEBUS_CIPHER.md "2026-04-27" section. */
+        (void)nodebus_synth_fe_enabled;  /* keep symbol live without firing */
         return;
     }
     default:
