@@ -23,12 +23,19 @@ also fires a click.
 
 import datetime
 import os
+import pathlib
 import subprocess
 import sys
 import tkinter as tk
 
-GAME_LOG_PATH = "/mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le/_emulation/runs/latest/game.log"
-ERROR_LOG_PATH = "/tmp/marker_button_errors.log"
+# Derive paths from the script's location so the marker button works no matter
+# where the repo is cloned. Layout: <SYSROOT>/games/pokemon_le/_emulation/marker_button.py
+_HERE = pathlib.Path(__file__).resolve().parent  # _emulation/
+_SYSROOT = _HERE.parent.parent.parent  # 3 up from _emulation = project sysroot
+
+GAME_LOG_PATH = str(_HERE / "runs" / "latest" / "game.log")
+# Stay inside the project sysroot — never write into WSL's /tmp
+ERROR_LOG_PATH = str(_SYSROOT / "tmp" / "marker_button_errors.log")
 
 
 def now_timestamp():

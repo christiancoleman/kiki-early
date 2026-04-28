@@ -36,6 +36,17 @@
  * the GL state into this TU. */
 extern volatile unsigned shim_last_draw_fbo;
 
+/* Helper: build "$SPIKE3_SYSROOT/tmp/<basename>" if SPIKE3_SYSROOT is set,
+ * else fall back to "/tmp/<basename>". Each bridge passes its own static
+ * buffer so the three call sites don't trample each other. Keeps our
+ * AF_UNIX sockets inside the project sysroot instead of WSL's /tmp. */
+static const char *shim_sysroot_tmp_path(char *buf, size_t buflen, const char *basename) {
+    const char *sr = getenv("SPIKE3_SYSROOT");
+    if (sr && *sr) snprintf(buf, buflen, "%s/tmp/%s", sr, basename);
+    else           snprintf(buf, buflen, "/tmp/%s", basename);
+    return buf;
+}
+
 /* ========== moved from spi_shim.c (1446-1600): state bridge (comment + includes + globals + now_ms + emit + accept + poll) ========== */
 
 
@@ -201,7 +212,11 @@ void shim_bridge_start(void) {
     if (!enabled || enabled[0] != '1') return;
 
     const char *sock_path = getenv("SPIKE3_BRIDGE_SOCKET");
-    if (!sock_path || !sock_path[0]) sock_path = "/tmp/spike3_bridge.sock";
+    if (!sock_path || !sock_path[0]) {
+        static char default_path[1024];
+        sock_path = shim_sysroot_tmp_path(default_path, sizeof(default_path),
+                                          "spike3_bridge.sock");
+    }
 
     /* Unlink any stale socket. */
     unlink(sock_path);
@@ -444,7 +459,11 @@ void shim_frame_start(void) {
     const char *enabled = getenv("SPIKE3_FRAME_BRIDGE");
     if (!enabled || enabled[0] != '1') return;
     const char *sock_path = getenv("SPIKE3_FRAME_SOCKET");
-    if (!sock_path || !sock_path[0]) sock_path = "/tmp/spike3_frame.sock";
+    if (!sock_path || !sock_path[0]) {
+        static char default_path[1024];
+        sock_path = shim_sysroot_tmp_path(default_path, sizeof(default_path),
+                                          "spike3_frame.sock");
+    }
 
     unlink(sock_path);
     shim_frame_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -539,7 +558,11 @@ void shim_audio_start(void) {
     const char *enabled = getenv("SPIKE3_AUDIO_BRIDGE");
     if (!enabled || enabled[0] != '1') return;
     const char *sock_path = getenv("SPIKE3_AUDIO_SOCKET");
-    if (!sock_path || !sock_path[0]) sock_path = "/tmp/spike3_audio.sock";
+    if (!sock_path || !sock_path[0]) {
+        static char default_path[1024];
+        sock_path = shim_sysroot_tmp_path(default_path, sizeof(default_path),
+                                          "spike3_audio.sock");
+    }
 
     unlink(sock_path);
     shim_audio_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
