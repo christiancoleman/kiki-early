@@ -83,23 +83,23 @@ static const char *remap_path(const char *path) {
      *     these and a sysroot overlay would either be wrong or empty. --- */
     if (strncmp(path, "/dev/", 5) == 0) return path;
     if (strncmp(path, "/proc/", 6) == 0) return path;
-    if (strncmp(path, "/tmp/", 5) == 0) {
-        /* Specific carve-outs that should land in the sysroot's /tmp, not the
-         * host /tmp (keeps WSL's filesystem clean). The game opens these via
-         * libc fopen which goes through this hook:
-         *   - /tmp/godot_logs[<TS>]  — Godot engine's log file
-         *   - /tmp/cache/...         — Mesa shader cache (also reinforced by
-         *                              MESA_SHADER_CACHE_DIR env var passed
-         *                              from run_game.sh)
-         * Other /tmp/ paths (shim's own AF_UNIX sockets, system-level tmp)
-         * keep falling through to the host. */
-        if (strncmp(path, "/tmp/godot_logs", 15) == 0 ||
-            strncmp(path, "/tmp/cache/",     11) == 0 ||
-            strcmp (path, "/tmp/cache")           == 0) {
-            goto do_remap;
-        }
-        return path;
-    }
+    // if (strncmp(path, "/tmp/", 5) == 0) {
+    //     /* Specific carve-outs that should land in the sysroot's /tmp, not the
+    //      * host /tmp (keeps WSL's filesystem clean). The game opens these via
+    //      * libc fopen which goes through this hook:
+    //      *   - /tmp/godot_logs[<TS>]  — Godot engine's log file
+    //      *   - /tmp/cache/...         — Mesa shader cache (also reinforced by
+    //      *                              MESA_SHADER_CACHE_DIR env var passed
+    //      *                              from run_game.sh)
+    //      * Other /tmp/ paths (shim's own AF_UNIX sockets, system-level tmp)
+    //      * keep falling through to the host. */
+    //     if (strncmp(path, "/tmp/godot_logs", 15) == 0 ||
+    //         strncmp(path, "/tmp/cache/",     11) == 0 ||
+    //         strcmp (path, "/tmp/cache")           == 0) {
+    //         goto do_remap;
+    //     }
+    //     return path;
+    // }
     if (strncmp(path, "/run/", 5) == 0) return path;
     /* Carve-out: /sys/firmware/ IS remapped even though /sys/ generally isn't.
      * Kernel /sys is a live sysfs interface we shouldn't rewrite, but

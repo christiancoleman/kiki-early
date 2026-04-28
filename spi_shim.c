@@ -278,7 +278,10 @@ real_write_t real_write = NULL;   /* used by shim_nodebus.c + shim_io.c write() 
  * modern Spike 3 hardware).
  *
  * /tmp/cache exists because Godot logs an ERROR when it can't create it
- * (Step 45); the mkdir here pre-empts that.
+ * (Step 45); the mkdir here pre-empts that. With shim_fs.c's remap_path
+ * routing every /tmp/<X> to $SYSROOT/tmp/<X> (post-Step-71 cleanup), this
+ * mkdir actually creates $SYSROOT/tmp/cache and the path stays inside the
+ * project sysroot — no pollution of WSL's /tmp.
  */
 
 __attribute__((constructor))

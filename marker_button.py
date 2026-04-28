@@ -15,7 +15,7 @@ Output:
         2026/04/28 - 14:05:48.178 - [marker] click #N (label)
 
     On write failure (file missing, permission, etc.), the failure is recorded
-    in /tmp/marker_button_errors.log so we can debug after the fact.
+    in $SYSROOT/tmp/marker_button_errors.log so we can debug after the fact.
 
 Edit the label field before clicking to tag what you're marking. Spacebar
 also fires a click.

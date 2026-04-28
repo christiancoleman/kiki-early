@@ -36,16 +36,8 @@
  * the GL state into this TU. */
 extern volatile unsigned shim_last_draw_fbo;
 
-/* Helper: build "$SPIKE3_SYSROOT/tmp/<basename>" if SPIKE3_SYSROOT is set,
- * else fall back to "/tmp/<basename>". Each bridge passes its own static
- * buffer so the three call sites don't trample each other. Keeps our
- * AF_UNIX sockets inside the project sysroot instead of WSL's /tmp. */
-static const char *shim_sysroot_tmp_path(char *buf, size_t buflen, const char *basename) {
-    const char *sr = getenv("SPIKE3_SYSROOT");
-    if (sr && *sr) snprintf(buf, buflen, "%s/tmp/%s", sr, basename);
-    else           snprintf(buf, buflen, "/tmp/%s", basename);
-    return buf;
-}
+/* shim_sysroot_tmp_path is defined as static inline in spi_shim.h —
+ * one source of truth for sysroot-rooted runtime paths. */
 
 /* ========== moved from spi_shim.c (1446-1600): state bridge (comment + includes + globals + now_ms + emit + accept + poll) ========== */
 
@@ -228,7 +220,14 @@ void shim_bridge_start(void) {
     }
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+    int n = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
+    if (n < 0 || (size_t)n >= sizeof(addr.sun_path)) {
+        SHIM_LOG("[bridge] socket path truncated (>%zu chars): %s",
+                 sizeof(addr.sun_path) - 1, sock_path);
+        close(shim_bridge_listen_fd);
+        shim_bridge_listen_fd = -1;
+        return;
+    }
 
     if (bind(shim_bridge_listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         SHIM_LOG("[bridge] bind(%s) failed: %s", sock_path, strerror(errno));
@@ -244,6 +243,7 @@ void shim_bridge_start(void) {
         return;
     }
 
+    SHIM_LOG("[bridge] bound + listening on %s", sock_path);
     shim_bridge_start_ms = shim_now_ms();
 
     pthread_t t_accept, t_poll;
@@ -472,7 +472,12 @@ void shim_frame_start(void) {
         return;
     }
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+    int n = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
+    if (n < 0 || (size_t)n >= sizeof(addr.sun_path)) {
+        SHIM_LOG("[frame] socket path truncated (>%zu chars): %s",
+                 sizeof(addr.sun_path) - 1, sock_path);
+        close(shim_frame_listen_fd); shim_frame_listen_fd = -1; return;
+    }
     if (bind(shim_frame_listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
         listen(shim_frame_listen_fd, 1) < 0) {
         SHIM_LOG("[frame] bind/listen(%s) failed: %s", sock_path, strerror(errno));
@@ -571,7 +576,12 @@ void shim_audio_start(void) {
         return;
     }
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+    int n = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
+    if (n < 0 || (size_t)n >= sizeof(addr.sun_path)) {
+        SHIM_LOG("[audio] socket path truncated (>%zu chars): %s",
+                 sizeof(addr.sun_path) - 1, sock_path);
+        close(shim_audio_listen_fd); shim_audio_listen_fd = -1; return;
+    }
     if (bind(shim_audio_listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
         listen(shim_audio_listen_fd, 1) < 0) {
         SHIM_LOG("[audio] bind/listen(%s) failed: %s", sock_path, strerror(errno));

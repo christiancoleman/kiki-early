@@ -2,10 +2,14 @@
 """
 Frame viewer for the Spike 3 emulation shim's real-GL frame bridge.
 
-Listens on /tmp/spike3_frame.sock (AF_UNIX SOCK_STREAM) for raw RGBA
+Listens on $SYSROOT/tmp/spike3_frame.sock (AF_UNIX SOCK_STREAM) for raw RGBA
 framebuffers emitted by the shim after each eglSwapBuffers in real-GL
 mode (SPIKE3_REAL_GL=1 + SPIKE3_FRAME_BRIDGE=1). Displays live in a
 tkinter window.
+
+The default --socket path is derived from this script's location (3 dirs up
+from _emulation/ = sysroot), matching where shim_bridges.c binds the socket
+when SPIKE3_SYSROOT is set in qemu's env. Override with --socket if needed.
 
 Wire protocol (little-endian, 16-byte header + W*H*4 payload):
     u32 magic       = 0xF00FBABA
@@ -19,7 +23,6 @@ Wire protocol (little-endian, 16-byte header + W*H*4 payload):
 Usage:
     # start BEFORE launching the game with SPIKE3_FRAME_BRIDGE=1
     python3 frame_viewer.py
-    python3 frame_viewer.py --socket /tmp/spike3_frame.sock
     python3 frame_viewer.py --save-every 30        # + save every 30th frame
     python3 frame_viewer.py --scale 0.5            # half-size window
     python3 frame_viewer.py --no-display --save-every 1  # headless capture mode
@@ -27,12 +30,19 @@ Usage:
 
 import argparse
 import os
+import pathlib
 import queue
 import socket
 import struct
 import sys
 import threading
 import time
+
+# Self-resolve sysroot from script location (sysroot/games/pokemon_le/_emulation/frame_viewer.py).
+_HERE = pathlib.Path(__file__).resolve().parent
+_SYSROOT = _HERE.parent.parent.parent
+DEFAULT_SOCKET = str(_SYSROOT / "tmp" / "spike3_frame.sock")
+DEFAULT_SAVE_DIR = str(_HERE / "captures" / "frames")
 
 import numpy as np
 from PIL import Image
@@ -218,14 +228,12 @@ def run_headless(args, sock):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--socket", default="/tmp/spike3_frame.sock")
+    ap.add_argument("--socket", default=DEFAULT_SOCKET)
     ap.add_argument("--scale", type=float, default=1.0,
                     help="window scale factor (1.0 = native, 0.5 = half-size)")
     ap.add_argument("--save-every", type=int, default=0,
                     help="save every Nth frame as PNG (0 = off)")
-    ap.add_argument("--save-dir",
-                    default="/mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le/"
-                            "_emulation/captures/frames")
+    ap.add_argument("--save-dir", default=DEFAULT_SAVE_DIR)
     ap.add_argument("--no-display", action="store_true",
                     help="headless mode — save frames only, no Tk window")
     ap.add_argument("--fullscreen", action="store_true",

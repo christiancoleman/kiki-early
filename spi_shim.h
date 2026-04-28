@@ -12,6 +12,7 @@
 #include <stdio.h>     /* snprintf — for SHIM_LOG */
 #include <stddef.h>    /* size_t */
 #include <stdint.h>    /* uintptr_t, uint32_t, uint8_t */
+#include <stdlib.h>    /* getenv — for shim_sysroot_tmp_path inline below */
 #include <unistd.h>    /* write, STDERR_FILENO — for SHIM_LOG single-syscall path */
 #include <dlfcn.h>     /* dlsym, RTLD_NEXT — for FWD_* */
 #include <signal.h>    /* sig_atomic_t, siginfo_t — for handler decls below */
@@ -160,6 +161,29 @@ void shim_patch_audio_driver_vtable(void);
 void shim_patch_video_player_assertion(void);
 void shim_patch_video_player_play_entry_brk(void);
 extern volatile uintptr_t shim_vp_play_entry_runtime;
+
+/* ---- Sysroot-rooted runtime paths ----
+ * One source of truth for "where do shim runtime files (sockets, caches,
+ * sentinels) live?" The convention: $SPIKE3_SYSROOT/tmp/<basename>. With a
+ * SPIKE3_SYSROOT in qemu's env (set by run_game.sh), shim runtime files
+ * stay inside the project tree and never touch WSL's /tmp.
+ *
+ * Used by:
+ *   - shim_bridges.c   — AF_UNIX socket binds (state/frame/audio bridges)
+ *   - spi_shim.c       — system() command-string rewriting (analogous helper)
+ *   - any future code  — if you need a runtime-writable path under sysroot/tmp
+ *
+ * Note: this is for paths the SHIM itself constructs and uses via direct
+ * syscalls (socket/bind, mkdir-from-shim-init, etc.) that don't go through
+ * shim_fs.c's remap_path(). The GAME's own libc fopen/open of /tmp/...
+ * paths is handled transparently by remap_path itself. */
+static inline const char *shim_sysroot_tmp_path(char *buf, size_t buflen,
+                                                const char *basename) {
+    const char *sr = getenv("SPIKE3_SYSROOT");
+    if (sr && *sr) snprintf(buf, buflen, "%s/tmp/%s", sr, basename);
+    else           snprintf(buf, buflen, "/tmp/%s", basename);
+    return buf;
+}
 
 /* ---- Injection layer (defined in shim_inject.c) ----
  * Sets up the SIGALRM handler, blocks SIGALRM on the main thread, and

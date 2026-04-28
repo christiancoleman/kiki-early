@@ -277,7 +277,9 @@ if [[ "$VIEWER" == "1" && "$FRAME_BRIDGE" == "1" ]]; then
     if command -v python3 >/dev/null; then
         viewer_log_target=/dev/null
         [[ "$DEBUG" == "1" ]] && viewer_log_target="$VIEWER_DBG_LOG"
-        viewer_args=("--socket" "$SYSROOT/tmp/spike3_frame.sock")
+        # Helpers self-resolve their socket path from __file__ (== $SYSROOT/tmp/spike3_*.sock).
+        # No --socket arg needed.
+        viewer_args=()
         [[ "$VIEWER_FULLSCREEN" == "1" ]] && viewer_args+=("--fullscreen")
         python3 "$SCRIPT_DIR/frame_viewer.py" "${viewer_args[@]+"${viewer_args[@]}"}" \
             >"$viewer_log_target" 2>&1 &
@@ -294,9 +296,9 @@ if [[ "$AUDIO_PLAYER" == "1" && "$AUDIO_BRIDGE" == "1" ]]; then
         [[ "$DEBUG" == "1" ]] && audio_log_target="$AUDIO_DBG_LOG"
         # Subshell groups the python | ffplay pipe so cleanup_all's pkill -P
         # reaps both halves. Stderr of both goes to the same audio log.
+        # audio_subscriber self-resolves its socket via __file__ (no --socket).
         (
-            python3 "$SCRIPT_DIR/audio_subscriber.py" --socket "$SYSROOT/tmp/spike3_audio.sock" \
-                    2>>"$audio_log_target" | \
+            python3 "$SCRIPT_DIR/audio_subscriber.py" 2>>"$audio_log_target" | \
             ffplay -f s16le -ar 44100 -ch_layout stereo -nodisp -autoexit \
                    -loglevel error -i - 2>>"$audio_log_target"
         ) &
