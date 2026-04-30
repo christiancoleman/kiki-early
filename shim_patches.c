@@ -794,3 +794,89 @@ void shim_patch_video_player_play_entry_brk(void) {
     SHIM_LOG("[vp_brk] patched play() entry @ %p: 0x%08x -> 0x%08x (brk #0)",
              (void *)instr, old, (unsigned)AARCH64_BRK_0);
 }
+
+/* ========== Step 72: sub_8edfe0 BRK-trap synthesizer ==========
+ *
+ * Replaces the in-binary nodebus-read shim with a shim-side synthesizer
+ * that lets us inject switch closures into the game's translator chain
+ * (sub_8edfe0 → sub_7b4d00 → sub_651610 → pending-list drainer).
+ *
+ * Verified bytes at game_base + 0x8edfe0 (Step 72 BN session 2026-04-30):
+ *   0x8edfe0  02 00 80 d2     mov   x2, #0          ; arg3 = NULL
+ *   0x8edfe4  b7 ff ff 17     b     sub_8edec0      ; tail call (-292 bytes)
+ *
+ * Function is exactly 8 bytes. We patch the first instruction with `brk #0`.
+ * The SIGTRAP handler (shim_sigtrap_handler in spi_shim.c) reads x0
+ * (channel) + x1 (out_buf), populates the 8-byte buffer per the arm-state,
+ * sets x0 = 1 (success), and sets pc = lr — which returns to the caller
+ * (sub_674b90 at 0x674d24) without executing the rest of sub_8edfe0.
+ *
+ * Side-effect review (per BN agent): sub_8edec0/sub_8edfe0 has no global
+ * counters; it just XOR-decrypts a network response into arg2. The caller
+ * gates `data_4482150[arg1] = 1` on success — our return-1 keeps that
+ * bookkeeping intact. Skipping the function is safe.
+ *
+ * Bypassing the real wire path means the channel buffers our shim gives
+ * back are fully synthetic. That's fine for the wedge-breaking experiment
+ * because shim_nodebus.c already synthesizes empty/dummy bridge responses
+ * — there is no real wire to read from. The real cabinet/playfield switch
+ * data was always going to be zero with the current netbridge stub.
+ *
+ * Always-on (no env gate) once enabled, because shim_fire_switch needs
+ * the trap site to be patched before it can arm a synthesis window.
+ * Self-protective: refuses to patch if the bytes don't match the expected
+ * `mov x2, #0` (so a future game build with a different sub_8edfe0 layout
+ * fails loudly rather than silently corrupting random instructions).
+ */
+#define SUB_8EDFE0_VA              0x8edfe0
+#define EXPECTED_SUB_8EDFE0_BYTES  0xd2800002u  /* mov x2, #0 — verified Step 72 */
+
+void shim_patch_sub_8edfe0_brk(void) {
+    /* Self-gate: install when explicitly requested (SPIKE3_PATCH_SUB_8EDFE0=1)
+     * OR implicitly when SPIKE3_FIRE_SWITCH is set (since shim_fire_switch
+     * needs the trap to drive switch 93's wire path). Skipping otherwise
+     * preserves the real wire-read behavior for runs that don't want
+     * synthesized channel state. */
+    {
+        const char *p_sw = getenv("SPIKE3_PATCH_SUB_8EDFE0");
+        const char *fs   = getenv("SPIKE3_FIRE_SWITCH");
+        int want = (p_sw && p_sw[0] == '1') || (fs && fs[0]);
+        if (!want) return;
+    }
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[sw_brk] game_base unresolved; sub_8edfe0 BRK aborted");
+        return;
+    }
+
+    uint32_t *instr = (uint32_t *)(game_base + SUB_8EDFE0_VA);
+    uintptr_t page = (uintptr_t)instr & ~(uintptr_t)4095;
+    if (mprotect((void *)page, 8192,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        SHIM_LOG("[sw_brk] mprotect RWX @ %p failed: %s",
+                 (void *)page, strerror(errno));
+        return;
+    }
+
+    uint32_t old = *instr;
+    if (old == AARCH64_BRK_0) {
+        SHIM_LOG("[sw_brk] sub_8edfe0 already patched @ %p; skipping",
+                 (void *)instr);
+        shim_sub_8edfe0_runtime = (uintptr_t)instr;
+        return;
+    }
+    if (old != EXPECTED_SUB_8EDFE0_BYTES) {
+        SHIM_LOG("[sw_brk] REFUSED to patch sub_8edfe0 @ %p: expected 0x%08x (mov x2,#0), got 0x%08x",
+                 (void *)instr, (unsigned)EXPECTED_SUB_8EDFE0_BYTES, old);
+        return;
+    }
+    /* Publish the runtime address BEFORE writing brk so the SIGTRAP handler
+     * recognizes the trap site even if the first trap fires immediately. */
+    shim_sub_8edfe0_runtime = (uintptr_t)instr;
+    __sync_synchronize();
+    *instr = AARCH64_BRK_0;
+    __builtin___clear_cache((char *)instr, (char *)instr + 4);
+    SHIM_LOG("[sw_brk] patched sub_8edfe0 @ %p: 0x%08x -> 0x%08x (brk #0)",
+             (void *)instr, old, (unsigned)AARCH64_BRK_0);
+}

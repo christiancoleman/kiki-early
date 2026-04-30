@@ -243,6 +243,148 @@ static void shim_capture_cmode_snap(uintptr_t game_base, uint64_t *out) {
 #define SHIM_SWITCH_STATE_BASE 0x4480220   /* stride 0x30, state @ +0x28 */
 #define SHIM_SWITCH_COUNT_ADDR 0x44cbaa0   /* dynamic switch count */
 
+/* ---- Step 72: switch-93 BRK-trap arm helper ----
+ *
+ * Publishes channel/payload/deadline atomically for the SIGTRAP handler in
+ * spi_shim.c. The handler reads these volatiles when sub_8edfe0 traps; if
+ * arg1 (channel) matches `channel` and now < deadline, the handler writes
+ * the payload into the caller's 8-byte buffer instead of synthesizing zeros.
+ *
+ * The deadline auto-expires; no disarm is needed. Setting hold_ms=0 disarms
+ * immediately (channel is also reset to -1).
+ *
+ * NOTE (Step 72c): The wire-arm (sub_8edfe0 BRK) only fires if the upstream
+ * poll thread (sub_675df0 → sub_674b90 → sub_8edfe0) is alive. In the
+ * current dormant-orchestrator state, that path is inactive and the arm
+ * is a no-op. Step 72c added a parallel "direct call" path that calls
+ * sub_651610(channel, payload) from the shim thread; that bypasses the
+ * dormant poll entirely and is the actual injection vehicle until/unless
+ * the orchestrator is unblocked.
+ */
+void shim_sub_8edfe0_arm(int channel, const uint8_t payload[8], uint32_t hold_ms) {
+    if (hold_ms == 0) {
+        shim_sub_8edfe0_arm_channel = -1;
+        shim_sub_8edfe0_arm_deadline_ms = 0;
+        __sync_synchronize();
+        return;
+    }
+    /* Write payload + channel BEFORE deadline so the handler sees a
+     * consistent (channel, payload, deadline) tuple — we ratchet the
+     * deadline last as the publication barrier. */
+    for (int i = 0; i < 8; i++) shim_sub_8edfe0_payload[i] = payload[i];
+    shim_sub_8edfe0_arm_channel = channel;
+    __sync_synchronize();
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+    shim_sub_8edfe0_arm_deadline_ms = now_ms + hold_ms;
+    __sync_synchronize();
+
+    SHIM_LOG("[sw_brk] arm: channel=%d payload=%02x%02x%02x%02x%02x%02x%02x%02x hold_ms=%u",
+             channel,
+             payload[0], payload[1], payload[2], payload[3],
+             payload[4], payload[5], payload[6], payload[7],
+             hold_ms);
+}
+
+/* Per-switch wire-side info for switches whose channel/bit positions have
+ * been confirmed via BN. Switches NOT in this table fall back to the
+ * legacy state-byte flip (which is acknowledged half-hooked but keeps
+ * the existing diagnostic working).
+ *
+ * `channel`        — value passed as arg1 to sub_8edfe0 (the inbound poll
+ *                    channel id; e.g. 6 for Node 1 cabinet inputs).
+ * `byte_index`     — index 0..7 into the 8-byte channel buffer.
+ * `bit_a_mask`     — bit-A "wire 1" mask (the rising-edge bit per
+ *                    sub_7b4d00's `+0xa` decode).
+ * `bit_b_mask`     — paired sentinel bit per `+0xb` decode; per BN trace
+ *                    it sets *(entry+0x23)=1 and selects state 2 vs 4.
+ *                    We set both for the safest closed-paired pattern.
+ */
+struct shim_switch_wire {
+    int      switch_id;
+    int      channel;
+    int      byte_index;
+    uint8_t  bit_a_mask;
+    uint8_t  bit_b_mask;
+};
+
+static const struct shim_switch_wire shim_switch_wire_map[] = {
+    /* Switch 93 "Start Button" (1-SW-11): descriptor at 0x43e7cf0
+     * (BN session 2026-04-30). Field 0x43e7d18 = 06 00 0b 00 01 00 01 00
+     * → channel=6, wire-bit=11. sub_7b4d00 decode: bit-A = 11+0xa = 21
+     * = byte 2 bit 5 (0x20); bit-B = 11+0xb = 22 = byte 2 bit 6 (0x40).
+     * Combined byte 2 = 0x60 for the closed-paired-sentinel pattern. */
+    { 93, 6, 2, 0x20, 0x40 },
+};
+
+static const struct shim_switch_wire *shim_find_switch_wire(int switch_id) {
+    size_t N = sizeof(shim_switch_wire_map) / sizeof(shim_switch_wire_map[0]);
+    for (size_t i = 0; i < N; i++) {
+        if (shim_switch_wire_map[i].switch_id == switch_id)
+            return &shim_switch_wire_map[i];
+    }
+    return NULL;
+}
+
+/* ---- Step 72c: direct call to sub_651610 (Recipe B) ----
+ *
+ * Bypasses the dormant orchestrator/poll-thread chain by calling the
+ * translator directly from the shim thread. sub_651610(channel, buf8)
+ * locks pthread_mutex_lock(0x4480240), XOR-diffs the buffer against an
+ * old per-channel snapshot, and pushes any changed switch onto the
+ * pending list at data_4480278 — where the drainer sub_6511c0 picks it
+ * up and fires the event.
+ *
+ * Why this works when the BRK trap doesn't: the upstream poll path
+ * (sub_675df0 → sub_674b90 → sub_8edfe0 → sub_7b4d00 → sub_651610) is
+ * dormant because the orchestrator gate (fire_event(0x80,0) returning
+ * truthy) hasn't fired. We jump straight to sub_651610 from outside,
+ * skipping the gate entirely.
+ *
+ * Caveats (per BN trace 2026-04-30):
+ *   - sub_651610 needs the pthread_mutex at 0x4480240 to be initialized.
+ *     C++ static init runs before any user code, so it should be live by
+ *     the time fire_switch fires (30 s after start).
+ *   - sub_651610 reads g_switch_state_array (0x4480220) to compute diffs.
+ *     If init (sub_650f00) hasn't run yet, the array may be partially
+ *     uninitialized. We accept that risk — first-run diff at start-of-day
+ *     just produces a "switch X opened" event for whichever bits look
+ *     non-zero in the uninitialized array.
+ *   - Drainer sub_6511c0 must be running on its own thread for the
+ *     pushed event to actually fire. Per BN, it is — independent of the
+ *     poll path that we know is dormant.
+ *
+ * Signature inferred from BN: void sub_651610(uint8_t channel, uint8_t *buf8).
+ * Return type unused — we don't read it.
+ */
+typedef void (*shim_sub_651610_fn_t)(uint8_t /*channel*/, uint8_t * /*buf8*/);
+
+#define SHIM_SUB_651610_VA  0x651610
+
+static int shim_direct_call_sub_651610(int channel, const uint8_t payload[8]) {
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[sw_brk] direct sub_651610: game_base unresolved; skip");
+        return -1;
+    }
+    /* Local mutable copy — sub_651610 may read its arg2 from registers
+     * differently than from a const string in .rodata. Stack buffer is
+     * the safest. */
+    uint8_t buf[8];
+    for (int i = 0; i < 8; i++) buf[i] = payload[i];
+
+    shim_sub_651610_fn_t fn = (shim_sub_651610_fn_t)(game_base + SHIM_SUB_651610_VA);
+    SHIM_LOG("[sw_brk] direct sub_651610(ch=%d, [%02x %02x %02x %02x %02x %02x %02x %02x]) @ %p",
+             channel,
+             buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+             (void *)fn);
+    fn((uint8_t)channel, buf);
+    SHIM_LOG("[sw_brk] direct sub_651610 returned");
+    return 0;
+}
+
 static int shim_fire_switch(int switch_id) {
     const struct shim_switch_entry *sw = shim_find_switch(switch_id);
     if (!sw) {
@@ -276,14 +418,22 @@ static int shim_fire_switch(int switch_id) {
         return -1;
     }
 
+    /* Wire-side info: when present, drive the BRK trap on sub_8edfe0
+     * (channel buffer write) instead of the post-translator state byte.
+     * The wire-side path actually exercises sub_651610's diff-and-enqueue
+     * into the pending list — which is what the byte-flip approach
+     * skipped. */
+    const struct shim_switch_wire *wire = shim_find_switch_wire(switch_id);
+
     uintptr_t state_addr = game_base +
         SHIM_SWITCH_STATE_BASE + (uintptr_t)switch_id * 0x30 + 0x28;
 
     char hdr[256];
     int hn = snprintf(hdr, sizeof(hdr),
-        "\n--- shim_fire_switch: %d '%s' (%s, %s, %s) state@0x%lx ---\n",
+        "\n--- shim_fire_switch: %d '%s' (%s, %s, %s) state@0x%lx mode=%s ---\n",
         switch_id, sw->name, sw->location, sw->type, sw->node_addr,
-        (unsigned long)state_addr);
+        (unsigned long)state_addr,
+        wire ? "wire-arm" : "state-flip");
     ssize_t u = write(STDERR_FILENO, hdr, (size_t)hn); (void)u;
 
     uint64_t snap_before[42 * 2];
@@ -293,22 +443,231 @@ static int shim_fire_switch(int switch_id) {
     uint8_t before_state = 0;
     memcpy(&before_state, (void*)state_addr, 1);
 
-    /* Close the switch. */
-    uint8_t closed = 1;
-    memcpy((void*)state_addr, &closed, 1);
+    if (wire) {
+        /* Step 72d — plant the switch_id in `data_44804b8`'s per-channel
+         * mapping slot. Per BN decompilation of sub_651610 (Step 72c),
+         * for each (channel, bit) pair sub_651610 reads the switch_id
+         * from `data_44804b8 + channel*0xb0 + 0x28 + abs_bit*2` and
+         * pushes the per-switch state struct (g_switch_state_array +
+         * switch_id*0x30) onto the pending list when the bit changes
+         * AND the slot is non-zero.
+         *
+         * The orchestrator-driven init (sub_7b4638) normally populates
+         * this slot. Since it's dormant, the slot reads 0 → sub_651610
+         * sees "no switch mapped to this bit" and silently no-ops.
+         * Plant the value ourselves to make our sub_651610 call land.
+         *
+         * Read = 4 bytes (zx.d in BN's IL), so we write u32. Adjacent
+         * bits' u32 reads overlap, but only the bit we plant has a
+         * non-zero value — adjacent bits read the SAME u32 with the
+         * planted byte at the wrong position, which numerically is some
+         * very large value treated as out-of-range switch_id. Worth
+         * mentioning: for switch 93 channel 6 bit 21, slot offset is
+         * 0x44808d8 + 0x28 + 42 = 0x4480902 + 0x28 = 0x448092a.
+         */
+        int abs_bit_a = wire->byte_index * 8 + __builtin_ctz(wire->bit_a_mask);
+        uintptr_t cbd_slot_addr = game_base + 0x44804b8
+                                + (uintptr_t)wire->channel * 0xb0
+                                + 0x28
+                                + (uintptr_t)abs_bit_a * 2;
+        uint32_t cbd_slot_old = 0;
+        memcpy(&cbd_slot_old, (void*)cbd_slot_addr, 4);
+        uint32_t cbd_slot_new = (uint32_t)switch_id;
+        memcpy((void*)cbd_slot_addr, &cbd_slot_new, 4);
+        SHIM_LOG("[sw_brk] planted switch_id=%d at data_44804b8+0x%lx (=%p): "
+                 "0x%08x -> 0x%08x  (channel=%d, abs_bit=%d)",
+                 switch_id,
+                 (unsigned long)(cbd_slot_addr - game_base),
+                 (void*)cbd_slot_addr,
+                 cbd_slot_old, cbd_slot_new,
+                 wire->channel, abs_bit_a);
 
-    /* Give the game a tick to notice. In practice the game's switch
-     * poll runs off netbridge cmd 0x27 responses — so the shim-side
-     * flip may go unnoticed until Plan C's translator hook is added.
-     * We still sleep briefly in case any polling thread samples the
-     * state array directly. */
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 20 * 1000 * 1000 }; /* 20 ms */
-    nanosleep(&ts, NULL);
+        /* Step 72c diagnostic dump. */
+        {
+            uint32_t cbd_count = 0;
+            uintptr_t pend_head = 0;
+            uint8_t   gate_44821b8 = 0;
+            uint32_t  gate_4482120 = 0;
+            memcpy(&cbd_count,    (void*)(game_base + 0x44cbda8), 4);
+            memcpy(&pend_head,    (void*)(game_base + 0x4480278), 8);
+            memcpy(&gate_44821b8, (void*)(game_base + 0x44821b8), 1);
+            memcpy(&gate_4482120, (void*)(game_base + 0x4482120), 4);
+            SHIM_LOG("[sw_brk] pre-fire: data_44cbda8=%u  pending_head=%p  "
+                     "data_44821b8=0x%02x  data_4482120=0x%08x",
+                     cbd_count, (void*)pend_head,
+                     gate_44821b8, gate_4482120);
+        }
+
+        /* Step 72f — sub_651610 disassembly shows `ldr x14, [x20, #0x220]`
+         * at 0x65164c, meaning g_switch_state_array @ 0x4480220 is a
+         * POINTER FIELD, not an embedded array. The actual per-switch
+         * structs live at *(uint64_t*)0x4480220 + sw_id*0x30, on the
+         * heap. We've been reading/writing the static .bss instead.
+         *
+         * Read the pointer here and use it for the real diagnostic. */
+        uintptr_t real_sw_array_ptr = 0;
+        memcpy(&real_sw_array_ptr, (void*)(game_base + 0x4480220), 8);
+        SHIM_LOG("[sw_brk] *0x4480220 (g_switch_state_array PTR) = %p",
+                 (void*)real_sw_array_ptr);
+
+        /* Step 72e — sub_651610's push gate diagnostic. Three conditions
+         * MUST hold for the push to happen on a rising edge:
+         *   1. *(g_switch_state_array + sw*0x30 + 0x2a) & 1 == 0
+         *   2. *(*(uint64_t*)data_4480228 + sw) & 1 == 0   (disable mask)
+         *   3. *(g_switch_state_array + sw*0x30 + 0x26) == 0  (counter)
+         * Plus the channel-bit slot (planted above) must hold sw_id != 0.
+         * Dump all three so we know which one (if any) blocks us. */
+        {
+            uintptr_t sw_struct = (real_sw_array_ptr ? real_sw_array_ptr
+                                                    : (game_base + 0x4480220))
+                                + (uintptr_t)switch_id * 0x30;
+            uint8_t  flag_2a = 0;
+            uint16_t counter_26 = 0;
+            uint8_t  flag_2a_pre[16] = {0};
+            memcpy(&flag_2a,     (void*)(sw_struct + 0x2a), 1);
+            memcpy(&counter_26,  (void*)(sw_struct + 0x26), 2);
+            memcpy(flag_2a_pre,  (void*)(sw_struct),        16);
+
+            uintptr_t mask_ptr = 0;
+            memcpy(&mask_ptr, (void*)(game_base + 0x4480228), 8);
+            uint8_t mask_byte = 0;
+            int mask_readable = 0;
+            if (mask_ptr >= 0x10000) {
+                /* Read as best we can; if it crashes our SIGSEGV handler
+                 * catches it. mask_ptr might already be game-relative. */
+                memcpy(&mask_byte, (void*)(mask_ptr + (uintptr_t)switch_id), 1);
+                mask_readable = 1;
+            }
+            SHIM_LOG("[sw_brk] sw93 struct dump: "
+                     "@%p first16=%02x%02x%02x%02x%02x%02x%02x%02x"
+                     "%02x%02x%02x%02x%02x%02x%02x%02x  "
+                     "+0x26 (counter)=%u  +0x2a (flag)=0x%02x",
+                     (void*)sw_struct,
+                     flag_2a_pre[0], flag_2a_pre[1], flag_2a_pre[2], flag_2a_pre[3],
+                     flag_2a_pre[4], flag_2a_pre[5], flag_2a_pre[6], flag_2a_pre[7],
+                     flag_2a_pre[8], flag_2a_pre[9], flag_2a_pre[10], flag_2a_pre[11],
+                     flag_2a_pre[12], flag_2a_pre[13], flag_2a_pre[14], flag_2a_pre[15],
+                     counter_26, flag_2a);
+            SHIM_LOG("[sw_brk] data_4480228=%p  mask[%d]=0x%02x readable=%d",
+                     (void*)mask_ptr, switch_id, mask_byte, mask_readable);
+        }
+
+        /* Build the closed-state payload (rising edge): bit-A | bit-B set
+         * at the wire-mapped byte index. */
+        uint8_t closed_payload[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (wire->byte_index >= 0 && wire->byte_index < 8) {
+            closed_payload[wire->byte_index] =
+                wire->bit_a_mask | wire->bit_b_mask;
+        }
+        uint8_t open_payload[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+        const uint32_t SHIM_FIRE_HOLD_MS = 120;
+
+        /* Path 1 — arm the sub_8edfe0 BRK synthesizer. Only effective if
+         * the orchestrator/poll thread happens to be alive during the
+         * arm window. In the current dormant-orchestrator state this
+         * is a no-op; left in as a diagnostic / future-proofing for
+         * runs where the gate fires. */
+        shim_sub_8edfe0_arm(wire->channel, closed_payload, SHIM_FIRE_HOLD_MS);
+
+        /* Path 2 — direct call to sub_651610 (Recipe B). Pushes the
+         * "switch closed" diff into the pending list immediately,
+         * regardless of orchestrator state. The drainer sub_6511c0
+         * (running on its own thread per BN) picks it up and fires the
+         * event. */
+        shim_direct_call_sub_651610(wire->channel, closed_payload);
+
+        /* Mid-fire dump — IMMEDIATELY after the closure call, before
+         * any drainer thread can run. Confirms whether sub_651610
+         * reached the push code path (counter would be 1) or bailed
+         * earlier (counter still 0). */
+        {
+            uintptr_t sw_struct = (real_sw_array_ptr ? real_sw_array_ptr
+                                                    : (game_base + 0x4480220))
+                                + (uintptr_t)switch_id * 0x30;
+            uint16_t counter_26 = 0;
+            uintptr_t pend_head = 0;
+            uint8_t   ch_buf[8] = {0};
+            memcpy(&counter_26, (void*)(sw_struct + 0x26), 2);
+            memcpy(&pend_head,  (void*)(game_base + 0x4480278), 8);
+            memcpy(ch_buf, (void*)(game_base + 0x44804b8
+                          + (uintptr_t)wire->channel * 0xb0 + 0x20), 8);
+            SHIM_LOG("[sw_brk] mid-fire (post-closure pre-release): "
+                     "sw93 (real) counter+0x26=%u  pending_head=%p  "
+                     "per-ch state[0x20..0x27]=%02x%02x%02x%02x%02x%02x%02x%02x",
+                     counter_26, (void*)pend_head,
+                     ch_buf[0], ch_buf[1], ch_buf[2], ch_buf[3],
+                     ch_buf[4], ch_buf[5], ch_buf[6], ch_buf[7]);
+        }
+
+        /* Hold — give the drainer + event handlers time to process the
+         * closed edge before we fire the release. */
+        struct timespec hold_ts = {
+            .tv_sec  = 0,
+            .tv_nsec = (long)SHIM_FIRE_HOLD_MS * 1000 * 1000
+        };
+        nanosleep(&hold_ts, NULL);
+
+        /* Release: zero payload triggers sub_651610's diff to record a
+         * "switch opened" transition. Crucial for switches that fire
+         * events on the falling edge (most pinball switches). */
+        shim_direct_call_sub_651610(wire->channel, open_payload);
+
+        /* Settle window so the release-edge events finish processing
+         * before we snap the cmode state and report Δ. */
+        struct timespec settle_ts = {
+            .tv_sec  = 0,
+            .tv_nsec = 80 * 1000 * 1000
+        };
+        nanosleep(&settle_ts, NULL);
+
+        /* Post-fire diagnostic — did anything land on the pending list,
+         * did the counter at +0x26 increment (proves sub_651610 reached
+         * the bit-walk for switch_id), and what's the per-channel state
+         * byte at +0x22 (proves arg2 reached the per-channel buffer)? */
+        {
+            uintptr_t pend_head = 0;
+            memcpy(&pend_head, (void*)(game_base + 0x4480278), 8);
+            uint8_t state_byte_in_g_arr = 0;
+            memcpy(&state_byte_in_g_arr, (void*)state_addr, 1);
+
+            uintptr_t sw_struct = game_base + 0x4480220 + (uintptr_t)switch_id * 0x30;
+            uint16_t counter_26 = 0;
+            uint8_t flag_2a = 0;
+            memcpy(&counter_26, (void*)(sw_struct + 0x26), 2);
+            memcpy(&flag_2a,    (void*)(sw_struct + 0x2a), 1);
+
+            uintptr_t per_channel = game_base + 0x44804b8
+                                  + (uintptr_t)wire->channel * 0xb0;
+            uint8_t channel_state[8] = {0};
+            memcpy(channel_state, (void*)(per_channel + 0x20), 8);
+
+            SHIM_LOG("[sw_brk] post-fire: pending_head=%p  "
+                     "g_switch93 state=0x%02x  "
+                     "sw_struct +0x26 counter=%u  +0x2a flag=0x%02x  "
+                     "per-ch[6] state[0x20..0x27]=%02x%02x%02x%02x%02x%02x%02x%02x",
+                     (void*)pend_head, state_byte_in_g_arr,
+                     counter_26, flag_2a,
+                     channel_state[0], channel_state[1], channel_state[2],
+                     channel_state[3], channel_state[4], channel_state[5],
+                     channel_state[6], channel_state[7]);
+        }
+    } else {
+        /* Legacy byte-flip path — kept for switches whose channel/bit
+         * mapping hasn't been traced yet. Known half-hooked: writes the
+         * post-translator state byte but skips sub_651610's pending-list
+         * push, so the drainer never fires the event. Diagnostic value
+         * only. */
+        uint8_t closed = 1;
+        memcpy((void*)state_addr, &closed, 1);
+
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 20 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+
+        memcpy((void*)state_addr, &before_state, 1);
+    }
 
     shim_capture_cmode_snap(game_base, snap_after);
-
-    /* Release the switch. */
-    memcpy((void*)state_addr, &before_state, 1);
 
     /* Report deltas. */
     size_t N = shim_cmode_table_count;
@@ -333,10 +692,16 @@ static int shim_fire_switch(int switch_id) {
 
     char tail[2048];
     int tn = snprintf(tail, sizeof(tail),
-        "  switch %d '%s': before_state=%u Δ=%d%s\n",
-        switch_id, sw->name, before_state, delta_count,
-        delta_count > 0 ? delta_buf : " (no cmode state change — translator "
-                                      "not yet hooked, see PROTOCOL.md)");
+        "  switch %d '%s': mode=%s before_state=%u Δ=%d%s\n",
+        switch_id, sw->name,
+        wire ? "wire-arm" : "state-flip",
+        before_state, delta_count,
+        delta_count > 0 ? delta_buf
+                        : (wire
+                            ? " (no cmode state change — bridge poll may not have"
+                              " reached sub_8edfe0(channel) during the arm window)"
+                            : " (no cmode state change — translator not yet"
+                              " hooked, see PROTOCOL.md)"));
     u = write(STDERR_FILENO, tail, (size_t)tn); (void)u;
 
     return delta_count;
@@ -590,6 +955,11 @@ static void *shim_vp_patch_thread(void *arg) {
 
     shim_patch_video_player_assertion();
     shim_patch_video_player_play_entry_brk();
+    /* Step 72: in-binary BRK trap that synthesizes per-channel switch
+     * state; needs game_base resolvable, so deferred to here too. The
+     * function self-gates on SPIKE3_PATCH_SUB_8EDFE0=1 OR SPIKE3_FIRE_SWITCH
+     * being set. */
+    shim_patch_sub_8edfe0_brk();
     return NULL;
 }
 
@@ -692,6 +1062,19 @@ static void *shim_force_gstreamer_thread(void *arg) {
     return NULL;
 }
 
+/* Step 72 deferred patch installer.
+ *
+ * Cannot be called from shim_inject_start at constructor time because
+ * shim_resolve_game_base() works by walking the calling thread's stack for
+ * a /game frame; at constructor time no game thread has run yet, so the
+ * resolver returns 0 and the patch aborts. Step 71's
+ * shim_patch_video_player_play_entry_brk has the same dependency and is
+ * already deferred by shim_vp_patch_thread (2 s sleep then call).
+ *
+ * shim_vp_patch_thread is gated on SPIKE3_PATCH_SPI_VIDEO=1 (default 1 in
+ * run_game.sh). The patches inside it self-gate on their own env vars or
+ * are unconditionally always-on. Adding our patch there inherits both the
+ * settle delay AND the gating discipline. */
 /* SPIKE3_FIRE_SWITCH=<id1:id2:...> — fire one or more switches after
  * SPIKE3_SWITCH_DELAY seconds (default 30).
  *
@@ -779,7 +1162,14 @@ void shim_inject_start(void) {
         }
     }
 
-    /* SPIKE3_FIRE_SWITCH=<id1[:id2:...]> — fire one or more switches. */
+    /* SPIKE3_FIRE_SWITCH=<id1[:id2:...]> — fire one or more switches.
+     *
+     * The companion BRK patch (sub_8edfe0) is installed inside
+     * shim_vp_patch_thread's 2 s settle, NOT here. shim_resolve_game_base
+     * doesn't work this early — backtrace has no /game frames at
+     * constructor-end time. SPIKE3_SWITCH_DELAY (default 30) is far longer
+     * than shim_vp_patch_thread's 2 s sleep, so by the time the firer
+     * arms, the BRK is in place. */
     const char *fs = getenv("SPIKE3_FIRE_SWITCH");
     if (fs && fs[0]) {
         char *copy = strdup(fs);

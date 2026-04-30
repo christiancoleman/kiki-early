@@ -555,6 +555,25 @@ volatile uintptr_t shim_vp_play_entry_runtime = 0;
 static int vp_brk_log_count = 0;
 #define VP_BRK_LOG_MAX 8
 
+/* Step 72: sub_8edfe0 BRK-trap synthesizer state.
+ * shim_patch_sub_8edfe0_brk publishes shim_sub_8edfe0_runtime; shim_inject.c's
+ * shim_sub_8edfe0_arm() sets the channel/payload/deadline atomically. The
+ * SIGTRAP handler reads these volatiles to decide what 8-byte buffer to
+ * synthesize for the trapping caller. */
+volatile uintptr_t shim_sub_8edfe0_runtime         = 0;
+volatile int       shim_sub_8edfe0_arm_channel     = -1;
+volatile uint64_t  shim_sub_8edfe0_arm_deadline_ms = 0;
+volatile uint8_t   shim_sub_8edfe0_payload[8]      = {0};
+static int shim_sub_8edfe0_trap_count = 0;
+#define SUB_8EDFE0_LOG_FIRST 4   /* log first N traps unconditionally */
+#define SUB_8EDFE0_LOG_EVERY 1024 /* and every Nth thereafter */
+
+static inline uint64_t shim_now_ms_monotonic(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+}
+
 static void shim_sigtrap_handler(int sig, siginfo_t *info, void *uc) {
     (void)sig; (void)info;
     ucontext_t *ctx = (ucontext_t *)uc;
@@ -582,6 +601,55 @@ static void shim_sigtrap_handler(int sig, siginfo_t *info, void *uc) {
                      (unsigned long)lr, read_ok);
         }
         mc->pc += 4;  /* skip the brk; original NOP doesn't need executing */
+        return;
+    }
+
+    /* ---- Step 72: sub_8edfe0 stub ----
+     * The trap fires at the function's first instruction (brk #0 replacing
+     * the original `mov x2,#0`). x0 is arg1 (channel id, low byte), x1 is
+     * arg2 (8-byte output buffer). We:
+     *   1. Pick an 8-byte payload. Default = zeros (no switch closures).
+     *      During an arm window where channel matches and the deadline
+     *      hasn't expired, use shim_sub_8edfe0_payload.
+     *   2. Write the 8 bytes into *x1.
+     *   3. Set x0 = 1 (success — caller AND-checks bit 0).
+     *   4. Set pc = lr — return to caller, skipping the rest of sub_8edfe0
+     *      (which was just `b sub_8edec0` doing the wire read we're replacing).
+     */
+    if (shim_sub_8edfe0_runtime != 0 && pc == shim_sub_8edfe0_runtime) {
+        int channel = (int)(mc->regs[0] & 0xff);
+        uintptr_t buf = mc->regs[1];
+        uintptr_t lr  = mc->regs[30];
+
+        uint8_t payload[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        int armed = 0;
+        int arm_ch = shim_sub_8edfe0_arm_channel;
+        if (arm_ch >= 0 && channel == arm_ch) {
+            uint64_t deadline = shim_sub_8edfe0_arm_deadline_ms;
+            if (deadline != 0 && shim_now_ms_monotonic() < deadline) {
+                for (int i = 0; i < 8; i++) payload[i] = shim_sub_8edfe0_payload[i];
+                armed = 1;
+            }
+        }
+
+        /* Guard against bogus arg2 — rare but cheap to check. The kernel
+         * page-faults on bad address would loop us forever (handler retry),
+         * so refuse to write if buf is obviously invalid. */
+        if (buf >= 0x10000) {
+            volatile uint8_t *out = (volatile uint8_t *)buf;
+            for (int i = 0; i < 8; i++) out[i] = payload[i];
+        }
+        mc->regs[0] = 1;     /* success */
+        mc->pc      = lr;    /* return to caller */
+
+        int seq = __sync_fetch_and_add(&shim_sub_8edfe0_trap_count, 1);
+        if (seq < SUB_8EDFE0_LOG_FIRST || (seq % SUB_8EDFE0_LOG_EVERY) == 0 || armed) {
+            SHIM_LOG("[sw_brk] sub_8edfe0 trap #%d ch=%d buf=%p armed=%d payload=%02x%02x%02x%02x%02x%02x%02x%02x lr=0x%lx",
+                     seq, channel, (void *)buf, armed,
+                     payload[0], payload[1], payload[2], payload[3],
+                     payload[4], payload[5], payload[6], payload[7],
+                     (unsigned long)lr);
+        }
         return;
     }
 

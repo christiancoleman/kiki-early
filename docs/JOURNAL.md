@@ -5806,3 +5806,122 @@ PIN_NVRAM rotation reached 00000005 (vs 00000002 in 70b) — game progressed dee
 - **Per user direction:** focus more on Radium next. `[REFERENCE_TOOL_A]/` is the semi-replicated player that "wraps Godot and plays videos on top of it". Search that dir for `radium` keyword for related resources before re-attacking the binding side.
 - **Trampoline log** (deferred from this step) — a small in-shim trampoline at sub_e3819c entry that captures `this`, `*(this+0x2c0)`, `*(this+0x988)` per call. Needed for definitive answer on whether Radium backend is registered.
 - The `is_inside_tree() Returning: false at can_process` pattern might appear at other Godot Node call sites (e.g., `_process_internal`, `_notification`, `set_process`) — would surface as more silent skips rather than visible errors.
+
+---
+
+## Step 72: switch-93 wire-side BRK trap on sub_8edfe0 (2026-04-30)
+
+The user-mode wedge — game runs end-to-end (rendering, audio, video, UART, polling) but its mode state machine never advances — is a switch-input-starvation problem. Step 72 builds the wire-side injection path so we can drive `switch 93 (Start Button)` into the game's translator chain and verify the cmode rotation theory.
+
+### Background — the chain (BN-confirmed, sessions 2026-04-29 / 2026-04-30)
+
+```
+sub_8edfe0(channel, buf8)            ; reads/decrypts 8-byte wire state for `channel`
+   → sub_7b4d00(channel, buf8)       ; iterates data_44cbd70, decodes per-switch bits
+       → sub_651610(channel, buf8)   ; XOR-diffs vs g_switch_state_array (0x4480220)
+           → pending list data_4480278
+               → drainer sub_6511c0  ; fires events via fire_event
+```
+
+`sub_651610` is the **single centralized translator** (no parallel writers found in BNQL xrefs to `0x4480220`).
+
+### Switch 93 wire-side numerics (BN session 2026-04-30)
+
+| Field | Value | Source |
+|---|---|---|
+| Descriptor | `0x43e7cf0` (size 0x40) | static analysis |
+| Field bytes at `0x43e7d18` | `06 00 0b 00 01 00 01 00` | hexdump_address |
+| **Channel** | **6** | byte 0 → `entry+0x46` at runtime via `sub_7b4638` |
+| **Wire-bit base** | **11** | byte 2 → `entry+0x47` at runtime |
+| Bit-A index | 21 (= 11 + 0xa) | `sub_7b4d00` decode at BN 0x7b4d5c–70 |
+| Bit-B index | 22 (= 11 + 0xb) | `sub_7b4d00` decode at BN 0x7b4db4–e08 |
+| Byte 2 mask (closed paired sentinel) | `0x60` (`0x20 | 0x40`) | bit 21 = byte 2/bit 5; bit 22 = byte 2/bit 6 |
+
+### Verified at sub_8edfe0 entry (game.bndb hexdump)
+
+```
+0x8edfe0  02 00 80 d2     mov   x2, #0          ; clear arg3
+0x8edfe4  b7 ff ff 17     b     sub_8edec0      ; tail-call (-292 bytes → 0x8edec0)
+```
+
+Function is exactly 8 bytes. `sub_8edec0` does the XOR-decrypt of a `mcp_nodebus_send_with_retry({0x80|channel,1,0x0a11})` response into arg2 using per-channel keys at `0x44fce43`. **No global counters mutated**, so early-return is safe; caller (`sub_674b90`) gates `data_4482150[arg1] = 1` on our return value.
+
+### Implementation — Recipe A (preferred): stub sub_8edfe0 via BRK trap
+
+Mirrors the existing Step 71 `shim_patch_video_player_play_entry_brk` pattern — patch the function's first 4 bytes with `brk #0` (`0xd4200000`), let the SIGTRAP handler decide the response:
+
+| File | Change |
+|---|---|
+| `spi_shim.h` | Declared globals `shim_sub_8edfe0_runtime`, `shim_sub_8edfe0_arm_channel`, `shim_sub_8edfe0_arm_deadline_ms`, `shim_sub_8edfe0_payload[8]`. Declared helpers `shim_patch_sub_8edfe0_brk()` and `shim_sub_8edfe0_arm()`. |
+| `shim_patches.c` | New `shim_patch_sub_8edfe0_brk()`: mprotect, byte-check (refuses unless `0xd2800002` = `mov x2,#0`), publishes runtime addr, writes `brk #0`. Always-on once enabled (no per-arm env gate). |
+| `spi_shim.c` | Extended `shim_sigtrap_handler` with a new dispatch branch: when `pc == shim_sub_8edfe0_runtime`, read `x0` (channel), `x1` (buf), `x30` (lr); compute payload (channel-matched + deadline-fresh → use armed payload, else zeros); write 8 bytes to `*x1`; set `x0 = 1` (success); set `pc = lr` to return to caller, skipping the rest of the function. Logs first 4 traps and then every 1024th, plus every armed trap. |
+| `shim_inject.c` | New `shim_sub_8edfe0_arm(channel, payload, hold_ms)` helper. New `shim_switch_wire_map[]` table (currently 1 entry: switch 93 → channel=6, byte=2, masks 0x20|0x40). `shim_fire_switch` now branches on `shim_find_switch_wire(id)`: when wire info present, use the BRK-arm path; else fall back to legacy state-byte flip. |
+| `shim_inject.c` | `shim_inject_start` now installs the BRK patch when either `SPIKE3_PATCH_SUB_8EDFE0=1` is set OR `SPIKE3_FIRE_SWITCH` is set (auto-implied). Patch lands at constructor-end time so it's in place before the first bridge poll. |
+
+### Why "always-on synthesizer" is safe for this experiment
+
+Once the trap is installed, sub_8edfe0 returns synthetic data (zeros for unarmed channels, payload for armed channel). That bypasses the real `sub_8edec0` wire read. Acceptable because: shim_nodebus.c **already** synthesizes empty/dummy bridge responses — there is no real wire to read from. Replacing zero-from-fake-wire with zero-from-shim is a no-op for non-armed channels.
+
+### Build verification
+
+```
+[build] OK — spi_shim.so: 298552 bytes
+```
+
+Strings/symbols present in linked output: `shim_patch_sub_8edfe0_brk`, `shim_sub_8edfe0_arm`, `shim_sub_8edfe0_payload`, all `[sw_brk]` log strings, `wire-arm`, `state-flip`. Pre-existing unused-function warnings for `nodebus_cipher_decrypt` and `log_caller_chain` are unchanged.
+
+### Test recipe (next run)
+
+```bash
+cd /mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le/_emulation
+SPIKE3_BRIDGE=1 TIMER=ON SPIKE3_FIRE_SWITCH=93 SPIKE3_SWITCH_DELAY=30 \
+  ./run_game.sh --debug
+```
+
+Run for ≥3 minutes (per `feedback_test_duration`). Watch for:
+
+- `[sw_brk] patched sub_8edfe0 @ ... (brk #0)` — patch installed.
+- `[sw_brk] sub_8edfe0 trap #N ch=X ...` — game's bridge poll is calling sub_8edfe0; shows which channels are polled in practice.
+- `[sw_brk] arm: channel=6 payload=000060...` — fire_switch_thread armed the synth.
+- Per-trap log with `armed=1 ch=6` during the 120 ms window — confirms the arm landed during a poll cycle.
+- `--- shim_fire_switch: 93 'Start Button' ... mode=wire-arm ---` followed by Δ count.
+- **Critical signal**: `[bridge] cmode delta:` lines after the 30 s mark → wedge cleared by switch-93 input. Or no deltas → wedge is upstream of switch processing (orchestrator gating, etc.).
+
+### What's open after Step 72
+
+- **Channel-id table is one entry**. If the bridge poll never reaches `channel=6`, the arm window is wasted. Diagnostic logging in the SIGTRAP handler will show which channels actually poll. If channel 6 isn't polled, we trace why (which Node-1 enumeration sub_674b90 driver thread does at startup).
+- **Hold time** is a guess (120 ms). If logs show "armed=1" never lands during a poll, increase. If sub_651610 sees only the rising edge but not the falling edge before deadline, increase.
+- **Bit-B requirement** unverified — the recipe sets both bits 21 and 22; if the latch path needs only bit-A, byte 2 = 0x20 may suffice. Cheap to A/B test if bit-B causes spurious "second switch" misfires.
+- **Other switches** (1-SW-X for Action / Coins / Tournament Start) follow the same channel=6 mapping per Pokemon LE manual — once switch-93 is verified working, fill in `shim_switch_wire_map[]` for the rest by deriving wire-bit from the `1-SW-N` field in the manifest.
+
+### Step 72b — first verification run + correction (2026-04-30)
+
+**First attempt failed at boot.** Patch was wired into `shim_inject_start` (constructor-end time). `shim_resolve_game_base()` returns 0 there because it works by walking the calling thread's stack for a `/game` frame — at constructor-end no game thread has called any shim hook yet, so the cache is empty. Log:
+`14:03:00 [sw_brk] game_base unresolved; sub_8edfe0 BRK aborted`. Step 71's `shim_patch_video_player_play_entry_brk` has the same dependency and is already deferred to `shim_vp_patch_thread`'s 2 s sleep. Moved the call there. Also moved env-gating (`SPIKE3_PATCH_SUB_8EDFE0=1` ∨ `SPIKE3_FIRE_SWITCH` set) into `shim_patch_sub_8edfe0_brk` itself so the deferred caller doesn't need its own gating logic.
+
+**Note on env forwarding (corrected reading of run_game.sh).** Earlier I thought run_game.sh needed new `-E` lines for `SPIKE3_FIRE_SWITCH` / `SPIKE3_SWITCH_DELAY`. Wrong: qemu-aarch64 user-mode inherits the parent shell's environment by default; `-E` only ADDS or modifies. Setting `SPIKE3_FIRE_SWITCH=93` in the invocation shell flows through to the game's `getenv()` automatically. No script change needed.
+
+**Second run (200 s, SPIKE3_FIRE_SWITCH=93 SPIKE3_SWITCH_DELAY=30 STATE_BRIDGE=1).**
+
+| Signal | Result |
+|---|---|
+| `[sw_brk] patched sub_8edfe0 @ ... (brk #0)` | ✓ at run+2 s — patch installed |
+| `[sw_brk] sub_8edfe0 trap #N ch=X` | **0 hits across 200 s** |
+| `[sw_brk] arm: channel=6 payload=0000600000000000 hold_ms=120` | ✓ at run+30 s — fire_switch armed |
+| `armed=1 ch=6` traps | 0 (because no traps at all) |
+| `--- shim_fire_switch: 93 'Start Button' ... mode=wire-arm ---` followed by Δ=0 | ✓ Δ=0 reported |
+| `[bridge] cmode delta:` | 0 across full run |
+
+**The function is dormant.** `sub_8edfe0` was never called even once. Yet bridge IS alive: cmd 0x27 probes (4 in 200 s) and cmd 0x41 with inner cmds `0xf0 / 0xfa / 0xfe` (identification/probe slots 0/1/2/4/7/8). Notably absent: any cmd `0x80..0x8f` (the `0x80|channel` query that `sub_8edec0` issues). So the upstream poll thread that calls `sub_674b90` (which then calls `sub_8edfe0`) hasn't started.
+
+**Wedge is upstream of the switch-poll path itself.** Mode-state isn't advancing → switch poll not activated → no calls to `sub_8edfe0` → arm never lands. The Step-72 instrumentation IS working as designed — it just confirms the dormancy hypothesis instead of breaking the wedge.
+
+### What's next after Step 72b
+
+Spawned a focused BN agent to trace **what gates `sub_674b90`** — the function whose inactivity blocks the entire chain. Two outcomes possible:
+
+- **Gate is a memory flag** (e.g. `if (data_X) call sub_674b90`). Then a `SPIKE3_POKE_*`-style env-gated thread can flip it after a settle, similar to existing `SPIKE3_POKE_CMODE` / `SPIKE3_POKE_STATE_FLAG`. Cheap to implement.
+- **Gate is a thread-create that's conditional** (e.g. only created post-init success). Then we'd have to either patch the conditional, or skip the gate entirely by Recipe B — directly enqueue a pending-list entry at `data_4480278` and let `sub_6511c0` drain it. More invasive but bypasses the gate.
+
+The BN agent's report will pick the path. JOURNAL update at Step 72c when results land.
+
