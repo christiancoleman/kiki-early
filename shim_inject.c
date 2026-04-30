@@ -5,7 +5,7 @@
  *   - Pokémon LE 105-switch manifest (transcribed from the manual) +
  *     shim_fire_switch / shim_find_switch helpers that drive it.
  *   - Event-sweep machinery (Step 52): shim_fire_event trampoline to the
- *     game's in-binary fire_event at BN VA 0x9c12a0, cmode-snapshot diff,
+ *     game's in-binary fire_event at BN VA 0x5c12a0, cmode-snapshot diff,
  *     and the blind 0..0xce sweep with per-event SIGALRM timeout + SEGV
  *     recovery via siglongjmp.
  *   - The sigjmp_buf + "sweep in progress" globals declared in spi_shim.h
@@ -175,7 +175,7 @@ static const struct shim_switch_entry *shim_find_switch(int id) {
 /* ---- Step 52: fire_event trampoline + event sweep ---------------------
  *
  * BN Step 52 revealed:
- *   fire_event @ 0x9c12a0: uint64_t(int32_t event_id, int64_t event_data)
+ *   fire_event @ 0x5c12a0: uint64_t(int32_t event_id, int64_t event_data)
  *     - bounds-checks event_id <= 0xce
  *     - walks linked list at data_485ea80[event_id*8]
  *     - each node: {callback_fn_ptr @ +0, priority @ +0x08, next @ +0x10}
@@ -960,6 +960,11 @@ static void *shim_vp_patch_thread(void *arg) {
      * function self-gates on SPIKE3_PATCH_SUB_8EDFE0=1 OR SPIKE3_FIRE_SWITCH
      * being set. */
     shim_patch_sub_8edfe0_brk();
+    /* Step 72g: fire_event selective-return BRK — forces the
+     * orchestrator-gating events (0x80..0x83) to return 1 so the
+     * nodebus poll thread spawns and the orchestrator completes.
+     * Self-gates on SPIKE3_FORCE_NODEBUS_GATES=1. */
+    shim_patch_fire_event_brk();
     return NULL;
 }
 
@@ -1120,6 +1125,67 @@ static void *shim_fire_switch_thread(void *arg) {
     return NULL;
 }
 
+/* ---- Step 72g: nodebus gate poker -----------------------------------
+ *
+ * Per BN trace (Step 72c): the nodebus poll loop checks 5 state flags
+ * before doing useful work. The orchestrator normally sets them, but in
+ * our environment the orchestrator runs only partially (fire_event hook
+ * forces returns but downstream writes don't all land — we see
+ * data_4482120 = 0x11 but data_44821b8 = 0 after the run). Poking the
+ * remaining flags directly bypasses the missing orchestrator code paths.
+ *
+ * The thread sleeps a beat (30 s) so the orchestrator has had time to
+ * run and update what it CAN, then writes the values it normally
+ * SHOULD have set on a fully-successful run.
+ *
+ * Self-gated on SPIKE3_FORCE_NODEBUS_GATES=1 (same gate as fire_event
+ * BRK; they're paired).
+ */
+static void *shim_poke_nodebus_gates_thread(void *arg) {
+    (void)arg;
+    const char *en = getenv("SPIKE3_FORCE_NODEBUS_GATES");
+    if (!en || en[0] != '1') return NULL;
+
+    /* Wait long enough that orchestrator has tried to run + fire_event
+     * hooks have fired their forced returns. ~30 s gives plenty of
+     * margin (orchestrator typically fires within 10 s of boot). */
+    sleep(30);
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[gates] game_base unresolved; aborting nodebus-gates poke");
+        return NULL;
+    }
+
+    /* Pre-poke read for the log. */
+    uint32_t pre_4482120 = 0, pre_44821b8 = 0;
+    uint32_t pre_4482124 = 0, pre_4482190 = 0, pre_4482194 = 0;
+    memcpy(&pre_4482120, (void*)(game_base + 0x4482120), 4);
+    memcpy(&pre_44821b8, (void*)(game_base + 0x44821b8), 1);
+    memcpy(&pre_4482124, (void*)(game_base + 0x4482124), 4);
+    memcpy(&pre_4482190, (void*)(game_base + 0x4482190), 4);
+    memcpy(&pre_4482194, (void*)(game_base + 0x4482194), 4);
+    SHIM_LOG("[gates] PRE: 0x4482120=0x%08x  0x44821b8=0x%02x  0x4482124=0x%08x  0x4482190=0x%08x  0x4482194=0x%08x",
+             pre_4482120, pre_44821b8, pre_4482124, pre_4482190, pre_4482194);
+
+    /* Per BN agent (Step 72c): values orchestrator sets on a successful
+     * run. data_4482120 |= 0x11 (OR — preserves any other bits already
+     * set); the rest are direct assignments. */
+    uint32_t v_4482120 = pre_4482120 | 0x11;
+    uint8_t  v_44821b8 = 1;
+    uint32_t v_4482124 = 1;
+    uint32_t v_4482190 = 1;
+    uint32_t v_4482194 = 2;
+    memcpy((void*)(game_base + 0x4482120), &v_4482120, 4);
+    memcpy((void*)(game_base + 0x44821b8), &v_44821b8, 1);
+    memcpy((void*)(game_base + 0x4482124), &v_4482124, 4);
+    memcpy((void*)(game_base + 0x4482190), &v_4482190, 4);
+    memcpy((void*)(game_base + 0x4482194), &v_4482194, 4);
+    SHIM_LOG("[gates] POST: 0x4482120=0x%08x  0x44821b8=0x%02x  0x4482124=0x%08x  0x4482190=0x%08x  0x4482194=0x%08x",
+             v_4482120, v_44821b8, v_4482124, v_4482190, v_4482194);
+    return NULL;
+}
+
 /* ---- Public entry point called from shim_install_crash_handler ---- */
 
 /* Registers SIGALRM handler, blocks SIGALRM on the main thread (so threads
@@ -1234,6 +1300,19 @@ void shim_inject_start(void) {
         if (pv && pv[0] == '1') {
             pthread_t t;
             if (pthread_create(&t, NULL, shim_vp_patch_thread, NULL) == 0)
+                pthread_detach(t);
+        }
+    }
+
+    /* SPIKE3_FORCE_NODEBUS_GATES=1 — Step 72g: spawn the gate-poker
+     * thread. Sleeps 30 s then writes the 5 nodebus orchestrator
+     * gate flags. Pairs with the fire_event BRK installed by
+     * shim_vp_patch_thread. */
+    {
+        const char *fg = getenv("SPIKE3_FORCE_NODEBUS_GATES");
+        if (fg && fg[0] == '1') {
+            pthread_t t;
+            if (pthread_create(&t, NULL, shim_poke_nodebus_gates_thread, NULL) == 0)
                 pthread_detach(t);
         }
     }

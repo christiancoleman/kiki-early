@@ -5925,3 +5925,107 @@ Spawned a focused BN agent to trace **what gates `sub_674b90`** — the function
 
 The BN agent's report will pick the path. JOURNAL update at Step 72c when results land.
 
+### Step 72c — BN sub_674b90 trace + Recipe B implementation (2026-04-30)
+
+BN agent report: `sub_674b90` is called from `sub_675df0` (the only path that ever passes a non-zero channel), which runs inside a `while(true)` loop in `mcp_nodebus_main_poll_loop_unsure` (0x675efc). The poll thread is spawned by `sub_675d10` (0x675d10) — but only **after** `fire_event(0x80, 0)` returns truthy. To enter the loop body the binary must also pass `mcp_nodebus_init_orchestrator() & 1 == 1`, which depends on `fire_event(0x82, 0)`. State flags `data_4482120 & 0x10`, `data_44821b8 & 1`, `data_4482124 = 1`, `data_4482190 = 1`, `data_4482194 = 2` must be set as well.
+
+The agent recommended **Suggestion B (direct call to `sub_651610`)** as the long-term answer — bypasses the dormant orchestrator entirely. Implemented in `shim_inject.c`'s wire-arm path: build closed/open 8-byte payloads, call `((void(*)(uint8_t,uint8_t*))(game_base+0x651610))(channel, payload)` directly, sleep through the hold window, then call again with zeros for the release edge.
+
+### Step 72d — diagnostic dump + planted switch_id (2026-04-30)
+
+First runs of Recipe B: ZERO cmode delta. Added pre/post-fire dumps to figure out why.
+
+**Key finding from the dump**: `data_44cbda8` (channel-bit map count) is **0** — the table that `sub_7b4d00` uses to map (channel, bit) → switch_id is **EMPTY**. It's populated at runtime by `sub_7b4638`, which is downstream of the dormant orchestrator. `sub_651610` walked it, found no entry matching channel=6 bit 21, silently no-op'd.
+
+But — looking at `sub_651610`'s actual decompilation and disassembly, the function does NOT use `data_44cbd70`. That table is only for `sub_7b4d00`. `sub_651610` uses a DIFFERENT structure at `data_44804b8`: per-channel struct of stride 0xb0, with a switch_id table at offset 0x28 (16 entries × 2 bytes per bit, accessed via `ldrh w6, [x3, #0x28]` where `x3 = data_44804b8 + 2*(88*ch + abs_bit)`).
+
+For switch 93 / channel 6 / bit 21 (= byte 2 bit 5): the slot is at `data_44804b8 + 6*0xb0 + 0x28 + 21*2 = data_44804b8 + 0x472`. We plant `0x005d` (= 93) there before calling `sub_651610`. Dump confirms plant: `data_44804b8+0x448092a: 0x00000000 -> 0x0000005d`. Per-channel state buffer at `+0x20..0x27` does get updated to `00 00 60 00 00 00 00 00` post-call — confirming `sub_651610` runs the byte-write outer loop.
+
+### Step 72e–f — pointer field reframe + push-already-happened diagnosis (2026-04-30)
+
+**Critical correction to memory** (was wrong about `g_switch_state_array`): the BN database's `g_switch_state_array` symbol at `0x4480220` is a **pointer field**, NOT an embedded array. The actual switch state structs live on the **heap** at `*(uint64_t*)0x4480220 + sw_id*0x30`. The disassembly at 0x65164c is `ldr x14, [x20, #0x220]` — a LOAD, not an LEA. Existing `shim_inject.c`'s `SHIM_SWITCH_STATE_BASE 0x4480220` is half-correct — it's the pointer's address, not the array's base. All previous fire_switch byte-flips at `game_base + 0x4480220 + sw_id*0x30 + 0x28` were writing to .bss-adjacent uninitialized memory, NOT to the real switch state.
+
+Updated diagnostic to dereference the pointer:
+
+```
+[sw_brk] *0x4480220 (g_switch_state_array PTR) = 0x735b5e128c30
+[sw_brk] sw93 struct dump: @0x735b5e129da0 first16=709d125e5b730000709d125e5b730000  +0x26 (counter)=1  +0x2a (flag)=0x00
+[sw_brk] data_4480228=0x735b5e0841e0  mask[93]=0x00
+[sw_brk] direct sub_651610(ch=6, [00 00 60 00 00 00 00 00])
+[sw_brk] mid-fire (post-closure pre-release): sw93 (real) counter+0x26=1  pending_head=0x735b5e129c50
+```
+
+**Switch 93's counter was already 1 PRE-fire** — meaning sw93 has already been edge-fired by something before our shim ran. The `cbnz w0, +0x10` at `0x6516e8` checks the OLD counter value: if non-zero (which it is, =1), the push is **skipped**. So our `sub_651610` calls are no-ops for switch 93 specifically.
+
+This is the central reframe of the investigation: **the switch input infrastructure is at least partially functional** (sw93 has been edge-fired, the struct exists with valid linked-list pointers, counter is non-zero). What's broken is the **cmode response** — the cmode handlers don't transition state when switch events fire. That's consistent with the dormant orchestrator: cmode transitions are gated on orchestrator state, not just switch events.
+
+### Pivot for Step 72g
+
+Switch-injection is no longer the right vehicle for breaking the wedge. The wedge is **in the cmode/orchestrator layer**: `fire_event(0x80,0)` and `fire_event(0x82,0)` aren't returning truthy because no handlers are registered for those events (or the registered handlers are upstream-dependent on something else dormant).
+
+Suggestion A from the original BN agent — **force `fire_event` to return 1 for event_ids 0x80, 0x81, 0x82, 0x83** — becomes the right path. Implementation: BRK trap on `fire_event` (BN VA `0x5c12a0` — verified via mcp__binary-ninja__function_at, NOT `0x9c12a0` which is inside sub_9bd9a8), handler reads `x0` (event_id), and:
+
+- If event_id ∈ {0x80, 0x81, 0x82, 0x83}: set x0=1, set pc=lr — selectively skip and return 1.
+- Else: emulate `fire_event`'s first instruction in the handler, advance pc by 4, and let the function run normally.
+
+Step 72g: implement and test. Expected outcome: orchestrator runs, populates `data_44cbd70`, spawns `sub_675df0` poll thread, polls switches naturally, cmode handlers start reacting to real or shim-injected switch events. If that works, switch 93 fire_switch (Recipe B path) becomes the actual unblocking step — but only AFTER the orchestrator is alive.
+
+### Step 72g — fire_event BRK + gate-poke results (2026-04-30)
+
+**Built and tested in two phases.**
+
+**Phase 1: BRK on fire_event alone.** Patched first instruction (`stp x19, x20, [sp, #-32]!`, bytes `0xa9be53f3`) with `brk #0`. SIGTRAP handler routes on x0 (event_id):
+- For event_ids ∈ {0x80, 0x81, 0x82, 0x83}: set w0=1, set pc=lr (skip).
+- For all others: emulate the stp in C (sp -= 32; *(sp+0)=x19; *(sp+8)=x20), advance pc by 4.
+
+Test: `SPIKE3_FORCE_NODEBUS_GATES=1 SPIKE3_FIRE_SWITCH=93 SPIKE3_SWITCH_DELAY=60 STATE_BRIDGE=1 TIMEOUT=200 ./run_game.sh --debug`.
+
+| Signal | Result |
+|---|---|
+| `[fe_brk] patched fire_event @ ...` | ✓ at run+2 s |
+| `[fe_brk] forced fire_event(0x80)` from `lr=game_base+0x675d20` | ✓ matches BN-predicted thread-spawn site (sub_675d10+0x10) |
+| `[fe_brk] forced fire_event(0x82)` from `lr=game_base+0x675148` | ✓ matches BN-predicted orchestrator gate (mcp_nodebus_init_orchestrator+0x...) |
+| `[fe_brk] forced fire_event(0x81)` from `lr=game_base+0x6b8da4` | unexpected location — different caller |
+| `pthread_create` 1 ms after `fire_event(0x80)` forced return | ✓ poll thread WAS spawned |
+| `[sw_brk] sub_8edfe0 trap` | **0** across 200 s |
+| `data_44821b8` post-run | **0x00** (gate flag NOT set despite orchestrator run) |
+| `data_4482120` post-run | `0x11` (orchestrator DID reach 0x6751c4) |
+| `data_44cbda8` (channel-bit map count) | **0** (table empty) |
+
+The thread spawns but the loop body never reaches `sub_8edfe0`. Three fire_event forced returns (0x80, 0x81, 0x82) — fire_event(0x83) never called. Only 4 passthrough events (0x3b, 0x06×3) in 200 s — most game logic doesn't reach fire_event because mode state is wedged.
+
+**Phase 2: + direct memory poke for gate flags** (the BN agent's full Suggestion A). Added `shim_poke_nodebus_gates_thread`: sleeps 30 s then writes the 5 flags `data_4482120 |= 0x11`, `data_44821b8 = 1`, `data_4482124 = 1`, `data_4482190 = 1`, `data_4482194 = 2`.
+
+Test: same as Phase 1 but `SPIKE3_SWITCH_DELAY=90` (fire after gate poke at 30 s).
+
+| Signal | Result |
+|---|---|
+| `[gates] PRE`: data_4482120=0x11, data_44821b8=0x00, data_4482124=0x01, data_4482190=0x00, data_4482194=0x01 | partial — orchestrator set 4 of 5; missing data_44821b8 and data_4482190 |
+| `[gates] POST`: all 5 set as expected | ✓ |
+| `data_44821b8 = 0x01` at fire_switch time (60 s post-poke) | ✓ stayed set |
+| `[sw_brk] sub_8edfe0 trap` | **STILL 0** |
+| `data_44cbda8` | **STILL 0** |
+| sw93 counter | 0 (was 1 in earlier runs) — different state, not progress |
+| cmode deltas | 0 |
+
+**Conclusion**: gate forcing + memory pokes get us further (thread spawned, gate flags set), but `data_44cbd70` (channel-bit map populated by `sub_7b4638`) is **still empty**. Without it, `sub_675df0`'s iteration body has no channels to poll, so `sub_8edfe0` is never called even though the poll thread is alive.
+
+**The deeper missing piece**: `sub_7b4638` (channel-bit-map populator) is not running. It's normally called somewhere in the orchestrator chain — but our `fire_event` hook **bypasses handlers entirely** (we set pc=lr after forcing the return value, so handlers never run). If sub_7b4638 is called by a handler chained from event 0x82 (or another), our hook silenced it.
+
+**Side concern**: `sw93 counter` was 1 in earlier runs (Step 72f) but 0 in this run. Suggests gate-forcing changed the boot path enough that switch 93's natural pre-firing didn't happen. Not a regression we care about — orient on the bigger picture.
+
+### Three Step 72h options
+
+**A. Trace `sub_7b4638` callers via BN, force its caller to run.** Targeted trace: who calls sub_7b4638, on what trigger? If a single chain `event 0x?? → handler → sub_7b4638`, we can either let that handler run (un-skip that event_id from our forced-return list) or directly call sub_7b4638 from the shim.
+
+**B. Trampoline-call `sub_7b4638` from the shim.** Add a thread that, after gate poke completes, calls `((void(*)(void))(game_base + 0x7b4638))()`. Risk: sub_7b4638 may have its own dependencies (nodebus tree, allocators) that aren't satisfied yet.
+
+**C. Hand-populate `data_44cbd70`.** From the Pokémon LE manual, we know all switches' (channel, wire-bit) tuples. Write entries directly. Tedious but bypasses everything between fire_event and the loop body. Stride is 0x50 — likely larger than just (channel, wire-bit), so we'd need BN trace of sub_7b4638 to know full entry layout anyway.
+
+**Recommendation**: A. Cheap to find out (one BN call), and the answer informs B vs C if A doesn't directly resolve.
+
+### Memory updates needed
+
+- Add new memory entry: `g_switch_state_array @ 0x4480220 is a pointer field, not array` — fix the long-standing assumption in `feedback_*` and `project_*` notes.
+- Update Step-71 / Step-72 area in `project_emulation_progress.md`: switch input layer works at least partially; wedge confirmed in orchestrator/cmode layer.
+

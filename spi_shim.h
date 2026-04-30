@@ -186,6 +186,19 @@ extern volatile uint8_t   shim_sub_8edfe0_payload[8];
  * disarms (deadline expires). Defined in shim_inject.c. */
 void shim_sub_8edfe0_arm(int channel, const uint8_t payload[8], uint32_t hold_ms);
 
+/* fire_event BRK selective-return (Step 72g): patches fire_event entry
+ * (BN VA 0x5c12a0) with `brk #0`. SIGTRAP handler reads x0 (event_id)
+ * and forces return 1 (skipping the function) for event_ids in
+ * {0x80, 0x81, 0x82, 0x83} — the orchestrator gates per Step 72c BN
+ * trace. For all other event_ids, emulates the function's first
+ * instruction (stp x19, x20, [sp, #-32]!) and advances pc by 4 to let
+ * the function run normally.
+ *
+ * Self-gated on SPIKE3_FORCE_NODEBUS_GATES=1. Without this gate set,
+ * the patch is not installed and fire_event runs untouched. */
+void shim_patch_fire_event_brk(void);
+extern volatile uintptr_t shim_fire_event_runtime;
+
 /* ---- AF_UNIX abstract-namespace addressing ----
  * WSL2's 9P mount of /mnt/c/... does NOT support AF_UNIX bind (errno 95
  * EOPNOTSUPP). Putting sockets under $SYSROOT/tmp/ on /mnt/c is therefore

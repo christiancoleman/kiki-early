@@ -568,6 +568,14 @@ static int shim_sub_8edfe0_trap_count = 0;
 #define SUB_8EDFE0_LOG_FIRST 4   /* log first N traps unconditionally */
 #define SUB_8EDFE0_LOG_EVERY 1024 /* and every Nth thereafter */
 
+/* Step 72g: fire_event BRK selective-return state. Patch published by
+ * shim_patch_fire_event_brk; SIGTRAP handler routes on event_id (x0). */
+volatile uintptr_t shim_fire_event_runtime = 0;
+static int shim_fire_event_forced_count = 0;
+static int shim_fire_event_pass_count   = 0;
+#define FIRE_EVENT_LOG_FORCED_MAX 32  /* log first N forced returns */
+#define FIRE_EVENT_LOG_PASS_MAX   4   /* and first N passthroughs */
+
 static inline uint64_t shim_now_ms_monotonic(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -649,6 +657,48 @@ static void shim_sigtrap_handler(int sig, siginfo_t *info, void *uc) {
                      payload[0], payload[1], payload[2], payload[3],
                      payload[4], payload[5], payload[6], payload[7],
                      (unsigned long)lr);
+        }
+        return;
+    }
+
+    /* ---- Step 72g: fire_event selective-return ----
+     * Trap fires at fire_event's first instruction (brk #0 replacing the
+     * original `stp x19, x20, [sp, #-32]!`). x0 holds event_id. We:
+     *   1. If event_id ∈ {0x80, 0x81, 0x82, 0x83}: force return 1 by
+     *      setting x0=1 and pc=lr (skip the function). These are the
+     *      orchestrator gates that shim_patch_fire_event_brk targets.
+     *   2. Otherwise: emulate the original `stp x19, x20, [sp, #-32]!`
+     *      in C (pre-decrement sp by 32, store x19 at sp+0, x20 at
+     *      sp+8) and advance pc by 4. The rest of fire_event then
+     *      runs unchanged — handlers fire, return value computed
+     *      normally.
+     */
+    if (shim_fire_event_runtime != 0 && pc == shim_fire_event_runtime) {
+        int event_id = (int)(mc->regs[0] & 0xff);
+        int is_target = (event_id == 0x80 || event_id == 0x81 ||
+                         event_id == 0x82 || event_id == 0x83);
+
+        if (is_target) {
+            mc->regs[0] = 1;
+            mc->pc      = mc->regs[30];  /* lr */
+            int seq = __sync_fetch_and_add(&shim_fire_event_forced_count, 1);
+            if (seq < FIRE_EVENT_LOG_FORCED_MAX) {
+                SHIM_LOG("[fe_brk] forced fire_event(0x%02x) -> 1 (skipped) seq=%d lr=0x%lx",
+                         event_id, seq, (unsigned long)mc->regs[30]);
+            }
+        } else {
+            /* Emulate `stp x19, x20, [sp, #-32]!` */
+            uintptr_t new_sp = (uintptr_t)mc->sp - 32;
+            *(volatile uint64_t *)(new_sp + 0) = mc->regs[19];
+            *(volatile uint64_t *)(new_sp + 8) = mc->regs[20];
+            mc->sp = new_sp;
+            mc->pc += 4;  /* skip the brk; original instruction now done */
+
+            int seq = __sync_fetch_and_add(&shim_fire_event_pass_count, 1);
+            if (seq < FIRE_EVENT_LOG_PASS_MAX) {
+                SHIM_LOG("[fe_brk] passthrough fire_event(0x%02x) seq=%d new_sp=0x%lx",
+                         event_id, seq, (unsigned long)new_sp);
+            }
         }
         return;
     }

@@ -469,11 +469,16 @@ const void *avcodec_find_decoder_by_name(const char *name) {
     return ret;
 }
 
-/* Get_hw_config, hwdevice_ctx_create, send_packet, receive_frame — all
- * REVERTED to passthrough for now. First goal is to confirm the hook itself
- * fires and we can see the call pattern. Once we see avcodec_find_decoder's
- * name, avcodec_open2's return, and the codec ptr flow, we can design the
- * intervention. */
+/* Step 72i tried to force these to NULL/ENOSYS when SPIKE3_SW_HEVC=1.
+ * RESULT: SIGABRT — Stern's video init at SpiVideoStreamDecoderBase.cpp:1830
+ * has `assert(hw_decoder)` that requires get_hw_config + hwdevice_ctx_create
+ * to BOTH succeed. There is no SW fallback at this level. Reverted to
+ * passthrough. The visible "frozen attract" is NOT caused by decoder EAGAIN
+ * (pre-fix: 50% receive_frame ok is normal SW HEVC latency, game tolerates
+ * it) — it's caused by VideoPlayerSpi not being in the Godot scene tree
+ * (can_process returns false → no _process() ticks → frames decoded but
+ * never displayed). See JOURNAL Step 71 + Step 72j.
+ */
 const void *avcodec_get_hw_config(const void *codec, int index) {
     if (!real_avcodec_get_hw_config) {
         real_avcodec_get_hw_config =
@@ -830,6 +835,67 @@ void shim_patch_video_player_play_entry_brk(void) {
  */
 #define SUB_8EDFE0_VA              0x8edfe0
 #define EXPECTED_SUB_8EDFE0_BYTES  0xd2800002u  /* mov x2, #0 — verified Step 72 */
+
+/* ========== Step 72g: fire_event selective-return BRK ==========
+ *
+ * Forces fire_event(event_id, ...) to return 1 for event_ids in
+ * {0x80, 0x81, 0x82, 0x83} — the four orchestrator gates per the
+ * Step 72c BN trace of mcp_nodebus_init_orchestrator and sub_675d10.
+ * For all other event_ids the trap handler emulates the function's
+ * first instruction in C (`stp x19, x20, [sp, #-32]!`) and advances
+ * pc by 4 so the rest of fire_event runs normally.
+ *
+ * Why selective: a blanket return-1 patch would corrupt all events,
+ * including ones that route to legitimate game-state handlers. We
+ * only want to force the orchestrator-gating events.
+ *
+ * Verified bytes at game_base + 0x5c12a0 (Step 72g BN session 2026-04-30):
+ *   0x5c12a0  f3 53 be a9    stp x19, x20, [sp, #-32]!  ; frame setup
+ *
+ * Self-gated on SPIKE3_FORCE_NODEBUS_GATES=1.
+ */
+#define FIRE_EVENT_VA              0x5c12a0
+#define EXPECTED_FIRE_EVENT_BYTES  0xa9be53f3u  /* stp x19, x20, [sp, #-32]! — verified Step 72g */
+
+void shim_patch_fire_event_brk(void) {
+    const char *en = getenv("SPIKE3_FORCE_NODEBUS_GATES");
+    if (!en || en[0] != '1') return;
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[fe_brk] game_base unresolved; fire_event BRK aborted");
+        return;
+    }
+
+    uint32_t *instr = (uint32_t *)(game_base + FIRE_EVENT_VA);
+    uintptr_t page = (uintptr_t)instr & ~(uintptr_t)4095;
+    if (mprotect((void *)page, 8192,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        SHIM_LOG("[fe_brk] mprotect RWX @ %p failed: %s",
+                 (void *)page, strerror(errno));
+        return;
+    }
+
+    uint32_t old = *instr;
+    if (old == AARCH64_BRK_0) {
+        SHIM_LOG("[fe_brk] fire_event already patched @ %p; skipping",
+                 (void *)instr);
+        shim_fire_event_runtime = (uintptr_t)instr;
+        return;
+    }
+    if (old != EXPECTED_FIRE_EVENT_BYTES) {
+        SHIM_LOG("[fe_brk] REFUSED to patch fire_event @ %p: expected 0x%08x (stp x19,x20,[sp,#-32]!), got 0x%08x",
+                 (void *)instr, (unsigned)EXPECTED_FIRE_EVENT_BYTES, old);
+        return;
+    }
+
+    shim_fire_event_runtime = (uintptr_t)instr;
+    __sync_synchronize();
+    *instr = AARCH64_BRK_0;
+    __builtin___clear_cache((char *)instr, (char *)instr + 4);
+    SHIM_LOG("[fe_brk] patched fire_event @ %p: 0x%08x -> 0x%08x (brk #0)",
+             (void *)instr, old, (unsigned)AARCH64_BRK_0);
+}
 
 void shim_patch_sub_8edfe0_brk(void) {
     /* Self-gate: install when explicitly requested (SPIKE3_PATCH_SUB_8EDFE0=1)
