@@ -1,360 +1,211 @@
-# `_emulation/` — Spike 3 emulation shim
+Build & launch
 
-This directory is the dev workspace for running the Pokémon LE `game` binary
-(ARM aarch64, Spike 3 platform) on an x86_64 dev machine under `qemu-user`.
-The core artifact is `spi_shim.so` — an `LD_PRELOAD` shim that intercepts the
-game's calls to hardware devices, libraries, and files it can't reach on a
-workstation, and synthesizes whatever the game expects.
+  Runtime layers (every binary inherits LD_PRELOAD=spi_shim.so)
 
-## Module guide
+  ┌── Constructor entry (spi_shim.c) ─────────────────────────────────────────┐
+  │  shim_init_dirs        → mkdir _emulation/captures/audio + /tmp/cache    │
+  │  shim_install_crash    → SIGSEGV/BUS/ABRT/TERM/INT/USR1/USR2/TRAP        │
+  │                           handlers; shim_bridge_start, shim_frame_start, │
+  │                           shim_audio_start, shim_inject_start            │
+  └──────────────────────────────────────────────────────────────────────────┘
 
-The shim started life as a single `spi_shim.c` monolith (~6400 lines). We
-split it into subsystem-scoped source files across nine phases — **85 % of
-the original code now lives in dedicated subsystem files**, with `spi_shim.c`
-acting as the small nucleus that holds the constructor, device-state globals,
-`intercept_device`, and the remaining INLINE_SYSCALL-dodging hooks (termios,
-ALSA, gstreamer, pthread_create, system).
+  Filesystem & device interception
 
-> **Terminology:** "source file" here means a C compilation unit — one `.c`
-> file that the compiler processes into one object, all of which the linker
-> bundles into `spi_shim.so`. Externally the result is one library;
-> internally the split keeps subsystems legible.
+  File: shim_fs.c
+  Owns: remap_path (/dev /proc /run /sys (≠ firmware) /home /root /var skipped — everything else gets $SYSROOT prefix;
+    /tmp carve-out commented out → falls through to host); open/openat/open64/openat64/fopen/fopen64; access/faccessat
+    (libc-level because glibc INLINE_SYSCALLs bypass faccessat hook); stat family; mkdir/mkdirat (treats EEXIST as
+    success); GPIO sysfs fake-fd pool (16 slots @ FAKE_FD_GPIO_BASE=1000); libgpiod chardev stubs (output-only)
+  ────────────────────────────────────────
+  File: spi_shim.c
+  Owns: intercept_device(path) dispatcher: /dev/spidev4.0→FAKE_FD_SPI, /dev/i2c-10→FAKE_FD_I2C, /dev/dri/card1→real
+    socketpair, /dev/shim-v4l2-*→fake fds, /dev/boot_display→fake fd, /dev/ttyAMA{2,5}→real socketpair
+  ────────────────────────────────────────
+  File: shim_io.c
+  Owns: close/read/lseek/write + LFS variants (lseek64, pread64, pwrite64, pread, pwrite) + mmap/mmap64/munmap
+    (file-backed only) observation hooks. UART read passes through real socketpair; UART write logs hex + calls
+    synthesize_bridge_response. GPIO sysfs synthetic reads ("0\n" for value, "out\n" for direction etc., one-shot latch
+    reset by lseek(0))
+  ────────────────────────────────────────
+  File: shim_ioctl.c
+  Owns: UART termios ioctls (TCGETS/TCSETS/TIOCMGET/FIONREAD/TIOCOUTQ); SPI MESSAGE_1 with per-cmd env-var overrides
+    SPIKE3_SPI_RX_XX=hexbytes (default rx[2]=0x04); DRM (1 CRTC, 2 connectors @ HDMI-A 1920×1080@60, MODE_PAGE_FLIP
+    synthesizes drm_event_vblank on the shim socketpair side + calls shim_frame_capture_at_page_flip); V4L2 returns
+    ENOTTY; I2C log-only
 
-Each file is self-contained in its own concern and depends on the others
-only via declarations in `spi_shim.h`.
+  Bridges & IPC (all AF_UNIX abstract namespace)
 
-### `spi_shim.h` — shared header
+  shim_bridges.c — three independent listeners, each with accept thread + (for state) poll thread:
 
-The only thing that crosses the source-file boundary. Holds:
+  ┌────────────────────────┬───────────────────────┬─────────────────────────────────────────────────────────────────┐
+  │          Name          │       Env gate        │                           Wire format                           │
+  ├────────────────────────┼───────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ @pokemon_spike3_bridge │ SPIKE3_BRIDGE=1       │ newline-delimited JSON cmode deltas, 10 Hz poll of cmode +0x308 │
+  ├────────────────────────┼───────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │                        │                       │ 16B header (magic 0xF00FBABA, seq, w16, h16, fmt, flags) +      │
+  │ @pokemon_spike3_frame  │ SPIKE3_FRAME_BRIDGE=1 │ W·H·4 RGBA. Captured every 2nd MODE_PAGE_FLIP via               │
+  │                        │                       │ glReadPixels(0,0,1920,1080) from shim_last_draw_fbo (or current │
+  │                        │                       │  READ_FRAMEBUFFER)                                              │
+  ├────────────────────────┼───────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ @pokemon_spike3_audio  │ SPIKE3_AUDIO_BRIDGE=1 │ raw S16_LE 2ch 44.1 kHz, no header. Tee'd from snd_pcm_writei   │
+  └────────────────────────┴───────────────────────┴─────────────────────────────────────────────────────────────────┘
 
-- `SHIM_LOG(...)` — uniform `[shim]` prefix on every diagnostic line.
-- `FWD_RET` / `FWD_VOID` / `FWD_RET_V` / `FWD_VOID_V` — macros used inside
-  GL/EGL stub bodies to tail-call the real Mesa implementation when
-  `SPIKE3_REAL_GL=1`, or fall through to the stub when not.
-- Display constants (`FAKE_MODE_HDISPLAY`, `FAKE_MODE_VDISPLAY`).
-- `FAKE_FD_*` constants for SPI / I2C / V4L2 / GPIO fake-fd pools.
-- `struct shim_cmode_entry` + externs for the game's 42-mode registry.
-- Device-layer state externs (spi_active, uart_game_fd, drm_game_fd,
-  transfer counters, etc.) that cross-TU hooks need.
-- `real_open` / `real_close` / `real_ioctl` / `real_read` / `real_write`
-  function pointer externs — resolved by `resolve_all()` on first open.
-- Forward declarations for cross-module functions: bridge lifecycle,
-  signal handlers, netbridge response synth, intercept dispatcher, fd
-  predicates, GPIO fake-fd pool operations.
+  Netbridge UART protocol (shim_nodebus.c)
 
-### `spi_shim.c` — main shim body (~960 lines, down from 6400)
+  Frame format [STX 0x02][CMD][ID][payload][CKSUM=−Σ][ETX 0x03] with byte-stuffing escape 0x1b NN→NN&0x7f. Synthesized
+  responses:
 
-The small nucleus that remains after nine phases of carving. Owns:
+  - 0x10 → cmd 0x10, 7-byte pwrdist version 01 00 00 00 00 00 00 (puts game on "has Spike 3 pwrdist" path)
+  - 0x11, 0x1c → silent ACK
+  - 0x15, 0x18, 0x1d → 1-byte 0x00 ACK
+  - 0x16 → 01 00 02 00 (status-poll exit signature)
+  - 0x20 → cmd 0x10, 4 zero bytes (hw version)
+  - 0x27 → alternating 0x06/0x02 (paired loop bit-2 toggle)
+  - 0x30 → cmd 0x20, NETBRIDGE_CRC32=0x357f5327
+  - 0x40 → log only, no response (intentional timeout = progress per Step 45)
+  - 0x41 → encrypted node-bus channel: log decoded inner_cmd + payload. NODEBUS_SYNTH_FE=1 enables fe_probe synthesis —
+  emits "node not present, default chip" response to inner_cmd 0xFE/0xFA. Memory warning: NODEBUS_SYNTH_FE=1 long stable
+   runs don't initialize Godot — not a healthy baseline.
 
-- `__attribute__((constructor))` entry points: directory setup
-  (`shim_init_dirs`) and the main `shim_install_crash_handler` that
-  registers SIGSEGV/SIGBUS/SIGTERM/SIGINT/SIGUSR1/SIGUSR2 handlers, then
-  delegates to `shim_bridge_start()`, `shim_frame_start()`, and
-  `shim_inject_start()` for the rest of the bring-up.
-- `dlopen` / `dlsym` interceptions for dynamically-loaded libEGL/GLES/GBM
-  handles (Step 59): the game `dlopen`s these libs and looks up symbols
-  against the returned handles, which normal LD_PRELOAD misses; we route
-  specific symbols (`eglCreateImageKHR`, `glEGLImageTargetTexture2DOES`)
-  back to our overrides.
-- `intercept_device()` — the `/dev/*` → fake-fd dispatcher called by the
-  open family in `shim_fs.c`.
-- fd predicates (`is_fake_fd` / `is_uart_fd` / `is_drm_fd` / `is_v4l2_fd`)
-  plus all the device-layer state globals they read.
-- `resolve_all()` — binds the five `real_*` libc function pointers.
-- termios wrappers (`tcsetattr` / `tcgetattr` / `tcflush` / etc.) —
-  glibc uses INLINE_SYSCALL for these, bypassing our ioctl hook.
-- `system` hook that blocks `openocd` / `/games/spike3/` shell-outs.
-- `pthread_create` hook forcing `PTHREAD_INHERIT_SCHED`.
-- `snd_pcm_*` ALSA stubs + paced writei capture to
-  `_emulation/audio/stream.s16le`.
-- `perror` diagnostic wrapper.
-- GStreamer passthrough + logging.
+  Cipher keys (nodebus_cipher_keys[32][16]) stay zero; game's per-slot status flag means encryption loop is skipped on
+  the wire so we treat as plaintext. nodebus_cipher_decrypt exists but isn't currently used (Step 69 retracted decode).
 
-### `shim_fs.c` — filesystem intercept layer (Phase 5)
+  GL / EGL / GBM (shim_gl.c)
 
-Every intercept on the path namespace:
+  Two modes selected by SPIKE3_REAL_GL (default 1):
 
-- Sysroot-aware `remap_path` helper (prepends `$SPIKE3_SYSROOT` to
-  absolute paths, skipping `/dev/`, `/proc/`, `/sys/`, `/tmp/`).
-- Path-open family: `open`, `openat`, **`open64`**, **`openat64`**,
-  **`fopen64`**. The 64-bit variants are essential — the game's Godot
-  resource loader uses `fopen64` to reach `main.pck`, so the plain
-  `open` hook alone misses it.
-- Access family: `access`, `faccessat`.
-- Stat family: `stat`, `lstat`, `__xstat`, `__lxstat`, `__xstat64`,
-  `__lxstat64`, `fstatat`, `__fxstatat`, `__fxstatat64`.
-- GPIO sysfs fake-fd pool: allocation / lookup / free helpers + the
-  arrays backing the pool. The 16-slot pool plus its per-slot path
-  string (`gpio_fake_paths[]`) and read-done latch (`gpio_fake_read_done[]`)
-  let the I/O hooks serve sysfs `value`/`direction`/`export` files.
-- `should_log_open` — diagnostic filter choosing which opens are worth
-  logging (device nodes, sysfs/procfs, Godot resources, etc.).
+  - Stub mode: every GLES/EGL/GBM call returns plausible defaults. Shaders "compile". Draws no-op.
+  - Real-GL mode: FWD_RET / FWD_VOID macros tail-call dlsym(RTLD_NEXT,...) into Mesa overlay
+  (mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/). Translation glue:
+    - eglGetDisplay/PlatformDisplay[EXT] → drops game's GBM_KHR query, asks Mesa for EGL_PLATFORM_SURFACELESS_MESA
+    - eglChooseConfig → patches EGL_SURFACE_TYPE: WINDOW_BIT→PBUFFER_BIT (Mesa surfaceless has no window configs)
+    - eglCreateWindowSurface → redirects to eglCreatePbufferSurface(1920×1080)
+    - eglMakeCurrent(draw=NULL) → fabricates fallback pbuffer from shim_last_real_config
+    - eglGetConfigAttrib(EGL_NATIVE_VISUAL_ID) → forces XR24 fourcc
+    - glFramebufferTexture2D/Layer → swap GL_TEXTURE_EXTERNAL_OES → GL_TEXTURE_2D
+    - eglCreateImageKHR → never forwards to Mesa (would deref fake GBM); registers {w,h,fourcc} in side-table, returns
+  sentinel. glEGLImageTargetTexture2DOES → looks up + does real glTexImage2D(0, RGBA8, w, h, ..., NULL) to give the
+  bound texture storage; tracks in shim_frametex for capture targeting.
+  - dlopen/dlsym interception (in spi_shim.c): tracks libEGL/libGLES/libgbm handles, substitutes our 3 EGLImage
+  overrides on dlsym(handle, "eglCreateImageKHR"/"eglDestroyImageKHR"/"glEGLImageTargetTexture2DOES").
+  - eglGetProcAddress returns table of our stubs (never forwards — would hand fake GBM to real Mesa).
 
-All open-family hooks call `intercept_device()` first so SPI/I2C/DRM/UART
-path matches land on the right fake-fd / socketpair before falling through
-to the real libc.
+  Diagnostics (shim_diagnostics.c)
 
-### `shim_io.c` — byte-level I/O hooks (Phase 7)
+  - shim_resolve_game_base() — atomic-cached, walks backtrace+dladdr for first frame inside ./game.
+  - shim_cmode_table[42] — BN VAs + expected mode_id/type_flags + name_hint. External TUs read this (the state bridge
+  poll thread, the event sweep, the cmode-poke thread, the switch-fire snapshotter).
+  - shim_dump_sound_globals — full /proc/self/maps + g_asset_registry hashtable walk (writes
+  _emulation/captures/asset_registry.bin with header, raw nodes).
+  - shim_dump_cmodes — read each cmode +0x08 (mode_id) +0x0c (type_flags) +0x58 (scene_ptr) +0x308 (init_flag); hexdump
+  scene_data of base_00, story_charmander_1, battle_mountain.
+  - shim_dump_dispatch_tables — registry @ data_4767b30 (42×8B), event handlers @ data_485ea80 (207 slots × 8B
+  linked-list head, walk +0x10), update types @ data_48c52c0 (5×8B).
+  - SIGSEGV → backtrace + sound + cmode + dispatch dumps, then SIG_DFL re-raise. Detects "in event sweep" and
+  siglongjmps back instead.
+  - SIGABRT → backtrace with ELF VAs for game frames (paste-able into BN), AudioServer singleton dump (data_451ac48
+  vtable slot enumeration), then SIG_DFL re-raise.
+  - SIGTERM/INT → dump and _exit(0). SIGUSR1 → dump and continue. SIGUSR2 → run event sweep.
 
-`close`, `read`, `write`, `lseek` plus the LFS variants `lseek64` /
-`pread64` / `pwrite64` (added defensively in Phase 7.post). The first run
-with the LFS hooks wired caught **`pread64` actually in use** — a real
-blind spot we'd been silently missing. `lseek64` and `pwrite64` have stayed
-dormant. The `pread64` hook now emits `fd=N offset=M count=K` for its first
-8 calls plus every 500th after that, so future investigation can map where
-those reads are actually coming from.
+  Injection layer (shim_inject.c)
 
-Dispatch order mirrors `intercept_device()`'s contract: GPIO fake fds →
-SPI/I2C/V4L2 fake fds → UART socketpair (with bridge-response synth on
-write) → DRM socketpair → everything else falls through to real libc.
+  - 105-switch manifest from Pokémon LE manual.
+  - shim_fire_event(id, data) — trampoline to game's fire_event @ ELF VA 0x9c12a0.
+  - shim_fire_switch(id) — flips byte at game_base + 0x4480220 + id*0x30 + 0x28. Note: no event dispatch; game's
+  translator hasn't been hooked, so closures may go unobserved until poll cycle.
+  - shim_event_sweep — fires events 0x00..0xce with alarm(1) per-event timeout, siglongjmp recovery on timeout (code 2)
+  or SEGV (code 1). Diffs cmode +0x308/+0x60 snapshots between events.
+  - 6 env-gated worker threads, all spawned at constructor:
+    - SPIKE3_SWEEP_AFTER=<sec> (+ SPIKE3_SWEEP_EVENTS=1) → run sweep
+    - SPIKE3_FIRE_SWITCH=<id1:id2:...> (+ SPIKE3_SWITCH_DELAY) → fire switch IDs
+    - SPIKE3_FORCE_GSTREAMER=<sec> → trampoline into game's gstreamer_init @ 0xcc1ec0
+    - SPIKE3_POKE_CMODE=<name>:<hex>:<delay> → write hex to cmode +0x308
+    - SPIKE3_POKE_STATE_FLAG=<mask>:<delay_ms> → atomic OR mask into system_state_flags @ 0x4482388
+    - SPIKE3_PATCH_SPI_VIDEO=1 → shim_vp_patch_thread calls all 6 patches after 2s settle
 
-### `shim_ioctl.c` — ioctl dispatch + DRM page-flip event synthesis (Phase 7)
+  Runtime patches (shim_patches.c)
 
-`ioctl()` for every fake or real fd the shim exposes:
+  Other hooks (in spi_shim.c + shim_net.c)
 
-- UART termios ioctls (`TCGETS` / `TCSETS` / `TIOCMGET` / `FIONREAD` / etc.)
-- SPI ioctl suite (`WR_MODE` / `WR_MAX_SPEED_HZ` / `MESSAGE_1` — **this is
-  where the single-byte fake nodebus response lives**, `rx[2]=0x04`, known
-  gap).
-- DRM ioctls: `VERSION`, `GET_CAP`, `MODE_GETRESOURCES`, `MODE_GETCONNECTOR`,
-  `MODE_GETCRTC`, `MODE_SETCRTC`, `MODE_CREATE_DUMB`, `MODE_ADDFB` /
-  `ADDFB2`, `MODE_PAGE_FLIP` (triggers frame capture), `GEM_CLOSE`, …
-- V4L2 first-pass probe (log + `ENOTTY`).
-- I2C ioctls (`SET_SLAVE`, `RDWR`, `SMBUS`).
+  Boundary contract (single header spi_shim.h)
 
-Also owns `drm_synthesize_flip_event` which pushes `DRM_EVENT_FLIP_COMPLETE`
-records onto the shim side of the DRM socketpair on every `MODE_PAGE_FLIP`,
-so the game's `select()` + `drmHandleEvent()` loop makes forward progress.
+  The TUs share a deliberately narrow interface:
+  - SHIM_LOG, FWD_RET/VOID(_V), shim_unix_abstract_addr, shim_format_log_timestamp
+  - Display: FAKE_MODE_HDISPLAY/VDISPLAY = 1920/1080
+  - Cmode table externs (read by shim_bridges.c poll, shim_inject.c sweep)
+  - 5 signal handlers + shim_event_sweep, shim_event_sweep_jmp, shim_event_fire_in_progress, shim_current_sweep_event_id
+   (set by inject, read by diagnostics)
+  - synthesize_bridge_response (called from io.c write hook)
+  - Fake fds (FAKE_FD_SPI=1023, I2C=1022, V4L2_MEDIA=1021, V4L2_VIDEO=1020, BOOT_DISPLAY=1019, GPIO_BASE=1000)
+  - 11 device-state externs + 5 fd predicates + 5 real-libc fn pointers
+  - GPIO pool externs
+  - 5 patch functions + 1 brk runtime addr
+  - Bridge/inject lifecycle entry points
+  - is_real_gl() cache
+  - shim_last_draw_fbo (set in shim_gl.c, read in shim_bridges.c)
 
-### `shim_gl.c` — OpenGL ES + EGL + GBM (Phase 6, the big one)
+  Notable assumptions / load-bearing details
 
-Combines three historically-separate subsystems into one source file
-because they share a lot of state (real-GL forwarding globals + fallback-
-pbuffer machinery).
+  1. Sysroot detection: _emulation lives at games/pokemon_le/_emulation, so ../../.. is the sysroot root. Both
+  run_game.sh and Python helpers depend on this layout.
+  2. BN-rebased addresses: every constant in shim_patches.c / shim_diagnostics.c / shim_inject.c is an ELF VA = current
+  BN VA (BN database rebased to base 0x0). Runtime address = shim_resolve_game_base() + ELF_VA.
+  3. PIE base resolved via backtrace+dladdr: requires at least one frame inside ./game on the calling thread's stack.
+  Sweep timer and poke threads have no game frames, so they wait until ioctl/etc fires the cache from a guest thread.
+  4. Stub mkdir at constructor for /tmp/cache: under remap rules /tmp/ is currently NOT remapped (carve-out commented
+  out in shim_fs.c:86–102). The constructor's mkdir("/tmp/cache", 0755) therefore lands on the host /tmp, not
+  $SYSROOT/tmp/cache — MESA_SHADER_CACHE_DIR env var passed in run_game.sh is the actual mechanism keeping shader cache
+  in-sysroot.
+  5. AF_UNIX abstract namespace: WSL2's 9P mount can't bind AF_UNIX on /mnt/c/.... All three bridges use abstract names
+  (\0pokemon_spike3_*); legacy filesystem socket reaping in run_game.sh + nuke_emulation.sh is harmless backward-compat.
+  6. DRM page-flip presentation: game uses MODE_PAGE_FLIP, not eglSwapBuffers. Frame capture trigger is in
+  shim_frame_capture_at_page_flip() called from the DRM ioctl handler. Captures every 2nd flip.
+  7. Per-cmd-byte SPI override (SPIKE3_SPI_RX_XX=) is loaded once on first MESSAGE_1 ioctl. To change values at runtime
+  you'd have to restart the game.
+  8. Switch closures via shim_fire_switch flip the state byte but DON'T currently fire game events — the netbridge cmd
+  0x27 → state-write → fire_event translator is unhooked (per the in-source comment + memory). So switches fire silently
+   until the game's own poll observes the byte.
 
-- **GBM**: fake `gbm_device` / `gbm_bo` / `gbm_surface` objects. Tiny
-  per-BO side table for `gbm_bo_get_width/height/format/stride`.
-- **EGL**: `SURFACELESS_MESA` display translation (Step 57+), Mesa config
-  capture, `eglChooseConfig` WINDOW→PBUFFER surface-type patching,
-  fallback-pbuffer injection at `eglMakeCurrent(draw=NULL)` (Step 59).
-  Plus the KHR image extension: `eglCreateImageKHR` fakes DMA-BUF import
-  with a regular GL texture.
-- **GLES 3.x**: the big pile of stubs. In stub mode (`SPIKE3_REAL_GL=0`)
-  each returns a plausible value; in real-GL mode the `FWD_*` macros
-  short-circuit to `dlsym(RTLD_NEXT, ...)` forwarding to Mesa.
-- `shim_frametex` texture tracker — per-texture `{tex_id, target, w, h}`
-  map populated from `glEGLImageTargetTexture2DOES` so the page-flip frame
-  capture in `shim_bridges.c` can pick the main render target.
-- `shim_last_draw_fbo` (exported) — set by `glBindFramebuffer`, read by
-  `shim_frame_capture_at_page_flip` in `shim_bridges.c`.
-- `eglGetProcAddress` routing table so the game's extension lookups land
-  on our overrides even when it bypasses the dynamic linker.
+  What's still missing or fragile
+  - 11 device-state externs + 5 fd predicates + 5 real-libc fn pointers
+  - GPIO pool externs
+  - 5 patch functions + 1 brk runtime addr
+  - Bridge/inject lifecycle entry points
+  - is_real_gl() cache
+  - shim_last_draw_fbo (set in shim_gl.c, read in shim_bridges.c)
 
-### `shim_diagnostics.c` — crash dumps + game-state inspection (Phase 3)
+  Notable assumptions / load-bearing details
 
-Concentrates all *observe-the-game* machinery:
+  1. Sysroot detection: _emulation lives at games/pokemon_le/_emulation, so ../../.. is the sysroot root. Both
+  run_game.sh and Python helpers depend on this layout.
+  2. BN-rebased addresses: every constant in shim_patches.c / shim_diagnostics.c / shim_inject.c is an ELF VA = current
+  BN VA (BN database rebased to base 0x0). Runtime address = shim_resolve_game_base() + ELF_VA.
+  3. PIE base resolved via backtrace+dladdr: requires at least one frame inside ./game on the calling thread's stack.
+  Sweep timer and poke threads have no game frames, so they wait until ioctl/etc fires the cache from a guest thread.
+  4. Stub mkdir at constructor for /tmp/cache: under remap rules /tmp/ is currently NOT remapped (carve-out commented
+  out in shim_fs.c:86–102). The constructor's mkdir("/tmp/cache", 0755) therefore lands on the host /tmp, not
+  $SYSROOT/tmp/cache — MESA_SHADER_CACHE_DIR env var passed in run_game.sh is the actual mechanism keeping shader cache
+  in-sysroot.
+  5. AF_UNIX abstract namespace: WSL2's 9P mount can't bind AF_UNIX on /mnt/c/.... All three bridges use abstract names
+  (\0pokemon_spike3_*); legacy filesystem socket reaping in run_game.sh + nuke_emulation.sh is harmless backward-compat.
+  6. DRM page-flip presentation: game uses MODE_PAGE_FLIP, not eglSwapBuffers. Frame capture trigger is in
+  shim_frame_capture_at_page_flip() called from the DRM ioctl handler. Captures every 2nd flip.
+  7. Per-cmd-byte SPI override (SPIKE3_SPI_RX_XX=) is loaded once on first MESSAGE_1 ioctl. To change values at runtime
+  you'd have to restart the game.
+  8. Switch closures via shim_fire_switch flip the state byte but DON'T currently fire game events — the netbridge cmd
+  0x27 → state-write → fire_event translator is unhooked (per the in-source comment + memory). So switches fire silently
+   until the game's own poll observes the byte.
 
-- `shim_safe_read` / `shim_hexdump_stderr` — guest-memory dump helpers.
-- `shim_dump_sound_globals` — Pokémon LE sound-registry snapshot.
-- `shim_cmode_table[]` — the 42-entry BN-extracted C-mode map (addresses,
-  flag bytes, human-readable names).
-- `shim_resolve_game_base()` — caching BN VA → runtime-address resolver.
-- `shim_dump_cmodes` / `shim_dump_dispatch_tables` — verbose state dumps.
-- `shim_sigsegv_handler` — SIGSEGV/SIGBUS handler: dumps, then `longjmp`
-  escapes back out of a faulting event-sweep iteration.
-- `shim_term_dump_handler` — SIGTERM / SIGINT / SIGUSR1 / SIGUSR2 handler
-  (dumps on the first three; runs `shim_event_sweep` on SIGUSR2).
+  What's still missing or fragile
 
-### `shim_inject.c` — active injection + scheduled probing (Phase 9)
-
-Everything the shim pushes *into* the running game, as opposed to code
-that merely intercepts calls coming out. Ends up being the biggest of the
-late-phase carves:
-
-- Pokémon LE 105-switch manifest (transcribed from manual 500-55AJ-01)
-  plus `shim_find_switch` / `shim_fire_switch` — fires a simulated
-  switch closure by poking the game's in-memory switch state array
-  (`data_4880220 + id*0x30 + 0x28`) and diffs cmode state before/after.
-- Event-sweep machinery (Step 52): `shim_fire_event` trampoline to the
-  game's in-binary `fire_event` at BN VA `0x9c12a0`, `shim_event_sweep`
-  that blind-fires every event ID 0..0xce with `event_data=0`, and per-
-  event SIGALRM timeout + SEGV recovery via `sigsetjmp`/`siglongjmp`.
-- The three event-sweep globals whose `extern`s live in `spi_shim.h`
-  (`shim_event_sweep_jmp`, `shim_event_fire_in_progress`,
-  `shim_current_sweep_event_id`) — read by `shim_sigsegv_handler` in
-  `shim_diagnostics.c` to longjmp out of a faulting sweep iteration.
-- Six env-gated worker threads:
-  - `SPIKE3_SWEEP_EVENTS=1` + `SPIKE3_SWEEP_AFTER=<sec>` — delayed sweep.
-  - `SPIKE3_FIRE_SWITCH=<id[:id:...]>` — fire one or more switches.
-  - `SPIKE3_FORCE_GSTREAMER=<sec>` — trampoline into `gstreamer_init`.
-  - `SPIKE3_POKE_CMODE=<name>:<hex>:<delay_s>` — force a cmode field.
-  - `SPIKE3_POKE_STATE_FLAG=<mask>:<delay_ms>` — OR bits into
-    `system_state_flags`.
-  - `SPIKE3_PATCH_SPI_VIDEO=1` — after a 2 s settle, call into
-    `shim_patches.c` to install the Step 62 vtable patch and Step 64
-    `get_format` NOP.
-- The SIGALRM handler used by the sweep to break out of hung event
-  handlers (installed by `shim_inject_start`, blocked on the main
-  thread so only the sweep-timer thread receives it).
-- `shim_inject_start()` — the single public entry point called from
-  `shim_install_crash_handler`. Registers SIGALRM, blocks it on the
-  main thread, and spawns each env-gated worker thread. All six env
-  vars are independent; any subset can be set on a given run.
-
-### `shim_patches.c` — runtime patches to the game (Phase 8)
-
-The "surgery" bucket — hooks and byte-level patches that alter game
-behavior at runtime:
-
-- **`memcpy` NULL-guard** (Step 45): the Godot error-logger path on the
-  DisplayRenderer thread hits `memcpy(dst=NULL, src=NULL)` because Godot
-  TLS singletons aren't registered on that thread. The hook returns
-  unchanged for NULL args, forwards to real libc `memcpy` otherwise.
-  Counted and logged (first 8, then every 1000th).
-- **Step 62 `SpiDecoder::Play` vtable patch**
-  (`shim_patch_spi_video_vtable`): replaces vtable slot `+0x28` with a
-  stub that sets `update_thread_running=1` and `state=PLAYING` instead
-  of polling for 250 ms on a flag that never sets under our shim. Gated
-  by `SPIKE3_PATCH_SPI_VIDEO=1`.
-- **Step 64 `get_format` callback NOP patch**
-  (`shim_patch_get_format_callback`): NOPs the `b.ne 0x920ce0` at BN VA
-  0xd20cf0 so the callback accepts the first pix_fmt libavcodec offers
-  instead of insisting on DRM_PRIME. Safety check: refuses to patch
-  unless the instruction is exactly the expected `0x54ffff81`. Gated by
-  `SPIKE3_SW_HEVC=1`.
-- **libavcodec HW-accel bypass** (Step 47): hooks
-  `avcodec_find_decoder_by_name` (to swap `hevc_v4l2request` → `hevc`
-  when `SPIKE3_SW_HEVC=1`), `avcodec_get_hw_config`,
-  `av_hwdevice_ctx_create`, `avcodec_send_packet`, and
-  `avcodec_receive_frame` — currently passthrough + logging except for
-  the name swap.
-- **Dummy-frame injection** (Step 47b, `SPIKE3_INJECT_VIDEO=1`): when
-  the real decoder returns EAGAIN and a packet is pending,
-  `avcodec_receive_frame` returns a shim-managed NV12 1920×1080 AVFrame
-  (black Y/neutral UV) with a monotonic PTS so the downstream
-  video path doesn't stall. `shim_init_dummy_frame` uses
-  `av_frame_alloc` / `av_frame_get_buffer` / `av_frame_ref` resolved
-  via `dlvsym(..., "LIBAVUTIL_57")`.
-
-Both Step 62 and Step 64 patches translate BN VA → runtime address via
-`shim_resolve_game_base()` (defined in `shim_diagnostics.c`) and
-`mprotect` the page to PROT_READ|WRITE|EXEC before writing. They're
-called from `shim_vp_patch_thread` in `spi_shim.c`.
-
-## Refactor progress at a glance
-
-| Phase | Carve | Lines moved |
-|---|---|---|
-| 1 | `spi_shim.h` header extraction (SHIM_LOG + FWD_* macros) | 41 |
-| 2 | `shim_bridges.c` (state bridge + frame bridge) | 462 |
-| 3 | `shim_diagnostics.c` (crash handlers + cmode table + dumps) | 722 |
-| 4 | `shim_nodebus.c` (netbridge protocol response synth) | 384 |
-| 5 | `shim_fs.c` (path/open/stat/access + GPIO pool) | 441 |
-| 6 | `shim_gl.c` (GBM + EGL + GLES + KHR image + eglGetProcAddress) | 1735 |
-| 7 | `shim_io.c` + `shim_ioctl.c` (fd I/O + ioctl dispatch + DRM events) | 654 |
-| 8 | `shim_patches.c` (memcpy NULL-guard + Step 62 vtable + Step 64 NOP + libavcodec hooks + dummy-frame injection) | 501 |
-| 9 | `shim_inject.c` (switch manifest + event sweep + 6 env-gated worker threads + SIGALRM handler) | 770 |
-
-Each phase was regression-tested against `runs/baseline/REFACTOR_BASELINE.txt`
-— the post-Phase-6 run log captured before any carving. Every phase has
-matched the baseline within timing-variance noise (`gpio` retry count ±4,
-frame count ±30) on all 22 error classes + all 7 hook-fired log lines.
-Per-phase deltas are preserved in `runs/baseline/PHASE{1..9}_REPORT.txt`.
-
-**The refactor is complete.** `spi_shim.c` is down to ~960 lines of
-device-state + device-intercept dispatcher + INLINE_SYSCALL-dodging
-termios/ALSA/gstreamer/pthread/system hooks.
-
-## Defensive-hook pattern: 32/64-bit variants
-
-glibc's Large File Support (LFS) APIs exist as distinct PLT symbols from
-their plain counterparts — e.g. `open` vs `open64`, `lseek` vs `lseek64`,
-`pread` vs `pread64`, `fopen` vs `fopen64`. On 64-bit aarch64 they're
-functionally identical (`off_t` is already 64-bit, so `off64_t` is the same
-width), **but the symbol resolution is separate**. A game that's linked
-against the 64-bit variant will silently bypass a shim hook on the plain
-variant, and vice versa.
-
-**Rule of thumb: when you hook one variant, hook both.** A hook added on the
-previously-unhooked variant should carry a `FIRST CALL` banner for at least
-one smoke-run so we observe whether it fires at all. The proactive
-`lseek64` / `pread64` / `pwrite64` additions in Phase 7.post caught
-`pread64` in active use the moment they were wired — a whole category of
-file reads we'd been missing across the refactor.
-
-**Current asymmetries worth closing later** (all low effort — ~15 lines
-each — but each may or may not surface new behavior):
-
-| Plain | 64-bit | Status |
-|---|---|---|
-| `pread` | `pread64` | Hook the plain variant; mirror the 64-bit semantics + same `FIRST CALL` banner |
-| `pwrite` | `pwrite64` | Same as pread |
-| `fopen` | `fopen64` (shim_fs.c) | **Highest priority** — path-taking function. An un-hooked `fopen` can leak un-remapped absolute paths through to libc. |
-
-The all-hooked pairs for reference (don't re-open these):
-`open` / `open64`, `openat` / `openat64`, `lseek` / `lseek64`, the whole
-stat/xstat/lxstat/fstatat family with `*64` cousins.
-
-## Other documents in this directory
-
-| File | Purpose |
-|---|---|
-| [`docs/SETUP.md`](docs/SETUP.md) | One-time dev-environment setup |
-| [`docs/JOURNAL.md`](docs/JOURNAL.md) | Step-by-step log of every attempt, success, and failure |
-| [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | Verified on-wire protocol facts (netbridge, DRM events, etc.) |
-| [`docs/MODE_TABLE.md`](docs/MODE_TABLE.md) | The 42 C-modes — names, addresses, flag meanings |
-| [`docs/HANDOFF.md`](docs/HANDOFF.md) | Current-state snapshot for picking up the work cold |
-| [`docs/ASSETS.md`](docs/ASSETS.md) | Running log of what assets the game loads |
-| [`docs/EVENT_SWEEP_STEP52.md`](docs/EVENT_SWEEP_STEP52.md) | Write-up of the Step 52 event-sweep approach |
-| [`docs/VIDEO_CLIPS.md`](docs/VIDEO_CLIPS.md) | Catalogue of the 229 extracted video clips |
-| `runs/baseline/REFACTOR_BASELINE.txt` | Error-count reference the refactor is regression-tested against |
-| `runs/baseline/PHASE*_REPORT.txt` | Per-phase refactor smoke-run diff vs. baseline |
-| `runs/baseline/historic_frame_counts.txt` | Per-phase frame-dir sizes preserved when the PNGs themselves were pruned on 2026-04-23 |
-| `reference/Binary Ninja Notebook Export (*).json` | Snapshot of the BN analyst's working notebook |
-
-## Restoring legacy capture hooks (shaders / textures / DMD)
-
-Step 56 removed three data-capture pipelines that had been useful early but
-were duplicative of `_extraction/` asset extraction:
-
-| Capture | Previous output path | Hook that wrote it |
-|---|---|---|
-| Shader source (GLSL) | `_emulation/shaders/shader_NNN_idM_typeXXXX.glsl` | `glShaderSource` in `shim_gl.c` |
-| Texture pixel data | `_emulation/textures/tex_NNNNNN_WxH_fmtXXXX_typeYYYY.raw` | `glTexImage2D` / `glTexSubImage2D` in `shim_gl.c` |
-| Compressed texture | `_emulation/textures/tex_compressed_NNNNNN_fmtXXXX.bin` | `glCompressedTexImage2D` / `glCompressedTexSubImage2D` in `shim_gl.c` |
-| DMD frame (BGRA) | `_emulation/dmd/frame_NNNNNN.bgra` (1024×256×4 = 1 MB/frame) | `gbm_bo_unmap` in `shim_gl.c` when the BO was tagged `is_dmd` |
-
-The physical dumps were deleted on 2026-04-23; the hook code was already
-gone since Step 56. To restore:
-
-1. Look at the git history for `shim_gl.c` around Step 56 (or the pre-Phase-6
-   monolith) — the hooks had roughly this shape: track shader/texture IDs in
-   a side table, then dump payload bytes on first write.
-2. Re-add the capture calls to the existing `glShaderSource`/`glTexImage2D`/
-   `gbm_bo_unmap` stub bodies in `shim_gl.c`.
-3. Re-add the output-directory `mkdir`s in `shim_init_dirs()` in `spi_shim.c`
-   (`_emulation/captures/{shaders,textures,dmd}`).
-
-`docs/ASSETS.md` has the detailed per-format byte-count tables the hooks
-used to size their dumps.
-
-## Environment variables at runtime
-
-Defaults baked into `run_game.sh`; override with `VAR=value ./run_game.sh`.
-
-| Variable | Effect |
-|---|---|
-| `SPIKE3_SYSROOT` | Absolute path the shim remaps `/data/...` etc. against. Set automatically by the runner. |
-| `SPIKE3_REAL_GL=1` | Forward EGL/GLES/GBM to real Mesa (requires the overlay built). Default on. |
-| `SPIKE3_FRAME_BRIDGE=1` | Expose `/tmp/spike3_frame.sock`. Default on. |
-| `SPIKE3_AUDIO_BRIDGE=1` | Expose `/tmp/spike3_audio.sock` (raw S16_LE 2ch 44.1 kHz PCM). Default on. |
-| `SPIKE3_BRIDGE=1` | Expose cmode-state JSON bridge on `/tmp/spike3_bridge.sock`. Default off. |
-| `SPIKE3_PATCH_SPI_VIDEO=1` | Apply the Step 62 `SpiDecoder::Play` vtable patch. Default on. |
-| `SPIKE3_SW_HEVC=1` | Apply Step 64 get_format NOP so software HEVC decode proceeds. Default on. |
-| `SPIKE3_POKE_CMODE=name:hex:delay_s` | Force a C-mode's `+0x308` field to `hex` after `delay_s` seconds. |
-| `SPIKE3_POKE_STATE_FLAG=mask:delay_ms` | OR `mask` into `system_state_flags` after delay. |
-| `SPIKE3_FIRE_SWITCH=id[:id:...]` | Fire one or more switch closures after startup. |
-| `SPIKE3_SWEEP_EVENTS=1` + `SPIKE3_SWEEP_AFTER=<sec>` | Kick off a blind event-sweep after N seconds. |
-| `SPIKE3_FORCE_GSTREAMER=<sec>` | Trampoline into the game's gstreamer_init after N seconds (diagnostic). |
-| `SPIKE3_INJECT_VIDEO=1` | Enable dummy-frame injection when `receive_frame` returns EAGAIN. Default off. |
-
+  - Path remap for /tmp commented out — shim_fs.c lines 86–102. Without it, /tmp/godot_logs and /tmp/cache go to host
+  /tmp. Memory says Godot logs end up at /tmp/godot_log(s) — so they're hitting host /tmp.
+  - NV persistence stubs (per memory): EEPROM and FS NV writes vanish. No SIGTERM flush.
+  - Switch translator unhooked — switch fires don't propagate.
+  - Cipher keys never refreshed — fe_probe synthesis uses zero keys; if game ever fetches non-zero keys via inner-cmd
+  0xfc, decryption diverges.
+  - Cmd 0x40 / 0x41 mostly log-only — game tolerates timeout (verified Step 45 lesson).
+  - VideoPlayerSpi is the current blocker (memory): brk probe + tbz NOP + Play vtable patch all in flight; play() loop
+  times out and destructor pure-virtual abort still observed.
+  - boot_display fd (FAKE_FD_BOOT_DISPLAY) is inert — ioctls return 0, writes swallowed. If real boot_display is doing
+  anything beyond log probes, we don't see it.

@@ -79,6 +79,18 @@ static const char *remap_path(const char *path) {
      * is either a Spike 3 path (we want it under $SYSROOT) or a host path
      * (we want it left alone). The skip list captures the latter. */
     if (path[0] != '/') return path;
+    /* Already-remapped paths: if the caller hands us a path that already
+     * starts with $SYSROOT/, don't double-prefix. Hits when Mesa's shader
+     * cache is given MESA_SHADER_CACHE_DIR=$SYSROOT/tmp/cache/mesa and then
+     * mkdirs subdirectories of that absolute path — without this guard
+     * each subdir mkdir would land at $SYSROOT/$SYSROOT/tmp/cache/...
+     * Also catches any other code path that pre-resolves sysroot before
+     * calling our hooks. The trailing '/' or '\0' check avoids matching
+     * a sibling path that happens to share the prefix (e.g. sysroot=/foo
+     * accidentally matching /foobar). */
+    if (strncmp(path, sysroot, sysroot_len) == 0 &&
+        (path[sysroot_len] == '/' || path[sysroot_len] == '\0'))
+        return path;
     /* --- Live kernel + IPC interfaces. Never remap; the host kernel owns
      *     these and a sysroot overlay would either be wrong or empty. --- */
     if (strncmp(path, "/dev/", 5) == 0) return path;
