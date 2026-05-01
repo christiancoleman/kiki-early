@@ -47,6 +47,7 @@
 extern int mkdir(const char *, unsigned int);
 
 #include "spi_shim.h"
+#include "shim_discovery.h"
 
 /* ---- Path remapping: moved to shim_fs.c in Phase 5. ---- */
 
@@ -352,6 +353,11 @@ static void shim_install_crash_handler(void) {
     sa_trap.sa_flags = SA_SIGINFO;
     sigemptyset(&sa_trap.sa_mask);
     sigaction(SIGTRAP, &sa_trap, NULL);
+
+    /* Discovery module init is deferred — see shim_vp_patch_thread.
+     * Calling shim_discovery_init() here would no-op because
+     * shim_resolve_game_base() returns 0 at constructor time (no /game
+     * frame on this thread's stack yet). */
 
     /* Optional state bridge over Unix socket (SPIKE3_BRIDGE=1). */
     shim_bridge_start();
@@ -700,6 +706,11 @@ static void shim_sigtrap_handler(int sig, siginfo_t *info, void *uc) {
                          event_id, seq, (unsigned long)new_sp);
             }
         }
+        return;
+    }
+
+    /* Delegate to the discovery module if PC didn't match the core patches. */
+    if (shim_discovery_handler(pc, uc)) {
         return;
     }
 

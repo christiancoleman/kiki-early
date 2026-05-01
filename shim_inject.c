@@ -43,6 +43,7 @@
 #include <pthread.h>
 
 #include "spi_shim.h"
+#include "shim_discovery.h"
 
 /* ========== moved from spi_shim.c (286-410): switch manifest ========== */
 /* ---- Step 52: Pokémon LE switch manifest ------------------------------
@@ -965,6 +966,9 @@ static void *shim_vp_patch_thread(void *arg) {
      * nodebus poll thread spawns and the orchestrator completes.
      * Self-gates on SPIKE3_FORCE_NODEBUS_GATES=1. */
     shim_patch_fire_event_brk();
+    /* Discovery module: same game_base-resolution dependency as the
+     * patches above, so deferred to the same 2 s settle window. */
+    shim_discovery_init();
     return NULL;
 }
 

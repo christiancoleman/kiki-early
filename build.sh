@@ -31,11 +31,13 @@ SOURCES=(
     shim_bridges.c
     shim_diagnostics.c
     shim_nodebus.c
+    shim_discovery.c
     shim_fs.c
     shim_gl.c
     shim_io.c
     shim_ioctl.c
     shim_patches.c
+    shim_avforward.c
     shim_inject.c
     shim_net.c
 )
