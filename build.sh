@@ -42,7 +42,11 @@ SOURCES=(
     shim_net.c
 )
 
+VERSION_SCRIPT="$SCRIPT_DIR/spi_shim.ver"
+
 echo "[build] $CC $CFLAGS"
 echo "[build] sources: ${SOURCES[*]}"
-$CC $CFLAGS -o spi_shim.so "${SOURCES[@]}" -ldl -lpthread
+$CC $CFLAGS -o spi_shim.so "${SOURCES[@]}" \
+    -Wl,--version-script="$VERSION_SCRIPT" \
+    -ldl -lpthread
 printf '[build] OK — spi_shim.so: %s bytes\n' "$(stat -c%s spi_shim.so)"

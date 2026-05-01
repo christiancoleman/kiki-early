@@ -1,0 +1,32 @@
+/* spi_shim.ver — version script for spi_shim.so.
+ *
+ * The Pokemon LE 0.81 game.elf is built against glibc-2.33+ and imports
+ * stat-family symbols at exactly that version (e.g. `stat@GLIBC_2.33`).
+ * For our LD_PRELOAD'd hooks to satisfy those imports, our .so must
+ * EXPORT the symbol with a matching versioned alias — which requires the
+ * GLIBC_2.33 version node to exist in our own dynamic version table.
+ *
+ * The parent chain (GLIBC_2.33 → GLIBC_2.17) mirrors what libc.so.6 itself
+ * declares. Some glibc loaders verify the parent linkage when matching a
+ * versioned reference; declaring the chain matches libc's structure so
+ * our exported `stat@GLIBC_2.33` is treated as fully equivalent.
+ *
+ * The unnamed `global: *;` block at the bottom keeps every other symbol
+ * on the default unversioned export, so existing hooks (mkdir, open,
+ * ioctl, dlsym, etc. — all of which intercept GLIBC_2.17-or-older
+ * imports cleanly via the unversioned-satisfies-versioned rule) keep
+ * working unchanged.
+ */
+
+/* Empty version node — declared only so it can serve as a parent for
+ * GLIBC_2.33 below. ld(1)'s version-script grammar rejects an empty
+ * `global:` block, so we use bare `{ };` instead. */
+GLIBC_2.17 { };
+
+GLIBC_2.33 {
+    global:
+        stat;
+        lstat;
+        stat64;
+        lstat64;
+} GLIBC_2.17;

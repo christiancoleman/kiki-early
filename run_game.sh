@@ -79,6 +79,12 @@ SW_HEVC="${SW_HEVC:-1}"
 # avcodec_send_packet/receive_frame to host NVDEC via AF_UNIX. Opt-in
 # (default 0) until validated against a full game run.
 FORWARD_DECODE="${FORWARD_DECODE:-0}"
+# FS_DIAG_VERBOSE=1: widen the [fs_diag] filter in the shim to match
+# any path containing "cache" or "shader" (in addition to /tmp/<X>).
+# Default off — safe to leave; opt in when investigating cache/shader
+# behavior or other "things hit the fan" debugging that wants maximum
+# fs-call visibility in discovery.log.
+FS_DIAG_VERBOSE="${FS_DIAG_VERBOSE:-0}"
 PATCH_AUDIO_ABRT="${PATCH_AUDIO_ABRT:-1}"
 STATE_BRIDGE="${STATE_BRIDGE:-0}"
 OFFLINE_MODE="${OFFLINE_MODE:-1}"
@@ -376,6 +382,7 @@ fi
 [[ "$PATCH_SPI_VIDEO"  == "1" ]] && args+=(-E "SPIKE3_PATCH_SPI_VIDEO=1")
 [[ "$SW_HEVC"          == "1" ]] && args+=(-E "SPIKE3_SW_HEVC=1")
 [[ "$FORWARD_DECODE"   == "1" ]] && args+=(-E "SPIKE3_FORWARD_DECODE=1")
+[[ "$FS_DIAG_VERBOSE"  == "1" ]] && args+=(-E "SPIKE3_FS_DIAG_VERBOSE=1")
 [[ "$PATCH_AUDIO_ABRT" == "1" ]] && args+=(-E "SPIKE3_PATCH_AUDIO_ABRT=1")
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")
 [[ "$OFFLINE_MODE"    == "1" ]] && args+=(-E "SPIKE3_OFFLINE=1")
