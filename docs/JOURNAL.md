@@ -6029,3 +6029,289 @@ Test: same as Phase 1 but `SPIKE3_SWITCH_DELAY=90` (fire after gate poke at 30 s
 - Add new memory entry: `g_switch_state_array @ 0x4480220 is a pointer field, not array` — fix the long-standing assumption in `feedback_*` and `project_*` notes.
 - Update Step-71 / Step-72 area in `project_emulation_progress.md`: switch input layer works at least partially; wedge confirmed in orchestrator/cmode layer.
 
+## Step 73: forward-decode bridge, fs hook completion, scene-loader trace (2026-04-30 → 2026-05-01)
+
+A multi-pronged session. Five concrete pieces of progress, none individually spectacular but together they close out the LD_PRELOAD path-coverage gap, prove out a host-NVDEC bridge, and reframe the front-end blocker around scene-tree attachment rather than decode.
+
+### 73a — discovery hook init was silently broken; moved out of constructor
+
+Symptom: previous-session `shim_discovery_init()` produced **zero** `[discovery] patched ...` lines despite the symbols being linked. Root cause: `shim_discovery_init()` was being called from `shim_install_crash_handler` — an `__attribute__((constructor))` function that runs at LD_PRELOAD time, **before the game's `main()` has started**. `shim_resolve_game_base()` walks the calling thread's stack for a `dladdr` frame inside `/game`; at constructor time no `/game` frame exists, so the resolver returns 0 and `shim_discovery_init()` hits its `if (!base) return;` guard.
+
+Same gotcha already documented at `shim_inject.c:1070-1082` for Step 72's deferred patches. Fix mirrors what's there: `shim_discovery_init()` moved into `shim_vp_patch_thread` after the existing 2-second settle, alongside `shim_patch_video_player_play_entry_brk`/`shim_patch_sub_8edfe0_brk`/`shim_patch_fire_event_brk`. The constructor call removed, replaced with a comment pointing at the new home.
+
+Verified via `objdump -d spi_shim.so | grep shim_discovery_init` — exactly one call site now, inside `shim_vp_patch_thread` at offset `+0x30`. Subsequent runs produce live `[discovery]` log lines.
+
+Also fixed log path: the previous `discovery_log()` opened `"discovery.log"` relative to CWD (which was `$GAME_DIR`, dropping the file in `games/pokemon_le/discovery.log` — wrong place). Changed to `"_emulation/runs/latest/discovery.log"` and switched `O_APPEND` → `O_TRUNC` so each run gets a fresh log instead of accumulating across runs.
+
+### 73b — host-NVDEC forward-decode bridge
+
+Per Researcher A's emulation architecture (memory note `project_emulation_architecture.md`), the long-term plan was to forward libavcodec calls out of QEMU to host-native equivalents. This session implements a working version of that for video decode specifically.
+
+**Architecture:**
+
+```
+game (aarch64) ─► sysroot libavcodec.so.59 ◄── still linked
+                  │
+                  │ (existing send_packet/receive_frame hooks at shim_patches.c)
+                  ▼
+           SPIKE3_FORWARD_DECODE=1 gate
+                  │
+                  ▼ AF_UNIX @spike3_decode (length-prefixed protocol)
+           decode_daemon.py (host x86_64)
+                  │
+                  ▼ PyAV → hevc_cuvid → NVDEC → NV12 plane bytes
+```
+
+**Components added:**
+
+- `_emulation/decode_daemon.py` — host-side AF_UNIX server. Per-connection session: receives `OPEN(codec_id, extradata)`, allocates `av.codec.CodecContext(hevc_cuvid)`, then handles `PACKET` / `RECEIVE` / `CLOSE` opcodes. NVDEC frames downloaded to NV12 via `frame.reformat(format='nv12')` / `to_ndarray`. Smoke-tested against `Lake_01_22_26_h265.mp4` at 44–98 fps.
+- `_emulation/decode_daemon_test.py` — standalone harness that demuxes a clip with PyAV and round-trips packets through the daemon. Validates the wire protocol independent of the C-side shim.
+- `_emulation/shim_avforward.c` — C client (8-slot session table, AVPacket field offsets, AVFrame buffer population via `av_frame_unref` + `av_frame_get_buffer`, row-by-row stride-aware copy). Lazy-opens the daemon connection on first `send_packet` for a given AVCodecContext. Uses `avcodec_parameters_from_context` to pull codec_id + extradata at session-open time. Falls back to local-libavcodec passthrough if daemon unreachable.
+- `shim_patches.c` integration: existing `avcodec_send_packet` / `avcodec_receive_frame` hooks early-return through `shim_avforward_*` when the gate is on. `shim_resolve_libav` un-`static`'d so the new TU can reuse it.
+- `run_game.sh` lifecycle: new `FORWARD_DECODE` env var (default 0) launches the daemon as a HELPER pre-game-start, logs to `runs/latest/decode_daemon.log`, dies via the existing `cleanup_all` SIGTERM-then-SIGKILL grace path.
+
+**First real-game-run results** (2026-04-30 23:18, then 23:42):
+
+- Three concurrent decoder sessions opened (`conn-1`, `conn-2`, `conn-3`) with codec=`hevc_cuvid` and `extradata=2453B` — different from our test clip's 2490B, confirming they're **real game-side AVCodecContexts** not the test harness.
+- `conn-3` ran longest: 400+ NV12 frames at 1940×1100, sustained ~16 s of decode.
+- First run died at the daemon side with `AttributeError: module 'av' has no attribute 'AVError'` — PyAV 14 dropped that shim. Replaced `except av.AVError` with `except av.error.EOFError` (graceful EOF → REP_EOF reply) plus generic `except Exception`. Smoke-tested clean post-fix; second run produced a clean lifecycle.
+
+**Recommendation against making this default**: PyAV + NVIDIA-WSL dependency, mid-stream daemon-crash recovery untested, `SPIKE3_INJECT_VIDEO`'s dummy-frame fallback bypassed when forward path engaged. Stays opt-in until a few more clean runs.
+
+### 73c — Godot shader-cache mystery → unhooked `chdir` → version-script fix
+
+**Investigation arc.** Discovery.log started showing `GODOT ERROR: rasterizer_gles3.cpp:335 Can't create shader cache folder, no shader caching will happen: /tmp/cache` reliably every run. Initial hypothesis: the directory doesn't exist. Verified: `/mnt/c/Workspace/pokemon-le-0.81.0/tmp/cache` exists in the sysroot, populated, with `mesa/mesa_shader_cache/` subdir; `[shim] mkdir REMAP: /tmp/cache -> $SYSROOT/tmp/cache` fires successfully at process start.
+
+So why does Godot say "can't create"? Added `[fs_diag]` logging to `stat`/`lstat`/`stat64`/`lstat64`/`access`/`mkdir`/`open`/`openat`/`opendir` for `/tmp/*` paths, mirrored to `discovery.log` (so the diagnostic survives even runs where qemu STDERR isn't captured to game.log). First instrumented run: **zero stat calls for `/tmp/cache` in the entire 38-second window** between the constructor mkdir and the warning firing. Mesa was actively probing `$SYSROOT/tmp/cache/mesa/mesa_shader_cache/<2-hex>/<hash>` (144 entries — its own shader hash tree, working fine). Godot was not.
+
+**First red herring chased**: GLIBC_2.33 versioning. Game imports `stat@GLIBC_2.33`, `lstat@GLIBC_2.33`, `stat64@GLIBC_2.33`, `lstat64@GLIBC_2.33`, `fstat64@GLIBC_2.33` — none of which were satisfied by the shim's unversioned `stat` (and `stat64`/`lstat64` had no hook *at all*). Added explicit hooks for `stat64`/`lstat64`. Then added a **version script** (`spi_shim.ver`) declaring `GLIBC_2.33` (with parent chain to `GLIBC_2.17`, mirroring libc.so.6's structure) so the four stat-family hooks export with the matching versioned alias. After this fix, `[fs_diag] stat64(/tmp/godot_logs)` lines appeared cleanly in discovery.log — proving versioned hooks now intercept. Shader cache still erred.
+
+**The actual cause**, found by re-reading `RasterizerGLES3::initialize()` (BN `sub_10a5970` → renamed `mcp_RasterizerGLES3_initialize`): the function calls an OS path-getter at `0x10a59fc` (`sub_32c6140` reads OS singleton's String member at offset `+0xc8` — possibly `cache_path` or `user_data_dir`), getting `/tmp/cache`. Then calls `DirAccess::open("/tmp/cache")` (= `sub_2d5f370`, renamed `mcp_DirAccess_open`). Internally that calls `vtable[+0x108]` = `change_dir` with the path. **`DirAccessUnix::change_dir` uses `chdir()` — and the shim never hooked `chdir()`.** `chdir@GLIBC_2.17` is in the game's PLT, went straight to libc unmapped, hit the host's nonexistent `/tmp/cache`, returned -1, `change_dir` returned `ERR_INVALID_PARAMETER`, `DirAccess::open` returned NULL, error site 1 fires.
+
+Added `chdir()` hook with `remap_path()` + `[fs_diag]`. Next run: **error gone**, replaced by:
+
+```
+[fs_diag] chdir(/tmp/cache) -> /mnt/c/.../tmp/cache  ret=0
+[fs_diag] chdir(/tmp/cache/shader_cache) ret=-1 errno=2   (didn't exist)
+[fs_diag] chdir(/tmp/cache/shader_cache) ret=0 errno=0    (after mkdir)
+[fs_diag] chdir(/tmp/cache/shader_cache/CanvasSdfShaderGLES3) ret=0
+```
+
+Godot now successfully chdirs into `/tmp/cache`, creates per-shader subdirs (`CanvasSdfShaderGLES3`, etc.), and proceeds. **No observable front-end change** — shader cache being broken never gated *display*; first-frame compile latency was the only practical impact. The actual front-end blocker is downstream (see 73e).
+
+**BN renames** (saved in DB after this step): `sub_10a5970` → `mcp_RasterizerGLES3_initialize` (with full diagnosis comment); `sub_2d5f370` → `mcp_DirAccess_open` (vtable+0x108 = change_dir, vtable+0x118 = make_dir noted); `sub_2d5edb0` → `mcp_DirAccess_create_for_path`.
+
+### 73d — fs-hook audit pass: 8 more path-rewriting hooks
+
+The chdir gap was a wake-up call. Audited the game's libc imports (`objdump -R game | grep @GLIBC | filter on fs-related names`) against the shim's hook list. Found 8 path-taking calls going straight to libc unmapped:
+
+| Hook | Why it matters |
+|---|---|
+| `unlink` | Save-file rotation, NV cleanup |
+| `rename` | Atomic save patterns (write-temp + rename); both paths remapped |
+| `rmdir` | Cleanup paths |
+| `readlink` | Symlink resolution; without remap, leaks real-host paths back to the caller |
+| `chmod` | NV-write permission setting |
+| `statfs` / `statvfs64` | Free-space checks (Mesa/Godot may use these before writing cache) |
+| `glob64` | Wildcard expansion; unmapped pattern would expand against real `/tmp/` (empty) |
+
+All eight added in one batch in `shim_fs.c`, using the same `remap_path` + `FS_DIAG_LOG` pattern. Two-path hooks (`rename`) remap both operands. All hooks forward via `dlsym(RTLD_NEXT, ...)`; no GLIBC_2.33 versioning issues since these are all `@GLIBC_2.17` and unversioned hooks satisfy the older version cleanly.
+
+Remaining unhooked imports (intentional): `fchmod`, `fdopen`, `fstat64`, `closedir`, `ftruncate*` (fd-based, no path); `umask`, `sync`, `getcwd` (no path arg); `mkfifo`, `mkstemp64`, `symlink`, `popen` (likely unused on this game's hot paths — leave for later if any actually surface).
+
+Also added: `FS_DIAG_VERBOSE=1` env-gate (`SPIKE3_FS_DIAG_VERBOSE=1` inside qemu) to widen the `[fs_diag]` filter from `/tmp/*` only to also match anything containing `cache` or `shader`. Default off (low log volume); on for "shit hit the fan" debugging where you want maximum visibility.
+
+### 73e — `select_and_load_scene` recursion analysis (user-driven BN trace)
+
+The persistent 822-entry alternating-`scene_id=10/11` pattern in discovery.log raised the question: is this normal, or is the game stuck in a retry loop? User did a thorough BN trace of `select_and_load_scene` (BN VA `0x730fb0`) and its callers; this section captures the conclusion verified against the binary.
+
+**Mechanism — queue-driven mutual invocation, not C-stack recursion:**
+
+```
+frame N:    select_and_load_scene(10)
+              fires fire_event(0xAB) at 0x73132c
+              event handler enqueues scene 11 into g_deferred_scene_queue
+              returns clean
+            main event loop ticks
+frame N+1:  process_deferred_scene_queue (sub_731ce0, called from main loop @ 0x720cf0)
+              walks 8 slots @ data_44ca400 (stride 0x14), countdown at +0x4
+              countdown == 0 → calls select_and_load_scene(11) at 0x731e4c
+              clears slot's scene_id (*(x19 + 8) = 0)
+              fires fire_event(0xAB) again
+              event handler enqueues scene 10
+            …loop continues, never C-recurses, stack stays flat
+```
+
+Verified via decompile of `process_deferred_scene_queue` (already renamed in DB). Bonus discovery: there's also a `fire_event(0xAF, &var_58)` fired per-frame from the same function at `0x731df4`, driven by a separate mutex-guarded linked-list at `data_44c9588` — at least three event channels in the discover-mode lifecycle (0xAB, 0xAD, 0xAF). The "is this scene already active?" check at `0x731d54` (`zx.d(i[2].b) != 0 && *i == *(x19 - 8)`) prevents same-slot double-loads but does **not** prevent two slots ping-ponging. By design — discover mode is a two-state UI flow (scene 10 = idle/background, scene 11 = active/content, periodic update).
+
+**What this implies for the front-end blocker:**
+
+The 822 alternations are the symptom of a **healthy game-logic layer driving a broken Godot-integration layer**. The C++ event loop is processing the queue, calling the loader, firing lifecycle events. Neither scene 10 nor 11 ever lands inside `/root` with `is_inside_tree() == true` — that's what `discovery.log:GODOT ERROR scene/main/node.cpp:867 [can_process] - Condition "!is_inside_tree()" is true. Returning: false` is reporting. Frames decoded by NVDEC arrive at the daemon, but the consuming `VideoPlayerSpi._process()` callback never runs because `can_process()` returns false.
+
+**Critical reframe (user's hypothesis, mostly confirmed):** Godot is **not** the orchestrator — Stern's C++ binary is. Main event loop is at `0x720cf0`. It ticks the deferred scene queue, calls `select_and_load_scene` directly. Godot is just the rendering / scripting framework wrapped around Stern's loop. The disconnect: Stern's `select_and_load_scene` resolves asset_id and emits 0xAB/0xAD/0xAF, but the corresponding Godot Node tree never gets `add_child()`'d into a parent that is itself inside the running scene tree.
+
+A previously-observed discovery.log line is now extra-suggestive: `GODOT ERROR: Node not found: "/root/Main" (absolute path attempted from "/root/Discover/discover_progress_bar")`. **`/root/Main`** is the parent the discover scripts expect to find — and it doesn't exist in our tree. That's likely the missing link.
+
+### Three threads to investigate next (in priority order)
+
+**1. Logs from the audit-pass hooks (cheap; do first).** Now that `unlink` / `rename` / `rmdir` / `readlink` / `chmod` / `statfs` / `statvfs64` / `glob64` all log under `[fs_diag]`, the first run after these hooks landed will surface every previously-silent path leak. Most likely candidates that were silently failing before: NV-store init (`/data/nv/...` writes), saved-state rotation, anything the game's persistence layer touches. Watch for `ret != 0` on any of these — each one is a hidden bug we can now see and fix in one go. A clean-default run with `FS_DIAG_VERBOSE=1` produces the audit log; grep for `[fs_diag] (unlink|rename|rmdir|readlink|chmod|statfs|statvfs64|glob64)` and triage by retval.
+
+**2. `/root/Main` missing parent (highest-value front-end lead).** Discovery.log shows `Node not found: "/root/Main"` errors fired from at least two scripts: `capture_battle_scene/battle_scene_grp/left_world_control/left_char_Sprite2D` and `Discover/discover_progress_bar`. The game's GD scripts assume `/root/Main` exists. We don't create it. **If `/root/Main` is the parent the loader expects to attach scenes to, creating it is the front-end fix.** Investigation steps:
+- Find which Godot script or C++ class is supposed to add the `Main` node (`grep -r "/root/Main" main.pck_extracted/` and `aarch64-linux-gnu-strings game | grep "Main"`)
+- Check if it's a top-level autoload (defined in `project.godot` or via a C++ ClassDB autoload registration)
+- Synthesize the node ourselves if possible: a one-liner `Node* main = memnew(Node); main->set_name("Main"); root->add_child(main);` injected via shim, OR via a shim-managed autoload
+
+**3. `select_and_load_scene` post-asset-load mount path.** We've traced the scene-loader as far as event firing (0xAB/0xAD/0xAF). What we **haven't** traced: what does the function actually do *between* asset_id resolution and `fire_event(0xAB)`? Specifically, does it ever call `Node.add_child()` or instantiate a Godot scene from a `PackedScene`? If yes — what parent does it attach to (and is that parent inside the running tree)? If no — who is supposed to mount the scene, and why isn't that happening? BN trace of `0x731154 → 0x73132c` (the body before the first event fire) should answer.
+
+### Other unexplored threads worth flagging
+
+These have surfaced across recent sessions but haven't been actively chased. Listed for future-us so we don't lose them.
+
+**a. The game.log STDERR-routing mystery.** During the 22:04 → 22:18 run, `game.log` mtime froze at 22:06:41 (just after a `shim_term_dump_handler` SIGUSR1 dump) but `discovery.log` and the decode daemon kept logging until 22:18:09. Discovery uses an independent fd; SHIM_LOG goes to STDERR. Something — possibly the term-dump handler closing or wedging stderr — is preventing later SHIM_LOG output from reaching `game.log` on some runs. Worth a focused look the next time we're losing stderr visibility unexpectedly.
+
+**b. Concurrent decoder sessions.** Forward-decode runs show **three** simultaneous `OPEN codec=hevc_cuvid` sessions (`conn-1`, `conn-2`, `conn-3`). We don't know which scene/clip each maps to. Likely candidates: attract-loop A vs B, plus a third for a UI element. Adding the daemon-side print of the first-packet size or hashing the extradata against our `_emulation/VIDEO_CLIPS.md` catalog would tell us. Useful for understanding which clip each decoder pipeline corresponds to once we get frames actually displaying.
+
+**c. The other 6 deferred-scene-queue slots.** `data_44ca400` has 8 slots × 0x14 bytes. Only 2 are exercised by the discover-mode 10↔11 ping-pong. What's the other 6 for? Probably broader scene categories (capture, battle, pokedex). Knowing the slot↔scene-category mapping would help us understand which game modes each slot drives.
+
+**d. Step-62 `VideoPlayerSpi` vtable patches — verification missing.** Step 62 / 71 patched the vtable's `Play` slot (+0x28) to a shim function that forces state=PLAYING and `update_thread_running=1` immediately. We never confirmed the patch is actually taking effect post-Step-71 + Step-72 changes. If forward-decode is feeding frames but `_process()` never ticks, the vtable patch's effect is moot — but we should verify.
+
+**e. `ManualGodotScene` at game VA `0x04630230`.** Per memory `reference_radium_scene_format.md`, this class wraps Radium scenes into Godot Node trees. We've never decompiled it. If it's the bridge between Radium (Stern's scene format) and Godot (the rendering tree), it's a candidate for who's supposed to call `add_child()` for loaded scenes. Tied directly to thread #3 (`select_and_load_scene` mount path).
+
+**f. Separate service as a possible input.** The investigation considered whether another process supplied an initialization dependency. This was an untested hypothesis. [Redacted: service endpoint and probing instructions.]
+
+**g. Comparison against `spike3/spike_menu/game` (user's pivot suggestion — strongly endorsed).** *Important clarification (2026-05-01):* there are no other Spike 3 game *titles* in this sysroot — `games/` contains only `pokemon_le/`. FOTE/Foo Fighters/etc would be entirely separate filesystems we don't have. **However**, `games/pokemon_le/spike3/spike_menu/game` IS in this sysroot — it's the Spike 3 system-menu binary that ships on every Spike 3 machine regardless of game title (test/service mode UI). Verified at the binary level:
+
+- spike_menu links the same NEEDED libs as pokemon_le (28 vs 31) — same EGL/GLES, same GStreamer/libavcodec stack, same DRM/GBM, same gpiod
+- spike_menu has **0 "godot" strings** vs pokemon_le's **457** — confirms NO Godot integration in spike_menu
+- Both have ~2-3 Nuklear references (probably boot/diag-screen common code; not the load-bearing UI for either)
+
+So the comparison is **better than another title's filesystem would be**: every variable except Godot is held constant. The delta between these two binaries IS the Godot integration layer Stern wrote. Loading spike_menu/game in BN and tracing its main-loop / scene-equivalent path tells us exactly what trampoline pattern the *non-Godot* Stern code uses — and conversely, what GLUE Pokemon LE's port added on top. If spike_menu has no equivalent of `select_and_load_scene` (or a much simpler one), we know the recursion/queue machinery in pokemon_le is *Godot-specific glue* and we can locate exactly the unmounted-tree bug from there.
+
+**h. Nuklear vs Radium vs Stern's C++ orchestrator — clarifying who drives what.** Per memory: NUK = Nuklear (system/test-mode UI, not pinball scenes); Radium = scene FORMAT (not runtime); Stern's C++ binary at `0x720cf0` = main event loop, the actual orchestrator. The *front-end issue* may genuinely be in the Godot integration layer between the C++ orchestrator and the rendered tree — i.e., a glue layer Stern wrote (likely `SpiSceneManager`, `SpiVideoPlayer`, or `ManualGodotScene`) that we haven't traced. Investigation thread (e) is the most direct attack on this.
+
+### Memory updates queued
+
+- `reference_video_player_spi.md` — already updated this session: noted that decoder fudge is in place, and that the actual blocker is scene-tree attachment.
+- New entry: `project_forward_decode_bridge.md` — worth writing once the bridge has 2+ stable runs. Captures the wire protocol, daemon lifecycle, env-var gates.
+- New entry: `project_fs_hook_audit_2026_05_01.md` — terse note that the LD_PRELOAD path-coverage gap is closed for this game's import set; references the chdir arc as the canonical example of "what we miss when we miss one".
+- `feedback_check_fs_first.md` — could cite the chdir arc as a concrete cautionary tale: when a path-related error appears, hooks may be the leak point even when the dir exists.
+
+## Step 73f: spike_menu vs pokemon_le architectural diff — orchestrator confirmed shared, scene-bridge layer isolated (2026-05-01)
+
+Followup to 73e's `select_and_load_scene` analysis. User's hypothesis that "Godot may not be the orchestrator" prompted a temporary pivot to `games/pokemon_le/spike3/spike_menu/game` — the Spike 3 system-menu binary that ships on every Spike 3 machine. spike_menu uses the same Stern platform stack (EGL/GLES, GStreamer, libavcodec, DRM/GBM, gpiod) **with zero Godot integration** (`0` "godot" strings vs pokemon_le's `457`). That makes spike_menu a controlled-experiment baseline: every variable except Godot is held constant, so the binary-level diff IS the Godot-port glue.
+
+This step documents what we **verified in BN**, what we **inferred but didn't confirm**, and what's still **open**. Future sessions should NOT treat the inferences as confirmed facts; this section calls out the boundary explicitly.
+
+### Confirmed in BN (high confidence — verified via decompile / vtable reads / string-table evidence)
+
+**Orchestrator pattern is identical across both binaries.** Both spawn a thread named `"procDispatch"` running a function with byte-identical structure:
+
+- spike_menu: `sub_5fc980` (init) calls `sub_5fc6b0(sub_5faadc+4, 8, "procDispatch", 0)` to spawn the dispatch thread; cond var lives at `0x88fdc8` / mutex at `0x88fd98`.
+- pokemon_le: `create_dispatch_thread` (already renamed) calls `CC_mainDispatchThread(process_dispatch_loop+4, 8, "procDispatch", 0)`; cond var at `0x44c9288` / mutex at `0x44c9258`.
+
+The dispatch loop (`sub_5faadc` ↔ `process_dispatch_loop`) is byte-similar:
+
+```c
+while (running) {
+    pthread_mutex_lock(work_mutex);
+    while (running && work_counter == last_seen) {
+        pthread_cond_wait(work_cond, work_mutex);   // wait for work signal
+    }
+    pthread_mutex_unlock(work_mutex);
+
+    pre_dispatch_hook();    // sub_67ef10 (spike_menu) / sub_720cf0 (pokemon_le)
+    char ctx = sub_..();    // sub_59eca0 / sub_5d7060
+
+    // Walk proc linked-list: head at known data addr, next at +0xe8
+    for (proc = head; proc; proc = *(proc + 0xe8)) {
+        flags = *(proc + 2);
+        countdown = *(proc + 0xf0);
+        if (!(flags & 0x40)) {
+            if (countdown <= 0 && !(flags & 0xffffc004) && ctx) {
+                *(proc + 2) = flags & 0x7fff;     // clear processing bit
+                dispatch_one_proc(proc + 4);       // sub_6905a0 / sub_86c210
+            } else {
+                *(proc + 0xf0) = countdown - 1;
+            }
+        }
+    }
+    fire_event(0x92, 0);   // post-dispatch hook (named in pokemon_le, sub_5859a0(0x92,0) in spike_menu)
+    sub_..(ctx);
+
+    // Wake supervisor
+    pthread_mutex_lock(supervisor_mutex);
+    pthread_cond_signal(supervisor_cond);
+    pthread_mutex_unlock(supervisor_mutex);
+}
+```
+
+**Proc structure layout (verified offsets, same in both binaries):**
+
+| Offset | Field | Notes |
+|---|---|---|
+| `+0x02` | flags (u16) | bit `0x40` = skip; mask `0x7fff` = clear-on-process |
+| `+0x04` | proc body / arg block | passed to per-proc dispatcher |
+| `+0xe8` | next pointer | linked-list traversal |
+| `+0xf0` | countdown (u32) | ticks to wait before dispatch |
+
+**Pre-dispatch hook in pokemon_le (sub_720cf0) does the per-tick orchestration work.** This is the function the user originally labeled "main event loop" in the Step 73e analysis — that label was incorrect. It is NOT the main loop; it's a per-tick hook called BY the procDispatch thread before each pass over the proc list. Verified: sub_720cf0 is called at `process_dispatch_loop+0x344` (offset `0x729344`) inside the dispatch loop body, and itself calls `process_deferred_scene_queue` (the 822-entries-per-run scene-load driver from Step 73e) plus 12 other subsystem ticks: sub_70e990, j_sub_8462e0, sub_64e320, sub_817250 (PRNG advance), drain_pending_switch_events, sub_7f8ad0, sub_7b52c0, sub_8670c0, sub_590360, sub_717dc0, sub_6d2da0, sub_6c0410, sub_7bfbc0, sub_7a7610, sub_719850, sub_767fe0, sub_65cf80. Wraps the whole thing in `fire_event(0x37, 0)` (entry gate) and `fire_event(0x38, 0)` (exit).
+
+**spike_menu uses `IScene` polymorphic class hierarchy.** Verified via mangled-name strings (`6IScene`, `12NuklearScene`, `11RadiumScene`, `17DMDEmulationScene`):
+
+```
+IScene (../source/display/lcd/DisplayRenderer.cpp neighborhood)
+├── NuklearScene
+├── RadiumScene
+└── DMDEmulationScene
+```
+
+Plus a `SceneCache` class with mangled-name evidence for `release_scene(IScene*, DisplayRenderer*)`, `scene_load_thread`, `demand_load_radium_bitmap`, `flush_bitmap_cache`. `SceneCache::PreLoadSceneCache` (`sub_685bf0`) is the function that walks `/lcd/auto_loaded`, `/lcd/demand_loaded`, `/nuk/images`, constructs RadiumScene objects for auto-loaded entries, and spawns the `"LoadSceneCache"` worker thread.
+
+**pokemon_le uses `GodotScene` polymorphic class hierarchy** — different base class than spike_menu, replacing `IScene` with `GodotScene`. Verified via:
+
+- Source-path leak: `"../source/display/lcd/GodotScene.cpp"` — Stern's own bridge layer source
+- `ManualGodotScene` constructor at `sub_725fc8`: allocates 0x11 bytes, copies `"ManualGodotScene"` string, sets `arg1 = &_vtable_for_GodotScene` then re-sets to `&_vtable_for_ManualGodotScene{for GodotScene}` (standard C++ derived-class construction)
+- Mangled lambda RTTI string `_Z18godot_switch_scene17PokemonGodotScene` proves a function `godot_switch_scene` exists, taking a `PokemonGodotScene*`
+
+```
+GodotScene (../source/display/lcd/GodotScene.cpp — Pokemon-LE-specific bridge)
+├── ManualGodotScene  (sub_725fc8 = constructor)
+└── PokemonGodotScene (referenced by godot_switch_scene; constructor not yet located)
+```
+
+**spike_menu uses GLib's GMainLoop only for GStreamer video message bus.** Initial finding (overstated in earlier turn) was retracted: only one xref to `g_main_loop_run` in spike_menu, and it's `sub_6d5240` — the body of a thread named `"VideoMessageBus"` spawned by `sub_6d5260` (which also sets `GST_PLUGIN_PATH` and calls `gst_init_check`). pokemon_le also has `g_main_loop_*` imports — same usage, almost certainly. **GMainLoop is NOT the orchestrator in either binary.**
+
+**spike_menu's `main()` is structurally simple:** readlink/dirname/chdir to set CWD; init three subsystems via `sub_5958e0`, `sub_639110`, `sub_5fc980` (which spawns procDispatch); install signal handlers; then enter a supervisor loop at `sub_5fc3c0` and `exit()` with its return. The supervisor itself does not dispatch work — it `pthread_cond_timedwait`s on the supervisor cond var (with 10s timeout for shutdown polling) and handles a one-time setup at `sub_5fb440` plus the shutdown/reboot path (`/bin/sync`, `/sbin/reboot -f`).
+
+### Strong inferences (consistent with evidence but NOT directly verified)
+
+- **The "display effect proc" is a specific proc registered in the proc linked-list with the `PR_FG_ACCESS_VIDEO_DISPLAY` capability bit set.** Inferred from the error string `"Attempting to access scene from non display effect proc without PR_FG_ACCESS_VIDEO_DISPLAY flag."` and the proc-flag bit field at `+0x02`. We did NOT locate the specific proc registration nor confirm which flag bit corresponds to that capability.
+- **`godot_switch_scene(PokemonGodotScene*)` is the bridge from Stern's proc system to Godot's scene tree** (where `add_child()`-into-scene-tree should happen). Inferred from name + signature; we could not locate the function body or its callers via direct xrefs (RTTI-only references; the lambda type info points to a data block at `0x42a5658` with no further xrefs).
+
+### Open questions (unsolved this step — DO NOT ASSUME ANY ANSWER)
+
+1. **Where is Godot's `MainLoop::iteration` (or equivalent frame tick) driven from?** Three candidates we have NOT eliminated:
+   - It's hidden inside one of the 12+ named-but-unstudied `sub_*` calls in pokemon_le's `sub_720cf0`
+   - It's run from a parallel thread spawned by one of pokemon_le's init functions (the equivalents of spike_menu's `sub_5958e0`/`sub_639110`/`sub_5fc980`)
+   - It's not happening at all — Godot's per-frame `_process()` callbacks never fire for game scenes because nothing ticks the SceneTree
+   The third option, if true, would directly explain the `is_inside_tree() returns false` symptom (scenes never get processed even after they're loaded). But we have NOT confirmed this — it is a hypothesis, not a finding.
+
+2. **What other `GodotScene` subclasses exist** beyond `ManualGodotScene` and `PokemonGodotScene`? The catalog could matter — knowing the full set tells us what scene categories Stern wired through the Godot bridge.
+
+3. **What does the `GodotScene` base class vtable look like?** Walking it (vtable at the address referenced by `sub_725fc8` line `*arg1 = &_vtable_for_GodotScene`) would enumerate the virtual interface — likely `switch`, `on_load`, `on_tick`, `release`, etc. — which directly informs what `godot_switch_scene` is supposed to do.
+
+4. **What does the OS path-getter at `sub_32c6140` (called from `mcp_RasterizerGLES3_initialize` at `0x10a59fc`) actually return?** We know it returns `"/tmp/cache"` empirically (matched the discovery.log path), but we don't know whether that's `OS::get_cache_path`, `OS::get_user_data_dir`, or something else. Member offset `+0xc8` of the OS singleton.
+
+5. **Spike_menu's `sub_5859a0`** — called from procDispatch with multiple integer args (0x92 post-dispatch, plus 0x10/0x11/0x13 from `sub_639110`'s init code). Looks like a multi-purpose op-code dispatcher. Role unconfirmed.
+
+### What this turn produces for follow-up
+
+- BN renames performed in both DBs (this step). Names use the `mcp_` prefix per session convention; uncertain renames carry an `_unsure` suffix so future sessions know the label is provisional.
+- The `process_dispatch_loop` ↔ `sub_5faadc` equivalence catalogued so a side-by-side trace becomes mechanical for any future investigation.
+
+### Actionable next probes (lowest-risk, highest-value)
+
+- Walk the GodotScene vtable from `_vtable_for_GodotScene` (referenced inside `mcp_ManualGodotScene_constructor`) — enumerate methods, find the dispatch slot called by the proc system.
+- Pattern-search for callers of `godot_switch_scene` via raw disasm of the function-body neighborhood (RTTI-only xrefs aren't enough; need binary search for the BL target).
+- Confirm or rule out the "frame tick missing" hypothesis by tracing the threads spawned by pokemon_le's init functions — find the threads that call any of `eglSwapBuffers`, `glClear`, or Godot's `MessageQueue::flush`.
+
