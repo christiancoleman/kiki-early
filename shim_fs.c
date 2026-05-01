@@ -812,6 +812,155 @@ int __lxstat64(int ver, const char *pathname, void *statbuf) {
     return real_fn(ver, actual, statbuf);
 }
 
+/* ========== Audit-pass hooks (2026-04-30) ==========
+ *
+ * After we shipped the chdir() hook, an audit of the game's libc imports
+ * (objdump -R game | grep @GLIBC | filter on fs-related names) found
+ * eight more path-taking calls that were going straight to libc unmapped:
+ *
+ *   unlink, rename, readlink, statfs, statvfs64, chmod, glob64, rmdir
+ *
+ * Same failure mode as chdir: if any of these hits a sysroot-only path
+ * (e.g. an NV-write cleanup `unlink("/data/nv/...")`, an atomic
+ * `rename(tmp, dst)` for save files, a `readlink` on a sysroot symlink,
+ * a `statfs` for free-space check), libc would dispatch to the host
+ * filesystem where the path doesn't exist, return -1, and the caller
+ * would silently mishandle. Each hook here calls remap_path() and emits
+ * fs_diag for /tmp/<X> + cache/shader paths (when SPIKE3_FS_DIAG_VERBOSE).
+ *
+ * Two-path hooks (rename, symlink) remap BOTH operands. */
+
+typedef int (*real_unlink_t)(const char *);
+int unlink(const char *pathname) {
+    static real_unlink_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_unlink_t)dlsym(RTLD_NEXT, "unlink");
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    if (diag) FS_DIAG_LOG("unlink(%s) -> %s", pathname ? pathname : "(null)",
+                          actual ? actual : "(null)");
+    int ret = real_fn(actual);
+    if (diag) FS_DIAG_LOG("unlink(%s) ret=%d errno=%d",
+                          pathname ? pathname : "(null)", ret, ret ? errno : 0);
+    return ret;
+}
+
+typedef int (*real_rename_t)(const char *, const char *);
+int rename(const char *oldpath, const char *newpath) {
+    static real_rename_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_rename_t)dlsym(RTLD_NEXT, "rename");
+    const char *old_a = oldpath ? remap_path(oldpath) : oldpath;
+    const char *new_a = newpath ? remap_path(newpath) : newpath;
+    int diag = FS_DIAG_TMP_PREFIX(oldpath) || FS_DIAG_TMP_PREFIX(newpath);
+    if (diag) FS_DIAG_LOG("rename(%s, %s) -> (%s, %s)",
+                          oldpath ? oldpath : "(null)",
+                          newpath ? newpath : "(null)",
+                          old_a ? old_a : "(null)",
+                          new_a ? new_a : "(null)");
+    int ret = real_fn(old_a, new_a);
+    if (diag) FS_DIAG_LOG("rename(%s, %s) ret=%d errno=%d",
+                          oldpath ? oldpath : "(null)",
+                          newpath ? newpath : "(null)",
+                          ret, ret ? errno : 0);
+    return ret;
+}
+
+typedef int (*real_rmdir_t)(const char *);
+int rmdir(const char *pathname) {
+    static real_rmdir_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_rmdir_t)dlsym(RTLD_NEXT, "rmdir");
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    if (diag) FS_DIAG_LOG("rmdir(%s) -> %s", pathname ? pathname : "(null)",
+                          actual ? actual : "(null)");
+    int ret = real_fn(actual);
+    if (diag) FS_DIAG_LOG("rmdir(%s) ret=%d errno=%d",
+                          pathname ? pathname : "(null)", ret, ret ? errno : 0);
+    return ret;
+}
+
+typedef ssize_t (*real_readlink_t)(const char *, char *, size_t);
+ssize_t readlink(const char *pathname, char *buf, size_t bufsiz) {
+    static real_readlink_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_readlink_t)dlsym(RTLD_NEXT, "readlink");
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    if (diag) FS_DIAG_LOG("readlink(%s) -> %s", pathname ? pathname : "(null)",
+                          actual ? actual : "(null)");
+    ssize_t ret = real_fn(actual, buf, bufsiz);
+    if (diag) FS_DIAG_LOG("readlink(%s) ret=%zd errno=%d",
+                          pathname ? pathname : "(null)", ret,
+                          (ret < 0) ? errno : 0);
+    return ret;
+}
+
+typedef int (*real_chmod_t)(const char *, unsigned int);
+int chmod(const char *pathname, unsigned int mode) {
+    static real_chmod_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_chmod_t)dlsym(RTLD_NEXT, "chmod");
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    if (diag) FS_DIAG_LOG("chmod(%s, mode=0%o) -> %s",
+                          pathname ? pathname : "(null)", mode,
+                          actual ? actual : "(null)");
+    int ret = real_fn(actual, mode);
+    if (diag) FS_DIAG_LOG("chmod(%s) ret=%d errno=%d",
+                          pathname ? pathname : "(null)", ret, ret ? errno : 0);
+    return ret;
+}
+
+typedef int (*real_statfs_t)(const char *, void *);
+int statfs(const char *pathname, void *buf) {
+    static real_statfs_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_statfs_t)dlsym(RTLD_NEXT, "statfs");
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    if (diag) FS_DIAG_LOG("statfs(%s) -> %s", pathname ? pathname : "(null)",
+                          actual ? actual : "(null)");
+    int ret = real_fn(actual, buf);
+    if (diag) FS_DIAG_LOG("statfs(%s) ret=%d errno=%d",
+                          pathname ? pathname : "(null)", ret, ret ? errno : 0);
+    return ret;
+}
+
+typedef int (*real_statvfs64_t)(const char *, void *);
+int statvfs64(const char *pathname, void *buf) {
+    static real_statvfs64_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_statvfs64_t)dlsym(RTLD_NEXT, "statvfs64");
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    if (diag) FS_DIAG_LOG("statvfs64(%s) -> %s", pathname ? pathname : "(null)",
+                          actual ? actual : "(null)");
+    int ret = real_fn(actual, buf);
+    if (diag) FS_DIAG_LOG("statvfs64(%s) ret=%d errno=%d",
+                          pathname ? pathname : "(null)", ret, ret ? errno : 0);
+    return ret;
+}
+
+/* glob64 — pattern expansion. We remap the pattern itself (so a pattern
+ * like "/tmp/cache/*" lands at $SYSROOT/tmp/cache/*) and forward.
+ * The result paths in the glob_t come back as the resolved sysroot paths
+ * — that's a leak (callers may compare them against the original
+ * pattern's prefix) but is the same behavior remap_path produces for
+ * other hooks. Acceptable for now; revisit if a glob caller depends on
+ * "/tmp/" prefix in returned paths. */
+struct shim_glob_t_opaque;  /* forward decl */
+typedef int (*real_glob64_t)(const char *, int,
+                              int (*errfunc)(const char *, int),
+                              struct shim_glob_t_opaque *);
+int glob64(const char *pattern, int flags,
+           int (*errfunc)(const char *, int),
+           struct shim_glob_t_opaque *pglob) {
+    static real_glob64_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_glob64_t)dlsym(RTLD_NEXT, "glob64");
+    const char *actual = pattern ? remap_path(pattern) : pattern;
+    int diag = FS_DIAG_TMP_PREFIX(pattern);
+    if (diag) FS_DIAG_LOG("glob64(%s) -> %s", pattern ? pattern : "(null)",
+                          actual ? actual : "(null)");
+    int ret = real_fn(actual, flags, errfunc, pglob);
+    if (diag) FS_DIAG_LOG("glob64(%s) ret=%d", pattern ? pattern : "(null)", ret);
+    return ret;
+}
+
 /* ========== libgpiod chardev stubs (2026-04-24) ==========
  * The game imports six symbols from libgpiod (the modern /dev/gpiochipN
  * character-device API). Known-gap: our shim only faked the legacy
