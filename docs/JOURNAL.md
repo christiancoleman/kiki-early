@@ -6315,3 +6315,20 @@ GodotScene (../source/display/lcd/GodotScene.cpp — Pokemon-LE-specific bridge)
 - Pattern-search for callers of `godot_switch_scene` via raw disasm of the function-body neighborhood (RTTI-only xrefs aren't enough; need binary search for the BL target).
 - Confirm or rule out the "frame tick missing" hypothesis by tracing the threads spawned by pokemon_le's init functions — find the threads that call any of `eglSwapBuffers`, `glClear`, or Godot's `MessageQueue::flush`.
 
+## Step 73g: Radium-as-orchestrator reframe + knowledge-base cleanup (2026-05-01)
+
+User-driven course correction during BN trace synthesis. The architectural model that was implicit in Steps 71–73f — "Godot drives the front-end, with Radium as a video/scene subsystem" — was inverted. **Radium is the primary UI runtime/renderer; Godot is an embedded element type within Radium scenes** via Stern's Pokemon-LE-specific `GodotScene` bridge layer (`../source/display/lcd/GodotScene.cpp`). All standard pinball UI (scores, pricing, AddCredits, GrandChamp, HighScore tiers, GameOver, attract rotation, tilt warnings) is rendered by Radium directly. Godot only drives Pokémon-specific embedded content (battle, capture, discover, pokédex). The 7-method binding API exposed by `ManualGodotScene` (`get_element` / `set_text` / `set_visible` / `set_clip` / `set_color` / `set_rect` / `set_transform`) is element-mutator semantics on a Radium element, not Node-tree semantics on Godot's SceneTree — confirming host(Radium) / embedded(Godot) directionality.
+
+Implication for the persistent `is_inside_tree() == false` symptom: it's NOT about a missing top-level `/root/Main` in Godot's main SceneTree. It's the embedded subtree owned by a `ManualGodotScene` element that's never properly attached when Radium loads a scene containing a Godot-typed element. That re-localizes the front-end fix significantly.
+
+### Knowledge-base cleanup (this step)
+
+To prevent future sessions from drifting back to wrong premises by reading stale docs, the knowledge structure was consolidated:
+
+- **New canonical entry point: `_emulation/MODEL.md`** — ≤2-page summary of the current architectural model, front-end-blocker hypothesis, suspect catalog, active env flags, next-probe priority, and where to find detail. Authoritative when anything elsewhere conflicts. Read first by every session.
+- **Removed (in git history): `docs/HANDOFF.md`** (superseded by MODEL.md), `docs/NEXT_SESSION.md` (superseded by MODEL.md), `docs/EVENT_SWEEP_STEP52.md` (already captured in JOURNAL Step 52).
+- **Memory updates:** `reference_radium_scene_format.md` had the Radium↔Godot relationship documented backwards in its "Integration with the game engine" section — corrected to reflect the embedded-element model. The MEMORY.md index now leads with a pointer to MODEL.md and flags the prior framing as inverted.
+- **Surviving docs/ files** (kept as living domain specs, not session-state): JOURNAL.md, PROTOCOL.md, BRIDGE_PROTOCOL.md, NODEBUS_CIPHER.md, NODEBUS_HASH.md, MODE_TABLE.md, ASSETS.md, VIDEO_CLIPS.md, RADIUM_INVESTIGATION.md, SETUP.md.
+
+Other memory entries (e.g. `reference_video_player_spi.md`, `project_emulation_progress.md`, `project_godot_engine.md`) likely need similar passes but weren't load-bearing enough to block forward motion this turn — left for incremental correction as future sessions touch them.
+
