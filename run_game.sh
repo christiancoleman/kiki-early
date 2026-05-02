@@ -63,9 +63,13 @@ set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
 
 # ---- Auto-detect paths ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# _emulation → pokemon_le → games → sysroot
-SYSROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-GAME_DIR="$SYSROOT/games/pokemon_le"
+# _emulation → <game_name> → games → sysroot.
+# Auto-detect from SCRIPT_DIR rather than hardcoding "pokemon_le" so the same
+# shim/run_game.sh can drive any Spike 3 game (Pokémon LE 0.81, Star Wars LE
+# 0.85, ...). Each game keeps its own _emulation/ dir (symlinked from the
+# canonical PLE one); SCRIPT_DIR resolves to whichever game we're launching.
+GAME_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SYSROOT="$(cd "$GAME_DIR/../.." && pwd)"
 LATEST_DIR="$SCRIPT_DIR/runs/latest"
 
 # ---- Defaults (override via env) ----

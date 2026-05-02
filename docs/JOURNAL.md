@@ -6332,3 +6332,250 @@ To prevent future sessions from drifting back to wrong premises by reading stale
 
 Other memory entries (e.g. `reference_video_player_spi.md`, `project_emulation_progress.md`, `project_godot_engine.md`) likely need similar passes but weren't load-bearing enough to block forward motion this turn — left for incremental correction as future sessions touch them.
 
+### Step 73h — BN database rename + Star Wars LE comparison binary added (2026-05-01, same-day followup)
+
+Two related changes:
+
+1. **BN database naming convention.** Every Binary Ninja `.bndb` file in this repo is now prefixed with the source game and version: `pokemon-le-0.81.0-{game,service_s_worker,image.bin,boot_display,dprint,netbridge.elf,powerdist_ext.hex.extracted}.bndb`. Previously the files were unprefixed (`game.bndb`, `netbridge.elf.bndb`, etc.). The rename matters because of #2 below.
+
+2. **Star Wars LE 0.85.0 added as a comparison filesystem.** Lives at `/mnt/c/Workspace/starwars-le-0.85.0/` (NOT inside this repo's tree — fully separate workspace). Same Stern Spike 3 platform, same proc system, same Radium UI runtime, same node-bus protocol. **Critically: 0 "godot" strings in `games/star_wars_2025_le/game`** vs Pokemon LE's 457 — confirms it's pure non-Godot Stern (the comparison value was already validated for spike_menu, but spike_menu is a system-menu binary; FotE/SW LE is a full pinball game). Has Researcher A annotations baked into the BNDB. Binary path: `games/star_wars_2025_le/starwars-le-0.85.0-game.bndb`.
+
+The investigative principle this enables: when in doubt about whether a function in `pokemon-le-0.81.0-game.bndb` is Pokemon-port glue or shared Stern code, open the equivalent in `starwars-le-0.85.0-game.bndb`. Present in both → shared Stern. Absent in SW LE or radically different → Pokemon-port glue (= the GodotScene bridge layer + dependents). Same logic applies for spike_menu but at smaller scope.
+
+MODEL.md updated with a "Comparison binaries" section naming all current BNDB paths. MEMORY.md updated to surface the rename + SW LE availability at the top. `reference_netbridge_firmware.md` updated to use the new prefixed name. Other memory entries that mention `.bndb` paths (`feedback_bn_sequential_only.md`, `feedback_bn_function_comments.md`, `project_msgpack_SERVICE_S_only.md`, `reference_nodebus_protocol.md`) left as-is for now — they reference the unprefixed names in passing context where the rename doesn't break meaning, and incremental correction as future sessions touch them is fine.
+
+### Step 73i — IScene base + GodotRenderer hierarchy mapped (2026-05-01)
+
+User-driven discovery from the BN Types panel: spike_menu, SW LE, and pokemon_le ALL have identical `IScene::DMDEmulationScene::vTable` (33 xrefs), `IScene::NuklearScene::vTable` (30 xrefs), and `IScene::RadiumScene::vTable` (66/66/68 xrefs respectively — only ~2 difference between SW LE and pokemon_le, which IS the SceneCache+IScene shared infrastructure). Pokemon LE adds **one new IScene subclass: `GodotRenderer`** (55 xrefs to its vtable). This nails down the architecture: IScene is Stern's shared abstract base, and Pokemon LE's port is one new IScene subclass that internally wraps a Godot Node tree.
+
+**Verified addresses (pokemon_le):**
+- IScene typeinfo: `0x42a3e28` (name string `"6IScene"` at `0x37b9ad0`)
+- IScene vtable: `0x42a4d10`
+- GodotRenderer typeinfo: `0x42ba340` (name `"13GodotRenderer"` at `0x37c6db8`)
+- GodotRenderer vtable: `0x422f538` (multiple-inheritance: secondary typeinfos at `0x42ba380`, `0x42ba428`, `0x42ba440` — likely Godot ClassDB-side bases)
+- GodotRenderer destructor (vtable slot 0): `0x4baf00` → confirmed handoff to IScene vtable at `0x42a4d10` at end of body. Mechanically proves IScene parentage.
+
+**GodotRenderer vtable layout (slots 0-10 known):**
+| Slot | Address | Role |
+|---|---|---|
+| 0 | `0x4baf00` | D2 destructor (mcp_GodotRenderer_dtor_base) |
+| 1 | `0x4bb130` | D0 deleting destructor (mcp_GodotRenderer_dtor_deleting) |
+| 2 | `0x4d1d70` | tiny getter `return *(this+0x50)` (mcp_GodotRenderer_get_state_unsure) |
+| 3 | `0x65f700` | stub `return 0` (mcp_GodotRenderer_vfn3_stub_returns_zero) |
+| 4-7 | `0x4bacd0` … `0x4bad00` | inherited from IScene (NOT overridden — same impls as the 0x4ba/0x4bb range methods) |
+| 8 | `0x65e360` | per-tick dispatch (mcp_GodotRenderer_tick_unsure): drains pending queue → `(*(*data_451adb0+0x6a8))()` → `sub_939d30()` |
+| 9 | `0x65ba70` | scene activation (mcp_GodotRenderer_activate_scene_unsure): wraps two GodotScene members at +0x58/+0x60, posts deferred ops to Godot main thread, two staged passes |
+| 10 | `0x4bad20` | inherited from IScene |
+
+**GodotRenderer object state (from destructor + slot-9 reads):**
+- `+0x40`/`+0x48` — main scene contexts
+- `+0x50` — state byte/word (slot 2 returns this)
+- `+0x58`/`+0x60` — two `GodotScene*` slots (LIKELY matches the scene_id=10/11 ping-pong from Step 73e — a single GodotRenderer instance holds two scene members and ticks both)
+- `+0xe0` — pthread_mutex (input-queue lock)
+- `+0x110/+0x118/+0x120` — pending-update queue: 0x68-byte entries with element-name string at +0x28 and std::function at +0x58 (the binding-API queue)
+- `+0x128` — pthread_mutex (output-queue lock)
+- `+0x158/+0x160/+0x168` — processed-entry queue: 0x40-byte entries
+- `+0x178` — element-name lookup registry (for `get_element(name)` API)
+
+**Refined front-end-blocker hypothesis:** the `is_inside_tree() == false` symptom can now be localized to one of three concrete failure modes:
+- (a) `GodotRenderer` slot 8 (per-tick dispatch) is never being invoked by the proc system → no queue drain, no MessageQueue flush, no Godot tick.
+- (b) Slot 8 IS invoked but `data_451adb0` (the singleton whose `+0x6a8` virtual is called inside slot 8) isn't initialized in our environment → the deferred-flush call is a no-op.
+- (c) Slot 9 (scene activation) never runs → the GodotScene members at `+0x58`/`+0x60` are present but the deferred attach-to-tree messages never get posted.
+
+All three are now mechanically investigable via xrefs on the vtable function addresses (slot 8 = `0x422f578`, slot 9 = `0x422f580`).
+
+**Renames (pokemon_le, requires File→Save):**
+- `func_8baf00` → `mcp_GodotRenderer_dtor_base`
+- `sub_4bb130` → `mcp_GodotRenderer_dtor_deleting`
+- `sub_4d1d70` → `mcp_GodotRenderer_get_state_unsure`
+- `sub_65f700` → `mcp_GodotRenderer_vfn3_stub_returns_zero`
+- `sub_65e360` → `mcp_GodotRenderer_tick_unsure`
+- `sub_65de40` → `mcp_GodotRenderer_drain_pending_queue`
+- `sub_65ba70` → `mcp_GodotRenderer_activate_scene_unsure`
+
+MODEL.md updated with new architecture paragraph, refined blocker section, full GodotRenderer suspect catalog, and reordered next-probe priorities (identifying `data_451adb0` is now #1).
+
+### Step 73j — IScene shared interface mapped + GodotRenderer bootstrap localized (2026-05-01)
+
+User course-correction: stop chasing Godot internals and find the Stern shared layer (IScene contract + its dispatchers in SceneCache/DisplayRenderer). This step delivers that map.
+
+**Found `mcp_GodotRenderer_bootstrap_godot` (`sub_65e390`)** — the function that initializes Godot from inside GodotRenderer's first activation. Hard-codes `Engine.cache_path = "/tmp/cache"` (Stern override; not from XDG_CACHE_HOME — explains the chdir-to-/tmp/cache investigation in Step 73c). Calls Godot Main::setup, Main::setup2, sets MainLoop, calls Main::start, registers GodotRenderer, then runs the first-frame tick. The `ready_flag` at `this[0xa]` gets set to 1 here. This function is the SINGLE entry point from Stern's GodotRenderer instance into the Godot runtime.
+
+**Found `mcp_GodotRenderer_load_pack_or_bootstrap` (`sub_65f0e0`)** — the "either bootstrap or load resource pack" dispatcher. Caller passes a `.pck` path; if not bootstrapped yet, tail-calls into bootstrap. Otherwise calls `ProjectSettings.load_resource_pack(path, false)` and registers the new pack. THIS is where the proc system meets Godot via the resource-pack-loading API. Its xrefs (`sub_65e388` via tiny stub + the actual upstream caller) tell us how the proc system triggers GodotRenderer; not yet traced.
+
+**IScene shared interface is now fully mapped.** Pokemon_le's IScene vtable at `0x42a4d10` has 11 primary virtual slots; decompiling each:
+
+- Slots 0/1 (D2/D0 destructors): NULL — pure virtual (every subclass overrides)
+- Slots 2/3: `__cxa_pure_virtual` at `0x46ab5c0` — pure virtual, semantic uncertain. GodotRenderer's slot-2 reads `*(this+0x50)` (state byte); slot-3 returns 0 (no-op).
+- Slots 4/5/6: concrete `set_flag(idx)`/`clear_flag(idx)`/`get_flag(idx)` writing/reading bytes at `this + 0x28 + idx`. NOT overridden by GodotRenderer — IScene's flag API is the shared default.
+- Slot 7: concrete `get_4tuple_default` outputs `(0,0,0,1.0f)` — a default rect/transform identity getter.
+- Slots 8/9: `__cxa_pure_virtual` — **the per-tick + activate-scene methods every concrete IScene subclass implements**. GodotRenderer's slot 8 = drain-queue + Godot iteration; slot 9 = scene mount via deferred attach.
+- Slot 10: concrete empty `ret` — optional hook stub.
+
+**Stern's IScene lifecycle contract (inferred):** `construct → activate(slot 9) → tick(slot 8) repeatedly → release(destructor)`. Slots 4-7 are the flag/state-mutator API the dispatcher uses to communicate with the scene from outside. RadiumScene/NuklearScene/DMDEmulationScene all conform to this same contract — that's the shared Stern surface area we wanted to surface.
+
+**External annotation comparison did not resolve IScene.** The comparison material did not provide the scene/UI naming shortcut being sought. [Redacted: third-party annotation prefixes, ranges and inventory.] The independent scene investigation continued.
+
+**Renames (pokemon_le, requires save):**
+- `sub_65e390` → `mcp_GodotRenderer_bootstrap_godot`
+- `sub_65f0e0` → `mcp_GodotRenderer_load_pack_or_bootstrap`
+- `sub_939d30` → `mcp_godot_Main_iteration_unsure`
+- `sub_32c61c0` → `mcp_godot_Engine_get_singleton`
+- `sub_2483700` → `mcp_godot_SceneTree_get_singleton_unsure`
+- `sub_66ce20` → `mcp_SceneCache_PreLoadSceneCache`
+
+**MODEL.md updated** with the IScene primary-virtual interface table and a reordered next-probe priority list explicitly anchored to "find Stern code that dispatches through IScene slots 8 (tick) and 9 (activate)".
+
+## Step 74: Stern boot sequence mapping + SW LE port + Godot-is-illegal scope lock (2026-05-02)
+
+### Step 74a — Sub-Stern slot-8/9 dispatcher mapping in SW LE 0.85
+
+Worked primarily in SW LE 0.85 BNDB to isolate Pokemon-port glue from shared Stern code.
+
+**Findings (no claims, just function identifications):**
+- `RadiumScene` typeinfo at SW LE `0x749d98`, name string `"11RadiumScene"` at `0x647bf0`. Vtable at `0x733ea0`. Slots 4-6 at `0x35f670/0x35f680/0x35f690` (consecutive 0x10-stride, same shape as PLE's IScene flag-accessor defaults — strong indicator of shared IScene base).
+- RadiumScene slot 8 (`0x41d100`) = small two-line `if (slot2_state) tail-call sub_52deb0(this+0x38, mode)`.
+- RadiumScene base ctor at `0x41e0c0` — BN auto-named the vtable as `&_vtable_for_RadiumScene{for 'IScene'}`, confirming RadiumScene IS an IScene subclass in SW LE.
+- 4 IScene subclasses in SW LE typeinfo data refs: `0x748240/0x748250/0x749d98/0x74cec8` — same count as Pokemon LE.
+- `mcp_SceneCache_initialize` (SW LE `sub_4c2140`) — scans `/lcd/demand_loaded`, `/nuk/images`, `/lcd/auto_loaded`, builds RadiumScene per file, spawns thread named `"LoadSceneCache"` running `mcp_SceneCache_load_thread_body` (`sub_4c2ea4`).
+- `mcp_SceneCache_load_thread_body` deserializes scenes via slot 12 (vtable+0x60) — beyond the IScene base interface.
+- `mcp_SceneCache_add_scene_to_display_unsure` (`sub_4c17e0`) — type-dispatches by IScene subclass (RadiumScene → arg1+0x50 hashmap; NuklearScene → arg1+0x110 hashmap), enqueues into 3 places.
+- `mcp_DisplayRenderer_render_thread_body` (SW LE `sub_35e130`) — DisplayRenderer's main render thread, ~3.7KB, 11 refs to `../source/display/lcd/DisplayRenderer.cpp` source-file string. Slot-8 dispatch at `0x35e710` via `(*(*p+0x40))(mode)`; slot-9 dispatch at `0x35e648` + `0x35f154` via `(*(*p+0x48))()`. Iterates lists drained from `this+0xf0` (tick) and `this+0x120` (activate).
+- `mcp_DisplayRenderer_singleton_get` (`sub_308d00`) — single-instruction `return data_804030`.
+- `mcp_g_display_renderer` (SW LE `data_804030`) — global DisplayRenderer singleton.
+- `mcp_request_scene_display_with_dedup_unsure` (`sub_3064e0`) — std::set dedup wrapper around `mcp_SceneCache_add_scene_to_display_unsure(g_scene_cache, scene, g_display_renderer)`.
+
+### Step 74b — Stern's main() boot sequence
+
+Decompiled SW LE `_start → __libc_start_main → main`:
+- `main`: readlink/dirname/chdir, init 2 semaphores, install 3 signal handlers, block SIGINT/SIGUSR1, call `sys_init() → sub_3f81d0() → sub_2b9b90() → exit(sub_2b95d0())`.
+- `sub_2b9b90` = `mcp_spawn_procDispatch_thread` — spawns `procDispatch` worker thread with name string baked in.
+- `sub_2b95d0` = `mcp_main_watchdog_shutdown` — main thread parks here in `pthread_cond_timedwait`, polls adjustment values, triggers reboot on signal.
+- Inside `sys_init`, `sub_309af0` = `mcp_init_renderer_and_scene_cache_singletons` — `new DisplayRenderer(0x1b8) → DisplayRenderer_ctor → mutex+deferred-list → wait_on_render_thread_ready → new SceneCache(0x1d0)("./assets") → post-init`.
+- `mcp_DisplayRenderer_ctor` (`sub_35ded0`): vptr install, condition_variable init, list head init, spawns thread named `"DisplayRenderer"`, waits on cv.
+- `mcp_SceneCache_ctor` (SW LE `sub_4c0250`): std::string + 4 hashmap inits + condition_variable + list head, spawns thread named `"PreLoadSceneCache"` running `mcp_PreLoadSceneCache_thread_body` (`sub_4c2e84`, just calls SceneCache_initialize).
+
+### Step 74c — Pokemon LE cross-validation
+
+In PLE BNDB:
+- `DisplayRenderer_render_loop` at `0x7b7ac0` (already named in earlier session) — byte-shape-identical to SW LE's `mcp_DisplayRenderer_render_thread_body`. Same field offsets, same OpenGL calls, same source-file line numbers in fprintf assertions. Slot-8 dispatch at `0x7b7cc0`; slot-9 dispatch at `0x7b7bf8` + `0x7b8704`.
+- `mcp_init_renderer_and_scene_cache_singletons` at PLE `0x5d7aa0` — byte-shape-identical to SW LE's `0x309af0`. Same memset, same magic 4, same sizes (0x1b8 / 0x1d0), same `"./assets"` path.
+- `mcp_SceneCache_PreLoadSceneCache` at PLE `0x66ce20` (already named in earlier session) — same shape as SW LE's `mcp_SceneCache_initialize`. Identical directory scan, identical RadiumScene factory pattern, identical "LoadSceneCache" thread spawn.
+- `mcp_g_display_renderer` (PLE `data_445fa40`), `mcp_g_scene_cache` (PLE `data_445fa48`) renamed.
+- `mcp_PreLoadSceneCache_thread_body` (PLE `sub_66db64`), `mcp_SceneCache_ctor` (PLE `sub_66af30`) renamed.
+
+### Step 74d — Runtime inspection of PLE (GDB attach)
+
+Launched PLE with `qemu-aarch64 -g 1234 ./game` (TIMEOUT=300, VIEWER=0, AUDIO_PLAYER=0). Attached via `gdb_target_remote 127.0.0.1:1234`. Continued; interrupted at +45s; `info threads`.
+
+Findings:
+- 46 threads alive. Main thread (Thread 1, CPU#0) at `0x...cbfb5d10` (libc — `pthread_cond_timedwait`-equivalent in `mcp_main_watchdog_shutdown`).
+- Thread 2 (CPU#4) in `ioctl()` from `spi_shim.so`; saved LR via stack-walk + `info symbol` resolved to `setcontext + 829512` in section `.text` of game = BN address `0x8FA890` = function **`spi_serial_bridge_thread`** (already named).
+- 40+ worker threads parked at single libc address (pthread_cond_wait).
+- 2 threads in `accept()` (frame/audio bridge listeners).
+- 1 thread in `select()`.
+- Game log shows ongoing `MODE_PAGE_FLIP`, `snd_pcm_writei`, `avcodec_send_packet`/`receive_frame`, `serial-number` polling — not crashed.
+
+### Step 74e — `feedback_godot_is_illegal.md` saved + MODEL.md scope reframe
+
+After two course-corrections from user ("treat Godot like cooties" 2026-05-01; "I hate seeing the word Godot" / "godot is illegal" / "Godot doesn't come into play until middle of game" 2026-05-02), wrote `memory/feedback_godot_is_illegal.md`:
+- Off-limits: `VideoPlayerSpi`, `ManualGodotScene`, `PokemonGodotScene`, `godot_switch_scene`, `GodotRenderer` pre-warm internals, `/tmp/godot_logs`, `./assets/godot/main.pck`.
+- Still fair game (shared Stern, present in SW LE too): IScene contract, slot 8/9 vtable dispatch, deferred-call queues, SceneCache, RadiumScene, node-bus, SPI cmd handling.
+- Calibration on overclaiming "CRITICAL/MAJOR/JACKPOT" on rehashed work.
+
+`memory/MEMORY.md` index updated with the new feedback entry above the prior `feedback_pivot_to_shared_stern` pointer.
+
+`MODEL.md` edits:
+- Reframed architecture paragraph (removed GodotScene-hierarchy details, kept shared Stern stack).
+- Replaced "What this means for the front-end blocker" with "Visible front-end symptom (2026-05-02)" — describes user-observed logo-then-frozen-loading-dots, frames the SW LE acid test.
+- Stripped Pokemon-Godot-specific suspect entries (GodotRenderer vtable enumeration, GodotScene hierarchy, mcp_GodotRenderer_bootstrap_godot, mcp_GodotRenderer_load_pack_or_bootstrap, mcp_RasterizerGLES3_initialize); historical detail noted as preserved in JOURNAL Step 73 + BN database.
+- Rewrote next-probe priority order with SW LE smoke-test as #1.
+- "Last meaningful update" timestamp bumped to 2026-05-02.
+
+### Step 74f — Star Wars LE 0.85 emulator port
+
+Goal: prove the emulator goal (boot any Spike 3 game to attract) by running our shim against SW LE.
+
+**Path-resolution change in `run_game.sh`** (lines 95-97):
+```diff
+-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+-# _emulation → pokemon_le → games → sysroot
+-SYSROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+-GAME_DIR="$SYSROOT/games/pokemon_le"
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# _emulation → <game_name> → games → sysroot. Auto-detect from SCRIPT_DIR
++# rather than hardcoding "pokemon_le" so the same shim/run_game.sh can drive
++# any Spike 3 game.
++GAME_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
++SYSROOT="$(cd "$GAME_DIR/../.." && pwd)"
+```
+
+Identical PLE behavior; works for any game.
+
+**Created `games/star_wars_2025_le/_emulation/`** in SW LE filesystem (`/mnt/c/Workspace/starwars-le-0.85.0/`). Populated with absolute-path symlinks back to PLE's canonical `_emulation/`:
+- Source: `shim_avforward.c`, `shim_bridges.c`, `shim_diagnostics.c`, `shim_discovery.c`, `shim_discovery.h`, `shim_fs.c`, `shim_gl.c`, `shim_inject.c`, `shim_io.c`, `shim_ioctl.c`, `shim_net.c`, `shim_nodebus.c`, `shim_patches.c`, `spi_shim.c`, `spi_shim.h`, `spi_shim.ver`
+- Build/run: `build.sh`, `run_game.sh`, `nuke_emulation.sh`
+- Built artifact: `spi_shim.so`
+- Mesa overlay: `mesa_sw_overlay/`
+- Python helpers: `decode_daemon.py`, `decode_daemon_test.py`, `frame_viewer.py`, `audio_subscriber.py`, `marker_button.py`, `historical-state-subscriber.py`
+
+Per-game runtime state (NOT symlinked — created fresh in SW LE): `runs/`, `captures/`.
+
+**Filesystem repairs in SW LE** (Windows-mount lost the original Linux symlinks, leaving 0-byte placeholder files):
+
+Wrote `/tmp/fix_swle_libs.py`: scans SW LE's `lib/`, `lib64/`, `usr/lib/`, `usr/lib64/` for 0-byte `*.so*` files; for each, finds the highest-versioned non-empty sibling (e.g., `libfoo.so.X.Y.Z`) and copies its content into the placeholder.
+- Result: 269 of 286 placeholders fixed. 17 left unfixable (cross-directory cases like `usr/lib/libblkid.so → lib/libblkid.so.1.1.0`); not blocking boot.
+
+Replaced top-level broken entries in SW LE `games/`:
+- `games/service_s_worker` (was 0-byte file) → copy of `games/star_wars_2025_le/service_s_worker` (272K).
+- `games/game` (was 0-byte file) → copy of `games/star_wars_2025_le/game` (8.3M).
+- `games/spike3` (was 0-byte file) → directory copy of `games/star_wars_2025_le/spike3/` (bin/, netbridge/, powerdist/, spike_menu/).
+
+### Step 74g — SW LE smoke-test runs
+
+Run 1 (TIMEOUT=60, no env overrides beyond defaults disabled): `./run_game.sh --debug -g 1234`. Game exited status 127 ("command not found") via `./game: error while loading shared libraries: /mnt/c/Workspace/starwars-le-0.85.0/usr/lib/libbluetooth.so.3: file too short`. → led to fix_swle_libs.py.
+
+Run 2 (after `fix_swle_libs.py`): `VIEWER=0 AUDIO_PLAYER=0 service_s_worker=0 BOOT_DISPLAY=0 TIMEOUT=30 ./run_game.sh --debug`. Game ran for the full 30s (status 124 = TIMEOUT). Log shows: same SPI cmd 0x40 / 0x6c spam pattern as PLE, NV-directory remap creating `data/nv/star_wars_2025_le/{FRRAM,LKRAM,SYS_NVRAM,NOV_NVRAM,PIN_NVRAM,NVRAM,PTRAM,node_diag,NVM}` on demand, UART bridge protocol exchanges (cmd 0x10/0x15/0x18/0x1d/0x11/0x27/0x16), DRM display setup, Mesa EGL setup, `glCheckFramebufferStatus(DEFAULT) = 0x8cd5 (COMPLETE)` reached.
+
+Activity counts at 30s:
+- `MODE_PAGE_FLIP`: 60 (PLE same window: 8160)
+- `snd_pcm_writei`: 3500 (PLE same window: 115000)
+- `avcodec_*`: 0 (PLE same window: 16000)
+
+Crash on shutdown via SIGTERM → `shim_term_dump_handler` → `shim_dump_sound_globals` → rodata probe at `game_base + 0x3607900` (`SE_PK_FX_ATTACK_TYPE_BUG`). That probe address is invalid in SW LE binary; segfaults inside the shim's diagnostic dump. Game itself didn't crash — only the shim's cleanup handler.
+
+### Step 74h — BN database renames committed
+
+PLE BNDB:
+- `sub_4d47ac` → `mcp_GodotRenderer_singleton_bootstrap`
+- `data 0x4413c50` → `mcp_g_godot_renderer` (was `godot_event_handler_hash_map`)
+- `sub_5d7aa0` → `mcp_init_renderer_and_scene_cache_singletons`
+- `sub_66af30` → `mcp_SceneCache_ctor`
+- `sub_66db64` → `mcp_PreLoadSceneCache_thread_body`
+- `data 0x445fa40` → `mcp_g_display_renderer`
+- `data 0x445fa48` → `mcp_g_scene_cache`
+
+SW LE BNDB:
+- `sub_4c2140` → `mcp_SceneCache_initialize`
+- `sub_4c2ea4` → `mcp_SceneCache_load_thread_body`
+- `sub_41e0c0` → `mcp_RadiumScene_base_ctor`
+- `sub_4c17e0` → `mcp_SceneCache_add_scene_to_display_unsure`
+- `sub_4bfe90` → `mcp_RadiumScene_subclass_A_ctor_unsure`
+- `sub_2b9b90` → `mcp_spawn_procDispatch_thread`
+- `sub_4c0250` → `mcp_SceneCache_ctor`
+- `sub_35ded0` → `mcp_DisplayRenderer_ctor`
+- `sub_309af0` → `mcp_init_renderer_and_scene_cache_singletons`
+- `sub_4c2e84` → `mcp_PreLoadSceneCache_thread_body`
+- `sub_2b95d0` → `mcp_main_watchdog_shutdown`
+- `sub_35e130` → `mcp_DisplayRenderer_render_thread_body`
+- `sub_308d00` → `mcp_DisplayRenderer_singleton_get`
+- `data 0x804030` → `mcp_g_display_renderer`
+- `sub_3064e0` → `mcp_request_scene_display_with_dedup_unsure`
+
+User confirmed File→Save on both DBs at intermediate checkpoints.
+
+### Step 74i — Pending follow-ups (not started)
+
+- Game-detect gating for `shim_dump_sound_globals` / `shim_dump_cmodes` / `shim_dump_dispatch_tables` so SIGTERM cleanup doesn't segfault on non-Pokemon games.
+- 17 cross-directory broken symlinks in SW LE's `usr/lib/` (libblkid.so, libcurses.so, lib++dfb.so, etc.) — left unfixed because they didn't block boot.
+
