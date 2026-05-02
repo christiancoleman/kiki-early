@@ -163,55 +163,10 @@ void shim_frame_capture_at_page_flip(void); /* called from the DRM PAGE_FLIP ioc
 void shim_audio_start(void);              /* audio bridge; no-op unless SPIKE3_AUDIO_BRIDGE=1 */
 void shim_audio_emit(const uint8_t *buf, size_t bytes); /* called from snd_pcm_writei */
 
-
-
-
-
-
-void shim_patch_spi_video_vtable(void);
-void shim_patch_get_format_callback(void);
-void shim_patch_audio_driver_vtable(void);
-
-void shim_patch_video_player_assertion(void);
-void shim_patch_video_player_play_entry_brk(void);
-extern volatile uintptr_t shim_vp_play_entry_runtime;
-
-/* sub_8edfe0 BRK-trap stub (Step 72): replaces the in-binary nodebus-read
- * function with a shim-side synthesizer. When armed, the SIGTRAP handler
- * (in spi_shim.c) writes shim_sub_8edfe0_payload into the caller's 8-byte
- * buffer when arg1 (channel) matches shim_sub_8edfe0_arm_channel, then
- * returns 1 + skips to LR. Outside the arm window, synthesizes an all-zero
- * buffer and returns 1 (matches the bridge poll's empty-frame status quo,
- * since the netbridge is fully synthesized by shim_nodebus.c anyway).
- *
- * Used to drive switch 93 (Start Button) by:
- *   shim_sub_8edfe0_arm(channel=6, payload={0,0,0x60,0,...}, hold_ms=120)
- * which pulses the wire-side bits (byte 2 bits 5+6 = bit indices 21+22 in
- * the 8-byte channel buffer per BN trace of sub_7b4d00) for ~120 ms then
- * releases. The diff-and-enqueue translator at sub_651610 sees the rising
- * edge, pushes a pending-list entry, and the drainer fires the event. */
-void shim_patch_sub_8edfe0_brk(void);
-extern volatile uintptr_t shim_sub_8edfe0_runtime;
-extern volatile int       shim_sub_8edfe0_arm_channel;     /* -1 == no channel armed */
-extern volatile uint64_t  shim_sub_8edfe0_arm_deadline_ms; /* CLOCK_MONOTONIC ms */
+extern volatile int       shim_sub_8edfe0_arm_channel;
+extern volatile uint64_t  shim_sub_8edfe0_arm_deadline_ms;
 extern volatile uint8_t   shim_sub_8edfe0_payload[8];
-
-/* Arm the BRK-trap synthesizer. After hold_ms ms, the channel match
- * disarms (deadline expires). Defined in shim_inject.c. */
 void shim_sub_8edfe0_arm(int channel, const uint8_t payload[8], uint32_t hold_ms);
-
-/* fire_event BRK selective-return (Step 72g): patches fire_event entry
- * (BN VA 0x5c12a0) with `brk #0`. SIGTRAP handler reads x0 (event_id)
- * and forces return 1 (skipping the function) for event_ids in
- * {0x80, 0x81, 0x82, 0x83} — the orchestrator gates per Step 72c BN
- * trace. For all other event_ids, emulates the function's first
- * instruction (stp x19, x20, [sp, #-32]!) and advances pc by 4 to let
- * the function run normally.
- *
- * Self-gated on SPIKE3_FORCE_NODEBUS_GATES=1. Without this gate set,
- * the patch is not installed and fire_event runs untouched. */
-void shim_patch_fire_event_brk(void);
-extern volatile uintptr_t shim_fire_event_runtime;
 
 /* ---- AF_UNIX abstract-namespace addressing ----
  * WSL2's 9P mount of /mnt/c/... does NOT support AF_UNIX bind (errno 95

@@ -944,30 +944,9 @@ static void *shim_poke_state_flag_thread(void *arg) {
     return NULL;
 }
 
-/* ========== moved from spi_shim.c (823-831): vp_patch thread ========== */
-static void *shim_vp_patch_thread(void *arg) {
+static void *shim_discovery_init_thread(void *arg) {
     (void)arg;
-    /* Wait for game's C++ static initializers to complete before patching.
-     * 2 seconds is generous; could shrink later once we know it's stable. */
     sleep(2);
-    shim_patch_spi_video_vtable();
-    shim_patch_get_format_callback();
-    shim_patch_audio_driver_vtable();
-
-    shim_patch_video_player_assertion();
-    shim_patch_video_player_play_entry_brk();
-    /* Step 72: in-binary BRK trap that synthesizes per-channel switch
-     * state; needs game_base resolvable, so deferred to here too. The
-     * function self-gates on SPIKE3_PATCH_SUB_8EDFE0=1 OR SPIKE3_FIRE_SWITCH
-     * being set. */
-    shim_patch_sub_8edfe0_brk();
-    /* Step 72g: fire_event selective-return BRK — forces the
-     * orchestrator-gating events (0x80..0x83) to return 1 so the
-     * nodebus poll thread spawns and the orchestrator completes.
-     * Self-gates on SPIKE3_FORCE_NODEBUS_GATES=1. */
-    shim_patch_fire_event_brk();
-    /* Discovery module: same game_base-resolution dependency as the
-     * patches above, so deferred to the same 2 s settle window. */
     shim_discovery_init();
     return NULL;
 }
@@ -1296,16 +1275,10 @@ void shim_inject_start(void) {
         }
     }
 
-    /* SPIKE3_PATCH_SPI_VIDEO=1 — apply the Step 62 SpiDecoder::Play vtable
-     * patch (and Step 64 get_format NOP) after a 2-second settle. The
-     * patch functions themselves live in shim_patches.c. */
     {
-        const char *pv = getenv("SPIKE3_PATCH_SPI_VIDEO");
-        if (pv && pv[0] == '1') {
-            pthread_t t;
-            if (pthread_create(&t, NULL, shim_vp_patch_thread, NULL) == 0)
-                pthread_detach(t);
-        }
+        pthread_t t;
+        if (pthread_create(&t, NULL, shim_discovery_init_thread, NULL) == 0)
+            pthread_detach(t);
     }
 
     /* SPIKE3_FORCE_NODEBUS_GATES=1 — Step 72g: spawn the gate-poker

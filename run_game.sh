@@ -28,11 +28,9 @@
 #   REAL_GL=<0|1>           [1]     forward EGL/GLES to Mesa vs return stubs
 #   FRAME_BRIDGE=<0|1>      [1]     emit RGBA frames on /tmp/spike3_frame.sock
 #   AUDIO_BRIDGE=<0|1>      [1]     emit S16_LE PCM on /tmp/spike3_audio.sock
-#   PATCH_SPI_VIDEO=<0|1>   [1]     vtable-patch SpiDecoder::Play (Step 62)
-#   SW_HEVC=<0|1>           [1]     NOP-patch get_format + accept SW pix_fmt
-#   PATCH_AUDIO_ABRT=<0|1>  [1]     patch AudioDriver vtable slot 7 to no-op
-#                                   (Step 65) — fixes pure-virtual abort during
-#                                   teardown race in audio mixer thread
+#   SW_HEVC=<0|1>           [1]     name-swap hevc_v4l2request → hevc in
+#                                   avcodec_find_decoder_by_name (libavcodec
+#                                   hook). No game-binary patching.
 #   STATE_BRIDGE=<0|1>      [0]     emit cmode JSON on /tmp/spike3_bridge.sock
 #   LOGFILE=<path>          []      redirect game stdout+stderr to a file
 #                                   (separate from --debug; only affects game)
@@ -77,7 +75,6 @@ TIMEOUT="${TIMEOUT:-0}"
 REAL_GL="${REAL_GL:-1}"
 FRAME_BRIDGE="${FRAME_BRIDGE:-1}"
 AUDIO_BRIDGE="${AUDIO_BRIDGE:-1}"
-PATCH_SPI_VIDEO="${PATCH_SPI_VIDEO:-1}"
 SW_HEVC="${SW_HEVC:-1}"
 # FORWARD_DECODE=1: launch decode_daemon.py and route the game's
 # avcodec_send_packet/receive_frame to host NVDEC via AF_UNIX. Opt-in
@@ -89,7 +86,6 @@ FORWARD_DECODE="${FORWARD_DECODE:-0}"
 # behavior or other "things hit the fan" debugging that wants maximum
 # fs-call visibility in discovery.log.
 FS_DIAG_VERBOSE="${FS_DIAG_VERBOSE:-0}"
-PATCH_AUDIO_ABRT="${PATCH_AUDIO_ABRT:-1}"
 STATE_BRIDGE="${STATE_BRIDGE:-0}"
 OFFLINE_MODE="${OFFLINE_MODE:-1}"
 VIEWER="${VIEWER:-1}"
@@ -383,11 +379,9 @@ if [[ "$REAL_GL" == "1" ]]; then
 fi
 [[ "$FRAME_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_FRAME_BRIDGE=1")
 [[ "$AUDIO_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_AUDIO_BRIDGE=1")
-[[ "$PATCH_SPI_VIDEO"  == "1" ]] && args+=(-E "SPIKE3_PATCH_SPI_VIDEO=1")
 [[ "$SW_HEVC"          == "1" ]] && args+=(-E "SPIKE3_SW_HEVC=1")
 [[ "$FORWARD_DECODE"   == "1" ]] && args+=(-E "SPIKE3_FORWARD_DECODE=1")
 [[ "$FS_DIAG_VERBOSE"  == "1" ]] && args+=(-E "SPIKE3_FS_DIAG_VERBOSE=1")
-[[ "$PATCH_AUDIO_ABRT" == "1" ]] && args+=(-E "SPIKE3_PATCH_AUDIO_ABRT=1")
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")
 [[ "$OFFLINE_MODE"    == "1" ]] && args+=(-E "SPIKE3_OFFLINE=1")
 
