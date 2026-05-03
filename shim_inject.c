@@ -944,10 +944,16 @@ static void *shim_poke_state_flag_thread(void *arg) {
     return NULL;
 }
 
+
+
+
+
+
 static void *shim_discovery_init_thread(void *arg) {
     (void)arg;
     sleep(2);
     shim_discovery_init();
+
     return NULL;
 }
 

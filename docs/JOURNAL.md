@@ -6642,3 +6642,85 @@ SW LE crashed because `"Connectivity/TestMenu/Diag_1360"` scene lookup returned 
 
 When a new session opens, MEMORY.md will point here via `Latest JOURNAL step: 75 — boot-blocker threads`. Update that pointer when a new Step N+1 is added.
 
+
+
+## Step 76: T2 SPI experiments + run-archiving infrastructure (2026-05-03)
+
+### Step 76a — Two new shim env-var knobs
+
+Added in `shim_ioctl.c`:
+- **`SPIKE3_SPI_QUIET=1`** — default rx[2] flips from `0x04` to `0x00`. Per-cmd overrides via `SPIKE3_SPI_RX_<HEX>=` still take precedence.
+- **`SPIKE3_SPI_DELAY_US=<int>`** — `usleep(N)` inside each SPI ioctl handler. Clamped 0..100000.
+
+Both wired into `run_game.sh` as `SPI_QUIET` / `SPI_DELAY_US` shell tunables (defaults 0).
+
+### Step 76b — T2 experimental results (PLE)
+
+Three PLE runs compared (all with `--debug` for full logs):
+
+| run | SPI_QUIET | SPI_DELAY_US | duration | page flips/sec | audio writes/sec | bridge timeouts |
+|---|---|---|---|---|---|---|
+| baseline (earlier today, log lost) | 0 | 0 | 30s | ~270 | ~3800 | unknown (not measured) |
+| QUIET=1 | 1 | 0 | 87s | ~3 | ~160 | 53 |
+| DELAY=100 | 0 | 100 | 147s | ~2 | ~93 | **105** |
+
+**Key finding:** byte 2 = 0x04 in the SPI RX is load-bearing for the netbridge protocol's "ack / data-available" semantics. With QUIET=1, the game thinks the bridge never has data, so bridge messages time out. Activity drops 24-90× because downstream work depends on successful bridge round-trips.
+
+**Same error categories** appeared in both QUIET and DELAY runs (and likely in baseline too — never confirmed because runs/latest was overwritten before we extracted error counts). The new persistent error families surfaced in this session:
+- `bridge message (cmd=N, id=N) response failed 110: Connection timed out` (53 in QUIET, 105 in DELAY)
+- `write failed to verify at N: reads back as ffffffff, should be N` (7 each — netbridge.elf or pwrdist flash verification)
+- `[Radium Error] VideoStreamDecoder: Error sending packet to decoder: Operation not permitted` (3-5)
+- `[Radium Error] Failed to get HW surface format.` (3-5)
+- `[hevc] Failed to find a V4L device for HW` (2-5)
+- `[hevc] Failed setup for format drm_prime: hwaccel initialisation returned error.` (2-5)
+- `failed to write BQ coefficients: No such file or directory` (4) — MAX9850 audio DAC config write
+- `bridge message ... Connection timed out` (errno 110)
+
+**Net interpretation for T2:** byte 2 = 0x04 is necessary; flipping it off doesn't help. Slowing the SPI rate doesn't change *which* paths the game runs — same error families, just amplified bridge timeouts. T2 in its naive form is not a win. Refined T2 would need cmd-specific responses (e.g., 0x04 only for cmds netbridge-handles-directly, different status bytes for node-addressed cmds) — would require studying netbridge.elf's `HOST_Update` dispatch table.
+
+**Default settings reverted.** `SPI_QUIET=0` and `SPI_DELAY_US=0` are the defaults. Knobs left in place for future experiments.
+
+### Step 76c — Run-archiving infrastructure
+
+Every run now creates its own folder; `runs/latest` is a symlink to it. Backward-compatible with anything referencing `runs/latest/<file>`.
+
+Layout:
+```
+runs/
+├── latest -> 2026-05-03T00.45.10_quiet_test/
+├── 2026-05-03T00.45.10_quiet_test/
+│   ├── run_info.txt       # timestamp, note, env-toggle table, qemu cmd
+│   ├── game.log
+│   ├── audio.log
+│   ├── boot_display.log
+│   ├── service_s_worker.log
+│   ├── decode_daemon.log
+│   ├── discovery.log
+│   └── viewer.log
+├── 2026-05-03T00.06.18_delay_100us/
+└── ...
+```
+
+New CLI flag: `--note "..."` (or `-note "..."`) — sanitized to `[a-z0-9_]`, max 40 chars, appended as suffix to the run dir name.
+
+`run_info.txt` is written **before** the qemu launch so metadata survives even if launch fails. Contains: timestamp, run_dir, sysroot, game_dir, note, raw shell invocation, all env-toggle values (DEBUG/SPI_QUIET/SPI_DELAY_US/...), and the full qemu command line.
+
+This addresses the recurring problem of "we can't compare to the previous run because runs/latest was overwritten."
+
+### Step 76d — NV persistence pushback (corrected)
+
+User pushed back on prior `project_persistence_gap.md` claim that "NV persistence is fully stubbed." Verified 2026-05-02:
+- **PIN_NVRAM persists correctly.** Sequential `00000065/00000066/00000067` files across runs, mtimes track run starts, NFI2-format content with NSEC timestamps + NDAT records.
+- **SYS_NVRAM/NVRAM/etc. have real content but stale mtimes.** Most likely cause: the game never triggers the "save settings" path because nobody completes Guided Setup → Save & Exit. Less likely: shim hooks subtly broken for those write paths.
+
+`project_persistence_gap.md` memory updated to reflect this nuance — the gap is narrower than originally claimed.
+
+### Step 76e — Pending followups
+
+- T1, T3, T4, T5, T6, T7, T8 from Step 75 still open. Most actionable:
+  - **T5** (spike_menu boot test) — fastest "is the env right" check, ~15 min.
+  - **T6** (full Researcher A list review for terminology) — pure orientation.
+  - **T7** (find first-run NV gate flag) — concrete static-analysis target.
+- Task #13 (gate Pokemon-specific shim diagnostics so SIGTERM doesn't segfault on non-Pokemon games) — still pending, not blocking anything currently.
+- 17 cross-directory broken symlinks in SW LE's `usr/lib/` from Step 74f — still unfixed, didn't block boot.
+
