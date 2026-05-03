@@ -269,6 +269,17 @@ int ioctl(int fd, unsigned long request, ...) {
             uint8_t cmd = (tx && len > 0) ? tx[len - 1] : 0;
             uint32_t cmd_seen = ++spi_cmd_count[cmd];
 
+            {
+                static int delay_us_cached = -1;
+                if (__builtin_expect(delay_us_cached < 0, 0)) {
+                    const char *d = getenv("SPIKE3_SPI_DELAY_US");
+                    delay_us_cached = (d && d[0]) ? atoi(d) : 0;
+                    if (delay_us_cached < 0) delay_us_cached = 0;
+                    if (delay_us_cached > 100000) delay_us_cached = 100000;
+                }
+                if (delay_us_cached > 0) usleep((useconds_t)delay_us_cached);
+            }
+
             /* Craft RX response BEFORE logging so the log reflects what we
              * actually returned. */
             if (rx && len > 0) {
@@ -278,7 +289,12 @@ int ioctl(int fd, unsigned long request, ...) {
                     if (n > len) n = len;
                     memcpy(rx, spi_rx_override[cmd], n);
                 } else if (len > 2) {
-                    rx[2] = 0x04;  /* historical default — keeps old behavior */
+                    static int quiet_cached = -1;
+                    if (__builtin_expect(quiet_cached < 0, 0)) {
+                        const char *q = getenv("SPIKE3_SPI_QUIET");
+                        quiet_cached = (q && q[0] == '1') ? 1 : 0;
+                    }
+                    rx[2] = quiet_cached ? 0x00 : 0x04;
                 }
             }
 

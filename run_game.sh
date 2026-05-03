@@ -36,6 +36,15 @@
 #                                   (separate from --debug; only affects game)
 #   QEMU=<bin>              [qemu-aarch64]     override qemu binary
 #
+# RUN ARCHIVING:
+#   Every run gets its own timestamped folder at runs/<TS>[_<note_slug>]/
+#   containing all log files for that run. runs/latest/ is a symlink to the
+#   most recent one — backward-compatible with everything that referenced
+#   runs/latest/<file>. A run_info.txt at the top of each folder records
+#   timestamp, note, the env-toggle table, and the qemu invocation.
+#   Pass --note "your description" (or -note) to add a slug to the folder
+#   name and a note line to run_info.txt.
+#
 #
 # PREREQS (see docs/SETUP.md for details):
 #   - qemu-user (provides qemu-aarch64 + binfmt_misc)
@@ -51,13 +60,26 @@ set -uo pipefail
 # ---- Parse script-level flags (everything else falls through to qemu) ----
 DEBUG=0
 POSITIONAL=()
+NOTE=""
+expecting_note=0
 for a in "$@"; do
+    if [[ "$expecting_note" == "1" ]]; then
+        NOTE="$a"; expecting_note=0; continue
+    fi
     case "$a" in
         --debug) DEBUG=1 ;;
+        --note|-note) expecting_note=1 ;;
         *)       POSITIONAL+=("$a") ;;
     esac
 done
 set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+
+# Sanitize note → directory-safe slug (alnum + underscore, lowercase, ≤40 chars).
+NOTE_SLUG=""
+if [[ -n "$NOTE" ]]; then
+    NOTE_SLUG=$(printf '%s' "$NOTE" | tr -c 'A-Za-z0-9' '_' | tr 'A-Z' 'a-z' | sed -E 's/_+/_/g; s/^_+//; s/_+$//')
+    NOTE_SLUG="${NOTE_SLUG:0:40}"
+fi
 
 # ---- Auto-detect paths ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -68,7 +90,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # canonical PLE one); SCRIPT_DIR resolves to whichever game we're launching.
 GAME_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SYSROOT="$(cd "$GAME_DIR/../.." && pwd)"
-LATEST_DIR="$SCRIPT_DIR/runs/latest"
+RUN_TS="$(date +%Y-%m-%dT%H.%M.%S)"
+RUN_DIRNAME="$RUN_TS${NOTE_SLUG:+_$NOTE_SLUG}"
+RUN_DIR="$SCRIPT_DIR/runs/$RUN_DIRNAME"
+LATEST_DIR="$RUN_DIR"
+mkdir -p "$RUN_DIR"
+ln -sfn "$RUN_DIRNAME" "$SCRIPT_DIR/runs/latest"
 
 # ---- Defaults (override via env) ----
 TIMEOUT="${TIMEOUT:-0}"
@@ -86,6 +113,17 @@ FORWARD_DECODE="${FORWARD_DECODE:-0}"
 # behavior or other "things hit the fan" debugging that wants maximum
 # fs-call visibility in discovery.log.
 FS_DIAG_VERBOSE="${FS_DIAG_VERBOSE:-0}"
+# SPI_QUIET=1: stop replying byte-2=0x04 ("ack/data-available") to every SPI
+# transfer; instead reply all-zeros. Per-cmd overrides via SPIKE3_SPI_RX_<HEX>=
+# still take precedence. T2 experiment per JOURNAL Step 75 — see if the game
+# behaves differently when it stops getting universal-positive responses.
+SPI_QUIET="${SPI_QUIET:-0}"
+# SPI_DELAY_US: sleep this many microseconds inside each SPI ioctl handler.
+# Real hardware's SPI poll loop runs at ~10kHz; qemu+shim handle each call in
+# microseconds, so the game polls millions/sec. Setting 100 caps at ~10kHz
+# (closer to realistic) and makes the log readable. T2-followup per JOURNAL
+# Step 75. Clamped 0..100000.
+SPI_DELAY_US="${SPI_DELAY_US:-0}"
 STATE_BRIDGE="${STATE_BRIDGE:-0}"
 OFFLINE_MODE="${OFFLINE_MODE:-1}"
 VIEWER="${VIEWER:-1}"
@@ -382,6 +420,8 @@ fi
 [[ "$SW_HEVC"          == "1" ]] && args+=(-E "SPIKE3_SW_HEVC=1")
 [[ "$FORWARD_DECODE"   == "1" ]] && args+=(-E "SPIKE3_FORWARD_DECODE=1")
 [[ "$FS_DIAG_VERBOSE"  == "1" ]] && args+=(-E "SPIKE3_FS_DIAG_VERBOSE=1")
+[[ "$SPI_QUIET"        == "1" ]] && args+=(-E "SPIKE3_SPI_QUIET=1")
+[[ "$SPI_DELAY_US"     != "0" ]] && args+=(-E "SPIKE3_SPI_DELAY_US=$SPI_DELAY_US")
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")
 [[ "$OFFLINE_MODE"    == "1" ]] && args+=(-E "SPIKE3_OFFLINE=1")
 
@@ -411,6 +451,29 @@ printf '[run_game] %s\n'        "${args[*]}" >&2
 if [[ "$TIMEOUT" == "0" ]]; then
     printf '[run_game] no timeout — press Ctrl+C to stop the game\n' >&2
 fi
+
+# Write run metadata to the top of the run dir (before launch — captured even
+# if launch fails). Includes timestamp, note, the env-toggle table, the full
+# qemu command line, and the originating shell invocation.
+{
+    printf '# run metadata — Pokémon LE / Star Wars LE emulation\n'
+    printf 'timestamp:   %s\n' "$RUN_TS"
+    printf 'run_dir:     %s\n' "$RUN_DIR"
+    printf 'sysroot:     %s\n' "$SYSROOT"
+    printf 'game_dir:    %s\n' "$GAME_DIR"
+    [[ -n "$NOTE" ]] && printf 'note:        %s\n' "$NOTE"
+    printf '\n# invocation (raw shell)\n'
+    printf '$ %s %s\n' "$0" "$*"
+    printf '\n# env-toggle settings (final values)\n'
+    for v in TIMEOUT REAL_GL FRAME_BRIDGE AUDIO_BRIDGE SW_HEVC FORWARD_DECODE \
+             FS_DIAG_VERBOSE SPI_QUIET SPI_DELAY_US STATE_BRIDGE OFFLINE_MODE \
+             VIEWER VIEWER_FULLSCREEN AUDIO_PLAYER TIMER  BOOT_DISPLAY \
+             BOOT_DISPLAY_DURATION STALE_KILL DEBUG LOGFILE; do
+        printf '  %-22s = %s\n' "$v" "${!v:-}"
+    done
+    printf '\n# qemu invocation\n'
+    printf '%s\n' "${args[*]}"
+} > "$RUN_DIR/run_info.txt"
 
 cd "$GAME_DIR"
 # Background qemu + wait so the trap can kill it directly on Ctrl+C (bash
