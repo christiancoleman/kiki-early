@@ -6579,3 +6579,66 @@ User confirmed File→Save on both DBs at intermediate checkpoints.
 - Game-detect gating for `shim_dump_sound_globals` / `shim_dump_cmodes` / `shim_dump_dispatch_tables` so SIGTERM cleanup doesn't segfault on non-Pokemon games.
 - 17 cross-directory broken symlinks in SW LE's `usr/lib/` (libblkid.so, libcurses.so, lib++dfb.so, etc.) — left unfixed because they didn't block boot.
 
+
+
+## Step 75: Boot-blocker threads — Connectivity Setup screen identified, eight investigation tracks (2026-05-02)
+
+User documentation of expected first-run boot sequence:
+1. Coin door start → ~10s Stern Pinball logo + "Initializing..." with animated dots
+2. ~5s Pokemon logo
+3. ~8s "Pending Licensor Approval" + SPIKE3 (animated)
+4. ~4s version screen: "POKEMON PRO / U.S.A. V0.75.0 / ENGLISH - 416172 / Stern Pinball logo"
+5. Boot screen with Spike3 logo + ProgressBar (Radium scene `demand_loaded/bc0792d8.../036fe928.../scene.radium.json`)
+6. ~2s **RED SCREEN (No Connection) + Guided Setup** — Lingua/Country/Free Play/Pricing/Volume/Networking/Stern Service S/Save&Exit
+7. After Save&Exit: Pokemon logo → attract loop
+
+Our emulator never gets past step 6. The "Connectivity/TestMenu/*" UI strings (`Page1, Cursor, Boxes_*, K_BKSPC, K_DONE, K_FWD, Numeric_Keyboard_Keypad`) are the operator's WiFi-credentials keyboard inside the Networking sub-page. The `"Connectivity/TestMenu/Diag_1360"` lookup that crashed SW LE at `sub_36a890` is a UI element in that screen.
+
+PLE: rendered, alert sound spam, can't dismiss (no input mechanism). SW LE: same code path but missing asset → NULL deref → SIGSEGV at `0xd8`.
+
+**NV persistence pushback (corrected previous claim):** PIN_NVRAM IS persisting — sequential `00000065/66/67` across runs, mtimes track run starts, NFI2-structured content with NSEC timestamps + NDAT records. SYS_NVRAM/NVRAM/etc. have real content but stale mtimes — likely because we never trigger "save settings" (no operator input completes the Guided Setup). `project_persistence_gap.md` memory needs amendment; the gap is narrower than stated.
+
+### Threads to pursue (user-proposed + a few additions)
+
+Numbered for reference. Listed in order of likely fruitfulness based on symptom-to-action distance, not user priority.
+
+**T1. Hardware-trust / DRM-style minimum-presence check.**
+Hypothesis: the game has a "minimum hardware acknowledged" gate before it leaves Guided Setup / enters attract. Stern manufactures these as kiosks; the firmware likely refuses to leave service mode until N nodes have responded credibly. Find that gate (probably in cmode init, switch-manifest validation, or one of the `data_44821xx` flags Step 72g touched). If we can satisfy or bypass, attract should proceed. Highest leverage; hardest to localize.
+
+**T2. Less-chatty shim / authentic device-presence pattern.**
+Currently the shim returns `00 00 04 00 00 00 00 00` to every SPI cmd. Real hardware doesn't always respond — non-present nodes return nothing, and the response byte 2 (currently hardcoded `0x04`) carries node-status. Hypothesis: the game expects a specific topology of present/absent nodes, and our universal-positive responses look wrong. Make the shim return "no response" (or a "device-absent" sentinel) for SPI commands targeting node IDs not in the Pokemon LE manual's node table; keep "present" responses only for the ~10 nodes actually in the cabinet (CPU, pwrdist, lcd, hdmi, coil4_led, pin, ws2812, magsensor, tmc, node4 variants per Step-26 hardware inventory). Surgical, high-impact, easy to A/B.
+
+**T3. Properly run dprint + boot_display.**
+We disabled both with `BOOT_DISPLAY=0` in recent runs. Stern's real boot uses `boot_display` to draw the splash sequence and `dprint` for debug-print output. The game opens `/games/data/boot_display_cmd` (FAILs in our log) which boot_display would have created. Without boot_display, the game's progress sequence may be skipping the splash and landing on the Guided Setup directly. Re-enable, see whether the boot sequence advances differently.
+
+**T4. Version-info screen orientation in BN.**
+User-suggested: rather than "fix everything and hope", anchor on the screen AFTER the Pokemon logo (the "POKEMON PRO / U.S.A. V0.75.0 / ENGLISH - 416172 / Stern Pinball logo" version screen). Find which Radium scene name corresponds to it, find the code that triggers it in the binary (likely a `select_and_load_scene(scene_id_X)` call), trace what gates that call. If the gate is a flag we can set, we're past the version screen and can chase the next gate.
+
+**T5. spike_menu boot under our emulator.**
+`games/pokemon_le/spike3/spike_menu/` has its own `game` binary + `image.bin` — a non-Godot Spike 3 system menu. Same shared Stern stack, no Pokemon-port glue. If our emulator can't boot spike_menu either, the bug is in the shared Stern path (env / hardware / nodebus). If spike_menu boots cleanly, the bug is specific to game-binary expectations beyond what spike_menu requires. spike_menu is small and usually completes its boot in seconds — quick test.
+
+**T6. Compare external terminology.**
+The proposed review concerned an external annotation set from Researcher A.
+It was an orientation task, with no code changes recorded here.
+[Redacted: third-party annotation inventory and identifying labels.]
+
+**T7. Find first-run / Service S-completed NV flag.**
+Find the specific NV byte the game checks to decide "show Guided Setup vs. show attract". If it lives in a writable NV file (we know PIN_NVRAM works), we can pre-populate it. Concretely: grep the binary for what reads from SYS_NVRAM near boot, find the if-condition that gates Guided Setup display. Brittle but cheap.
+
+**T8. Connectivity diag asset audit.**
+SW LE crashed because `"Connectivity/TestMenu/Diag_1360"` scene lookup returned NULL. Verify whether PLE actually has that scene in its `image.bin` — if so, the SW LE difference is "asset present in PLE only", which would be useful confirmation. If neither has it, both are coincidentally hitting the same NULL but PLE survives somehow (maybe checks `if (NULL) skip` somewhere we haven't seen). Use `_extraction/spike_extract_out/` index to look up scene names by SHA1.
+
+### Likely highest-fruitfulness ranking
+
+1. **T2 (less-chatty shim)** — small code change with broad behavioral impact; testable in <30 min.
+2. **T5 (spike_menu boot)** — fastest "is the env right at all" check; should take <15 min to set up and run.
+3. **T1 (hardware-trust gate)** — likely the actual root cause but hardest to localize; should be informed by T2/T5 results.
+4. **T3 (dprint/boot_display re-enable)** — easy to enable and re-run; may unblock the boot sequence if it relies on boot_display side effects.
+5. **T4, T7** — both depend on BN work; medium effort.
+6. **T6** — pure orientation; do alongside.
+7. **T8** — confirms a hypothesis but doesn't unblock progress.
+
+### Latest-step pointer (2026-05-02)
+
+When a new session opens, MEMORY.md will point here via `Latest JOURNAL step: 75 — boot-blocker threads`. Update that pointer when a new Step N+1 is added.
+
