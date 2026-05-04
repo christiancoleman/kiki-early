@@ -6724,3 +6724,241 @@ User pushed back on prior `project_persistence_gap.md` claim that "NV persistenc
 - Task #13 (gate Pokemon-specific shim diagnostics so SIGTERM doesn't segfault on non-Pokemon games) — still pending, not blocking anything currently.
 - 17 cross-directory broken symlinks in SW LE's `usr/lib/` from Step 74f — still unfixed, didn't block boot.
 
+## Step 77: Alternate startup-mode experiment and scene-loading observations (2026-05-04)
+
+### Step 77a — Startup-mode experiment
+
+> [Redacted: the activation patch, target address, write value and confirming
+> patch log. This experiment altered startup mode; the observations below
+> describe that altered run, not normal startup.]
+
+### Step 77b — Run diff (baseline `01.05.01` no-patch vs `23.53.48_diag_mode_v2` diag-on)
+
+Both runs same shim infrastructure modulo the byte; baseline had `SPI_DELAY_US=100`, diag had `=0`, so SPI poll volume differs but semantic events are comparable. Pulled unique log-line patterns from each, filtered SPI noise, diffed.
+
+**Activity that exists ONLY in the diag run:**
+
+| New event | Source / interpretation |
+|---|---|
+| `Node not found: "/root/Main"` from `/root/Discover/discover_progress_bar` | Discover/Pokédex GDScript instantiating |
+| Same error from `/root/capture_battle_scene/battle_scene_grp/...` | Capture battle scene instantiating |
+| `Node not found: "AnimationPlayer"` from `/root/pokemon_battle_scene` | Pinball battle scene instantiating |
+| `bridge: cmd 0x41 slot=N inner_cmd=0xfa/0xfe payload=[…]` | **Encrypted nodebus traffic** — see `project_nodebus_cipher.md`. Never seen in baseline. |
+| `bridge: no synthetic response for cmd 0x12` | New cmd 0x12 issued; our shim doesn't synthesize it yet. |
+| `[gpiod] line_request_output(gpiochip1:7, consumer="ant2")` | Antenna-2 GPIO init (Bluetooth/WiFi-related) |
+| `system() rm -rf /connectivity/files/gkpd_{1,2,3}` | Cleanup of "gkpd" cache files |
+| `access /connectivity/update/UPDATE_COMPLETED` (FAILED) | Software-update marker probe |
+| Two extra `/proc/cpuinfo` opens (fd 36, 37) | Additional CPU enum |
+
+Baseline has **zero** hits on `Discover`, `capture_battle_scene`, `pokemon_battle_scene`, `bridge cmd 0x41`, or any of the others.
+
+### Step 77c — User context: connects to extracted-previs keyboard-jump test scene
+
+User confirmed: when extracting the Godot project (`assets/godot/main.pck`), there's a test mode that shows a scene with keyboard combinations (Ctrl+B/D/C/P per project `CLAUDE.md`) to hop directly into battle / discover / capture / pokédex. The diag flag plausibly gates the **same** test-cycler — the C++ side that auto-attempts these scenes without needing real keyboard input or completed Guided Setup. Code structure consistent: 7 of the 8 previs `.gd` scripts call `get_node("/root/Main")` (`bkgnd_video_player_manager`, `capture_bkgnd_video_player_manager`, `capture_char_sprite_manager`, `discover_bkgnd_video_player`, `discover_progress_bar`, `game_session`, etc.). User said `/root/Main` was commented out in the previs project to make it work; in the shipping binary `/root/Main` is also missing for the same root cause (see 77d).
+
+### Step 77d — `/root/Main` re-look: nothing new
+
+Per `feedback_grep_journal_before_change.md`, did a 30-second grep before deep-diving:
+
+- BN entry **[81]** (referenced JOURNAL line 5192): standard Godot init bypassed — `OS::initialize` / `DisplayServer::create` / `RenderingServer::init` / `SceneTree::init` / `Main::setup` / `Main::start` are all absent from runtime flow. `procDispatch` at `sub_b2ae90` drives the show via condition variables and event firing.
+- Step **73g** (2026-05-01): Radium-as-orchestrator reframe. The `is_inside_tree() == false` symptom isn't about a missing top-level `/root/Main` in Godot's main SceneTree — it's the embedded Godot subtree owned by a `ManualGodotScene` element that never properly attaches when Radium loads a scene containing a Godot-typed element.
+- Strings check fresh: `Main::Setup`, `Main::Setup2`, `Main::Start`, `Main::Cleanup` are present in the binary as C++ symbols, and `res://scenes/main.tscn` exists in `main.pck`. Neither is on the runtime path.
+
+So there's no new lead here. The `/root/Main` errors the diag flag triggers are downstream evidence of "test-cycler activated, but the embedded-subtree mount machinery still isn't there." Not a Godot fix path — Pokemon-port glue, out of scope per `feedback_godot_is_illegal.md`.
+
+### Step 77e — `runs/latest` fixed
+
+Side bug surfaced during 77b log inspection: `runs/latest` had become a stale directory (with old log files + broken self-symlinks) instead of a symlink. `run_game.sh`'s `ln -sfn "$RUN_DIRNAME" "$SCRIPT_DIR/runs/latest"` silently no-ops when the link target already exists as a directory, so per-run logs were going to the timestamped dir but `runs/latest/` kept showing yesterday's contents.
+
+Fix: `rm -rf runs/latest`, then a fresh run (`runs/2026-05-03T23.59.10_diag_mode_v3_symlink_test`) re-created the symlink correctly. `runs/latest` now points at the most recent run dir as designed.
+
+### Step 77f — What this gives us / open threads
+
+**Useful side door:** the diag flag is a way to push the game into trying to render Pokemon-specific scenes (Discover/Capture/Battle) and exercise encrypted-nodebus + antenna paths **without** completing operator-side Guided Setup. Doesn't bypass the embedded-subtree mount problem — the scenes still error on `/root/Main` — but it activates a richer set of code paths than the attract-loop baseline.
+
+**Not a fix for the front-end blocker** (Step 75): the Connectivity Setup / Guided Setup path still doesn't complete; the test-cycler is a separate boot-mode selector. The two are independent.
+
+**Open:**
+- Whether the diag flag is C++ side or Godot side: `Main::Setup2` exists as a C++ symbol — possibly the second-stage init that respects this byte. Static-analysis target if useful.
+- Whether the encrypted bridge traffic (cmd 0x41) and `gkpd_*` rm calls are part of the test-cycler's setup or unrelated diag-mode side effects.
+- Cmd 0x12 has no synthetic response — minor gap in `shim_nodebus.c`. Add when bridge work resumes.
+
+## Step 78: BN notebook 2026-05-04 export — full boot-flow map + 7 high-value new leads (2026-05-04)
+
+### Step 78a — Source
+
+Fresh BN notebook export at `_emulation/reference/game - Binary Ninja Notebook Export (2026-05-04).json` (160 entries across 11 categories: algorithm 36, system_interaction 29, architecture 29, data_flow 34, hidden_feature 19, capability 4, hardware_interfaces 3, environmental 2, data_format 2, persistence 1, security 1). Substantially more boot-flow detail than the older 2026-04-22 export the memory still pointed at; previous version had 80 entries.
+
+### Step 78b — Startup authorization and diagnostic state
+
+> [Redacted: authorization-bypass mechanisms, patch targets and values,
+> key-derivation and provisioning details, and protected storage locations.]
+
+The notebook proposed a relationship between authorization state, diagnostic
+mode and a 12-state initialization machine. Subsequent work distinguished
+static structure from runtime evidence; the notebook alone did not prove the
+machine was responsible for the observed scene cycle.
+
+### Step 78c — `sub_873900` is a 12-state init/mode machine
+
+State machine "controls initialization sequence":
+- **State 0**: startup authorization check. [Redacted: internal identifier.]
+- **States 1-3**: initialization phases
+- **States 4-5**: diagnostic mode transitions
+- **States 6-8**: scene loading and processing  ← matches our Step 77 run-diff (Discover/Capture/Battle attempts)
+- **States 9-10**: cleanup and reset
+- (state 11 unaccounted for in notebook)
+
+[Redacted: the proposed authorization-override transition.] That's the test-cycler we observed.
+
+### Step 78d — Six-tier boot sequence (newly mapped at last)
+
+```
+_start (0x49cb80)
+ └─ __libc_start_main → main (0x461270)
+     • sets system_state_flags = 0x10
+     • sem_init on data_440abc8, data_440abe8
+     • registers SIGINT(2)/SIGBUS(10)/SIGSEGV(12)
+     • → primary_initialization_orchestrator (0x678bc0)
+         · init_spi_serial_bridge      ← MUST succeed or exits 0xe2
+         · mcp_eeprom_init
+         · mcp_init_renderer_and_scene_cache_singletons (0x5d7aa0)  ← graphics + boot-splash
+         · mcp_node_record_table_init
+         · hardware_input_validation
+         · [Redacted: identity/authorization initialization details]
+         · fires events 0x5c → 0x5e → 0x5f → 0x5d
+         · sets data_4482328 = 1 at completion
+     • → secondary_initialization (0x5abbf0)
+         · fires event 0x10 (start)
+         · CONDITIONAL: if sub_7a8de0(0x13) → calls sub_579d30() + setup
+         · fires event 0x11 (complete) — TWICE (early-return path + normal path)
+     • → create_dispatch_thread (0x72b160) → spawns 'procDispatch' (process_dispatch_loop @ 0x7292ac)
+     • → main_event_loop_with_timeout (0x72aba0)
+         · pthread_cond_timedwait on g_main_loop_condition_var (0x44c9288), 10s timeout
+         · timing thresholds 0x257ms (599) and 0xe0f ms (3599) at g_timestamp_threshold_1 (0x44cb2e0)
+         · shutdown: /bin/sync + /sbin/reboot -f gated by flags 0x44c9468 / 0x44c9469
+```
+
+**Notebook quote on "no orchestrator":** "The control flow chain implements NO SINGLE ORCHESTRATOR. Instead, each tier signals completion via events: hardware tier fires readiness events (0x5c/0x5e/0x5f/0x5d), event dispatch tier signals main loop via condition variable, main loop synchronizes timing across tiers."
+
+### Step 78e — Seven high-value new leads
+
+Ranked by breakthrough potential. All addresses from BN notebook 2026-05-04; will re-verify each before relying on it (per `feedback_verify_every_address.md`).
+
+1. **`sub_7a8de0(0x13)` decompile** — secondary_initialization's conditional branch. If false, the early-return path is taken (still fires 0x11 but skips `sub_579d30` + setup). Smallest scope, most surgical "what gates progression" target. Single function, called with known immediate. **Top of probe queue.**
+
+2. **Event 0x11 runtime trace** — verify it fires AND its handlers run to completion. We have BRK-trap infra in `shim_discovery.c`; need to add `fire_event` (0x5c12a0) hook with id == 0x11 filter. ~30 min.
+
+3. **`showBootScreenGameTitleProgressBar` (0x6bd2ac) reachability test** — notebook flags it as "orphaned / no direct callers" — possibly abandoned 5260-byte function. If it never fires in our runs, our boot-splash is something else (likely the direct-DRM/KMS path at `create_boot_splash_egl_context` 0x901d10 + `DisplayRenderer_render_loop` 0x7b76e0). BRK-trap or breakpoint test, ~10 min.
+
+4. **`data_4482328` xrefs** — set to 1 at primary_init completion. Could be a wait-gate other code reads. Quick BN xrefs query.
+
+5. **`sub_873900` full decompile** — the 12-state machine itself. Bigger function but central to mode transitions; tells us *exactly* what advances each state. Decompile + comment, ~45 min.
+
+6. **Timing-threshold runtime watcher** — main loop checks elapsed time vs `g_timestamp_threshold_1` (0x44cb2e0) against 599ms and 3599ms thresholds. Needs runtime instrumentation; useful if probes 1-5 don't unblock anything.
+
+7. [Redacted: a proposed way to synthesize protected startup state. This was an unimplemented lead.]
+
+### Step 78f — Connections to prior steps
+
+- **Step 75 thread T7**: the inquiry narrowed to persistent first-run state and its relationship to startup. [Redacted: proposed protected-state modifications.]
+- **Step 77 test-cycler observation**: confirmed by `sub_873900` states 6-8.
+- **Step 73g `is_inside_tree() == false` orphaned-subtree theory**: not contradicted; the diag flag activates the test-cycler but downstream `/root/Main` errors are downstream of the embedded-Godot-subtree mount problem, which the notebook also corroborates ("Godot Engine compiled into binary but NOT used for rendering — only asset management").
+- **`feedback_godot_is_illegal.md`**: nothing here is Godot. The state machine, event 0x11 gating, sub_7a8de0 decision are pure shared Stern code — should reproduce in SW LE 0.85. T6 reorientation deferred to Researcher A-list review later; for now the fresh notebook covers most of it.
+
+### Step 78g — Probe queue (status)
+
+| # | Lead | Status |
+|---|---|---|
+| 1 | `sub_7a8de0(0x13)` | **DONE** — ruled out as front-end blocker (see 78h.1) |
+| 2 | Event 0x11 runtime fire trace | not started |
+| 3 | `showBootScreenGameTitleProgressBar` reachability | not started |
+| 4 | `data_4482328` xrefs | not started |
+| 5 | `sub_873900` 12-state machine | **STRUCTURE VERIFIED**; runtime presence not verified (see 78h.2) |
+| 6 | Timing-threshold runtime watcher | not started |
+| 7 | [Redacted: protected-state synthesis lead] | not started |
+
+Plus options that emerged mid-session:
+
+| ID | Option | Status |
+|---|---|---|
+| (i) | BRK-trap `sub_873900` entry to confirm runtime invocation, dump arg1 / lr / state object | **queued by user** — finish lead 5 verification |
+| (ii) | Look up handlers we already runtime-dumped for events 0x11 / 0x5d / 0x5f in BN | **in progress this session** |
+| (iii) | Bit-19 patch test (flip bit 19 of `data_44cb9f0`, run, see what `sub_579d30` adds) | not started |
+
+### Step 78h — In-session work completed (2026-05-04)
+
+#### 78h.1 — Lead 1 verification + ruling out
+
+- `sub_7a8de0(arg1)` decompile + verify: bit-tester for `data_44cb9f0`, returns `bit arg1 of data_44cb9f0` if `arg1` in [1, 0x23], else error.
+- Constructor `sub_7a8b90` allocates `data_44cb9f0 = calloc(5,1)` (5 bytes / 40 bits) + 36-byte `data_44cb9c0` + 4 more 5-byte bitfields at `data_44cb9d0[0..3]`. Initializes `data_44cb9c0[1..0x23]` from static .rodata table at **`0x4389b5a`** (4-byte stride per entry, byte 0 of each entry copied).
+- Setter `sub_7a8a80(idx, bitfield)`: sets bit `idx` in bitfield iff `data_44cb9c0[idx] & 1`. So **`bit idx of data_44cb9f0 = LSB of byte at (0x4389b5a + idx*4)`** at construction time.
+- For `idx=19`, source byte at **`0x4389ba6` = 0x00** (verified via hexdump_address). Bit 19 statically clear.
+- `secondary_initialization` (0x5abbf0) disasm verified actual control flow:
+  ```
+  if ((fire_event(0x10) & 1) == 0) tail-call fire_event(0x11);   // early return
+  else {
+      if ((sub_7a8de0(0x13) & 1) != 0) sub_579d30();              // bit 19 gates ONLY this
+      sub_5d6480(1, 0, 0, &data_4363c78);                          // unconditional
+      sub_72aa60(1);                                               // unconditional
+      sub_57a8f0(1);                                               // unconditional
+      tail-call fire_event(0x11);
+  }
+  ```
+- **Notebook framing was wrong**: it said bit 19 gates "sub_579d30 + additional setup functions"; only `sub_579d30` is gated. The rest of the chain runs unconditionally on the non-early-return path.
+- All 4 handlers for event 0x10 (registered at `event_handler_table[0x10]`) verified to return 1 unconditionally via disasm:
+  - `0x4be6a0` — array iteration setting `*(item + 0x48) = 1`, `mov w0, #0x1; ret`
+  - `0x4c2410` — `bl sub_4c2020`, array iteration `bl sub_4be820`, `mov w0, #0x1; ret`
+  - `0x4d9db0` — `mov w0, #0x1; ret` (NOP-padded prologue at sym `sub_4d9da8`)
+  - `0x70e790` — `bl sub_729d60` + read config 0x25/0x24 to fields `+0x108`/`+0x110`, `mov w0, #0x1; ret` (NOP-padded prologue at sym `sub_70e788`)
+- Therefore `fire_event(0x10)` returns 1 in our runs; `secondary_initialization` does NOT take the early-return path. Bit 19 / `sub_579d30` is a small optional pre-step.
+- **Reuse note**: Step 52 (2026-04-21) already covered `fire_event` semantics extensively and built `shim_fire_event` trampoline at `0x5c12a0`. This session re-derived the dispatch logic for the analysis above. Future event-handler work should reference Step 52's infrastructure (notably `shim_fire_event` is already callable from shim TUs).
+
+#### 78h.2 — Lead 5 (sub_873900) structural verification
+
+- `sub_873900` confirmed 12-state machine (states 0..11, validated by `cmp w0, #0xb / b.hi`).
+- State words: `arg1[0x110]` = next, `arg1[0x114]` = current. Bail-out guard: `arg1[0x178] & 1`.
+- Tick: `bl 0x45c650` with arg `0x30d40` = 200000 μs = 200ms = 5Hz.
+- State dispatch table at **`0x37cc818`** (12 bytes): `[0x10, 0x58, 0x4e, 0x53, 0x00, 0x49, 0x22, 0x1a, 0x69, 0x15, 0x17, 0x00]`. Jump destination = `0x87397c + (sxtb(table[state]) << 2)`.
+- Computed state → block jump:
+  | state | byte | jump | calls / does |
+  |---|---|---|---|
+  | **0** | [redacted] | [redacted] | Startup authorization check; implementation details redacted |
+  | 1 | 0x58 | 0x873adc | sets state=2, `bl 0x872fa0` |
+  | 2 | 0x4e | 0x873ab4 | flag check `+0x179`, sets state=3 |
+  | 3 | 0x53 | 0x873ac8 | `bl 0x872540` |
+  | 4 | 0x00 | 0x87397c | default dispatch entry, `bl 0x733310` (timestamp) |
+  | 5 | 0x49 | 0x873aa0 | flag check `+0x1e8`, sets state=6 |
+  | 6 | 0x22 | 0x873a04 | sets state=7, complex; calls into `+0x150` vector |
+  | 7 | 0x1a | 0x8739e4 | flag check `+0x179`, sets state=6 |
+  | 8 | 0x69 | 0x873b20 | `bl 0x86cf70` |
+  | 9 | 0x15 | 0x8739d0 | flag check, jumps to state-0 logic |
+  | 10 | 0x17 | 0x8739d8 | clears `+0x110`, jumps to state-0 logic |
+  | 11 | 0x00 | 0x87397c | duplicate of state 4 |
+- **Static reachability is unresolved**: zero callers to `sub_873900` (only `sub_873c24` — a 1-line wrapper); zero callers to `sub_873c24`; zero 8-byte-LE pointer matches in binary; zero RELATIVE relocations (binary has 0 total).
+- Per user direction: assume dynamic dispatch via heap/stack-resident object, NOT dead code.
+- Runtime evidence (Step 77 diag-on test-cycler scene attempts) is *consistent with* sub_873900 driving the test cycler but does NOT prove it (could be one of the other 13 authorization-related paths the notebook describes). **Option (i) — BRK-trap entry — is the unfinished verification.**
+
+#### 78h.3 — Tools added this session
+
+- `shim_inject.c::shim_dump_event_handlers(int event_id)` — walks `event_handler_table[event_id]` linked list at runtime (`game_base + 0x445ea80 + event_id*8`), logs each node's callback runtime addr + computed VA + priority + next ptr. Up to 32 nodes per event.
+- `shim_inject.c::shim_apply_event_handler_dump()` — calls the above for events `{0x10, 0x11, 0x5c, 0x5d, 0x5e, 0x5f}`. cwd-gated on `pokemon_le`.
+- Hooked from `shim_discovery_init_thread` after `[REDACTED: startup-override helper]`.
+
+#### 78h.4 — Runtime-collected handler data
+
+Run: `runs/2026-05-04T11.19.01_event_handler_dump_v1/game.log`. All from `event_handler_table` after game-side static constructors complete:
+
+| event | handler count | handler VAs (chain order) | priorities |
+|---|---|---|---|
+| 0x10 | 4 | 0x4be6a0, 0x4c2410, 0x4d9db0, 0x70e790 | 0, 0, 0, 0 (all return 1 — verified) |
+| 0x11 | 5 | 0x4bd4b0, 0x4be5f0, 0x4d9db0, 0x7e7e60, 0x8707c0 | 0, 0, 0, 0, 0 (not yet read) |
+| 0x5c | 0 | (none) | — (default-return-1) |
+| 0x5d | 16 | 0x5d4140, 0x825f80, 0x4afcc0, 0x4c50d0, 0x4d5190, 0x4d9db0, 0x4dcb50, 0x588ad0, 0x673cc0, 0x6ad7e0, 0x6c0820, 0x6f6690, 0x715050, 0x716620, 0x854690, 0x8708c0 | **128**, **100**, then 14 × 0 |
+| 0x5e | 0 | (none) | — |
+| 0x5f | 1 | 0x75c430 | 0 |
+
+**Shared handler note**: `0x4d9db0` (just `return 1`) appears in events 0x10, 0x11, 0x5d. Skip in BN lookups.
+
+
+

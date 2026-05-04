@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <sys/types.h>
+#include <dirent.h>
 
 #include "spi_shim.h"
 #include "shim_discovery.h"
@@ -65,9 +66,29 @@ extern int mkdir(const char *, unsigned int);
  */
 static int fs_diag_path_match(const char *p) {
     if (!p) return 0;
-    if (strncmp(p, "/tmp/", 5) == 0) return 1;
+    /* Recursion guard: never log the log file itself, or any log under
+     * runs/latest/. Without this, FS_DIAG_ALL=1 turns every fs op into a
+     * log call → log file open → fs op → log call → ... stack-overflow
+     * SEGV before init even gets going. */
+    if (strstr(p, "discovery.log") != NULL) return 0;
+    if (strstr(p, "runs/latest")   != NULL) return 0;
 
-    static int verbose = -1;  /* lazy-init; -1 = unread */
+    static int diag_all = -1;
+    if (__builtin_expect(diag_all < 0, 0)) {
+        const char *e = getenv("SPIKE3_FS_DIAG_ALL");
+        diag_all = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (diag_all) return 1;
+
+    if (strncmp(p, "/tmp/", 5) == 0) return 1;
+    if (strstr(p, "lcd")           != NULL) return 1;
+    if (strstr(p, "nuk")           != NULL) return 1;
+    if (strstr(p, "assets")        != NULL) return 1;
+    if (strstr(p, "auto_loaded")   != NULL) return 1;
+    if (strstr(p, "demand_loaded") != NULL) return 1;
+    if (strstr(p, ".radium")       != NULL) return 1;
+
+    static int verbose = -1;
     if (__builtin_expect(verbose < 0, 0)) {
         const char *e = getenv("SPIKE3_FS_DIAG_VERBOSE");
         verbose = (e && e[0] == '1') ? 1 : 0;
@@ -787,8 +808,8 @@ int __xstat64(int ver, const char *pathname, void *statbuf) {
  * opendir with internal syscalls or the openat is taking a different
  * code path we're missing, we'd never see the call. Hooking opendir
  * itself catches it definitively. */
-typedef void *(*real_opendir_t)(const char *);
-void *opendir(const char *name) {
+typedef DIR *(*real_opendir_t)(const char *);
+DIR *opendir(const char *name) {
     static real_opendir_t real_fn = NULL;
     if (!real_fn) {
         real_fn = (real_opendir_t)dlvsym(RTLD_NEXT, "opendir", "GLIBC_2.17");
@@ -799,9 +820,9 @@ void *opendir(const char *name) {
                (name && strstr(name, "cache") != NULL);
     if (diag) FS_DIAG_LOG("opendir(%s) -> %s", name ? name : "(null)",
                           actual ? actual : "(null)");
-    void *ret = real_fn(actual);
+    DIR *ret = real_fn(actual);
     if (diag) FS_DIAG_LOG("opendir(%s) ret=%p errno=%d",
-                          name ? name : "(null)", ret, ret ? 0 : errno);
+                          name ? name : "(null)", (void *)ret, ret ? 0 : errno);
     return ret;
 }
 
@@ -958,6 +979,406 @@ int glob64(const char *pattern, int flags,
                           actual ? actual : "(null)");
     int ret = real_fn(actual, flags, errfunc, pglob);
     if (diag) FS_DIAG_LOG("glob64(%s) ret=%d", pattern ? pattern : "(null)", ret);
+    return ret;
+}
+
+/* ========== Comprehensive fs hook coverage (2026-05-04) ==========
+ * Comprehensive instrumentation for the SceneCache investigation: every
+ * fs-related libc function the game imports gets a hook. Path-bearing
+ * hooks remap. fd-only hooks log when SPIKE3_FS_DIAG_ALL=1 (or when the
+ * fs_diag filter matches). Goal is black-box visibility — assume hidden
+ * call paths and instrument exhaustively. */
+
+/* readdir/readdir64 — log entry name through the proper struct dirent.
+ * d_name access via the real header avoids any layout guesswork. */
+typedef struct dirent *(*real_readdir_t)(DIR *dirp);
+struct dirent *readdir(DIR *dirp) {
+    static real_readdir_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_readdir_t)dlsym(RTLD_NEXT, "readdir");
+    struct dirent *ret = real_fn(dirp);
+    if (ret && FS_DIAG_TMP_PREFIX(ret->d_name)) {
+        FS_DIAG_LOG("readdir(dir=%p) -> %s", (void *)dirp, ret->d_name);
+    }
+    return ret;
+}
+
+typedef struct dirent64 *(*real_readdir64_t)(DIR *dirp);
+struct dirent64 *readdir64(DIR *dirp) {
+    static real_readdir64_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_readdir64_t)dlsym(RTLD_NEXT, "readdir64");
+    struct dirent64 *ret = real_fn(dirp);
+    if (ret && FS_DIAG_TMP_PREFIX(ret->d_name)) {
+        FS_DIAG_LOG("readdir64(dir=%p) -> %s", (void *)dirp, ret->d_name);
+    }
+    return ret;
+}
+
+typedef int (*real_closedir_t)(DIR *dirp);
+int closedir(DIR *dirp) {
+    static real_closedir_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_closedir_t)dlsym(RTLD_NEXT, "closedir");
+    int ret = real_fn(dirp);
+    if (FS_DIAG_TMP_PREFIX("")) {
+        FS_DIAG_LOG("closedir(dir=%p) ret=%d", (void *)dirp, ret);
+    }
+    return ret;
+}
+
+typedef void (*real_rewinddir_t)(DIR *dirp);
+void rewinddir(DIR *dirp) {
+    static real_rewinddir_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_rewinddir_t)dlsym(RTLD_NEXT, "rewinddir");
+    if (FS_DIAG_TMP_PREFIX("")) {
+        FS_DIAG_LOG("rewinddir(dir=%p)", (void *)dirp);
+    }
+    real_fn(dirp);
+}
+
+/* getcwd — the game queries CWD here. Log unconditionally so we can
+ * correlate scene-cache enumeration with the running CWD. */
+typedef char *(*real_getcwd_t)(char *buf, size_t size);
+char *getcwd(char *buf, size_t size) {
+    static real_getcwd_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_getcwd_t)dlsym(RTLD_NEXT, "getcwd");
+    char *ret = real_fn(buf, size);
+    static int logged = 0;
+    /* Log first 16 calls + every 1000th to keep volume manageable. */
+    int count = __atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED);
+    if (count <= 16 || (count % 1000) == 0) {
+        FS_DIAG_LOG("getcwd #%d -> %s", count, ret ? ret : "(null)");
+    }
+    return ret;
+}
+
+/* fdopen — fd → FILE* conversion. No path; log fd. */
+typedef FILE *(*real_fdopen_t)(int fd, const char *mode);
+FILE *fdopen(int fd, const char *mode) {
+    static real_fdopen_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_fdopen_t)dlsym(RTLD_NEXT, "fdopen");
+    FILE *ret = real_fn(fd, mode);
+    if (FS_DIAG_TMP_PREFIX("")) {
+        FS_DIAG_LOG("fdopen(fd=%d, mode=%s) -> %p", fd, mode ? mode : "(null)", (void *)ret);
+    }
+    return ret;
+}
+
+/* fstat64 — fd-based stat. No path. */
+typedef int (*real_fstat64_t)(int fd, void *statbuf);
+int fstat64(int fd, void *statbuf) {
+    static real_fstat64_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_fstat64_t)dlsym(RTLD_NEXT, "fstat64");
+    int ret = real_fn(fd, statbuf);
+    if (FS_DIAG_TMP_PREFIX("")) {
+        FS_DIAG_LOG("fstat64(fd=%d) ret=%d errno=%d", fd, ret, ret ? errno : 0);
+    }
+    return ret;
+}
+
+/* ftruncate / ftruncate64 — fd-based truncate. */
+typedef int (*real_ftruncate_t)(int fd, off_t length);
+int ftruncate(int fd, off_t length) {
+    static real_ftruncate_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_ftruncate_t)dlsym(RTLD_NEXT, "ftruncate");
+    int ret = real_fn(fd, length);
+    if (FS_DIAG_TMP_PREFIX("")) {
+        FS_DIAG_LOG("ftruncate(fd=%d, length=%ld) ret=%d", fd, (long)length, ret);
+    }
+    return ret;
+}
+
+typedef int (*real_ftruncate64_t)(int fd, off_t length);
+int ftruncate64(int fd, off_t length) {
+    static real_ftruncate64_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_ftruncate64_t)dlsym(RTLD_NEXT, "ftruncate64");
+    int ret = real_fn(fd, length);
+    if (FS_DIAG_TMP_PREFIX("")) {
+        FS_DIAG_LOG("ftruncate64(fd=%d, length=%ld) ret=%d", fd, (long)length, ret);
+    }
+    return ret;
+}
+
+/* popen — runs a shell command, returns FILE*. The command is parsed by
+ * /bin/sh; we don't try to parse out paths within. Log the full command. */
+typedef FILE *(*real_popen_t)(const char *command, const char *type);
+FILE *popen(const char *command, const char *type) {
+    static real_popen_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_popen_t)dlsym(RTLD_NEXT, "popen");
+    SHIM_LOG("popen(\"%s\", \"%s\")", command ? command : "(null)",
+             type ? type : "(null)");
+    return real_fn(command, type);
+}
+
+/* system() is hooked in spi_shim.c (path-rewrite logic for /connectivity/...).
+ * Don't redefine here. */
+
+/* execvp — execute a command with PATH search. Log program + first arg. */
+typedef int (*real_execvp_t)(const char *file, char *const argv[]);
+int execvp(const char *file, char *const argv[]) {
+    static real_execvp_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_execvp_t)dlsym(RTLD_NEXT, "execvp");
+    SHIM_LOG("execvp(file=%s, argv[1]=%s)",
+             file ? file : "(null)",
+             (argv && argv[0] && argv[1]) ? argv[1] : "(none)");
+    return real_fn(file, argv);
+}
+
+/* dup2 — fd duplication. */
+typedef int (*real_dup2_t)(int oldfd, int newfd);
+int dup2(int oldfd, int newfd) {
+    static real_dup2_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_dup2_t)dlsym(RTLD_NEXT, "dup2");
+    int ret = real_fn(oldfd, newfd);
+    if (FS_DIAG_TMP_PREFIX("")) {
+        FS_DIAG_LOG("dup2(old=%d, new=%d) ret=%d", oldfd, newfd, ret);
+    }
+    return ret;
+}
+
+/* fchmod — fd-based chmod. */
+typedef int (*real_fchmod_t)(int fd, unsigned int mode);
+int fchmod(int fd, unsigned int mode) {
+    static real_fchmod_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_fchmod_t)dlsym(RTLD_NEXT, "fchmod");
+    int ret = real_fn(fd, mode);
+    if (FS_DIAG_TMP_PREFIX("")) {
+        FS_DIAG_LOG("fchmod(fd=%d, mode=0%o) ret=%d", fd, mode, ret);
+    }
+    return ret;
+}
+
+/* fcntl64 intentionally NOT hooked: variadic third arg + cmd-dependent
+ * type means safely intercepting it would require a cmd-by-cmd switch.
+ * Skip until we have evidence a specific cmd matters. */
+
+/* __openat64_2 / __open_2 / __open64_2 / __openat_2 — FORTIFY_SOURCE
+ * hardened variants of the open family. Libstdc++ imports __openat64_2
+ * (verified via nm -D on libstdc++.so.6.0.32), so std::basic_filebuf::open
+ * → __openat64_2 → glibc syscall — bypasses our public-name hooks on
+ * openat/openat64. Without these hooks, every .radium open via ifstream
+ * is invisible to the shim. Same remap_path treatment as the non-_2
+ * variants. */
+typedef int (*real_openat64_2_t)(int dirfd, const char *pathname, int flags);
+int __openat64_2(int dirfd, const char *pathname, int flags) {
+    static real_openat64_2_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_openat64_2_t)dlsym(RTLD_NEXT, "__openat64_2");
+    int fake = pathname ? intercept_device(pathname) : 0;
+    if (fake) return fake;
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    if (diag) FS_DIAG_LOG("__openat64_2(dirfd=%d, %s, flags=0x%x) -> %s",
+                          dirfd, pathname ? pathname : "(null)", flags,
+                          actual ? actual : "(null)");
+    int ret = real_fn ? real_fn(dirfd, actual, flags) : -1;
+    if (diag) FS_DIAG_LOG("__openat64_2(%s) ret=%d errno=%d",
+                          pathname ? pathname : "(null)", ret,
+                          (ret < 0) ? errno : 0);
+    return ret;
+}
+
+typedef int (*real_open_2_t)(const char *pathname, int flags);
+int __open_2(const char *pathname, int flags) {
+    static real_open_2_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_open_2_t)dlsym(RTLD_NEXT, "__open_2");
+    int fake = pathname ? intercept_device(pathname) : 0;
+    if (fake) return fake;
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    if (diag) FS_DIAG_LOG("__open_2(%s, flags=0x%x) -> %s",
+                          pathname ? pathname : "(null)", flags,
+                          actual ? actual : "(null)");
+    int ret = real_fn ? real_fn(actual, flags) : -1;
+    if (diag) FS_DIAG_LOG("__open_2(%s) ret=%d errno=%d",
+                          pathname ? pathname : "(null)", ret,
+                          (ret < 0) ? errno : 0);
+    return ret;
+}
+
+int __open64_2(const char *pathname, int flags) {
+    static real_open_2_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_open_2_t)dlsym(RTLD_NEXT, "__open64_2");
+    int fake = pathname ? intercept_device(pathname) : 0;
+    if (fake) return fake;
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    if (diag) FS_DIAG_LOG("__open64_2(%s, flags=0x%x) -> %s",
+                          pathname ? pathname : "(null)", flags,
+                          actual ? actual : "(null)");
+    int ret = real_fn ? real_fn(actual, flags) : -1;
+    if (diag) FS_DIAG_LOG("__open64_2(%s) ret=%d errno=%d",
+                          pathname ? pathname : "(null)", ret,
+                          (ret < 0) ? errno : 0);
+    return ret;
+}
+
+int __openat_2(int dirfd, const char *pathname, int flags) {
+    static real_openat64_2_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_openat64_2_t)dlsym(RTLD_NEXT, "__openat_2");
+    int fake = pathname ? intercept_device(pathname) : 0;
+    if (fake) return fake;
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    if (diag) FS_DIAG_LOG("__openat_2(dirfd=%d, %s, flags=0x%x) -> %s",
+                          dirfd, pathname ? pathname : "(null)", flags,
+                          actual ? actual : "(null)");
+    int ret = real_fn ? real_fn(dirfd, actual, flags) : -1;
+    if (diag) FS_DIAG_LOG("__openat_2(%s) ret=%d errno=%d",
+                          pathname ? pathname : "(null)", ret,
+                          (ret < 0) ? errno : 0);
+    return ret;
+}
+
+/* Internal-name aliases of the open family. glibc exports both the public
+ * (open/openat/open64/openat64) AND the underscored internal (__open etc.)
+ * names. libstdc++ MAY call the underscored ones to bypass FORTIFY checks
+ * or for other internal reasons. LD_PRELOAD wraps by symbol name, so
+ * hooking the public name doesn't catch calls to the underscored alias. */
+typedef int (*real_open_t)(const char *, int, ...);
+int __open(const char *pathname, int flags, ...) {
+    static real_open_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_open_t)dlsym(RTLD_NEXT, "__open");
+    int fake = pathname ? intercept_device(pathname) : 0;
+    if (fake) return fake;
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    int ret;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags);
+        int mode = va_arg(ap, int);
+        va_end(ap);
+        ret = real_fn ? real_fn(actual, flags, mode) : -1;
+    } else {
+        ret = real_fn ? real_fn(actual, flags) : -1;
+    }
+    if (diag) FS_DIAG_LOG("__open(%s, flags=0x%x) -> %s ret=%d errno=%d",
+                          pathname ? pathname : "(null)", flags,
+                          actual ? actual : "(null)", ret,
+                          (ret < 0) ? errno : 0);
+    return ret;
+}
+
+int __open64(const char *pathname, int flags, ...) {
+    static real_open_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_open_t)dlsym(RTLD_NEXT, "__open64");
+    int fake = pathname ? intercept_device(pathname) : 0;
+    if (fake) return fake;
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    int ret;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags);
+        int mode = va_arg(ap, int);
+        va_end(ap);
+        ret = real_fn ? real_fn(actual, flags, mode) : -1;
+    } else {
+        ret = real_fn ? real_fn(actual, flags) : -1;
+    }
+    if (diag) FS_DIAG_LOG("__open64(%s, flags=0x%x) -> %s ret=%d errno=%d",
+                          pathname ? pathname : "(null)", flags,
+                          actual ? actual : "(null)", ret,
+                          (ret < 0) ? errno : 0);
+    return ret;
+}
+
+typedef int (*real_openat_int_t)(int, const char *, int, ...);
+int __openat(int dirfd, const char *pathname, int flags, ...) {
+    static real_openat_int_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_openat_int_t)dlsym(RTLD_NEXT, "__openat");
+    int fake = pathname ? intercept_device(pathname) : 0;
+    if (fake) return fake;
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    int ret;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags);
+        int mode = va_arg(ap, int);
+        va_end(ap);
+        ret = real_fn ? real_fn(dirfd, actual, flags, mode) : -1;
+    } else {
+        ret = real_fn ? real_fn(dirfd, actual, flags) : -1;
+    }
+    if (diag) FS_DIAG_LOG("__openat(dirfd=%d, %s, flags=0x%x) -> %s ret=%d errno=%d",
+                          dirfd, pathname ? pathname : "(null)", flags,
+                          actual ? actual : "(null)", ret,
+                          (ret < 0) ? errno : 0);
+    return ret;
+}
+
+int __openat64(int dirfd, const char *pathname, int flags, ...) {
+    static real_openat_int_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_openat_int_t)dlsym(RTLD_NEXT, "__openat64");
+    int fake = pathname ? intercept_device(pathname) : 0;
+    if (fake) return fake;
+    const char *actual = pathname ? remap_path(pathname) : pathname;
+    int diag = FS_DIAG_TMP_PREFIX(pathname);
+    int ret;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags);
+        int mode = va_arg(ap, int);
+        va_end(ap);
+        ret = real_fn ? real_fn(dirfd, actual, flags, mode) : -1;
+    } else {
+        ret = real_fn ? real_fn(dirfd, actual, flags) : -1;
+    }
+    if (diag) FS_DIAG_LOG("__openat64(dirfd=%d, %s, flags=0x%x) -> %s ret=%d errno=%d",
+                          dirfd, pathname ? pathname : "(null)", flags,
+                          actual ? actual : "(null)", ret,
+                          (ret < 0) ? errno : 0);
+    return ret;
+}
+
+/* fork — child process creation. Log the call; child's pid is logged on
+ * return. The child inherits our shim via LD_PRELOAD environment. */
+typedef pid_t (*real_fork_t)(void);
+pid_t fork(void) {
+    static real_fork_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_fork_t)dlsym(RTLD_NEXT, "fork");
+    pid_t ret = real_fn();
+    SHIM_LOG("fork() ret=%d (parent_view)", (int)ret);
+    return ret;
+}
+
+/* mount / umount2 — fs-mount manipulation. Log path operands but DO NOT
+ * remap (these are kernel-level ops that the game shouldn't really be
+ * using; logging serves as a tripwire). */
+typedef int (*real_mount_t)(const char *src, const char *target,
+                             const char *fstype, unsigned long flags,
+                             const void *data);
+int mount(const char *src, const char *target, const char *fstype,
+          unsigned long flags, const void *data) {
+    static real_mount_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_mount_t)dlsym(RTLD_NEXT, "mount");
+    SHIM_LOG("mount(src=%s, target=%s, fstype=%s, flags=0x%lx)",
+             src ? src : "(null)", target ? target : "(null)",
+             fstype ? fstype : "(null)", flags);
+    return real_fn(src, target, fstype, flags, data);
+}
+
+typedef int (*real_umount2_t)(const char *target, int flags);
+int umount2(const char *target, int flags) {
+    static real_umount2_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_umount2_t)dlsym(RTLD_NEXT, "umount2");
+    SHIM_LOG("umount2(target=%s, flags=0x%x)",
+             target ? target : "(null)", flags);
+    return real_fn(target, flags);
+}
+
+/* sync / syncfs — global / fd-targeted fs sync. */
+typedef void (*real_sync_t)(void);
+void sync(void) {
+    static real_sync_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_sync_t)dlsym(RTLD_NEXT, "sync");
+    if (FS_DIAG_TMP_PREFIX("")) FS_DIAG_LOG("sync()");
+    real_fn();
+}
+
+typedef int (*real_syncfs_t)(int fd);
+int syncfs(int fd) {
+    static real_syncfs_t real_fn = NULL;
+    if (!real_fn) real_fn = (real_syncfs_t)dlsym(RTLD_NEXT, "syncfs");
+    int ret = real_fn(fd);
+    if (FS_DIAG_TMP_PREFIX("")) {
+        FS_DIAG_LOG("syncfs(fd=%d) ret=%d", fd, ret);
+    }
     return ret;
 }
 

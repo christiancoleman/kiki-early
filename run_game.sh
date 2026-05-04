@@ -420,6 +420,7 @@ fi
 [[ "$SW_HEVC"          == "1" ]] && args+=(-E "SPIKE3_SW_HEVC=1")
 [[ "$FORWARD_DECODE"   == "1" ]] && args+=(-E "SPIKE3_FORWARD_DECODE=1")
 [[ "$FS_DIAG_VERBOSE"  == "1" ]] && args+=(-E "SPIKE3_FS_DIAG_VERBOSE=1")
+[[ "${SPIKE3_FS_DIAG_ALL:-}" == "1" ]] && args+=(-E "SPIKE3_FS_DIAG_ALL=1")
 [[ "$SPI_QUIET"        == "1" ]] && args+=(-E "SPIKE3_SPI_QUIET=1")
 [[ "$SPI_DELAY_US"     != "0" ]] && args+=(-E "SPIKE3_SPI_DELAY_US=$SPI_DELAY_US")
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")

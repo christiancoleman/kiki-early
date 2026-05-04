@@ -949,11 +949,51 @@ static void *shim_poke_state_flag_thread(void *arg) {
 
 
 
+/* Step 78 lead 1 (event 0x10 gate probe). Walks event_handler_table[event_id]
+ * and logs each handler's callback VA so we can look it up in BN. Pokemon-LE
+ * VAs hardcoded; SW LE will differ. */
+#define POKEMON_EVENT_TABLE_VA 0x445ea80
+#define POKEMON_EVENT_NODE_CB_OFF   0
+#define POKEMON_EVENT_NODE_PRIO_OFF 8
+#define POKEMON_EVENT_NODE_NEXT_OFF 16
+
+static void shim_dump_event_handlers(int event_id) {
+    uintptr_t base = shim_resolve_game_base();
+    if (!base) return;
+    void **table = (void **)(base + POKEMON_EVENT_TABLE_VA);
+    void *head = table[event_id];
+    SHIM_LOG("[event_dump] event 0x%02x: head=%p (entry @ %p)",
+             event_id, head, (void *)&table[event_id]);
+    int count = 0;
+    void *node = head;
+    while (node && count < 32) {
+        void *cb       = *(void **)((char *)node + POKEMON_EVENT_NODE_CB_OFF);
+        uint8_t prio   = *(uint8_t *)((char *)node + POKEMON_EVENT_NODE_PRIO_OFF);
+        void *next     = *(void **)((char *)node + POKEMON_EVENT_NODE_NEXT_OFF);
+        long cb_va = (long)((uintptr_t)cb - base);
+        SHIM_LOG("[event_dump]   [%d] cb=%p (VA 0x%lx) prio=%u next=%p",
+                 count, cb, cb_va, (unsigned)prio, next);
+        node = next;
+        count++;
+    }
+    if (count >= 32) SHIM_LOG("[event_dump]   ...truncated at 32 nodes");
+}
+
+static void shim_apply_event_handler_dump(void) {
+    char cwd[512];
+    if (!getcwd(cwd, sizeof(cwd)) || !strstr(cwd, "pokemon_le")) return;
+    static const int events[] = {0x10, 0x11, 0x5c, 0x5d, 0x5e, 0x5f};
+    for (size_t i = 0; i < sizeof(events)/sizeof(events[0]); i++) {
+        shim_dump_event_handlers(events[i]);
+    }
+}
+
 static void *shim_discovery_init_thread(void *arg) {
     (void)arg;
     sleep(2);
     shim_discovery_init();
 
+    shim_apply_event_handler_dump();
     return NULL;
 }
 
