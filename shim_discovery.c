@@ -51,6 +51,7 @@ void discovery_log(const char *fmt, ...) {
 #define DISCOVERY_ADDR_POLL_SPAWN     0x675d10
 #define DISCOVERY_ADDR_SCENE_LOAD     0x730fb0
 #define DISCOVERY_ADDR_QUEUE_SCENE    0x731930  /* sub_731930 — wrapper that calls select_and_load_scene; trap here to find its caller */
+#define DISCOVERY_ADDR_ASSET_PTR      0x7310f4  /* inside select_and_load_scene, instruction right after bl get_asset_ptr_by_packed_id (str x0, [sp]); x0 = bytecode ptr, x19 = asset_id, x26 = scene_id */
 
 /* Expected first instructions (aarch64) to ensure binary compatibility */
 #define EXPECTED_GODOT_ERR      0xa9bb7bfdu  /* stp fp, lr, [sp, #-0x50]! */
@@ -60,6 +61,7 @@ void discovery_log(const char *fmt, ...) {
 #define EXPECTED_POLL_SPAWN     0xa9bf7bf3u  /* stp x19, lr, [sp, #-0x10]! */
 #define EXPECTED_SCENE_LOAD     0xf001e108u  /* adrp x8, 0x4353000 */
 #define EXPECTED_QUEUE_SCENE    0xb001ecc8u  /* adrp x8, 0x44ca000 */
+#define EXPECTED_ASSET_PTR      0xf90003e0u  /* str x0, [sp] */
 
 #define AARCH64_BRK_0           0xd4200000u
 
@@ -70,6 +72,7 @@ static uintptr_t runtime_node_query = 0;
 static uintptr_t runtime_poll_spawn = 0;
 static uintptr_t runtime_scene_load = 0;
 static uintptr_t runtime_queue_scene = 0;
+static uintptr_t runtime_asset_ptr = 0;
 
 static void patch_point(uintptr_t base, uintptr_t offset, uint32_t expected, uintptr_t *runtime_out, const char *name) {
     uint32_t *instr = (uint32_t *)(base + offset);
@@ -107,6 +110,7 @@ void shim_discovery_init(void) {
     patch_point(base, DISCOVERY_ADDR_POLL_SPAWN,   EXPECTED_POLL_SPAWN,   &runtime_poll_spawn,   "poll_spawn");
     patch_point(base, DISCOVERY_ADDR_SCENE_LOAD,   EXPECTED_SCENE_LOAD,   &runtime_scene_load,   "scene_load");
     patch_point(base, DISCOVERY_ADDR_QUEUE_SCENE,  EXPECTED_QUEUE_SCENE,  &runtime_queue_scene,  "queue_scene");
+    patch_point(base, DISCOVERY_ADDR_ASSET_PTR,    EXPECTED_ASSET_PTR,    &runtime_asset_ptr,    "asset_ptr");
 }
 
 int shim_discovery_handler(uintptr_t pc, void *ucontext) {
@@ -164,6 +168,42 @@ int shim_discovery_handler(uintptr_t pc, void *ucontext) {
         *(volatile uint64_t *)(new_sp + 0) = mc->regs[19];
         *(volatile uint64_t *)(new_sp + 8) = mc->regs[30];
         mc->sp = new_sp;
+        mc->pc += 4;
+        return 1;
+    }
+
+    if (pc == runtime_asset_ptr) {
+        /* Right after `bl get_asset_ptr_by_packed_id` inside select_and_load_scene.
+         * x0 = bytecode pointer, x19 = packed_id (asset_id), x26 = scene_id.
+         * Dedup: only log first occurrence per (scene_id) so we don't spam. */
+        static int seen_mask[1024] = {0};
+        void *bytecode = (void *)mc->regs[0];
+        int32_t asset_id = (int32_t)mc->regs[19];
+        int scene_id = (int)mc->regs[26];
+        if (scene_id >= 0 && scene_id < 1024 && !seen_mask[scene_id]) {
+            seen_mask[scene_id] = 1;
+            if (bytecode) {
+                /* Dump 256 bytes split across multiple log lines: hex / ascii.
+                 * UTF-16-LE is just hex with a different lens, decode offline. */
+                discovery_log("scene_bytecode_BEGIN(scene_id=%d, asset_id=%d, ptr=%p)", scene_id, asset_id, bytecode);
+                for (int chunk = 0; chunk < 4; chunk++) {
+                    char hex[260] = {0};
+                    char ascii[80] = {0};
+                    int base = chunk * 64;
+                    for (int i = 0; i < 64; i++) {
+                        unsigned char b = ((unsigned char *)bytecode)[base + i];
+                        snprintf(hex + i*3, 4, "%02x ", b);
+                        ascii[i] = (b >= 32 && b < 127) ? b : '.';
+                    }
+                    discovery_log("  +%03x: %s | %s", base, hex, ascii);
+                }
+                discovery_log("scene_bytecode_END(scene_id=%d)", scene_id);
+            } else {
+                discovery_log("scene_bytecode(scene_id=%d, asset_id=%d) bytecode=NULL", scene_id, asset_id);
+            }
+        }
+        /* Emulate str x0, [sp] */
+        *(volatile uint64_t *)mc->sp = mc->regs[0];
         mc->pc += 4;
         return 1;
     }

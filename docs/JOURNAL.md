@@ -7105,6 +7105,126 @@ The cycle pattern (~12Hz alternation) strongly suggests a paired UI redraw bound
 - A switch input held in an unintended state (cabinet button pressed → menu nav loop)
 - A timer-based scene transition with a condition check that's never satisfied
 
+## Step 81: Cycle source traced — `sub_7b3060` is the Connectivity TestMenu/Diag_1360 main loop (= Step 75 front-end blocker) (2026-05-04)
+
+The scene 10↔11 cycle has been traced from `select_and_load_scene` upward through several wrapper layers to the function that actually drives the front-end UI: `sub_7b3060`, the `Connectivity/TestMenu/Diag_1360` main loop. **This is the same blocker called out in Step 75.** Future investigation goes from here.
+
+### Verified scene-load call chain
+
+```
+sub_7b3060 (Diag_1360 main loop — runs the Connectivity TestMenu UI)
+   │
+   │  while (true) {
+   │    ...vfunc tick on arg1...
+   │    if (sub_72a5c0(8) == 0) break;             ← exit on no pending type-8 event
+   │    ...
+   │    if (data_445d940 != 0) { decrement;
+   │       sub_5a94f0(*sub_7b3b80(...), 2,    x23_1, NULL); }   // mask 2 = scene 10 path
+   │    if (data_445d928 != 0) { decrement;
+   │       sub_5a94f0(*sub_7b3b80(...), 4,    x23_2, NULL); }   // mask 4 = scene 11 path
+   │    if (data_445d978 != 0) { decrement;
+   │       sub_5a94f0(*sub_7b3b80(...), 8,    x23_3, NULL); }   // mask 8 = scene 12 path
+   │    if (data_445d960 != 0) { decrement;
+   │       sub_5a94f0(*sub_7b3b80(...), 1,    x23_4, NULL); }   // mask 1 = scene 9 path
+   │    if (...condition...) sub_5a94f0(_, 0x10, 0, NULL);      // mask 0x10 = scene 16 path?
+   │    ... continue ...
+   │  }
+   │
+   ▼
+sub_5a94f0(arg1, mask, arg3, arg4)        — scene-dispatch by bit mask
+    Tests bits of `mask` (= w20):
+      bit 0 (mask 1)   → bl sub_58fc10  → sub_731930(0x9)   = scene  9
+      bit 1 (mask 2)   → bl sub_58fc20  → sub_731930(0xa)   = scene 10   ← caller_va 0x5a9630
+      bit 2 (mask 4)   → bl sub_58fc30  → sub_731930(0xb)   = scene 11   ← caller_va 0x5a9624
+      bit 3 (mask 8)   → bl sub_58fc40  → sub_731930(0xc)   = scene 12
+   │  (multiple bits in same call dispatch all in sequence)
+   ▼
+sub_731930 (one-line wrapper at 0x731984)
+   │  Increments g_scene_queue_sequence_counter and tail-calls:
+   ▼
+select_and_load_scene(scene_id, ...)       at 0x730fb0
+```
+
+Each lower-level `sub_58fc{10,20,30,40}` function is a one-liner that hardcodes its scene_id constant (9 / 10 / 11 / 12 respectively) and tail-calls `sub_731930`.
+
+### Counters that gate dispatch
+
+| .bss address | gates dispatch of | last-known data | x23 source (passed as arg3) |
+|---|---|---|---|
+| `data_445d940` | mask 2 (scene 10) | uint32 | `data_445d950` |
+| `data_445d928` | mask 4 (scene 11) | uint32 | `data_445d938` |
+| `data_445d978` | mask 8 (scene 12) | uint32 | `data_445d988` |
+| `data_445d960` | mask 1 (scene  9) | uint32 | `data_445d970` |
+
+Each is a count-down: when > 0, sub_7b3060 decrements and dispatches; when 0, it skips. So the cycle is sustained by something **incrementing** these counters every frame. That's the next investigation target.
+
+### Exit condition
+
+`sub_7b3060` exits its `while(true)` only when `sub_72a5c0(8) == 0`. `sub_72a5c0(N)` walks the global `event_queue_head` linked list and returns 1 if any queued entry's first byte == N (excluding the entry currently being processed — `data_44c9250`). So the loop terminates only when the proc queue has no pending **type-8** events.
+
+### Runtime evidence
+
+From the `2026-05-04T15:54:26_queue_scene_caller_v2` run (90 s) — discovery BRK trap added on `sub_731930` entry logs scene_id + caller_va:
+
+| scene_id | call count | caller_va |
+|---|---|---|
+| 12 | 1 | 0x7220c4 (different — initial path, NOT in the cycle) |
+| 10 | 328 | 0x5a9630 (= return-addr after `bl sub_58fc20` at 0x5a962c) |
+| 11 | 328 | 0x5a9624 (= return-addr after `bl sub_58fc30` at 0x5a9620) |
+
+Scene 9 and 16 paths were NOT exercised in this run (their counters stayed at 0).
+
+### Scenes loaded — what we know vs. what we don't
+
+**File-level (verified by host strace, Step 80):** 34 unique `.radium` files were actually opened during the run — 19 from `auto_loaded/` and 15 from `demand_loaded/`. The full path list is in Step 80's strace output. Loading works.
+
+**scene_id ↔ .radium path mapping:** **NOT yet definitively determined.** From `scene_config_table` we know:
+- scene_id 10 → asset_id 10 (image-id high16 = 0)
+- scene_id 11 → asset_id 11 (image-id high16 = 0)
+- scene_id 12 → asset_id 12 (image-id high16 = 0)
+
+But asset_id refers into image.bin's packed_id space, which then resolves through bytecode to a `.radium` reference. We have not yet decoded that final step. The Connectivity TestMenu names below appear in the binary as strings:
+
+```
+Connectivity/TestMenu/Page1
+Connectivity/TestMenu/Page2
+Connectivity/TestMenu/Cursor
+Connectivity/TestMenu/Cursor_Space
+Connectivity/TestMenu/Cursor_Done
+Connectivity/TestMenu/Cursor_enter
+Connectivity/TestMenu/Enter_Cursor
+Connectivity/TestMenu/Boxes_1..4
+Connectivity/TestMenu/Boxes_AllGray
+Connectivity/TestMenu/Numeric_Keyboard_Keypad
+Connectivity/TestMenu/K_12345
+Connectivity/TestMenu/K_AllDim
+Connectivity/TestMenu/K_BKSPC / K_BKSPC_DIM
+Diag_1360
+```
+
+These are SCENE NAMES (or sub-element names) that the Radium scene tree uses; some are sub-objects within a parent `.radium`. The mapping from scene_id 10/11 → which of these names → which `.radium` file IS NOT YET PROVEN. Do not assume it. Future step: decode definitively (e.g., extend the BRK trap to log the scene's name string, or open the Diag_1360 `.radium` in the Radium player and read the scene tree).
+
+### Instrumentation added in this step (lives in `shim_discovery.c`)
+
+| BRK addr | what it logs |
+|---|---|
+| `0x730fb0` (`select_and_load_scene` entry) | `scene_id`, `asset_id` (read from `scene_config_table[scene_id]`), `caller_va` (= lr at entry) |
+| `0x731930` (`sub_731930` entry) | `scene_id`, `caller_va` (caller of the wrapper) |
+
+These traps work alongside the bind-mount setup from Step 80; nothing in Step 81 disturbs the FS pivot.
+
+### Next steps (in priority order)
+
+1. **Definitively identify which `.radium` file is scene_id 10 and which is scene_id 11.** Two paths: (a) extend the trap to log the scene's name string after the asset_bytecode resolution path; (b) inspect `Connectivity/TestMenu/Diag_1360.radium` in the Radium player (whichever of the 34 SHA-1 dirs holds it) and read its scene-tree references. (a) is more authoritative; (b) is faster.
+2. **Find what posts type-8 events** to `event_queue_head`. That's what keeps `sub_7b3060` looping. If we drain those events naturally, the menu may advance. If we patch/hook to drain them artificially, we bypass the menu.
+3. **Find what increments counters** `data_445d940` / `data_445d928`. These are the per-frame dispatch triggers. If a real-hardware-only condition (e.g., a switch state, a network event) is supposed to clear them but never fires in our env, we've found a concrete shim hook target.
+4. Out-of-band: the test-cycler diag flag from Step 77 unlocked downloadmgr's state machine but did NOT bypass `sub_7b3060`. The Diag_1360 menu loop runs **alongside** the downloadmgr thread, not via it. Two independent stuck systems; this one is the visible UI blocker.
+
+### Why this matters
+
+We've been chasing "what's stuck" for months. With `sub_7b3060` identified as the Diag_1360 main loop, every future investigation can be framed in terms of: *what would make this loop progress on real hardware that doesn't happen in our env?* That's a much more targeted question than "what's wrong with file loading" or "what's wrong with the SceneCache." The Step 80 pivot (scenes load fine) and Step 81 finding (cycle is the menu loop) together close the "is the engine working?" question — the engine works, it's stuck in a UI screen waiting for input/events we don't supply.
+
+
 
 
 
