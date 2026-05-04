@@ -6960,5 +6960,152 @@ Run: `runs/2026-05-04T11.19.01_event_handler_dump_v1/game.log`. All from `event_
 
 **Shared handler note**: `0x4d9db0` (just `return 1`) appears in events 0x10, 0x11, 0x5d. Skip in BN lookups.
 
+## Step 79: Architecture decision point — LD_PRELOAD path-remap → mount-namespace bind mounts (2026-05-04)
+
+Decision point captured during investigation of why `.radium` files aren't visibly opened. Recording the assessment + proposal before attempting POC. Commit pinned for revert if needed.
+
+### Assessment
+
+The LD_PRELOAD path-remap architecture has a fundamental ceiling we keep colliding with: it can only intercept calls that go through *named libc symbols we know to hook*. Today alone we found that internal glibc symbols (`__open*_2`, etc.) need separate hooks; raw syscalls bypass libc entirely; libstdc++ may use paths that are completely opaque from outside; and even when our hooks fire, the path-remapping logic itself has subtle holes (relative paths bypassing remap, nested CWD interactions, etc.). We're not 95% of the way there. We're at a structural wall.
+
+The right answer is **not** a kernel driver. That's heavyweight, hard in WSL2, and unnecessary because **Linux already provides the right primitive: mount namespaces with bind mounts.**
+
+### Proposal
+
+```
+unshare --mount --user --map-root-user bash -c '
+    mount --bind /mnt/c/Workspace/pokemon-le-0.81.0/games        /games
+    mount --bind /mnt/c/Workspace/pokemon-le-0.81.0/etc          /etc/spike3   # selective
+    mount --bind /mnt/c/Workspace/pokemon-le-0.81.0/connectivity /connectivity
+    mount --bind /mnt/c/Workspace/pokemon-le-0.81.0/data         /data
+    cd /games/pokemon_le
+    LD_PRELOAD=spi_shim.so qemu-aarch64 ./game
+'
+```
+
+When the game opens `/games/pokemon_le/assets/lcd/auto_loaded/...`, the **kernel** resolves it through the namespace's mount table. Doesn't matter if it's a `fopen64` call, a `__openat64_2` call, a raw `syscall(SYS_openat,...)`, or inline assembly — it all hits the kernel and the kernel sees the bind mount. **Every path-related hole closes simultaneously.**
+
+The LD_PRELOAD shim stays — but only for what it should always have done: **hardware**. SPI bridges, I2C devices, GPIO, audio DACs, UART netbridge, frame/audio sockets to the host, etc.
+
+### Why this beats alternatives
+
+| Option | Verdict |
+|---|---|
+| Continue current approach | Wall. We literally cannot intercept what we cannot enumerate. |
+| Kernel driver | Right idea, wrong layer. WSL2 makes custom drivers painful. We get the same property from a userspace mount namespace, which is just-works in WSL2. |
+| Dedicated WSL env with `/games/` paths | Solves the path problem but: doesn't scale to multi-game, creates a separate dev environment, you still need hardware hooks. |
+| **Mount namespace + bind mounts (proposed)** | Same FS guarantees as kernel driver. Same path correctness as dedicated WSL. Lives in the same WSL distro. ~50 lines of bash. |
+
+### What we lose / what we keep
+
+Lose: shim_fs.c's `remap_path`, ~20 of our fs hooks, the audit-pass hooks for unlink/rename/etc., the `should_log_open` filter, the `__openat64_2` etc. variants we just added. Roughly 600-800 lines of fs-specific shim code becomes dead.
+
+Keep: every hardware hook (SPI/I2C/UART/V4L2/DRM/GPIO/ALSA), discovery infrastructure, BRK traps, the diag-mode patch, the event-handler dump, the Radium scene catalog, the BN notebook integration, JOURNAL.
+
+### Plan
+
+1. **5-minute POC:** `unshare -m -r` and bind-mount `/games`. Run the existing game with no fs shim hooks (or just bypass remap_path to be a no-op). Verify the game opens .radium files visibly via existing fopen64 hook. Single experiment definitively answers our current question — *and* validates the refactor direction in one shot.
+2. If POC validates: write a `run_game_namespace.sh` that does the bind-mount setup, then iteratively delete fs hooks from the shim.
+3. End state: shim becomes "hardware bridge" only, ~30% of its current size. New games come online by scripting their bind-mount table, not by adding hooks.
+
+### Risks
+
+- WSL2 mount-namespace behavior can have quirks. Bind mounts work, but `unshare --user` may need `kernel.unprivileged_userns_clone=1` set on some distros.
+- Some host paths we DO want to redirect (fontconfig probing /home/c/...) — handled by bind-mounting our config in or by setting env vars, not by remap.
+- A few "writes" we currently emulate via remap (audit-pass `unlink /connectivity/...`). Bind mount handles these for free, but verify clean run.
+
+## Step 80: POC validated — file loading was a phantom, real blocker is scene-cycling at 10↔11 (2026-05-04)
+
+### Pivot summary
+
+After months of escalating LD_PRELOAD shim coverage (50+ hooks added including FORTIFY-source variants `__openat64_2` / `__open_2` / `__open64_2`, internal aliases `__open` / `__openat` / `__open64` / `__openat64`, dirent variants `readdir` / `readdir64`, getcwd, fdopen, etc.), we still saw zero `.radium` opens in our shim log. The conclusion drawn was "scenes aren't being read." **That conclusion was wrong.**
+
+Authoritative host-level strace (qemu-aarch64 wrapped with `strace -f -e openat`) shows definitively:
+
+- **34 unique `.radium` files actually opened** in a 120s run (19 from auto_loaded, 15 from demand_loaded)
+- All via libc-internal call paths the LD_PRELOAD-name-based hooks don't intercept
+- ZERO indication file loading is broken
+
+**Pillar memory `feedback_build_works.md` validated.** The shipping build runs on thousands of cabinets daily. SceneCache works. Our shim was simply blind to a code path it doesn't hook.
+
+### The actual blocker
+
+`select_and_load_scene` (logged via the discovery BRK trap at `0x730fb0`) is called in a tight cycle:
+
+| scene_id | call count | timing |
+|---|---|---|
+| 12 | 1 | initial |
+| 0 | 1 | initial |
+| **10** | **443** | cycling 14:32:31 → 14:33:14 |
+| **11** | **443** | cycling, alternating with 10 |
+
+That's ~12 cycles/sec of `10→11→10→11→...` for the entire observation window after init. Visible symptoms (per user observation):
+- "Startup in progress" animation freezes
+- Menu navigation sound spams repeatedly
+- Same two scenes keep re-selecting; nothing advances past
+
+Scenes 10 and 11 are presumably a paired UI surface (e.g., status bar + content area, or two menu pages). Whatever invariant should advance the game past them is not being satisfied. **The actual investigation target moves from "filesystem" to "what triggers `select_and_load_scene(10/11)` cycle and what would break it."**
+
+### Bind-mount approach validated
+
+Before the pivot we proposed in Step 79: replace LD_PRELOAD path-remap with mount-namespace + bind mounts. Tested today and confirmed:
+
+- `sudo mkdir /games /connectivity /data && sudo mount --bind <sysroot>/{games,connectivity,data}` creates native-path equivalents
+- Game-relative paths (`./assets/...` from CWD) and absolute paths (`/games/...`, `/connectivity/...`) all resolve correctly via the kernel's mount table
+- `.radium` files readable through the bind-mounted paths (verified via direct read + strace)
+- Note: bind mounts on /mnt/c (9p) only succeed at HOST level, not inside an unprivileged user namespace (verified — standard Linux user-namespace behavior, NOT a WSL quirk; per `feedback_verify_quirks.md`)
+
+### Establishing the new normal
+
+**Setup (one-time per WSL boot):**
+```bash
+sudo bash -c 'mkdir -p /games /connectivity /data && \
+  mount --bind /mnt/c/Workspace/pokemon-le-0.81.0/games        /games && \
+  mount --bind /mnt/c/Workspace/pokemon-le-0.81.0/connectivity /connectivity && \
+  mount --bind /mnt/c/Workspace/pokemon-le-0.81.0/data         /data'
+```
+
+After setup, `/games`, `/connectivity`, `/data` are kernel-resolved into the sysroot. Game absolute-path references work natively. Bind mounts persist until reboot or explicit `umount`.
+
+A wrapper script lives at `_emulation/scripts/setup_bind_mounts.sh` (added in this step) that does this idempotently and verifies the mounts.
+
+**Shim now plays a smaller role.** The shim's filesystem code (remap_path, all open-family hooks, all stat-family hooks, opendir/readdir, glob64, etc.) is now redundant — paths resolve via the kernel. The shim still serves its real purpose: hardware emulation (SPI/I2C/UART/V4L2/DRM/GPIO/ALSA), the diag-mode patch, the event-handler dump, the discovery BRK traps, frame/audio bridges to the host.
+
+**Refactor: deferred but documented.** Removing the redundant fs code is a cleanup task with non-zero risk (the hooks intercept some non-FS-related paths like environment-aware stub returns); doing it now would distract from the scene-cycle investigation. Mark for cleanup pass after the front-end blocker is solved. Pruning candidates:
+- `shim_fs.c::remap_path` (entire function)
+- All open-family wrappers (`open`, `openat`, `open64`, `openat64`, `__open*`, `__openat*`, `__open*_2`, `fopen`, `fopen64`, `fdopen`)
+- All stat-family wrappers
+- `opendir`, `readdir`, `readdir64`, `closedir`, `rewinddir`
+- `unlink`, `rename`, `readlink`, `chmod`, `glob64`, `rmdir`, `statfs`, `statvfs64`, `mkdir`, `mkdirat`
+- `chdir`, `getcwd`
+- Audit-pass blocks
+- `should_log_open` filter
+- The `FS_DIAG_TMP_PREFIX` / `fs_diag_path_match` / `SPIKE3_FS_DIAG_*` env vars
+
+That's roughly the bottom 60% of `shim_fs.c` (~700+ lines). The gpiod stub block at the bottom of `shim_fs.c` stays (it's hardware, not FS).
+
+### What was learned (process-level)
+
+- **`feedback_grep_loose_first.md`** added — too-specific greps caused false-negatives that propped up bad hypotheses for hours.
+- **`feedback_verify_quirks.md`** added — "WSL doesn't enforce O_DIRECTORY" was a wrong claim from misread strace, easily falsified by a 1-line C test.
+- **`feedback_build_works.md`** added — "SceneCache might be broken in this build" was almost said and would have been wrong; the build is correct, our environment was incomplete.
+- **`feedback_root_is_fine.md`** added — workarounds to avoid sudo (chroot inside user-namespace, fake-root trees) cost more than `sudo mount --bind` would have.
+
+These four memories are now PILLARS in `MEMORY.md` to prevent re-treading the same loops in future sessions.
+
+### Open / next thread
+
+**Investigate the `select_and_load_scene(10/11)` cycle:**
+1. Identify what scenes 10 and 11 actually are (user can decode the scene_id → SHA1 dir mapping via Radium player; this gives us the visual content).
+2. Find what calls `select_and_load_scene` in this cycle — BRK trap with backtrace, or static xref + correlation.
+3. Determine the invariant that's expected to break the cycle (likely: a specific switch state, a NV byte, a timing condition, or a network-readiness flag).
+
+The cycle pattern (~12Hz alternation) strongly suggests a paired UI redraw bound to a state condition that's not advancing. Most likely candidates:
+- A "startup progress bar" whose update value isn't moving (hardware-init counter not incrementing in our env)
+- A switch input held in an unintended state (cabinet button pressed → menu nav loop)
+- A timer-based scene transition with a condition check that's never satisfied
+
+
+
 
 

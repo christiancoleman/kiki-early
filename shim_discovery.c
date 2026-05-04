@@ -50,6 +50,7 @@ void discovery_log(const char *fmt, ...) {
 #define DISCOVERY_ADDR_NODE_QUERY     0x8f38e0
 #define DISCOVERY_ADDR_POLL_SPAWN     0x675d10
 #define DISCOVERY_ADDR_SCENE_LOAD     0x730fb0
+#define DISCOVERY_ADDR_QUEUE_SCENE    0x731930  /* sub_731930 — wrapper that calls select_and_load_scene; trap here to find its caller */
 
 /* Expected first instructions (aarch64) to ensure binary compatibility */
 #define EXPECTED_GODOT_ERR      0xa9bb7bfdu  /* stp fp, lr, [sp, #-0x50]! */
@@ -58,6 +59,7 @@ void discovery_log(const char *fmt, ...) {
 #define EXPECTED_NODE_QUERY     0x9001d302u  /* adrp x2, 0x4353000 */
 #define EXPECTED_POLL_SPAWN     0xa9bf7bf3u  /* stp x19, lr, [sp, #-0x10]! */
 #define EXPECTED_SCENE_LOAD     0xf001e108u  /* adrp x8, 0x4353000 */
+#define EXPECTED_QUEUE_SCENE    0xb001ecc8u  /* adrp x8, 0x44ca000 */
 
 #define AARCH64_BRK_0           0xd4200000u
 
@@ -67,6 +69,7 @@ static uintptr_t runtime_asset_load = 0;
 static uintptr_t runtime_node_query = 0;
 static uintptr_t runtime_poll_spawn = 0;
 static uintptr_t runtime_scene_load = 0;
+static uintptr_t runtime_queue_scene = 0;
 
 static void patch_point(uintptr_t base, uintptr_t offset, uint32_t expected, uintptr_t *runtime_out, const char *name) {
     uint32_t *instr = (uint32_t *)(base + offset);
@@ -103,6 +106,7 @@ void shim_discovery_init(void) {
     patch_point(base, DISCOVERY_ADDR_NODE_QUERY,   EXPECTED_NODE_QUERY,   &runtime_node_query,   "node_query");
     patch_point(base, DISCOVERY_ADDR_POLL_SPAWN,   EXPECTED_POLL_SPAWN,   &runtime_poll_spawn,   "poll_spawn");
     patch_point(base, DISCOVERY_ADDR_SCENE_LOAD,   EXPECTED_SCENE_LOAD,   &runtime_scene_load,   "scene_load");
+    patch_point(base, DISCOVERY_ADDR_QUEUE_SCENE,  EXPECTED_QUEUE_SCENE,  &runtime_queue_scene,  "queue_scene");
 }
 
 int shim_discovery_handler(uintptr_t pc, void *ucontext) {
@@ -164,8 +168,37 @@ int shim_discovery_handler(uintptr_t pc, void *ucontext) {
         return 1;
     }
 
+    if (pc == runtime_queue_scene) {
+        /* sub_731930(scene_id, ...) — wrapper around select_and_load_scene.
+         * lr at entry = caller's return address. */
+        int scene_id = (int)mc->regs[0];
+        uintptr_t lr = (uintptr_t)mc->regs[30];
+        long caller_va = (long)(lr - game_base);
+        discovery_log("queue_scene_w_731930(scene_id=%d) caller_va=0x%lx", scene_id, caller_va);
+        /* Emulate adrp x8, 0x44ca000 */
+        mc->regs[8] = (game_base + 0x44ca000);
+        mc->pc += 4;
+        return 1;
+    }
+
     if (pc == runtime_scene_load) {
-        discovery_log("select_and_load_scene(scene_id=%d)", (int)mc->regs[0]);
+        int scene_id = (int)mc->regs[0];
+        /* lr at function entry is the caller's return address — the instruction
+         * right after their `bl select_and_load_scene`. Subtracting the runtime
+         * game_base gives us the BN VA of the caller's site. */
+        uintptr_t lr = (uintptr_t)mc->regs[30];
+        long caller_va = (long)(lr - game_base);
+        /* Also log the asset_id from scene_config_table[scene_id] for context. */
+        const uintptr_t TABLE_VA = 0x43fcf10;
+        const uintptr_t STRIDE   = 32;
+        int32_t aid = -1;
+        if (scene_id > 0 && scene_id < 0x375) {
+            uintptr_t entry_addr = game_base + TABLE_VA + (uintptr_t)scene_id * STRIDE;
+            void *array_ptr = *(void **)entry_addr;
+            if (array_ptr) aid = *(int32_t *)array_ptr;
+        }
+        discovery_log("select_and_load_scene(scene_id=%d, asset_id=%d) caller_va=0x%lx",
+                      scene_id, aid, caller_va);
         /* Emulate adrp x8, 0x4353000 */
         mc->regs[8] = (game_base + 0x4353000);
         mc->pc += 4;
