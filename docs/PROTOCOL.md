@@ -1649,6 +1649,29 @@ Per Stern's "SPIKE System and Node Guide" (Fall of the Empire manual §2). Platf
 - Plugging a SPIKE node into a real Ethernet port may damage hardware
 - 48V DC main supply bus; 48V nodes drive high-power outputs; standard I/O nodes pull power from the node bus, supplied by CPU
 
+#### Node firmware files (this build)
+
+Hex files in `games/pokemon_le/*.hex` follow `{function}node-{MCU_variant}-{version}.hex` (general-purpose nodes drop the `node` infix). All shipped at version `1_31_0`.
+
+| Function prefix | MCU variants shipped |
+|---|---|
+| `coil4` | LPC1112_101, LPC1112_201, LPC1313 |
+| `coil4_led` | LPC1313 |
+| `pin` | LPC1112_101, LPC1112_201, LPC1313 |
+| `node4` (general-purpose) | LPC812, LPC1124_303 |
+| `ws2812` | LPC1313 |
+| `ws2812pin` | LPC1313 |
+| `hdmi` | LPC1313 |
+| `hdmi_ws2812` | LPC1313 |
+| `lcd` | LPC1113_302 |
+| `magsensor` | LPC812 |
+| `tmc2590` | LPC1313 |
+| `tmc5041` | LPC1313 |
+
+Power-distribution firmware is separate at `spike3/powerdist/powerdist_ext.hex` (programmed via the powerdist node, not the main RS-485 bus). These hex files are flashed onto remote node MCUs by `mcp_nodebus_flash_node_firmware @ 0x8f5484` over the encrypted node-bus channel (see §5.1) during commissioning. Not emulated by the shim.
+
+*Verified by:* `ls games/pokemon_le/*.hex` — 17 files matching the table above.
+
 ### CPU board (520-1007-42)
 
 Raspberry Pi CM4 carrier on a 509-1007-42 board. Address: Node 0, fixed. Lives in the backbox. Display outputs the CM4 exposes:
