@@ -1140,6 +1140,23 @@ Spike 2 era: audio was encrypted via `NODEBUS_Hash` round-trips to the netbridge
 
 ---
 
+# then write a local scene_catalog.py with that game's SHA-1 catalog
+```
+
+(Adjust the `../` count to match nesting depth.)
+
+When SW LE 0.85 is brought into the same toolchain: same drill. Symlink the three shared bits + write `<sw_le>/assets/lcd/scene_catalog.py`. Most of SW LE's bc0792d8 entries should carry over from spike_menu's catalog (shared Stern code).
+
+#### Refactor candidate: shared Stern catalog
+
+If/when SW LE's catalog also reuses the bc0792d8 descriptions verbatim (very likely), promote the shared block from `scene_catalog.py` files into `assets/lcd/_stern_shared_catalog.py` and have each game's per-game catalog `from _stern_shared_catalog import SHARED_BC0792D8` and merge it into its own `SCENE_INFO`. Skipped today (only two consumers, manageable copy-paste cost; refactor when third consumer arrives).
+
+### Bridge to game code (out-of-scope reference)
+
+The Radium scene tree integrates with Godot via `ManualGodotScene` (vtable at game VA `0x4630230`). Its constructor `sub_b25fc8 @ 0xb25fc8` is called from `load_scene_assets @ 0xb321d0` at `0xb32370` and `0xb32388`. **Per `feedback_godot_is_illegal.md` (2026-05-02), the ManualGodotScene internals — its extended ftable at `0x4630240..0x4630340`, the VideoPlayerSpi class layout, and the play() vtable — are out of scope for active investigation.** They are documented in JOURNAL Steps 36, 71-72 if needed for archeology, but should not be promoted into PROTOCOL.
+
+---
+
 ## 10. Display pipeline (DRM / GBM / EGL / GLES)
 
 The game presents frames via Linux's KMS/DRM stack with EGL on top of GBM. Three layers in the shim:
