@@ -45,22 +45,34 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--socket", default=DEFAULT_SOCKET,
                     help="path to the shim's AF_UNIX audio socket")
+    ap.add_argument("--tcp", default=None,
+                    help="connect via TCP HOST:PORT instead of --socket "
+                         "(used by system-mode-spike: hostfwd to qemu guest)")
     ap.add_argument("--chunk", type=int, default=8192,
                     help="recv() chunk size in bytes (default 8192)")
     args = ap.parse_args()
 
+    if args.tcp:
+        host, _, port = args.tcp.rpartition(":")
+        if not host or not port:
+            raise SystemExit(f"[audio_sub] --tcp expected HOST:PORT, got {args.tcp!r}")
+        family, addr = socket.AF_INET, (host, int(port))
+    else:
+        family, addr = socket.AF_UNIX, args.socket
+
     # Retry-connect so the subscriber can be started before the shim.
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     attempts = 0
     while True:
+        s = socket.socket(family, socket.SOCK_STREAM)
         try:
-            s.connect(args.socket)
+            s.connect(addr)
             break
-        except (FileNotFoundError, ConnectionRefusedError):
+        except (FileNotFoundError, ConnectionRefusedError, OSError):
             if attempts == 0:
-                print(f"[audio_sub] waiting for {args.socket} …",
+                print(f"[audio_sub] waiting for {addr} …",
                       file=sys.stderr, flush=True)
             attempts += 1
+            s.close()
             time.sleep(0.5)
     print(f"[audio_sub] connected", file=sys.stderr, flush=True)
 

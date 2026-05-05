@@ -7367,3 +7367,76 @@ Pokémon logo (centered PNG) is a separate layer rendered by `create_boot_splash
 Per PROTOCOL §14: from a clean state the full sequence produces the same PC/LR result. Verified 2026-05-05 with two consecutive `./RUN_QEMU.sh --headless --debug --ephemeral --gdb 1234` runs.
 
 
+## Step 84: System-mode visible parity — game frames blit into /dev/fb0 + launch-time speedups (2026-05-05)
+
+### Why
+
+Step 83 stood up system-mode for HW-watchpoint debugging but ran headless with the bridges off. To validate that system-mode reaches the same boot state as user-mode (apples-to-apples comparison) we need to *see* what the game is rendering — same way `frame_viewer.py` works in user-mode. The user explicitly directed: "never run it headless or with the bridges off… same experience so we can compare apples to apples." Saved as `feedback_system_mode_parity.md`.
+
+### Direction (and the dead ends)
+
+Initial plan was to expose the existing AF_UNIX abstract bridges to a host subscriber via qemu user-mode networking + hostfwd. That ran into multiple verified roadblocks:
+
+- **GENET hard-disabled.** qemu raspi4b 10.0.8 actively patches `brcm,bcm2711-genet-v5` (and `brcm,bcm2711-pcie`, `brcm,bcm2711-thermal`) to `status = "disabled"` at boot, before the kernel parses the DTB. The disable list is in qemu's `compat_disable[]` array (verified via `strings $(which qemu-system-aarch64) | grep -B1 'has been disabled'`). No way to re-enable at runtime — without a platform device the kernel can't probe a driver.
+- **USB-net via DWC2 doesn't enumerate.** `-device usb-net,netdev=net0` correctly attaches to qemu's emulated DWC2 controller (verified via `info qtree` from `qemu -monitor stdio`). But the Stern kernel's built-in `dwc_otg` (RPi downstream) only matches `brcm,bcm2708-usb` and doesn't know how to drive qemu's BCM2711-style register layout. Patching the DTB's compat to `brcm,bcm2835-usb` (which mainline `dwc2.ko` matches) didn't get probe to fire either — likely a missing-PHY/clock issue, but not pursued further.
+- **DTB-resident networking is intrinsically constrained.** PCIe disabled = no virtio-net-pci. raspi4b machine model has no virtio-mmio or vsock by default.
+
+### The actual fix — write into /dev/fb0
+
+`bcm2708_fb` exposes a kernel framebuffer at `/dev/fb0` that qemu's GTK display window mirrors directly. We don't need any cross-VM transport: the shim can `mmap(/dev/fb0)` and blit each captured frame straight into the kernel framebuffer. qemu shows the bytes.
+
+Implementation in `shim_bridges.c::shim_fb0_blit`:
+
+- Lazy init on first frame: `open("/dev/fb0", O_RDWR)`, `ioctl(FBIOGET_VSCREENINFO)` to learn dims + bpp + R/B offset (detect BGRA vs RGBA), `mmap` the framebuffer.
+- Per-frame: format-convert RGBA8 → fb0 native (32 bpp BGRA / 16 bpp RGB565), nearest-neighbor scale if src and fb dims differ.
+- Same-size + 32 bpp = fast path (memcpy when no R/B swap, simple loop otherwise).
+- Gated on `SPIKE3_FB0_OUTPUT=1`. Coexists with the existing AF_UNIX/TCP bridge — both are no-ops when their respective consumers aren't present.
+
+The capture path in `shim_frame_capture_at_page_flip` was already running every 2nd MODE_PAGE_FLIP via `glReadPixels`. Added `shim_fb0_blit(w, h, shim_frame_buf)` after the existing `shim_frame_send`. The early-return guard `if (shim_frame_client_fd < 0) return;` was widened to also pass when `SPIKE3_FB0_OUTPUT=1` (cached after first call).
+
+### Force fb0 to game resolution
+
+qemu raspi4b's default fb0 was 800×480, smaller than the game's 1920×1080. The `bcm2708_fb` driver honors `bcm2708_fb.fbwidth=` / `bcm2708_fb.fbheight=` kernel cmdline params, so `RUN_QEMU.sh`'s `-append` now carries `bcm2708_fb.fbwidth=1920 bcm2708_fb.fbheight=1080`. Verified: `bcm2708_fb soc:fb: Registered framebuffer for display 0, size 1920x1080`.
+
+### WSLg fullscreen crash
+
+GTK on WSLg's Wayland surface aborts qemu with `Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display.` on certain operations including fullscreen toggles. WSLg also exposes an X11 socket; forcing `GDK_BACKEND=x11` before the qemu invocation makes GTK use X11 instead of Wayland and the fullscreen crash goes away. Added to `RUN_QEMU.sh`.
+
+### Launch-time speedups
+
+The repack step (cpio | zstd of ~373 MiB initramfs into ~92 MiB) was the bulk of launch time at ~30 s. Two changes in `RUN_QEMU.sh`:
+
+- **mtime-gated repack**: if `rootfs.cpio.zst` is newer than every file under `initramfs/`, skip the repack entirely. Most relaunches (no shim/overlay/script edits) become instant.
+- **zstd -3 instead of -19**: when the repack does run, ~6× faster (~30 s → ~5 s) for a ~10 % bigger archive. The archive is never shipped, so size is unimportant.
+
+### TCP-listen support added to bridges (for the future)
+
+While debugging the abandoned networking path, `shim_bridges.c` got a generic `shim_bridge_create_listener()` helper that creates either an AF_INET TCP listener (when `SPIKE3_*_TCP_PORT` env is set) or the original abstract AF_UNIX listener. `frame_viewer.py` and `audio_subscriber.py` got a parallel `--tcp HOST:PORT` flag. None of this is exercised in the current system-mode flow but it's harmless and ready if a transport-capable rig appears later. Same-shape change in `shim_bridge_start` / `shim_frame_start` / `shim_audio_start`.
+
+### Files changed
+
+- `_emulation/shim_bridges.c` — `shim_bridge_create_listener` helper; AF_INET/AF_UNIX accept threads use `sockaddr_storage`; new `shim_fb0_blit` + lazy fb0 init; capture-path guard widened to honor fb0 mode.
+- `_emulation/historical-system-rig/RUN_QEMU.sh` — `bcm2708_fb.fbwidth=1920 bcm2708_fb.fbheight=1080` in `-append`; `GDK_BACKEND=x11` exported; mtime-gated repack with `zstd -3`.
+- `_emulation/historical-system-rig/initramfs/usr/local/bin/wrap_game.sh` — `SPIKE3_FRAME_BRIDGE=1`, `SPIKE3_AUDIO_BRIDGE=1`, `SPIKE3_FB0_OUTPUT=1`. (Earlier intermediate state had a USB-net + DHCP block; reverted as part of the dead-end backout.)
+- `_emulation/frame_viewer.py`, `_emulation/audio_subscriber.py` — added `--tcp HOST:PORT` flag, original abstract-AF_UNIX behavior unchanged.
+- `_emulation/docs/PROTOCOL.md` — §2 alternate-path block updated; §14 expanded with "Visible display via /dev/fb0", "Force fb0 to game resolution", "Avoid the WSLg fullscreen crash", "Networking is not available" subsections; stale "no host-side subscribers, bridges=0" framing replaced.
+- `_emulation/historical-system-rig/README.md` — purposes restated as HW-watchpoint debugging + visible parity; quick-reference dropped `--headless`; speedup notes added.
+- Memory: `feedback_system_mode_parity.md` (apples-to-apples rule), `feedback_announce_when_waiting.md` (announce long waits before going silent).
+
+### Verified end-to-end (2026-05-05)
+
+`./RUN_QEMU.sh --debug --ephemeral --gdb 1234` boots the system-mode rig with `GDK_BACKEND=x11`. qemu's GTK window appears, kernel boot text scrolls, then the Pokémon logo + animated "Startup In Progress" overlay renders in the GTK window — same screen the user-mode `frame_viewer.py` shows. Boot-status wait loop completes (bit-3 cleared) at the same point as user-mode, confirmed by user. Total elapsed slower than user-mode (cross-arch TCG + full kernel emulation overhead, irreducible without KVM) but the path is reliable.
+
+### What's NOT verified
+
+- Audio output via fb0 (audio still flows to the AF_UNIX abstract socket in-VM with no host-side subscriber — silent in system-mode, intentionally). If audio-parity becomes important, options are: install a host-side ALSA capture in the VM, or wire one of the other transports.
+- Whether the boot reaches Step 6's Guided Setup (the front-end blocker per `CURRENT INVESTIGATION` memory). System-mode reaches at least the same "Startup In Progress" point as user-mode; whether downstream behavior also matches is the next investigation, not addressed here.
+
+### Open questions / next steps
+
+1. The Diag_1360 menu loop (JOURNAL Step 81) is still the front-end blocker. With visible parity in system-mode now available, both rigs can be observed side-by-side to look for divergences.
+2. fb0 blit cadence is currently every 2nd page-flip (matched the bridge's existing rhythm). If TCG rendering lag becomes an issue, an env-tunable decimation (`SPIKE3_FB0_DECIMATE=N`) is a one-line change.
+3. The shipping production cabinet uses real `/dev/dri/card1` + KMS, not fb0. The fb0 path is purely an emulation-rig feedback channel; real game code is unaffected.
+
+
+

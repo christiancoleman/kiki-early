@@ -177,9 +177,9 @@ Each script handles its own subsystem. Verified against the live `/etc/init.d/` 
 - **`mcp_init_renderer_and_scene_cache_singletons` (`0x5d7aa0`) is the canonical Stern boot sequence** for graphics + scene cache. Five steps inside (per Stern source-line assertions in the binary): `new DisplayRenderer(0x1b8) → constructor → mutex+deferred-list → wait_on_render_thread_ready → new SceneCache(0x1d0)("./assets") → post-init`. Equivalent in Star Wars LE 0.85: `0x309af0`. Equivalent in `spike_menu`: see §13.
 - **`pthread_create` with `SCHED_RR`** — the dispatch thread (`procDispatch`) needs RR scheduling. Under qemu-user without `CAP_SYS_NICE` this fails silently; the shim's `shim_pthread_create` forces `PTHREAD_INHERIT_SCHED` to skip the failing path. See §2 "Common gotchas."
 
-### Localized-message-table primitive (used by step 3 overlays)
+### Localized-message-table primitive (used by step 2's overlay)
 
-When the boot code wants to draw a UI string (like "Startup In Progress%s" or "Pending Licensor Approval"), it goes through a two-level table lookup:
+When the boot code wants to draw a localized UI string (like "Startup In Progress%s"), it goes through a two-level table lookup:
 
 ```
 caller — e.g. mcp_draw_startup_in_progress_overlay
@@ -205,9 +205,9 @@ The `%s` argument is built by `sub_7de9c0(3, …)` — likely "stringify the int
 
 The msgid → string-table resolution was **established empirically** (PROTOCOL.md §14 "System-mode debugging" workflow): a HW read watchpoint on `mcp_localized_string_table[0x789]` runtime address `0x55598e89c8` fired with PC = `0x7a64ec` (inside `mcp_lookup_localized_msg_by_id`) and LR = `0x5cdf90` (inside `mcp_draw_startup_in_progress_overlay`). The same chain handles every other localized-string draw.
 
-### Boot-splash tick chain (step 3 overlays)
+### Boot-splash tick chain (step 2 + step 3 overlays)
 
-The state-machine path that decides which overlay text to draw between init steps:
+The state-machine path that decides which overlay text to draw on top of the Pokémon-logo / SPIKE3-logo phase:
 
 ```
 primary_initialization_orchestrator (0x678bc0)
@@ -231,9 +231,37 @@ primary_initialization_orchestrator (0x678bc0)
      └─ sub_7b6be0 — std::condition_variable::notify_all on DisplayRenderer's cv (wakes render thread)
 ```
 
-The flag mask at `*(arg1 + 0x38)` is what ultimately determines whether step 3 shows "Startup In Progress" vs "Pending Licensor Approval" vs another message. Identifying who SETS that mask, and what determines which bit is set during early init, is the next thread to pull when investigating "why isn't the next screen showing in our emulator."
+The flag mask at `*(arg1 + 0x38)` (absolute address `0x445f838`, since `arg1 = &data_445f800`) is what ultimately determines which overlay text gets drawn on a given tick. Bit 3 specifically drives the step-2 "Startup In Progress" overlay; the other bits drive other overlays — which specific bit fires which string isn't fully pinned down yet beyond bit 3.
 
-*Verified by:* runtime hardware-read-watchpoint observation 2026-05-05 (PC `0x7a64ec`, LR `0x5cdf90`); BN decompile of the listed functions.
+#### Who sets the mask
+
+The bits are written by a family of one-bit-per-function setter helpers, one per dispatch slot. The bit-3 setter (the one driving "Startup In Progress") is:
+
+- **`mcp_set_startup_in_progress_overlay_flag` (`0x5d0930`)** — `arg1 == 1` ORs `0x08` into the mask, `arg1 == 0` ANDs `~0x08`. Only two callers, both inside `primary_initialization_orchestrator`:
+  - `0x678dc8` — `sub_5d0930(1)` enables the overlay just before the boot wait loop.
+  - `0x678e0c` — `sub_5d0930(0)` clears the bit after the wait loop exits.
+
+The wait loop in between is **counter-bounded (~480 iterations)** and exits early when `mcp_scene_cache_preload_done` (`data_4482108`) becomes non-zero. Pseudocode:
+
+```c
+sub_5d0930(1);                          // SET bit 3 → enable overlay
+counter = 0x1e0;                        // 480 iterations
+do {
+    mcp_boot_splash_tick(0);            // bit-3 path renders "Startup In Progress"
+    usleep(...);
+} while (--counter != 1 && mcp_scene_cache_preload_done == 0);
+sub_5d0930(0);                          // CLEAR bit 3 → disable overlay
+mcp_boot_splash_tick(0);                // tick once after clear
+usleep(0xfa00);
+mcp_boot_splash_tick(1);                // final tick
+fire_event(0x5f, 0);
+```
+
+`mcp_scene_cache_preload_done` is set to 1 at `0x66d490` inside `SceneCache_PreLoadRadiumAssets` — i.e. when the Radium scene preload phase finishes (after enumerating `/lcd/demand_loaded/*.{radium,json}`, `/nuk/images/*.{jpg,bmp,png,dds}`, `/lcd/auto_loaded/*.{radium,json}` and constructing the auto-loaded `RadiumScene` objects). That preload runs on a **background thread** (`RadiumAssetLoader_ThreadEntry`) launched by `mcp_SceneCache_ctor` at `0x66b06c` via `CC_mainDispatchThread(RadiumAssetLoader_ThreadEntry+0xc, 8, "PreLoadSceneCache", arg1)`.
+
+Implication: the wait loop is **time-bounded regardless** — even if the asset preload thread hangs, the orchestrator continues after ~8 wall seconds (in user-mode; longer in system-mode TCG emulation). The overlay is therefore not the proximate cause of any indefinite stall; the actual front-end blocker (per `CURRENT INVESTIGATION` memory, JOURNAL Step 81) is the Diag_1360 menu loop downstream.
+
+*Verified by:* runtime hardware-read-watchpoint observation 2026-05-05 (PC `0x7a64ec`, LR `0x5cdf90`); BN decompile of the listed functions; `get_xrefs_to(0x445f838)` to enumerate writers, `get_xrefs_to(0x5d0930)` to confirm only the two orchestrator call-sites; `get_xrefs_to(0x4482108)` to find the `SceneCache_PreLoadRadiumAssets` writer; chain confirmed by user (system-mode and user-mode both reach the post-overlay state).
 
 ---
 
@@ -1218,6 +1246,8 @@ The Radium scene tree integrates with Godot via `ManualGodotScene` (vtable at ga
 
 ## 10. Display pipeline (DRM / GBM / EGL / GLES)
 
+**Data flow at a glance.** The game does its own real GLES rendering — no synthesized frames are fed to it. We intercept the hardware-specific framebuffer presentation parts (DRM/KMS ioctls + GBM allocation calls) and replace them with stand-ins, but every `glClear` / `glDraw*` / shader / texture upload the game issues is forwarded through to **real Mesa with the llvmpipe CPU rasterizer**, which writes real pixels into a real off-screen EGL pbuffer (returned by Mesa's `eglCreatePbufferSurface(1920×1080)` after we redirect the game's `eglCreateWindowSurface` call). At each fake page-flip the shim does `glReadPixels` on that pbuffer, getting bit-exact what the game just rendered, and routes the bytes to one or more sinks (frame bridge over AF_UNIX/TCP, `/dev/fb0` blit for the qemu GTK window, periodic on-disk capture). GBM in this flow is a handle stand-in — its BOs are `calloc(256)` scratch pointers used as opaque tokens passed between layers; the only GBM BOs that actually carry pixel data are the special 1024×256 DMD path (`gbm_bo_map` returns `calloc(stride*height)` storage and `gbm_bo_unmap` captures it). The result: anything the game draws — including any rendering bug — shows up in the pbuffer and downstream, just executed slower by software raster than by a real GPU.
+
 The game presents frames via Linux's KMS/DRM stack with EGL on top of GBM. Three layers in the shim:
 
 1. **`/dev/dri/card1`** — DRM ioctls intercepted before they'd reach the real device
@@ -1669,6 +1699,16 @@ The shim (`spi_shim.so`, built from 11 TUs) intercepts every device the game exp
 | GPIO sysfs (`/sys/class/gpio/*/value`, `direction`, etc.) | fake fd pool `1000..1015` | direct GPIO access (e.g. for libgpiod) | Synthetic reads: `"0\n"` value, `"out\n"` direction. One-shot latch reset by `lseek(0)` |
 | libgpiod chardev (`/dev/gpiochip*`) | (Stub) | newer GPIO interface | output-only; reads not modeled |
 
+### Runtime binary patches (`shim_patches.c`)
+
+| Patch | Gate | Target |
+|---|---|---|
+| memcpy NULL-guard | always on | silently no-op when src/dst NULL — fixes Godot DisplayRenderer thread crash on un-initialized TLS |
+| `avcodec_find_decoder_by_name` remap | `SPIKE3_SW_HEVC=1` | `"hevc_v4l2request"` / `"hevc_v4l2m2m"` → `"hevc"` so libavcodec's software HEVC decoder is selected when the game asks for the V4L2 hwaccel variant |
+| Dummy NV12 frame injection | `SPIKE3_INJECT_VIDEO=1` | when `avcodec_receive_frame` returns EAGAIN with pending packets, ref a 1920×1080 black frame with monotonic PTS so the game's render path always gets *something* |
+
+In addition to the gated patches above, `shim_patches.c` also installs unconditional **passthrough hooks** for `avcodec_get_hw_config`, `av_hwdevice_ctx_create`, `avcodec_send_packet`, `avcodec_receive_frame` — these resolve the real symbols via `dlvsym`, log call activity, and dispatch to either real libavcodec (default) or the host NVDEC daemon when `SPIKE3_FORWARD_DECODE=1` (the dispatch lives in `shim_avforward.c`).
+
 ### Other hooks (in `spi_shim.c` + `shim_net.c`)
 
 | Hook | Behavior |
@@ -1678,7 +1718,6 @@ The shim (`spi_shim.so`, built from 11 TUs) intercepts every device the game exp
 | termios family | UART fd gets fake-OK because glibc INLINE_SYSCALLs bypass our ioctl hook |
 | ALSA | Full set of fake-success stubs; `snd_pcm_writei` captures + paces. See §8 |
 | GStreamer | passthrough+log on `init_check`/`factory_make`/`parse_launch`/`bin_add`/`element_link`/`set_state`/`deinit`. **Linked but unused in PLE 0.81** — no static callers in the game binary; gstreamer init never fires unless `SPIKE3_FORCE_GSTREAMER=N` trampoline is used. The actual video path is 100% direct libavcodec via Stern's `spi_video_player` (`SpiVideoStreamDecoderBase` class) plus Radium's own `VideoStreamDecoder` |
-| `__dynamic_cast` | instrumented for VideoPlayerSpi range (BN `0xe30000–0xe50000`) |
 | `connect` / `getaddrinfo` (`shim_net.c`) | log-only passthrough gated by `SPIKE3_OFFLINE=1` |
 
 ### Hardware reference: Stern Spike 3 nodes
@@ -1819,8 +1858,24 @@ The DisplayRenderer / SceneCache / RadiumScene / proc-system / node-bus / SPI / 
 
 ## 14. System-mode debugging (HW watchpoints)
 
+### Visible display via /dev/fb0
+
+qemu raspi4b's GTK window mirrors the kernel's `/dev/fb0` framebuffer (`bcm2708_fb` driver). The shim's frame-capture path hooks into the `MODE_PAGE_FLIP` ioctl handler — every second flip, it does `glReadPixels` on the current draw FBO and (when `SPIKE3_FB0_OUTPUT=1`) blits the RGBA bytes directly into mmap'd `/dev/fb0`. Result: the qemu GTK window shows whatever the game just rendered, with no host-side subscriber, no cross-VM transport, no networking-stack workarounds. Same architecture as the user-mode `frame_viewer.py` flow but with `/dev/fb0` instead of an AF_UNIX abstract socket.
+
+Implementation lives in `shim_bridges.c::shim_fb0_blit` (lazy `open(/dev/fb0)` + `FBIOGET_VSCREENINFO` on first frame, mmap, then per-frame format-convert + nearest-neighbor scale into the mapped framebuffer). It runs alongside the existing AF_UNIX/TCP frame-bridge path — both are no-ops if their respective consumers aren't enabled.
+
+**Force fb0 to game resolution.** qemu raspi4b's default `bcm2708_fb` size is 800×480, smaller than the game's 1920×1080. The kernel's `bcm2708_fb` driver honors the `bcm2708_fb.fbwidth=` / `bcm2708_fb.fbheight=` cmdline params, so `RUN_QEMU.sh`'s `-append` carries `bcm2708_fb.fbwidth=1920 bcm2708_fb.fbheight=1080`. With those, fb0 registers at native game resolution and no scaling is needed in the blit fast path.
+
+**Avoid the WSLg fullscreen crash.** GTK on WSLg's Wayland backend crashes qemu with `Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display.` on certain operations (notably fullscreen toggles). `RUN_QEMU.sh` exports `GDK_BACKEND=x11` before launching qemu — WSLg also exposes an X11 socket, GTK is happy on X11, fullscreen works.
+
+### Networking is not available in this environment
+
+For completeness: TCP-based bridges are not available in the system-mode rig as of 2026-05-05. qemu raspi4b 10.0.8's machine code disables `brcm,bcm2711-pcie`, `brcm,bcm2711-genet-v5`, and `brcm,bcm2711-thermal` in the DTB before the kernel parses it (verified via the `bcm2711 dtc: %s has been disabled!` warnings + the `compat_disable[]` array in the qemu binary). `-device usb-net` attaches to qemu's emulated DWC2 controller correctly (verified via `info qtree` from the monitor) but no kernel driver enumerates the resulting USB device — the rootfs's built-in `dwc_otg` driver expects BCM2835 register layout, mainline `dwc2.ko` won't auto-bind to the DTB's `brcm,bcm2708-usb` compat string, and patching the DTB to `brcm,bcm2835-usb` (which dwc2 would match) still doesn't get past probe in this combo. The `SPIKE3_FB0_OUTPUT` path sidesteps the entire problem.
+
 # 1. Boot. --ephemeral discards SD writes; --debug backgrounds qemu; --gdb [PORT] enables gdbstub.
-./RUN_QEMU.sh --headless --debug --ephemeral --gdb 1234
+# DO NOT pass --headless: per feedback_system_mode_parity.md the GTK window must be up so
+# /dev/fb0 visible-display + general parity with user-mode are preserved.
+./RUN_QEMU.sh --debug --ephemeral --gdb 1234
 
 # 2. Watch the boot until the game launches. The wrap_game.sh prints
 #    "GAME_PIE_MAP: <base>-<end> r-xp ... /games/game" lines once exec /games/game completes.

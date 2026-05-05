@@ -306,11 +306,10 @@ static void shim_init_dirs(void) {
 /* ---- Poke threads (Phase 9) moved to shim_inject.c ---- */
 
 /* ---- Patches (Phase 8) + injection threads (Phase 9) carved out ----
- * shim_patch_spi_video_vtable / shim_patch_get_format_callback live in
- * shim_patches.c. The vp_patch thread that applies them, all other
- * env-gated worker threads, the event-sweep machinery, and the
- * SIGALRM handler live in shim_inject.c. See spi_shim.h for the
- * two public entry points (shim_event_sweep, shim_inject_start). */
+ * Runtime patches + libavcodec entry-point hooks live in shim_patches.c.
+ * Env-gated worker threads, the event-sweep machinery, and the SIGALRM
+ * handler live in shim_inject.c. See spi_shim.h for the two public entry
+ * points (shim_event_sweep, shim_inject_start). */
 
 /* Forward decl — full definition further down (Step 71 brk probe). */
 static void shim_sigtrap_handler(int sig, siginfo_t *info, void *uc);
@@ -544,17 +543,16 @@ int system(const char *cmd) {
     return real_fn(cmd);
 }
 
-/* ---- SIGTRAP handler for VideoPlayerSpi::play() entry probe (Step 71) ----
- * shim_patch_video_player_play_entry_brk patches the NOP at sub_e3819c
- * (BN VA 0xe3819c — the function entry) with `brk #0`. When the game calls
- * play(), execution traps here. The handler reads the function's `this`
- * pointer (x0 by aarch64 calling convention), peeks at the in-tree flag
- * (this+0x2c0) and the Radium playback object pointer (this+0x988), logs
- * the values, advances PC past the brk, and returns. The skipped instruction
- * was a NOP, so no behavior change.
- *
- * Limited to first VP_BRK_LOG_MAX traps to avoid log spam if play() is
- * called every frame. */
+/* ---- SIGTRAP handler — DORMANT (was Step 71/72/72g BRK-trap probes) ----
+ * The handler below was wired to three BRK-trap probes:
+ *   - shim_patch_video_player_play_entry_brk @ sub_e3819c (Step 71 VP probe)
+ *   - shim_patch_sub_8edfe0_brk              (Step 72 nodebus synthesiser)
+ *   - shim_patch_fire_event_brk              (Step 72g event-id selective-pass)
+ * The patch installer functions have been removed. The runtime-address
+ * volatiles below stay zero, so every condition in the handler short-
+ * circuits and the handler is a no-op. Kept for now only so that any future
+ * BRK probe can re-arm one of these volatiles without re-installing the
+ * SIGTRAP action. Safe to delete entirely if no probe is anticipated. */
 #include <ucontext.h>
 
 volatile uintptr_t shim_vp_play_entry_runtime = 0;

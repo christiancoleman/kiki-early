@@ -24,8 +24,6 @@
  *     trampoline / poke to translate BN VAs to runtime addresses.
  *   - shim_cmode_table[] / shim_cmode_table_count (shim_diagnostics.c)
  *     — used by the cmode snapshot diff and cmode poke.
- *   - shim_patch_spi_video_vtable / shim_patch_get_format_callback
- *     (shim_patches.c) — called from shim_vp_patch_thread.
  *   - shim_event_sweep() exported here and called from the SIGUSR2
  *     handler in shim_diagnostics.c.
  */
@@ -1096,19 +1094,13 @@ static void *shim_force_gstreamer_thread(void *arg) {
     return NULL;
 }
 
-/* Step 72 deferred patch installer.
- *
- * Cannot be called from shim_inject_start at constructor time because
- * shim_resolve_game_base() works by walking the calling thread's stack for
- * a /game frame; at constructor time no game thread has run yet, so the
- * resolver returns 0 and the patch aborts. Step 71's
- * shim_patch_video_player_play_entry_brk has the same dependency and is
- * already deferred by shim_vp_patch_thread (2 s sleep then call).
- *
- * shim_vp_patch_thread is gated on SPIKE3_PATCH_SPI_VIDEO=1 (default 1 in
- * run_game.sh). The patches inside it self-gate on their own env vars or
- * are unconditionally always-on. Adding our patch there inherits both the
- * settle delay AND the gating discipline. */
+/* Note on deferred patching: any future BRK-trap installer needs to defer
+ * past constructor time because shim_resolve_game_base() walks the calling
+ * thread's stack for a /game frame, and at constructor time no game thread
+ * has run yet (resolver returns 0). The historical pattern was a
+ * shim_vp_patch_thread that slept 2 s then called the installers; that
+ * thread and its installers have been removed but the constraint stands
+ * for any replacement. */
 /* SPIKE3_FIRE_SWITCH=<id1:id2:...> — fire one or more switches after
  * SPIKE3_SWITCH_DELAY seconds (default 30).
  *

@@ -26,15 +26,90 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <sys/time.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/fb.h>
 
 #include "spi_shim.h"
+
+/* Common listener creator for the three bridges. Two transport modes:
+ *   1. Default — abstract AF_UNIX socket named `abstract_name`. Same-kernel
+ *      subscribers (user-mode shim flow) connect directly.
+ *   2. TCP override — when env-var `tcp_port_env` is set to a positive port
+ *      number, create AF_INET listener on 0.0.0.0:PORT instead. This is the
+ *      system-mode-spike path: a host-side subscriber reaches it via qemu
+ *      user-net hostfwd (host:PORT → guest:PORT) so the abstract-namespace
+ *      kernel-boundary problem is sidestepped.
+ *
+ * `tag` is used only in log messages.
+ *
+ * Returns the listening fd, or -1 on error. */
+static int shim_bridge_create_listener(const char *abstract_name,
+                                       const char *tcp_port_env,
+                                       const char *tag) {
+    const char *port_str = getenv(tcp_port_env);
+    if (port_str && port_str[0]) {
+        long port = strtol(port_str, NULL, 0);
+        if (port <= 0 || port > 0xffff) {
+            SHIM_LOG("[%s] %s=%s out of range; falling back to abstract AF_UNIX",
+                     tag, tcp_port_env, port_str);
+        } else {
+            int fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (fd < 0) {
+                SHIM_LOG("[%s] socket(AF_INET) failed: %s", tag, strerror(errno));
+                return -1;
+            }
+            int yes = 1;
+            (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+            struct sockaddr_in sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sin_family = AF_INET;
+            sa.sin_addr.s_addr = htonl(INADDR_ANY);
+            sa.sin_port = htons((uint16_t)port);
+            if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+                SHIM_LOG("[%s] bind(0.0.0.0:%ld) failed: %s",
+                         tag, port, strerror(errno));
+                close(fd);
+                return -1;
+            }
+            if (listen(fd, 1) < 0) {
+                SHIM_LOG("[%s] listen() failed: %s", tag, strerror(errno));
+                close(fd);
+                return -1;
+            }
+            SHIM_LOG("[%s] listening on TCP 0.0.0.0:%ld (%s override)",
+                     tag, port, tcp_port_env);
+            return fd;
+        }
+    }
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        SHIM_LOG("[%s] socket(AF_UNIX) failed: %s", tag, strerror(errno));
+        return -1;
+    }
+    struct sockaddr_un addr;
+    socklen_t addrlen = shim_unix_abstract_addr(&addr, abstract_name);
+    if (bind(fd, (struct sockaddr*)&addr, addrlen) < 0 ||
+        listen(fd, 1) < 0) {
+        SHIM_LOG("[%s] bind/listen(@%s) failed: %s",
+                 tag, abstract_name, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    SHIM_LOG("[%s] listening on @%s (abstract AF_UNIX)", tag, abstract_name);
+    return fd;
+}
 
 /* shim_last_draw_fbo is set by the glBindFramebuffer hook in spi_shim.c; the
  * capture function reads it atomically. Keep as extern to avoid dragging
  * the GL state into this TU. */
 extern volatile unsigned shim_last_draw_fbo;
+
+/* Forward decl — defined at end of file; called from frame-capture path. */
+static void shim_fb0_blit(int src_w, int src_h, const uint8_t *src_rgba);
 
 /* shim_unix_abstract_addr is defined as static inline in spi_shim.h —
  * the canonical AF_UNIX addressing strategy: abstract namespace, no fs
@@ -114,7 +189,7 @@ static void shim_bridge_emit(const char *json_line) {
 static void *shim_bridge_accept_thread(void *arg) {
     (void)arg;
     for (;;) {
-        struct sockaddr_un addr;
+        struct sockaddr_storage addr;
         socklen_t addrlen = sizeof(addr);
         int fd = accept(shim_bridge_listen_fd, (struct sockaddr*)&addr, &addrlen);
         if (fd < 0) {
@@ -209,30 +284,10 @@ void shim_bridge_start(void) {
     const char *enabled = getenv("SPIKE3_BRIDGE");
     if (!enabled || enabled[0] != '1') return;
 
-    shim_bridge_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (shim_bridge_listen_fd < 0) {
-        SHIM_LOG("[bridge] socket() failed: %s", strerror(errno));
-        return;
-    }
+    shim_bridge_listen_fd = shim_bridge_create_listener(
+        ABSTRACT_BRIDGE_NAME, "SPIKE3_BRIDGE_TCP_PORT", "bridge");
+    if (shim_bridge_listen_fd < 0) return;
 
-    struct sockaddr_un addr;
-    socklen_t addrlen = shim_unix_abstract_addr(&addr, ABSTRACT_BRIDGE_NAME);
-
-    if (bind(shim_bridge_listen_fd, (struct sockaddr*)&addr, addrlen) < 0) {
-        SHIM_LOG("[bridge] bind(@%s) failed: %s", ABSTRACT_BRIDGE_NAME, strerror(errno));
-        close(shim_bridge_listen_fd);
-        shim_bridge_listen_fd = -1;
-        return;
-    }
-
-    if (listen(shim_bridge_listen_fd, 1) < 0) {
-        SHIM_LOG("[bridge] listen() failed: %s", strerror(errno));
-        close(shim_bridge_listen_fd);
-        shim_bridge_listen_fd = -1;
-        return;
-    }
-
-    SHIM_LOG("[bridge] bound + listening on @%s (abstract)", ABSTRACT_BRIDGE_NAME);
     shim_bridge_start_ms = shim_now_ms();
 
     pthread_t t_accept, t_poll;
@@ -243,7 +298,7 @@ void shim_bridge_start(void) {
         pthread_detach(t_poll);
     }
 
-    SHIM_LOG("[bridge] threads ready on @%s (abstract AF_UNIX)", ABSTRACT_BRIDGE_NAME);
+    SHIM_LOG("[bridge] threads ready");
 }
 
 /* ========== moved from spi_shim.c (1945-2063): frame bridge (comment + globals + accept + drop + send_all + send) ========== */
@@ -284,7 +339,7 @@ static size_t   shim_frame_buf_size = 0;
 static void *shim_frame_accept_thread(void *arg) {
     (void)arg;
     for (;;) {
-        struct sockaddr_un addr;
+        struct sockaddr_storage addr;
         socklen_t addrlen = sizeof(addr);
         int fd = accept(shim_frame_listen_fd, (struct sockaddr*)&addr, &addrlen);
         if (fd < 0) {
@@ -395,7 +450,16 @@ static void shim_frame_send(int w, int h, const uint8_t *rgba) {
 static uint32_t shim_capture_flip_counter = 0;
 
 void shim_frame_capture_at_page_flip(void) {
-    if (shim_frame_client_fd < 0) return;
+    /* Skip readback when nothing's consuming. Two possible sinks:
+     *   - shim_frame_client_fd >= 0 → TCP/AF_UNIX subscriber connected
+     *   - SPIKE3_FB0_OUTPUT=1       → blitting to /dev/fb0 (qemu GTK window)
+     * Cache fb0 env once (cheap; getenv each frame would be silly). */
+    static int fb0_env_cached = -1;
+    if (fb0_env_cached == -1) {
+        const char *e = getenv("SPIKE3_FB0_OUTPUT");
+        fb0_env_cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (shim_frame_client_fd < 0 && !fb0_env_cached) return;
     if ((++shim_capture_flip_counter) & 1) return;  /* every 2nd flip */
 
     static void (*real_glReadPixels)(int, int, int, int, unsigned, unsigned, void*) = NULL;
@@ -435,6 +499,7 @@ void shim_frame_capture_at_page_flip(void) {
     real_glReadPixels(0, 0, w, h, 0x1908 /* GL_RGBA */, 0x1401 /* GL_UNSIGNED_BYTE */,
                       shim_frame_buf);
     shim_frame_send(w, h, shim_frame_buf);
+    shim_fb0_blit(w, h, shim_frame_buf);
     if (verbose)
         SHIM_LOG("[frame_cap] sent %dx%d (flip #%u, from_fbo=%u prev_read=%d)",
                  w, h, shim_capture_flip_counter, game_fbo, prev_read);
@@ -447,21 +512,11 @@ restore:
 void shim_frame_start(void) {
     const char *enabled = getenv("SPIKE3_FRAME_BRIDGE");
     if (!enabled || enabled[0] != '1') return;
-    shim_frame_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (shim_frame_listen_fd < 0) {
-        SHIM_LOG("[frame] socket() failed: %s", strerror(errno));
-        return;
-    }
-    struct sockaddr_un addr;
-    socklen_t addrlen = shim_unix_abstract_addr(&addr, ABSTRACT_FRAME_NAME);
-    if (bind(shim_frame_listen_fd, (struct sockaddr*)&addr, addrlen) < 0 ||
-        listen(shim_frame_listen_fd, 1) < 0) {
-        SHIM_LOG("[frame] bind/listen(@%s) failed: %s", ABSTRACT_FRAME_NAME, strerror(errno));
-        close(shim_frame_listen_fd); shim_frame_listen_fd = -1; return;
-    }
+    shim_frame_listen_fd = shim_bridge_create_listener(
+        ABSTRACT_FRAME_NAME, "SPIKE3_FRAME_BRIDGE_TCP_PORT", "frame");
+    if (shim_frame_listen_fd < 0) return;
     pthread_t t;
     if (pthread_create(&t, NULL, shim_frame_accept_thread, NULL) == 0) pthread_detach(t);
-    SHIM_LOG("[frame] listening on @%s (abstract AF_UNIX)", ABSTRACT_FRAME_NAME);
 }
 
 /* ========== Audio bridge (post-refactor addition, 2026-04-24) ==========
@@ -486,7 +541,7 @@ static pthread_mutex_t shim_audio_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *shim_audio_accept_thread(void *arg) {
     (void)arg;
     for (;;) {
-        struct sockaddr_un addr;
+        struct sockaddr_storage addr;
         socklen_t addrlen = sizeof(addr);
         int fd = accept(shim_audio_listen_fd, (struct sockaddr*)&addr, &addrlen);
         if (fd < 0) {
@@ -538,19 +593,133 @@ void shim_audio_emit(const uint8_t *buf, size_t bytes) {
 void shim_audio_start(void) {
     const char *enabled = getenv("SPIKE3_AUDIO_BRIDGE");
     if (!enabled || enabled[0] != '1') return;
-    shim_audio_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (shim_audio_listen_fd < 0) {
-        SHIM_LOG("[audio] socket() failed: %s", strerror(errno));
-        return;
-    }
-    struct sockaddr_un addr;
-    socklen_t addrlen = shim_unix_abstract_addr(&addr, ABSTRACT_AUDIO_NAME);
-    if (bind(shim_audio_listen_fd, (struct sockaddr*)&addr, addrlen) < 0 ||
-        listen(shim_audio_listen_fd, 1) < 0) {
-        SHIM_LOG("[audio] bind/listen(@%s) failed: %s", ABSTRACT_AUDIO_NAME, strerror(errno));
-        close(shim_audio_listen_fd); shim_audio_listen_fd = -1; return;
-    }
+    shim_audio_listen_fd = shim_bridge_create_listener(
+        ABSTRACT_AUDIO_NAME, "SPIKE3_AUDIO_BRIDGE_TCP_PORT", "audio");
+    if (shim_audio_listen_fd < 0) return;
     pthread_t t;
     if (pthread_create(&t, NULL, shim_audio_accept_thread, NULL) == 0) pthread_detach(t);
-    SHIM_LOG("[audio] listening on @%s (abstract AF_UNIX, S16_LE 2ch 44.1 kHz raw)", ABSTRACT_AUDIO_NAME);
+    SHIM_LOG("[audio] wire format: S16_LE 2ch 44.1 kHz raw");
+}
+
+/* ========== /dev/fb0 output (system-mode-spike — render game into qemu's
+ * GTK window, no host-side subscriber needed). ==========
+ *
+ * Gated by SPIKE3_FB0_OUTPUT=1. Lazy-init on first frame: open(/dev/fb0),
+ * FBIOGET_VSCREENINFO to learn dims+format, mmap. Each frame: convert
+ * RGBA8 -> fb0's native pixel format (RGBA8 / BGRA8 / RGB565), nearest-
+ * neighbor scale if src and dst dims differ, write to mmap'd memory.
+ *
+ * In real hardware the kernel framebuffer is owned by the boot logo briefly
+ * then idle while EGL/DRM does its thing. In qemu raspi4b, fb0 is what the
+ * GTK display surface mirrors, so writing into it makes frames visible
+ * without any cross-VM transport. */
+
+static int      shim_fb0_fd            = -1;
+static uint8_t *shim_fb0_mem           = NULL;
+static size_t   shim_fb0_size          = 0;
+static int      shim_fb0_w             = 0;
+static int      shim_fb0_h             = 0;
+static int      shim_fb0_bpp           = 0;     /* bytes per pixel */
+static int      shim_fb0_swap_rb       = 0;
+static int      shim_fb0_init_done     = 0;
+static int      shim_fb0_init_failed   = 0;
+
+static void shim_fb0_init_once(void) {
+    if (shim_fb0_init_done || shim_fb0_init_failed) return;
+
+    const char *enabled = getenv("SPIKE3_FB0_OUTPUT");
+    if (!enabled || enabled[0] != '1') { shim_fb0_init_failed = 1; return; }
+
+    shim_fb0_fd = open("/dev/fb0", O_RDWR);
+    if (shim_fb0_fd < 0) {
+        SHIM_LOG("[fb0] open(/dev/fb0) failed: %s", strerror(errno));
+        shim_fb0_init_failed = 1;
+        return;
+    }
+
+    struct fb_var_screeninfo vinfo;
+    if (ioctl(shim_fb0_fd, FBIOGET_VSCREENINFO, &vinfo) < 0) {
+        SHIM_LOG("[fb0] FBIOGET_VSCREENINFO failed: %s", strerror(errno));
+        close(shim_fb0_fd); shim_fb0_fd = -1;
+        shim_fb0_init_failed = 1;
+        return;
+    }
+
+    shim_fb0_w        = (int)vinfo.xres;
+    shim_fb0_h        = (int)vinfo.yres;
+    shim_fb0_bpp      = (int)(vinfo.bits_per_pixel / 8);
+    shim_fb0_swap_rb  = (vinfo.red.offset > vinfo.blue.offset);  /* BGRA-ish */
+
+    if (shim_fb0_bpp != 2 && shim_fb0_bpp != 4) {
+        SHIM_LOG("[fb0] unsupported bpp %d (only 2 / 4 handled)", shim_fb0_bpp * 8);
+        close(shim_fb0_fd); shim_fb0_fd = -1;
+        shim_fb0_init_failed = 1;
+        return;
+    }
+
+    shim_fb0_size = (size_t)shim_fb0_w * (size_t)shim_fb0_h * (size_t)shim_fb0_bpp;
+    shim_fb0_mem  = mmap(NULL, shim_fb0_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                         shim_fb0_fd, 0);
+    if (shim_fb0_mem == MAP_FAILED) {
+        SHIM_LOG("[fb0] mmap(%zu) failed: %s", shim_fb0_size, strerror(errno));
+        shim_fb0_mem = NULL;
+        close(shim_fb0_fd); shim_fb0_fd = -1;
+        shim_fb0_init_failed = 1;
+        return;
+    }
+
+    SHIM_LOG("[fb0] ready: %dx%d %dbpp swap_rb=%d (%zu bytes mapped)",
+             shim_fb0_w, shim_fb0_h, shim_fb0_bpp * 8, shim_fb0_swap_rb,
+             shim_fb0_size);
+    shim_fb0_init_done = 1;
+}
+
+static void shim_fb0_blit(int src_w, int src_h, const uint8_t *src_rgba) {
+    shim_fb0_init_once();
+    if (!shim_fb0_init_done || !shim_fb0_mem || !src_rgba) return;
+
+    const int dst_w = shim_fb0_w;
+    const int dst_h = shim_fb0_h;
+    const int bpp   = shim_fb0_bpp;
+    const int swap  = shim_fb0_swap_rb;
+
+    /* Same-size 32bpp fast path */
+    if (src_w == dst_w && src_h == dst_h && bpp == 4) {
+        for (int y = 0; y < dst_h; y++) {
+            const uint8_t *s = src_rgba + (size_t)y * (size_t)src_w * 4;
+            uint8_t       *d = shim_fb0_mem + (size_t)y * (size_t)dst_w * 4;
+            if (swap) {
+                for (int x = 0; x < dst_w; x++) {
+                    d[x*4 + 0] = s[x*4 + 2];   /* B */
+                    d[x*4 + 1] = s[x*4 + 1];   /* G */
+                    d[x*4 + 2] = s[x*4 + 0];   /* R */
+                    d[x*4 + 3] = 0xff;
+                }
+            } else {
+                memcpy(d, s, (size_t)dst_w * 4);
+            }
+        }
+        return;
+    }
+
+    /* General path: nearest-neighbor scale + format convert. */
+    for (int y = 0; y < dst_h; y++) {
+        int sy = (y * src_h) / dst_h;
+        const uint8_t *srow = src_rgba + (size_t)sy * (size_t)src_w * 4;
+        uint8_t       *drow = shim_fb0_mem + (size_t)y * (size_t)dst_w * (size_t)bpp;
+        for (int x = 0; x < dst_w; x++) {
+            int sx = (x * src_w) / dst_w;
+            const uint8_t *p = srow + sx * 4;
+            uint8_t r = p[0], g = p[1], b = p[2];
+            if (bpp == 4) {
+                drow[x*4 + 0] = swap ? b : r;
+                drow[x*4 + 1] = g;
+                drow[x*4 + 2] = swap ? r : b;
+                drow[x*4 + 3] = 0xff;
+            } else { /* bpp == 2 → RGB565 */
+                uint16_t pix = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+                memcpy(drow + x*2, &pix, 2);
+            }
+        }
+    }
 }

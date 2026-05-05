@@ -66,17 +66,25 @@ def recv_exact(sock, n):
     return bytes(buf)
 
 
-def connect_retry(path, attempts=120, delay=0.5):
+def connect_retry(addr, attempts=120, delay=0.5):
+    """Connect to either an AF_UNIX path/abstract name (str) or a TCP
+    (host, port) tuple. The system-mode-spike rig uses TCP via qemu user-net
+    hostfwd because the in-VM abstract socket isn't reachable from the host."""
+    is_tcp = isinstance(addr, tuple)
     for i in range(attempts):
         try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.connect(path)
+            if is_tcp:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.connect(addr)
+            else:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(addr)
             return s
-        except (FileNotFoundError, ConnectionRefusedError):
+        except (FileNotFoundError, ConnectionRefusedError, OSError):
             if i == 0:
-                print(f"[viewer] waiting for {path} …", flush=True)
+                print(f"[viewer] waiting for {addr} …", flush=True)
             time.sleep(delay)
-    raise SystemExit(f"[viewer] gave up waiting for {path}")
+    raise SystemExit(f"[viewer] gave up waiting for {addr}")
 
 
 def recv_loop(sock, out_queue, stop_event):
@@ -233,6 +241,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--socket", default=DEFAULT_SOCKET)
+    ap.add_argument("--tcp", default=None,
+                    help="connect via TCP HOST:PORT instead of --socket "
+                         "(used by system-mode-spike: hostfwd to qemu guest)")
     ap.add_argument("--scale", type=float, default=1.0,
                     help="window scale factor (1.0 = native, 0.5 = half-size)")
     ap.add_argument("--save-every", type=int, default=0,
@@ -251,10 +262,18 @@ def main():
                          "Pokémon LE build needs no correction)")
     args = ap.parse_args()
 
-    print(f"[viewer] starting (socket={args.socket}, scale={args.scale}, "
+    if args.tcp:
+        host, _, port = args.tcp.rpartition(":")
+        if not host or not port:
+            raise SystemExit(f"[viewer] --tcp expected HOST:PORT, got {args.tcp!r}")
+        addr = (host, int(port))
+    else:
+        addr = args.socket
+
+    print(f"[viewer] starting (addr={addr}, scale={args.scale}, "
           f"save_every={args.save_every}, display={not args.no_display})", flush=True)
 
-    sock = connect_retry(args.socket)
+    sock = connect_retry(addr)
     print(f"[viewer] connected", flush=True)
 
     if args.no_display:

@@ -1,37 +1,22 @@
 /*
- * shim_patches.c — runtime patches the shim applies to the game's behavior.
+ * shim_patches.c — runtime patches and libavcodec entry-point hooks.
  *
- * Phase 8 of the refactor. Owns:
- *   - memcpy NULL-guard (Step 45): makes Godot's error-logger path on the
- *     DisplayRenderer thread non-fatal.
- *   - Step 62 SpiDecoder::Play vtable patch: replaces the real Play slot
- *     with a shim that sets update_thread_running=1 and returns 1 without
- *     waiting on FFmpeg. Gated by SPIKE3_PATCH_SPI_VIDEO=1.
- *   - Step 64 get_format callback NOP patch: NOPs the b.ne that insists on
- *     DRM_PRIME, so the callback accepts the first pix_fmt libavcodec
- *     offers. Gated by SPIKE3_SW_HEVC=1.
- *   - libavcodec HW-accel bypass (Step 47): redirects
- *     avcodec_find_decoder_by_name(hevc_v4l2request) → hevc and logs the
- *     other decoder entry points (get_hw_config / hwdevice_ctx_create /
- *     send_packet / receive_frame) as passthrough.
+ * Active content:
+ *   - memcpy NULL-guard (Step 45): silently no-ops a memcpy() with src or
+ *     dst NULL. Fixes the Godot error-logger path on the Stern/Radium
+ *     DisplayRenderer thread, where Godot's TLS singletons are unregistered
+ *     and vformat()/memcpy(NULL,…) would otherwise SEGV. Always-on.
+ *   - libavcodec entry-point hooks: avcodec_find_decoder_by_name (with the
+ *     SPIKE3_SW_HEVC=1 hevc_v4l2request → hevc remap), avcodec_get_hw_config,
+ *     av_hwdevice_ctx_create, avcodec_send_packet, avcodec_receive_frame.
+ *     All resolve real symbols via dlvsym and log activity. send/receive
+ *     dispatch to shim_avforward.c when SPIKE3_FORWARD_DECODE=1.
  *   - Dummy-frame injection (Step 47b): when SPIKE3_INJECT_VIDEO=1 and the
- *     real decoder returns EAGAIN, avcodec_receive_frame fakes a valid
- *     AVFrame so the game's render path gets SOMETHING. Shares the
- *     libavcodec machinery above.
+ *     real decoder returns EAGAIN with pending packets, avcodec_receive_frame
+ *     synthesises an NV12 1920×1080 black AVFrame so the game's renderer
+ *     always has something current to upload.
  *
- * What's NOT here (intentionally):
- *   - shim_vp_patch_thread — the thread that applies the two patches after
- *     a 2-second settle. Stays in spi_shim.c through Phase 8, moves to
- *     shim_inject.c in Phase 9 along with the other timer threads.
- *
- * Cross-TU dependencies resolved via spi_shim.h:
- *   - SHIM_LOG macro
- *   - shim_resolve_game_base() — used by both patch functions to translate
- *     BN VAs to live runtime addresses.
- *
- * Cross-TU APIs exposed via spi_shim.h:
- *   - shim_patch_spi_video_vtable() — called from shim_vp_patch_thread.
- *   - shim_patch_get_format_callback() — called from shim_vp_patch_thread.
+ * Cross-TU deps (via spi_shim.h): SHIM_LOG macro.
  */
 
 #define _GNU_SOURCE
