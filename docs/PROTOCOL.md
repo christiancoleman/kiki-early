@@ -23,6 +23,7 @@ When a claim here turns out to be wrong, **delete it**. Do not leave a banner. G
 11. [Game runtime model (switches, events, modes)](#11-game-runtime-model-switches-events-modes)
 12. [Hardware shim coverage reference](#12-hardware-shim-coverage-reference)
 13. [Comparison binaries (SW LE 0.85)](#13-comparison-binaries-sw-le-085)
+14. [System-mode debugging (HW watchpoints)](#14-system-mode-debugging-hw-watchpoints)
 
 ---
 
@@ -175,6 +176,64 @@ Each script handles its own subsystem. Verified against the live `/etc/init.d/` 
 - **`init_spi_serial_bridge` is a hard gate.** Failure returns exit code `0xe2` and `game_monitor` immediately re-exec's. In emulation we synthesize the SPI/UART bridge responses (see §4 / §12) — the gate would otherwise loop forever.
 - **`mcp_init_renderer_and_scene_cache_singletons` (`0x5d7aa0`) is the canonical Stern boot sequence** for graphics + scene cache. Five steps inside (per Stern source-line assertions in the binary): `new DisplayRenderer(0x1b8) → constructor → mutex+deferred-list → wait_on_render_thread_ready → new SceneCache(0x1d0)("./assets") → post-init`. Equivalent in Star Wars LE 0.85: `0x309af0`. Equivalent in `spike_menu`: see §13.
 - **`pthread_create` with `SCHED_RR`** — the dispatch thread (`procDispatch`) needs RR scheduling. Under qemu-user without `CAP_SYS_NICE` this fails silently; the shim's `shim_pthread_create` forces `PTHREAD_INHERIT_SCHED` to skip the failing path. See §2 "Common gotchas."
+
+### Localized-message-table primitive (used by step 3 overlays)
+
+When the boot code wants to draw a UI string (like "Startup In Progress%s" or "Pending Licensor Approval"), it goes through a two-level table lookup:
+
+```
+caller — e.g. mcp_draw_startup_in_progress_overlay
+   └─ mcp_lookup_localized_msg_by_id(msgid)        // 0x7a6490
+        ├─ bounds-check: msgid u< 0xd53            // 3411 messages total
+        ├─ idx = mcp_msgid_to_strtable_idx[msgid]  // u16 array @ 0x44cb998
+        ├─ bounds-check: idx u< 0xd53
+        ├─ row = mcp_localized_string_table[idx]   // pointer table @ 0x4394d80
+        └─ return mcp_pick_localized_string_from_row(row)  // 0x7d82d0
+                  └─ language_idx = (data_436c0c0 == 5) ? read_config_value_validated(8) : data_436c0c0
+                  └─ return row[language_idx]
+```
+
+Each row is a 5-pointer array (English / Spanish / French / German / Italian, in that slot order). All five slots can point to the same English string when no translation exists — for "Startup In Progress" they do.
+
+**Verified message IDs** (against this build):
+
+| msgid | String | Caller |
+|---:|---|---|
+| `0x789` (1929) | `"Startup In Progress%s"` (formatted with one %s arg) | `mcp_draw_startup_in_progress_overlay` (`0x5cddd0`) |
+
+The `%s` argument is built by `sub_7de9c0(3, …)` — likely "stringify the integer 3" producing something like `"...3"` or `"..., step 3"`. Not yet decoded.
+
+The msgid → string-table resolution was **established empirically** (PROTOCOL.md §14 "System-mode debugging" workflow): a HW read watchpoint on `mcp_localized_string_table[0x789]` runtime address `0x55598e89c8` fired with PC = `0x7a64ec` (inside `mcp_lookup_localized_msg_by_id`) and LR = `0x5cdf90` (inside `mcp_draw_startup_in_progress_overlay`). The same chain handles every other localized-string draw.
+
+### Boot-splash tick chain (step 3 overlays)
+
+The state-machine path that decides which overlay text to draw between init steps:
+
+```
+primary_initialization_orchestrator (0x678bc0)
+ │  Calls mcp_boot_splash_tick at 3 sites: 0x678de4, 0x678e14, 0x678e24
+ │  (i.e. between sub-system inits — three "boot status update" beats)
+ │
+ └─ mcp_boot_splash_tick                             // 0x5d6ef0
+     ├─ sub_733310                                   // get current-time-since-boot-ms
+     ├─ sub_647720, sub_8191d0                       // enable-gate predicates
+     ├─ sub_7b6db0  → render_sprite_to_framebuffer   // re-render the Pokémon logo sprite
+     ├─ mcp_boot_state_dispatch                      // 0x5d0cb0 — vtable dispatch on data_445f800
+     │   └─ mcp_boot_state_mask_dispatch             // 0x5d0670 — bit-mask dispatch
+     │       │ flag bit (in *(arg1 + 0x38)) selects which overlay to draw:
+     │       │   bit 3 (0x008)  → mcp_draw_startup_in_progress_overlay  (this is the one we traced)
+     │       │   bit 0 (0x001)  → sub_5cebf0
+     │       │   bits 1-2 (0x6) → sub_5cf110
+     │       │   bit 4 (0x10)   → sub_5ce0b0
+     │       │   bit 5 (0x20)   → sub_5ce670
+     │       │   bits 6-9 (0x3c0) / bit 10 (0x400) / bit 13 (0x2000) / bit 14 (0x4000) → other paths
+     │       └─ sub_5d6da0(*(arg1 + 8), 3)           // commit/render
+     └─ sub_7b6be0 — std::condition_variable::notify_all on DisplayRenderer's cv (wakes render thread)
+```
+
+The flag mask at `*(arg1 + 0x38)` is what ultimately determines whether step 3 shows "Startup In Progress" vs "Pending Licensor Approval" vs another message. Identifying who SETS that mask, and what determines which bit is set during early init, is the next thread to pull when investigating "why isn't the next screen showing in our emulator."
+
+*Verified by:* runtime hardware-read-watchpoint observation 2026-05-05 (PC `0x7a64ec`, LR `0x5cdf90`); BN decompile of the listed functions.
 
 ---
 
@@ -1755,3 +1814,62 @@ If a shim change improves PLE behavior but breaks SW LE, the change is touching 
 The DisplayRenderer / SceneCache / RadiumScene / proc-system / node-bus / SPI / audio code is all shared. Anything Godot-specific (PCK loading, ClassDB registration, `_process(delta)` ticks, scene-tree management, libgodot internals) is PLE-only and out of active investigation scope.
 
 *Verified by:* JOURNAL Step 73 (2026-05-01) onwards — IScene vtable decompile per slot, SW LE function shape matches.
+
+---
+
+## 14. System-mode debugging (HW watchpoints)
+
+# 1. Boot. --ephemeral discards SD writes; --debug backgrounds qemu; --gdb [PORT] enables gdbstub.
+./RUN_QEMU.sh --headless --debug --ephemeral --gdb 1234
+
+# 2. Watch the boot until the game launches. The wrap_game.sh prints
+#    "GAME_PIE_MAP: <base>-<end> r-xp ... /games/game" lines once exec /games/game completes.
+tail -f last_run.log
+# (Ctrl+C tail when you see GAME_PIE_MAP for /games/game)
+
+# 3. Compute runtime addresses. Default PIE base with ASLR off in this kernel
+#    is 0x5555550000 (verified 2026-05-05). For any BN VA, runtime = 0x5555550000 + BN_VA.
+python3 -c 'B=0x5555550000; print(hex(B + 0x43989c8))'   # example: a table-entry address
+
+# 4. Attach gdb and set the read watchpoint.
+gdb-multiarch -ex 'set arch aarch64' \
+              -ex 'target remote :1234' \
+              -ex 'rwatch *(unsigned long long*)0x55598e89c8' \
+              -ex 'commands
+                 silent
+                 printf "\n=== HIT pc=%p (BN 0x%llx)  lr=%p (BN 0x%llx) ===\n", \
+                   $pc, (unsigned long long)$pc - 0x5555550000, \
+                   $lr, (unsigned long long)$lr - 0x5555550000
+                 printf "  x0=%p x1=%p x19=%p x20=%p\n", $x0, $x1, $x19, $x20
+                 bt 30
+                 c
+                 end' \
+              -ex 'continue'
+
+# 5. Each hit prints PC and LR translated to BN VAs. Look up those addresses in BN
+#    to identify the function reading the location.
+```
+
+### PIE base discovery — first time on a new build
+
+The PIE base for the game.elf changes only when the kernel's mmap-base policy or ASLR setting changes. With `randomize_va_space=0` (set by initramfs/init), in this Stern kernel build, the base has been **0x5555550000** consistently. To re-verify on a fresh build:
+
+```bash
+# After boot, tail last_run.log for the GAME_PIE_MAP line printed by wrap_game.sh:
+grep -E 'GAME_PIE_MAP.*r-xp 00000000.*/games/game' last_run.log | head -1
+# Expected format:
+# GAME_PIE_MAP: 5555550000-55559af000 r-xp 00000000 fe:02 1835258  /games/pokemon_le/game
+# The first hex value (start of the r-xp 00000000 line for the game binary) IS the PIE base.
+```
+
+**Subshell-PID gotcha:** `wrap_game.sh` uses a backgrounded subshell to `cat /proc/$$/maps`. `$$` in POSIX `(…)` subshells refers to the parent shell's PID, which after `exec /games/game` becomes the game's PID. The subshell sleeps 100 ms first to let `exec` complete. If the sleep is too short, the subshell sees the pre-`exec` busybox/wrapper maps instead of the game's. If you ever see `GAME_PIE_MAP` showing `/bin/busybox` or `/bin/sh`, increase the sleep.
+
+### BN VA ↔ runtime translation
+
+The game's BN database is rebased to base 0x0, so `BN VA == ELF VA == file offset`. With ASLR off, `runtime_addr = 0x5555550000 + BN_VA` and `BN_VA = runtime_addr - 0x5555550000`. Always run the math through python (per `feedback_compute_via_python.md`):
+
+```bash
+python3 -c 'B=0x5555550000; va=0x43989c8; print(f"BN 0x{va:x} -> runtime 0x{B+va:x}")'
+python3 -c 'B=0x5555550000; rt=0x55598e89c8; print(f"runtime 0x{rt:x} -> BN 0x{rt-B:x}")'
+```
+

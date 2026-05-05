@@ -7283,4 +7283,87 @@ For each section in the new PROTOCOL.md target structure (Project overview, Quic
 After this point, JOURNAL Steps remain valuable for "what we tried and learned along the way," but should not be the source for facts about how the platform works. Cite PROTOCOL.md sections for facts; cite JOURNAL Steps only for "why this workaround exists" narrative context.
 
 
+## Step 83: System-mode HW-watchpoint debugging stood up; "Startup In Progress" overlay traced (2026-05-05)
+
+### Why
+
+Two threads converged. First: the user asked whether the on-screen "Pokémon logo + Startup In Progress" boot overlay is a Radium scene. Static analysis got close — `mcp_draw_startup_in_progress_overlay` (formerly `sub_5cddd0`) sprintf's a localized message and renders via `sub_6485f0`, but BN's xref engine couldn't link the localized-message-table reads to a specific caller because the table is dynamically indexed (`ldr xN, [base, x_msgid, lsl #3]`). Pure static chase wouldn't pin the reader.
+
+Second: the project had no working method for "what code reads memory location X" runtime questions. qemu-aarch64 *user-mode* gdbstub does NOT expose aarch64 BRP/WRP debug registers, so `rwatch` insertion always failed. GDB does not fall back to software read watchpoints. System mode (`qemu-system-aarch64 -M raspi4b`) DOES expose HW watchpoints, but `game.elf` crashes there at `glWindow.cpp:970` `eglGetError() == EGL_SUCCESS` long before any rendering — qemu raspi4b has no GPU. Neither mode could answer a memory-trace question without help.
+
+### Direction
+
+Run the user-mode shim (which has the GL/EGL/GBM/DRM stubs that get past the EGL assertion) inside the system-mode VM. Same shim, same Mesa overlay — but the surrounding execution gives us HW watchpoints. Hybrid we hadn't tried.
+
+Concretely:
+1. **Auto-stage** `_emulation/spi_shim.so` and `_emulation/mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/` into the system-mode initramfs on every launch via a small addition to `RUN_QEMU.sh`.
+2. **Wrap `/games/game`** with `wrap_game.sh` that sets `LD_PRELOAD=spi_shim.so`, sets up Mesa overlay env, prints PIE base of game process.
+3. **Disable userspace ASLR** in initramfs `init` (`echo 0 > /proc/sys/kernel/randomize_va_space` before `switch_root`). PIE base then deterministic at `0x5555550000`.
+4. **Deploy Mesa overlay to fresh tmpfs** at `/newroot/mnt/mesa` (LUKS rootfs and data partitions both too small to absorb 362 MB even via `snapshot=on`).
+5. Add `--gdb [PORT]` flag to `RUN_QEMU.sh` that appends `-gdb tcp::PORT` to the qemu invocation.
+
+### Findings
+
+The hybrid works. Game progresses through EGL assertion, runs SPI poll loops + Radium-scene-discovery `opendir` calls, hits the message-lookup path. HW read watchpoint on `mcp_localized_string_table[0x789]` (runtime `0x55598e89c8`) fired 26 times, every hit at PC `BN 0x7a64ec` (= inside `mcp_lookup_localized_msg_by_id`) and LR `BN 0x5cdf90` (= inside `mcp_draw_startup_in_progress_overlay`). Re-verified across two fresh boots; PC/LR session-stable.
+
+**Original question answered:** "Startup In Progress" text is **not** a Radium scene. It's drawn by direct game-binary text rendering via the chain documented in PROTOCOL §3 "Boot-splash tick chain":
+
+```
+primary_initialization_orchestrator (0x678bc0)
+ └─ mcp_boot_splash_tick (0x5d6ef0)        // 3 sites in primary_init
+     └─ mcp_boot_state_dispatch (0x5d0cb0)
+         └─ mcp_boot_state_mask_dispatch (0x5d0670)
+             └─ [bit 3 of *(arg1 + 0x38)] mcp_draw_startup_in_progress_overlay (0x5cddd0)
+                 └─ mcp_lookup_localized_msg_by_id(0x789)
+                     ├─ mcp_msgid_to_strtable_idx[0x789]      → strtable index
+                     ├─ mcp_localized_string_table[idx]        → 5-lang row
+                     └─ mcp_pick_localized_string_from_row     → "Startup In Progress%s"
+```
+
+Pokémon logo (centered PNG) is a separate layer rendered by `create_boot_splash_egl_context` / `DisplayRenderer_render_loop` — also direct GL, not Radium.
+
+**Side findings worth saving:**
+- qemu-aarch64 user-mode gdbstub does not provide HW watchpoints (documented in PROTOCOL §14 + Tips table).
+- qemu-system-aarch64 raspi4b gdbstub provides 4 HW BRPs + 4 HW WRPs.
+- BN MCP plugin "click status to restart" handler crashes BN when a stale BN process is squatting on port 9009 — symptom looked like a regression in our prior shutdown-deadlock fix, but actually was a zombie process from an earlier UI crash. Killed zombie → behavior restored.
+- openmcpgdb's `set logging file ... redirect on` does not reliably create the on-disk log via MCP; output instead surfaces in the next `gdb_custom` call's `command_output` field.
+- Harness blocks `sleep N && next-cmd` chains. Use `until <cond>; do sleep N; done`. Captured as `feedback_until_loop_not_sleep.md`.
+
+### Renames committed (BN MCP)
+
+| Old | New |
+|---|---|
+| `sub_7a6490` | `mcp_lookup_localized_msg_by_id` |
+| `sub_7d82d0` | `mcp_pick_localized_string_from_row` |
+| `sub_5cddd0` | `mcp_draw_startup_in_progress_overlay` |
+| `sub_5d6ef0` | `mcp_boot_splash_tick` |
+| `sub_5d0cb0` | `mcp_boot_state_dispatch` |
+| `sub_5d0670` | `mcp_boot_state_mask_dispatch` |
+| `data_4394d80` | `mcp_localized_string_table` |
+| `data_44cb998` | `mcp_msgid_to_strtable_idx` |
+
+### Files changed
+
+- `_emulation/historical-system-rig/RUN_QEMU.sh` — auto-stage shim + overlay; new `--gdb [PORT]` flag.
+- `_emulation/historical-system-rig/initramfs/init` — disable ASLR; deploy `wrap_game.sh` + `spi_shim.so` + `mesa_sw_overlay` to /newroot; redirect `$GAME` via sed of `shared`.
+- `_emulation/historical-system-rig/initramfs/usr/local/bin/wrap_game.sh` — new (PIE-base print + LD_PRELOAD + Mesa env + exec game).
+- `_emulation/historical-system-rig/initramfs/usr/local/lib/spi_shim.so` — staged (overwritten each launch by RUN_QEMU.sh).
+- `_emulation/historical-system-rig/README.md` — new (points at PROTOCOL §14; declares primary purpose = HW-watchpoint debugging).
+- `_emulation/docs/PROTOCOL.md` — new §14 "System-mode debugging (HW watchpoints)"; expanded §3 with "Visible boot sequence", "Localized-message-table primitive", "Boot-splash tick chain"; refreshed Persistence-gap subsection in §12.
+- Memory: 18 files slimmed to PROTOCOL pointers (no duplicate fact content); section-number references replaced with topic-name pointers; new `feedback_until_loop_not_sleep.md`.
+- Repo CLAUDE.md (root + `games/pokemon_le/`) reduced to one-liner pointers at PROTOCOL.
+
+### Open questions / next steps
+
+1. **Who sets `*(arg1 + 0x38)` bit 3?** This is the proximate driver for which boot overlay shows when. Once known, we can determine why our emulator gets stuck before the next overlay (e.g. step 4's "POKÉMON PRO" header / Guided Setup) — likely the Diag_1360 cycle from Step 81 is preventing the bit progression.
+2. **What does `sub_7de9c0(3, &var_a8)` produce?** It's the `%s` argument that fills `"Startup In Progress%s"`.
+3. **What sets the language index `data_436c0c0`?** `mcp_pick_localized_string_from_row` reads it. Likely set during operator-config persist load.
+4. **Drawing chain for "Initializing....."** (boot step 1) — `boot_display` ELF + `dprint` helper, not yet decompiled.
+5. **SPIKE3-logo growth animation** (boot step 3) — primitive not yet identified.
+6. **Replicate the system-mode HW-watchpoint setup in user mode** — fallback option if system mode regresses; would need either qemu-user patch to expose BRP/WRP, or an mprotect-trap inside the shim.
+
+### Acid test (re-runnable)
+
+Per PROTOCOL §14: from a clean state the full sequence produces the same PC/LR result. Verified 2026-05-05 with two consecutive `./RUN_QEMU.sh --headless --debug --ephemeral --gdb 1234` runs.
+
 
