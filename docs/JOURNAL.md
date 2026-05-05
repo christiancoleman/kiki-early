@@ -7224,8 +7224,63 @@ These traps work alongside the bind-mount setup from Step 80; nothing in Step 81
 
 We've been chasing "what's stuck" for months. With `sub_7b3060` identified as the Diag_1360 main loop, every future investigation can be framed in terms of: *what would make this loop progress on real hardware that doesn't happen in our env?* That's a much more targeted question than "what's wrong with file loading" or "what's wrong with the SceneCache." The Step 80 pivot (scenes load fine) and Step 81 finding (cycle is the menu loop) together close the "is the engine working?" question — the engine works, it's stuck in a UI screen waiting for input/events we don't supply.
 
+## Step 82: Documentation consolidation — PROTOCOL.md as single source of truth (2026-05-04)
 
+### Why
 
+Documentation has accumulated 14+ overlapping `.md` files across the repo. They overlap, drift, sometimes contradict. JOURNAL.md is narrative + speculation, not a stable reference, but everywhere cited. Concrete trigger today: while investigating the scene-10/11 cycle, this session re-derived image.bin section-5 layout from scratch — even though `PROTOCOL.md` Step 44 already documented it. The `MEMORY.md` "READ FIRST" entry pointed at MODEL.md and JOURNAL Steps 79-81 (narrative), not at PROTOCOL.md (truth). PROTOCOL had no TOC, so even after being told to look there, finding the relevant section wasn't obvious. About an hour was lost to the re-derivation.
+
+### Direction
+
+Adopt one source-of-truth doc: `_emulation/docs/PROTOCOL.md`. Verified facts only. Self-contained sections (no cross-doc reference required to evaluate a claim). JOURNAL keeps its job as exploration/narrative log. MEMORY entries point at PROTOCOL, not JOURNAL. Stale docs deleted outright (git history is the archive — no "STALE" banners that risk re-importing wrong info).
+
+Plan file: `/home/c/.claude/plans/i-agree-with-removing-vast-feigenbaum.md`.
+
+### Files to be deleted in this consolidation
+
+Snapshotted here BEFORE any deletions, so future sessions can `git log -- <path>` for archeology:
+
+- `_emulation/docs/RADIUM_INVESTIGATION.md` (Godot-bridge investigation, killed by `feedback_godot_is_illegal.md` 2026-05-02)
+- `_emulation/docs/ASSETS.md` (asset-loading log, absorbed into PROTOCOL Radium / audio / video sections)
+- `_emulation/docs/BRIDGE_PROTOCOL.md` (absorbed into PROTOCOL UART section)
+- `_emulation/docs/NODEBUS_HASH.md` (absorbed into PROTOCOL Nodebus section)
+- `_emulation/docs/NODEBUS_CIPHER.md` (absorbed into PROTOCOL Nodebus section)
+- `_emulation/docs/MODE_TABLE.md` (absorbed into PROTOCOL Game runtime section)
+- `_emulation/docs/SETUP.md` (absorbed into PROTOCOL Quick-start section)
+- `_emulation/docs/VIDEO_CLIPS.md` (absorbed into PROTOCOL Radium section)
+- `_emulation/MODEL.md` (architecture intro → PROTOCOL §1; suspect catalog/inferences captured below)
+- `_emulation/README.md` (shim architecture absorbed into Hardware shim coverage section)
+- `_emulation/historical-system-rig/README.md` (absorbed into Quick-start subsection "alternate full-system spike")
+- `_extraction/tools/spike_extract/README.md` (format details → PROTOCOL image.bin section, usage → PROTOCOL Asset extraction section)
+- `docs/SOURCE OF TRUTH.md` (empty boilerplate, replaced by PROTOCOL.md)
+- `docs/startup_routine.md` (absorbed into PROTOCOL Boot sequence section)
+- `docs/startup_sequence_technical_reference.md` (absorbed into PROTOCOL Boot sequence section)
+- `GEMINI.md` (outdated; explicitly told "do NOT rely on PROTOCOL.md" which contradicts current direction)
+- `_emulation/mesa_sw_overlay/pkg/usr/share/doc/libxml2/README.md` (vendored package doc, not project content)
+
+### Inferences from MODEL.md preserved here (not promoted to PROTOCOL)
+
+These are NOT verified facts; they're working hypotheses captured for the investigation thread. Future sessions: treat as starting points for inquiry, not as truth.
+
+- The Diag_1360 main loop (`sub_7b3060`) is the front-end blocker (per Step 81). What unblocks it on real hardware is unknown — candidates: a switch state we don't simulate, a network event from netbridge, a counter we haven't found the writer for.
+- IScene shared abstract base layout (vtable slot semantics — slot 8 tick / slot 9 activate, slots 4-6 flag accessors) was derived by decompiling each slot. Mapping is consistent across PLE and SW LE 0.85 pokemon-port-glue functions but the "tick/activate" semantic labels are inferred from observed call patterns, not from a header file.
+- DisplayRenderer render-loop equivalence (PLE `0x7b7ac0` ↔ SW LE `mcp_DisplayRenderer_render_thread_body`) is byte-shape-identical at the OpenGL call level but the field offsets used to drain queues are inferred to match between binaries.
+- Cycle source (`sub_7b3060` → `sub_5a94f0` → `sub_58fc{10,20,30,40}` → `sub_731930` → `select_and_load_scene`) is verified at the call-chain level via decompile + runtime BRK trap, but the *meaning* of scenes 9/10/11/12 (mask bits 0/1/2/3) as "shared system scene types" vs. "specific UI element types" is inferred.
+
+These move with the investigation — re-verify before relying on them.
+
+### Per-topic absorption workflow
+
+For each section in the new PROTOCOL.md target structure (Project overview, Quick-start, Boot, UART, Nodebus, image.bin, Asset extraction, Audio, Radium, Display, Runtime, Hardware shim, Comparison binaries):
+1. Inventory candidate sources from the deletion list above + memory + code
+2. Resolve conflicts by VERIFICATION — run a test, read the binary, or read code; not by file mtime
+3. Strip uncertainty before writing
+4. Self-contained section, with `*Verified by:*` footnote per subsection
+5. Delete absorbed source files
+6. Update memory entries that pointed at deleted files
+7. Update code comments that cited JOURNAL Steps for verified facts
+
+After this point, JOURNAL Steps remain valuable for "what we tried and learned along the way," but should not be the source for facts about how the platform works. Cite PROTOCOL.md sections for facts; cite JOURNAL Steps only for "why this workaround exists" narrative context.
 
 
 

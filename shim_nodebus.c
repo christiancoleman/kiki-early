@@ -53,7 +53,7 @@ extern real_write_t real_write;
  * game emits is encrypted under a zero key block. We reproduce that here so
  * decryption matches.
  *
- * Algorithm and full RE notes: docs/NODEBUS_CIPHER.md.
+ * Algorithm and full RE notes: docs/PROTOCOL.md §5.1.
  *
  * If we ever start synthesizing key-fetch responses, this table is where we
  * record the (fake) key bytes we hand out, so subsequent traffic decrypts
@@ -245,7 +245,7 @@ static void log_caller_chain(const char *prefix) {
  * points at the first encrypted byte (inner_cmd), and is overwritten with
  * the decrypted bytes.
  *
- * See docs/NODEBUS_CIPHER.md § 1.2 for the algorithm.
+ * See docs/PROTOCOL.md §5.1 "Cipher algorithm" for the algorithm.
  */
 static void nodebus_cipher_decrypt(uint8_t slot, uint8_t inner_len, uint8_t *buf) {
     uint8_t mask = (uint8_t)(((slot & 0x1F) << 4) | ((inner_len + 1) & 0x0F));
@@ -507,7 +507,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
      * Step 67 update: cmd 0x40 / 0x41 senders identified. Cmd 0x41 is the
      * encrypted node-bus channel (sub_8ec410 → sub_9166c0); cmd byte is
      * runtime-computed. We don't synthesize responses, but we DO decrypt the
-     * outbound payload here for visibility — see cases below + NODEBUS_CIPHER.md.
+     * outbound payload here for visibility — see cases below + PROTOCOL.md §5.1.
      */
     case 0x40: {
         /* Cleartext bridge sub-protocol. payload[0] is the sub-cmd byte.

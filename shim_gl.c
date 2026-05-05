@@ -988,7 +988,7 @@ static int stub_eglClientWaitSyncKHR(void *display, void *sync, int flags, uint6
  * 2. Set: each stub forwards to the real Mesa implementation via
  *    dlsym(RTLD_NEXT, ...) (cached per-function). Expects the Mesa overlay
  *    at mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/ to be on
- *    LD_LIBRARY_PATH. See _emulation/SETUP.md §3b.
+ *    LD_LIBRARY_PATH. See _emulation/docs/PROTOCOL.md §2 "Run the game".
  */
 
 #define GL_NO_ERROR              0

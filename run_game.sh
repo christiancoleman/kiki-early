@@ -46,7 +46,7 @@
 #   name and a note line to run_info.txt.
 #
 #
-# PREREQS (see docs/SETUP.md for details):
+# PREREQS (see docs/PROTOCOL.md §2 for details):
 #   - qemu-user (provides qemu-aarch64 + binfmt_misc)
 #   - gcc-aarch64-linux-gnu (only if you modify the shim — run ./build.sh)
 #   - Mesa overlay built: cd mesa_sw_overlay && ./build_overlay.sh

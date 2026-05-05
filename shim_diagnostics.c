@@ -335,7 +335,7 @@ static void shim_dump_sound_globals(void) {
  * For 42 slots, dump (mode_id, type_flags, scene_ptr, init_flag) to give
  * us a live snapshot of the game's mode state. If static init ran
  * successfully these will all have the expected mode_id / type_flags
- * values matching MODE_TABLE.md. If any init_flag is non-zero, that mode
+ * values matching PROTOCOL.md §11. If any init_flag is non-zero, that mode
  * has transitioned from static-registration to "activated" state.
  */
 

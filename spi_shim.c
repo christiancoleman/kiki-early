@@ -6,8 +6,8 @@
  * cross-file declarations are in spi_shim.h. All source files compile into
  * a single spi_shim.so via ./build.sh.
  *
- * See _emulation/README.md for the module guide and this file's role, and
- * _emulation/SETUP.md for environment setup.
+ * See _emulation/docs/PROTOCOL.md §12 for the module guide and this file's role,
+ * and _emulation/docs/PROTOCOL.md §2 for environment setup.
  *
  * Build:  ./build.sh
  * Run:    ./run_game.sh    (auto-detects sysroot from script location)
