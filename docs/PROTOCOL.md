@@ -1713,12 +1713,6 @@ Status LED (D2) blink codes (real-hardware debug only):
 
 **Emulation:** the shim returns synthetic pwrdist responses for cmds 0x10/0x15/0x16/0x18/0x1c/0x1d (see §4). Sending all-zeros for status bytes has worked through init. If the game starts gating later features on specific rail/door state, we may need to send "all rails OK, door closed" bits.
 
-### Persistence gap
-
-Both EEPROM (i2c slave 0x57) writes and `/connectivity/` filesystem NV writes vanish in the current shim — no SIGTERM flush, no actual persistence layer. Any "play and persist" workflow needs the persistence layer wired before it can survive a restart.
-
----
-
 ## 13. Comparison binaries (SW LE 0.85)
 
 The emulator's correctness target is "boot ANY Spike 3 game to attract." Every claim about Stern-shared code (proc system, IScene base class, DisplayRenderer, SceneCache, RadiumScene, node-bus, SPI, audio) should reproduce in **Star Wars LE 0.85.0** because both games run the same Stern stack. SW LE has **zero Godot** in its binary (vs Pokémon LE's 457 "godot" string hits) — making it the cleanest A/B target for "what is Pokémon-port glue vs. shared Stern?"
