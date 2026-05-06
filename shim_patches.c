@@ -221,14 +221,10 @@ typedef const void *(*real_avcodec_find_decoder_by_name_t)(const char *name);
 typedef const void *(*real_avcodec_get_hw_config_t)(const void *codec, int index);
 typedef int (*real_av_hwdevice_ctx_create_t)(void **device_ctx, int type,
                                               const char *device, void *opts, int flags);
-typedef int (*real_avcodec_send_packet_t)(void *avctx, const void *pkt);
-typedef int (*real_avcodec_receive_frame_t)(void *avctx, void *frame);
 
 static real_avcodec_find_decoder_by_name_t real_avcodec_find_decoder_by_name = NULL;
 static real_avcodec_get_hw_config_t real_avcodec_get_hw_config = NULL;
 static real_av_hwdevice_ctx_create_t real_av_hwdevice_ctx_create = NULL;
-static real_avcodec_send_packet_t real_avcodec_send_packet = NULL;
-static real_avcodec_receive_frame_t real_avcodec_receive_frame = NULL;
 
 static unsigned int av_send_count = 0;
 static unsigned int av_recv_count = 0;
@@ -334,84 +330,14 @@ int av_hwdevice_ctx_create(void **device_ctx, int type, const char *device,
     return ret;
 }
 
-/* ========== moved from spi_shim.c (1868-2020): Dummy-frame injection ========== */
-/* ---- Dummy-frame injection (Step 47b) ----
- *
- * DRM-based HW decode is being set up successfully (av_hwdevice_ctx_create
- * returned 0 for AV_HWDEVICE_TYPE_DRM=8), packets are being sent to the
- * codec, but receive_frame always returns EAGAIN (-11) — no real frames
- * because our DRM socketpair doesn't actually decode. Inject a dummy
- * NV12 1920×1080 all-black frame so the game's video renderer gets SOMETHING.
- *
- * AVFrame field offsets (libavutil 57 / ffmpeg 5.1, stable):
- *   width:   104   int
- *   height:  108   int
- *   format:  116   int  (AV_PIX_FMT_NV12 = 23)
- *
- * We let libavutil helpers (av_frame_alloc, av_frame_get_buffer, av_frame_ref,
- * av_frame_unref) do allocation. The only direct field pokes are the three
- * ints above.
- */
-#define DUMMY_FRAME_W      1920
-#define DUMMY_FRAME_H      1080
-#define AV_PIX_FMT_NV12    23
-#define AVFRAME_OFF_WIDTH  104
-#define AVFRAME_OFF_HEIGHT 108
-#define AVFRAME_OFF_FORMAT 116
-#define AVFRAME_OFF_PTS    136   /* int64_t  — ffmpeg 5.1 stable layout */
-#define AVFRAME_OFF_PKTDTS 144   /* int64_t  — ffmpeg 5.1 stable layout */
-
-typedef void *(*real_av_frame_alloc_t)(void);
-typedef int  (*real_av_frame_get_buffer_t)(void *frame, int align);
-typedef int  (*real_av_frame_ref_t)(void *dst, const void *src);
-typedef void (*real_av_frame_unref_t)(void *frame);
-
-static void *shim_dummy_frame = NULL;
-static int shim_dummy_frame_inited = 0;
-
-static void shim_init_dummy_frame(void) {
-    if (shim_dummy_frame_inited) return;
-    shim_dummy_frame_inited = 1;  /* flag now, regardless of success */
-
-    real_av_frame_alloc_t      alloc    = shim_resolve_libav("av_frame_alloc", "LIBAVUTIL_57");
-    real_av_frame_get_buffer_t getbuf   = shim_resolve_libav("av_frame_get_buffer", "LIBAVUTIL_57");
-
-    if (!alloc || !getbuf) {
-        SHIM_LOG("shim_init_dummy_frame: couldn't resolve libavutil helpers (alloc=%p getbuf=%p)",
-                 (void *)alloc, (void *)getbuf);
-        return;
-    }
-
-    void *f = alloc();
-    if (!f) {
-        SHIM_LOG("shim_init_dummy_frame: av_frame_alloc returned NULL");
-        return;
-    }
-
-    *(int *)((char *)f + AVFRAME_OFF_WIDTH)  = DUMMY_FRAME_W;
-    *(int *)((char *)f + AVFRAME_OFF_HEIGHT) = DUMMY_FRAME_H;
-    *(int *)((char *)f + AVFRAME_OFF_FORMAT) = AV_PIX_FMT_NV12;
-
-    int gb_ret = getbuf(f, 32);
-    if (gb_ret < 0) {
-        SHIM_LOG("shim_init_dummy_frame: av_frame_get_buffer returned %d", gb_ret);
-        return;
-    }
-
-    /* Zero-fill Y plane to 0x10 (studio black luma), UV plane to 0x80
-     * (neutral chroma). data/linesize are at known offsets 0/64. */
-    uint8_t **data = (uint8_t **)f;
-    int *linesize  = (int *)((char *)f + 64);
-    if (data[0]) memset(data[0], 0x10, (size_t)linesize[0] * DUMMY_FRAME_H);
-    if (data[1]) memset(data[1], 0x80, (size_t)linesize[1] * (DUMMY_FRAME_H / 2));
-
-    shim_dummy_frame = f;
-    SHIM_LOG("shim_init_dummy_frame OK: frame=%p data[0]=%p linesize[0]=%d",
-             f, data[0], linesize[0]);
-}
-
-/* State: number of pending frames to deliver. send_packet accepts → +1. */
-static int shim_pending_dummies = 0;
+/* (The Step 47b dummy-frame injection block lived here until 2026-05-06.
+ * It allocated an NV12 1920×1080 black AVFrame and injected it on
+ * avcodec_receive_frame EAGAIN — useful when the only "decode" we had was a
+ * DRM socketpair that produced no real frames. Now that shim_avforward.c
+ * routes packets to host NVDEC, real frames arrive and dummies are
+ * unnecessary. AVFrame/AVPacket field offsets that lived here are now
+ * duplicated in shim_avforward.c at AVFRAME_OFF_* / AVPKT_OFF_* — see that
+ * file for the canonical copy.) */
 
 int avcodec_send_packet(void *avctx, const void *pkt) {
     /* SPIKE3_FORWARD_DECODE is the only decode path. Forward to host
@@ -463,8 +389,3 @@ int avcodec_receive_frame(void *avctx, void *frame) {
     return -5;  /* -EIO */
 }
 
-/* (Step 47b dummy-frame injection path removed 2026-05-06 along with the
- * libavcodec SW fallback in avcodec_receive_frame above. Forward-decode is
- * now the only decode path; bridge-unreachable is a hard error. The
- * shim_init_dummy_frame() machinery above is no longer called from anywhere
- * — left in place to keep the diff minimal; can be removed in a follow-up.) */

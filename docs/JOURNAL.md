@@ -7439,4 +7439,185 @@ While debugging the abandoned networking path, `shim_bridges.c` got a generic `s
 3. The shipping production cabinet uses real `/dev/dri/card1` + KMS, not fb0. The fb0 path is purely an emulation-rig feedback channel; real game code is unaffected.
 
 
+## Step 85: Forward-decode bridge restored as default; SW HEVC fallback removed; decoder patches renamed and made unconditional (2026-05-06)
+
+### Why
+
+User asked about a video error log (`Failed to find a V4L2 device for H265` / `drm_prime hwaccel init returned error` / `Failed to get HW surface format` / `Error parsing NAL unit #0`) and through the analysis arc surfaced a goal that the project had been drifting away from: **no software HEVC decoding anywhere; the bridge to host NVDEC should be the default path, not opt-in**. This Step is the rationalization: cleans up the decoder layer to one path, removes the silent fallback that was masking bridge issues, and brings the rig back to the configuration Step 73b last verified working.
+
+The session also exercised the new pillar rule `feedback_search_over_recall.md` ("don't recall from memory; use `/lore` and read Step N+1 alongside Step N to catch supersession"). That rule fired correctly: memory's claim that "decoder is not the blocker per Step 72i/72j" was caught as fabricated when the actual JOURNAL Steps were re-read, which led to discovering the Step 73b host-NVDEC bridge had been deleted entirely in `efba162` and that the b.ne NOP supporting it had been collateral-damaged in `748720a` / `a4d5ea0`. Without applying the pillar, the investigation would have accepted a wrong picture.
+
+### State at session start
+
+- Forward-decode bridge (`shim_avforward.c` + `decode_daemon.py`): **deleted in `efba162`** "Big refactor; removing things we don't use anymore" (2026-05-05 20:03 EDT). Untouched in JOURNAL.
+- Decoder-name remap (`hevc_v4l2request` → `hevc`, gated `SPIKE3_SW_HEVC=1`): still present in `shim_patches.c`.
+- `shim_patch_get_format_callback` (the b.ne NOP at game VA `0x920cf0` that lets the game's `get_format` accept NV12): **also deleted, in `748720a` "A refactor to remove unused / old code"** (2026-05-02), undocumented. Comment block in `shim_patches.c` still referenced the function but the body and call site were gone.
+- Memory `reference_video_player_spi.md` cited "Step 72i" and "Step 72j" for the verdict "decoder is not the blocker." Neither substep exists — Step 72 substeps stop at `g`. The actual content lived in Step 73b/73e, which the memory missed entirely.
+
+### Restoration phase 1 — forward-decode bridge
+
+Recovered the two whole files from `git show efba162~1:`:
+- `_emulation/shim_avforward.c` (501 lines) — C client: 8-slot session table, AF_UNIX `@spike3_decode` connect, AVPacket field reads at offsets 8/16/24/32/40, AVFrame buffer population via `av_frame_get_buffer` + stride-aware row copy, REQ_OPEN/PACKET/RECEIVE/CLOSE wire protocol mirroring the daemon.
+- `_emulation/decode_daemon.py` (382 lines) — host AF_UNIX server: per-connection `Session` with `av.codec.CodecContext.create("hevc_cuvid", "r")`, NVDEC frames downloaded via `frame.reformat(format='nv12')` + `to_ndarray`, REP_OPEN_OK / FRAME / EAGAIN / EOF replies. Includes SW fallback if `hevc_cuvid` open fails (handled inside daemon, transparent to shim).
+
+Restored integration:
+- `_emulation/shim_patches.c` — the two `SPIKE3_FORWARD_DECODE` early-return blocks at the head of `avcodec_send_packet` / `avcodec_receive_frame`.
+- `_emulation/run_game.sh` — `FORWARD_DECODE` env var (defaulted to `1`, was `0` originally), daemon-launch helper, qemu env-forward.
+- `_emulation/build.sh` — `shim_avforward.c` re-added to `SOURCES`.
+- `_emulation/spi_shim.h` — forward-decode declarations (skipped the unrelated `sub_8edfe0_*` removals from the same commit, which were Step 72 BRK trap work, correctly stale).
+- `_emulation/historical-system-rig/initramfs/usr/local/bin/wrap_game.sh` — `SPIKE3_FORWARD_DECODE=1` for system-mode parity.
+
+Smoke test against `Lake_01_22_26_h265.mp4` (real game clip, 1940×1100, extradata=2490B): 194 NV12 frames in 3.98 s = 48.7 fps via NVDEC. Daemon log shows `OPEN codec=hevc_cuvid extradata=2490B` and successive `frame #N` lines.
+
+### Restoration phase 2 — the b.ne NOP
+
+Discovered while planning the rename that `shim_patch_get_format_callback` only appears in comments in current `shim_patches.c`, not as a callable function. Pickaxe history showed:
+- Function lived in `spi_shim.c` originally (per Phase 8 refactor comment).
+- At commit `c4d581f` (Step 73b add, 2026-04-30) the function was alive in `shim_inject.c`, called from `shim_vp_patch_thread` after a 2-second sleep.
+- `748720a` "A refactor to remove unused / old code" (2026-05-02) removed 528 lines from `shim_patches.c`, including this function.
+- `a4d5ea0` "Cleaning things up. Or trying to" (2026-05-05) removed the patch-thread wrapper alongside other Step-72 dead code.
+
+Step 73b's verified-working configuration **had the NOP active**. Without it:
+1. Game calls `avcodec_open2` on the AVCodecContext.
+2. libavcodec invokes the game's `get_format` callback with a list of supported pix_fmts.
+3. Game's callback iterates looking for `AV_PIX_FMT_DRM_PRIME` (0xb3); none are offered (since we route to plain `hevc` SW decoder which produces NV12 / YUV420P).
+4. `cmp w0, #0xb3` → not equal → `b.ne 0x920ce0` loops back; eventually exhausts list and errors.
+5. `avcodec_open2` fails. Game's `SpiVideoStreamDecoderBase.cpp:1830` `assert(hw_decoder)` SIGABRTs (per Step 47).
+
+So forward-decode would never get a chance to engage — the game crashes before sending the first packet. The restored bridge would have been a stillbirth.
+
+Recovery: pulled the function body from `c4d581f`'s `shim_patches.c`. Restored at `shim_patches.c:148-198` (paraphrased):
+
+```c
+#define GET_FORMAT_BNE_VA   0x920cf0
+#define AARCH64_NOP         0xd503201fu
+
+void shim_patch_get_format_callback(void) {
+    if (!shim_decoder_patch_enabled()) return;
+    /* mprotect → byte-check expected `b.ne 0x920ce0` (0x54ffff81) →
+     * write AARCH64_NOP → __builtin___clear_cache. */
+}
+```
+
+Hooked into the existing `shim_discovery_init_thread` (Step 73a's deferred-init pattern) — no new thread spawned:
+
+```c
+static void *shim_discovery_init_thread(void *arg) {
+    sleep(2);
+    shim_discovery_init();
+    [REDACTED: startup-override call];
+    shim_patch_get_format_callback();   // ← new
+    return NULL;
+}
+```
+
+The 2-second sleep already handles game-base resolution timing.
+
+### Decision: rename SPIKE3_SW_HEVC → SPIKE3_DECODER_PATCH
+
+User pushed back on the `SPIKE3_SW_HEVC` name — implies "use software decoder," but the patches don't decode anything. They have two effects:
+1. `avcodec_find_decoder_by_name`: rewrite `hevc_v4l2request` / `hevc_v4l2m2m` → `hevc` so the game can resolve **any** working decoder pointer (V4L2 stateless m2m HEVC slice device doesn't exist in our env).
+2. `shim_patch_get_format_callback`: NOP the `b.ne` so the game accepts NV12 instead of demanding DRM_PRIME.
+
+These are **compatibility patches**, not "software decoding." The actual decode is done by `shim_avforward.c` → host NVDEC. The renamed-to-`hevc` decoder libavcodec allocates as a result of (1) is functionally inert under forward-decode — it has an open AVCodecContext but never sees a packet because send_packet is intercepted before it.
+
+Rename:
+- env var: `SPIKE3_SW_HEVC` → `SPIKE3_DECODER_PATCH`
+- gate function: `shim_sw_hevc_enabled` → `shim_decoder_patch_enabled`
+- log tag: `[sw_hevc]` → `[decoder_patch]`
+- default flipped: previously `(s && s[0] == '1')` (default-OFF), now `!(s && s[0] == '0')` (default-ON; `SPIKE3_DECODER_PATCH=0` to disable for debugging)
+- removed `SW_HEVC` knob from `run_game.sh` defaults / qemu env-forward / `run_info.txt` env-toggle list
+- removed `export SPIKE3_SW_HEVC=1` from `wrap_game.sh`
+
+Post-rename, the env var is no longer surfaced as a routine knob. Setting `SPIKE3_DECODER_PATCH=0` in the parent shell still flows through to qemu via inherited environment if anyone needs to disable for debugging.
+
+### Decision: remove CPU SW fallback
+
+`avcodec_send_packet` / `avcodec_receive_frame` previously fell through to `real_avcodec_send_packet` / `real_avcodec_receive_frame` (i.e., the renamed-to-`hevc` SW decoder running on the in-VM CPU) when forward-decode reported unreachable. This was a silent fallback — game continues running, just with 5-fps SW HEVC instead of 49-fps NVDEC. Looks like a generic game-side performance issue from the outside.
+
+Removed the fallback. New behavior: when `shim_avforward_send_packet` / `shim_avforward_receive_frame` return `0` (forward couldn't engage), the wrappers return `-EIO` directly with a rate-limited `[forward unreachable; SW fallback removed]` log line. Game's own error handling kicks in (which per Step 47 means SIGABRT at `SpiVideoStreamDecoderBase.cpp:1830`).
+
+User-explicit trade-off: loud failure beats silent slow-fallback because (a) we want this to be a playable video game, not a CPU-decode toy; (b) bridge issues should surface immediately, not look like a generic game bug; (c) the daemon is launched by `run_game.sh` before qemu, so under normal flow it's ready before any send_packet — the only failure mode this hard-fail catches is daemon-died-mid-run, which is exactly the case where loud >> silent.
+
+### Decision: native `hevc_v4l2request` is out of scope
+
+User's original intent for "HW decode" was to use `hevc_v4l2request` natively — i.e., remove the decoder patches entirely and satisfy the game's expected V4L2 stateless decode path. Analysis:
+
+`hevc_v4l2request` is FFmpeg's V4L2 stateless HEVC hwaccel. Implementing it natively would require:
+1. A fake V4L2 m2m device under `/dev/video*` answering REQBUFS / S_EXT_CTRLS (HEVC slice params) / QBUF / DQBUF.
+2. Actual bitstream decode — most realistically still routed to host NVDEC (delegated at the V4L2 layer instead of the libavcodec layer, but same endpoint).
+3. DMA-BUF allocation for the capture-queue buffer (memfd + udmabuf).
+4. `EGL_EXT_image_dma_buf_import` + `glEGLImageTargetTexture2DOES` recognizing our fake DMA-BUFs.
+
+Step 47 already attempted layer 4 and walled at *"a real DMA-BUF fd that EGL can import via EGL_EXT_image_dma_buf_import"* — marked as bigger than the excitement-per-hour budget.
+
+The structural wall: our Mesa overlay is `MESA_LOADER_DRIVER_OVERRIDE=swrast` + `LIBGL_ALWAYS_SOFTWARE=1`. **OpenGL runs on CPU.** Even with a perfect DMA-BUF, swrast can't sample GPU memory because there's no GPU passthrough into qemu user-mode. Any "real" DMA-BUF would have to be CPU-readable backing — same memory traffic as the current AF_UNIX bridge, just dressed up in V4L2 + DMA-BUF wrappers.
+
+**End result for native `hevc_v4l2request`**: thousands of new lines of V4L2 + DMA-BUF + EGL shim code to deliver bytes to the same place the current 900-line bridge already delivers them. Zero performance benefit because swrast is the bottleneck regardless. Decision: keep the two compatibility patches, document them clearly via the rename, leave the door open for native `hevc_v4l2request` only if (a) GPU passthrough becomes available in qemu user-mode or (b) we move to a system-mode rig with a real GL driver. Neither is on the near-term path.
+
+### Cleanup: dead code
+
+After removing the CPU fallback, several `shim_patches.c` symbols became unused (compiler warnings):
+- `real_avcodec_send_packet_t` / `real_avcodec_receive_frame_t` typedefs
+- `real_avcodec_send_packet` / `real_avcodec_receive_frame` static function pointers
+- `shim_init_dummy_frame()` (Step 47b dummy NV12 1920×1080 black frame allocator) + its statics `shim_dummy_frame`, `shim_dummy_frame_inited`, `shim_pending_dummies`
+- Local copies of macros now duplicated in `shim_avforward.c`: `DUMMY_FRAME_W/H`, `AV_PIX_FMT_NV12`, `AVFRAME_OFF_WIDTH/HEIGHT/FORMAT/PTS/PKTDTS`
+- `real_av_frame_alloc_t` / `real_av_frame_get_buffer_t` / `real_av_frame_ref_t` / `real_av_frame_unref_t` typedefs (only used by `shim_init_dummy_frame`)
+
+All deleted. `shim_patches.c` line count: 391 (was ~480). Build: clean — the four `-Wunused-*` warnings are gone; remaining warnings are pre-existing in other TUs (`shim_nodebus.c`, `shim_fs.c`, `spi_shim.h` timestamp).
+
+The AVFrame/AVPacket field offsets that lived in `shim_patches.c` are now duplicated in `shim_avforward.c` at `AVFRAME_OFF_*` / `AVPKT_OFF_*`. Treat `shim_avforward.c`'s definitions as canonical going forward — it's the only TU that actually pokes those fields.
+
+### Memory + skill updates
+
+- **Deleted** `memory/reference_video_player_spi.md` outright. It cited fabricated Step 72i / Step 72j as the source for "decoder is not the real blocker," and referencing nonexistent Steps undermines all its other (factually correct) claims about VideoPlayerSpi vtable / decoder chain / attract-mode. Information remains recoverable from JOURNAL Steps 47 / 62 / 71 / 72b–g / 73b / 73e and from the BN database.
+- **Added** `memory/feedback_search_over_recall.md` as a PILLAR-level feedback. Codifies the rule that triggered this Step's discovery arc:
+  1. For project-state facts (which Steps cover what, conclusions, addresses, decisions), use `/lore` active search instead of memory recall.
+  2. When verifying a claim from JOURNAL Step N, ALWAYS also read Step N+1 — the chronologically next Step frequently revises, supersedes, or extends earlier conclusions.
+  Rule was triggered by the failure mode where stale memory cited "Step 72i" that doesn't exist; reading Step 73 (next step after Step 72) surfaced the actual relevant work (forward-decode bridge implementation in 73b, scene-tree-attachment reframe in 73e). Without the rule, this Step's restoration would not have happened.
+
+### Verified end-to-end
+
+Build: `[build] OK — spi_shim.so: 232256 bytes`. All forward-decode + decoder-patch symbols present (`shim_avforward_enabled`, `shim_avforward_send_packet`, `shim_avforward_receive_frame`, `shim_patch_get_format_callback`).
+
+Daemon harness round-trip: 194/200 NV12 frames at 49.5 fps via `hevc_cuvid` NVDEC against the same `Lake_01_22_26_h265.mp4` clip Step 73b used. Wire protocol verified end-to-end: REQ_OPEN → REP_OPEN_OK, REQ_PACKET → REP_PACKET_OK, REQ_RECEIVE → REP_FRAME (header + Y-plane + UV-plane), REQ_CLOSE → REP_OK.
+
+User game run (`runs/2026-05-06T12.45.39_hw_refactor`):
+- `[decoder_patch] patched get_format b.ne @ 0x77f488260cf0: 0x54ffff81 -> 0xd503201f (NOP)` at run+5 s → b.ne NOP applied successfully at runtime, byte-check passed.
+- 3× `[avforward] session OPEN ok ... codec_id=173 extradata=2453B` → three real game-side AVCodecContexts opened on the daemon (codec_id=173 = HEVC, extradata=2453B matches Step 73b's recorded value, distinct from the test harness's 2490B).
+- `avcodec_receive_frame #1000 ... [forward] (ok=449 err=551)` → 1000 receive_frame calls: 449 returned a frame, 551 returned `-EAGAIN` (daemon queue empty, expected at ~50% rate per Step 73b).
+- `[forward unreachable; SW fallback removed]`: **0 hits**. Bridge engaged on every send/receive. Zero CPU HEVC decoding occurred.
+
+The decoder-name-remap log (`[decoder_patch] remapping decoder name 'hevc_v4l2request' -> 'hevc'`) did not fire — game presumably calls `avcodec_find_decoder(AV_CODEC_ID_HEVC)` (codec_id-based) rather than `avcodec_find_decoder_by_name("hevc_v4l2request")` (name-based). Our hook only catches the name variant. Operationally inert: the b.ne NOP makes the get_format callback accept whatever pix_fmt libavcodec offers, and the bridge intercepts send/receive before the underlying decoder ever sees a packet. The decoder-name remap is defense in depth; not load-bearing under the current bridge-active flow.
+
+### What's NOT verified
+
+- **System-mode forward-decode is currently a no-op.** `wrap_game.sh` exports `SPIKE3_FORWARD_DECODE=1` for parity with user-mode, but the in-VM abstract AF_UNIX namespace can't see the host daemon — `connect()` to `@spike3_decode` fails fast, the no-CPU-fallback path returns `-EIO`. Game's video pipeline will hard-fail in system-mode until cross-VM transport is in place. This is a regression from "in-VM SW decode silently kept things alive" — by design per the no-fallback decision, but it means system-mode video doesn't work at all right now.
+- **End-to-end game playback through to attract-loop video display** — the bridge is delivering frames, but per Step 73e the front-end blocker is scene-tree attachment (`/root/Main` parent missing), not decode. Frames arrive but are not rendered until the orchestrator reframe (Step 81's Diag_1360 work) or scene-tree attachment is solved.
+
+### Open questions / next steps
+
+1. **System-mode cross-VM transport** for forward-decode. Step 84 documented why every networking path on `-M raspi4b` is blocked: GENET hard-disabled by qemu's `compat_disable[]`, USB-net DWC2 doesn't enumerate, no PCIe / virtio-mmio / vsock by default. Reaching forward-decode parity in system-mode requires one of:
+   - Re-add the TCP-listen support that was removed in `6c9e6d1` plus a patched qemu binary that re-enables GENET (one-time qemu rebuild).
+   - DTB-overlay patching to inject a virtio-mmio bus + virtio-net.
+   - virtio-vsock if qemu raspi4b can be coaxed to expose it.
+   - Switch machine model from `-M raspi4b` to `-M virt` (loses production-hardware fidelity; raspi4b matches real CM4).
+2. **Front-end blocker** is the Diag_1360 menu loop (Step 81) → still the active investigation, unaffected by today's work.
+3. **Dead code follow-up**: `shim_patches.c`'s remaining libavcodec hooks (`avcodec_get_hw_config`, `av_hwdevice_ctx_create`) are passthrough-with-logging — never exercised meaningfully in the forward-decode flow because `avcodec_open2` doesn't call hwaccel paths when get_format returns a SW-compatible pix_fmt. Could be deleted in a follow-on cleanup once we confirm they're truly never hit. Keep for now as a diagnostic safety net.
+
+### Files changed
+
+- `_emulation/shim_avforward.c` — restored from `efba162~1`, 501 lines, default-on bridge client.
+- `_emulation/decode_daemon.py` — restored from `efba162~1`, 382 lines, host AF_UNIX server with `hevc_cuvid` + SW fallback.
+- `_emulation/shim_patches.c` — restored `shim_patch_get_format_callback`; renamed `shim_sw_hevc_enabled` → `shim_decoder_patch_enabled` (default-on); removed CPU fallback in `avcodec_send_packet` / `avcodec_receive_frame` (return `-EIO`); deleted dummy-frame infrastructure (~80 lines) + unused typedefs/statics.
+- `_emulation/spi_shim.h` — added forward-decode + `shim_patch_get_format_callback` declarations; updated comments.
+- `_emulation/shim_inject.c` — added `shim_patch_get_format_callback()` call inside `shim_discovery_init_thread` (no new thread).
+- `_emulation/build.sh` — `shim_avforward.c` re-added to SOURCES.
+- `_emulation/run_game.sh` — `FORWARD_DECODE` env var (default-on) + daemon-launch helper + qemu env-forward; removed `SW_HEVC` from defaults / forward / `run_info.txt`.
+- `_emulation/historical-system-rig/initramfs/usr/local/bin/wrap_game.sh` — `SPIKE3_FORWARD_DECODE=1` exported; `SPIKE3_SW_HEVC` export removed.
+- `memory/reference_video_player_spi.md` — DELETED (stale Step 72i/72j refs).
+- `memory/feedback_search_over_recall.md` — NEW PILLAR feedback.
+- `memory/MEMORY.md` — VideoPlayerSpi index line replaced with the new PILLAR entry.
+
+
 
