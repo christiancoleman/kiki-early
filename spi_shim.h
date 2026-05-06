@@ -55,11 +55,21 @@ void *shim_resolve_libav(const char *sym, const char *version);
 /* ---- Forward-decode hooks (defined in shim_avforward.c) ----
  * Called from shim_patches.c's avcodec_send_packet / avcodec_receive_frame
  * when SPIKE3_FORWARD_DECODE=1. Each returns 1 if it handled the call (and
- * wrote the libav return code into *out_ret), or 0 if the caller should
- * fall through to the local-libavcodec passthrough. */
+ * wrote the libav return code into *out_ret), or 0 if the bridge couldn't
+ * engage (daemon unreachable / all slots in use). The caller HARD-FAILS
+ * on the 0 return — there is no SW fallback; see shim_patches.c rationale. */
 int shim_avforward_enabled(void);
 int shim_avforward_send_packet(void *avctx, const void *avpkt, int *out_ret);
 int shim_avforward_receive_frame(void *avctx, void *frame, int *out_ret);
+
+/* ---- Decoder compatibility patch (defined in shim_patches.c) ----
+ * Patches the b.ne at game VA 0x920cf0 in the game's get_format callback
+ * so it accepts NV12 instead of insisting on DRM_PRIME. Required for any
+ * non-V4L2-stateless decoder to function — both the diagnostic SW hevc
+ * path and the forward-decode bridge. Default-on; gate via
+ * SPIKE3_DECODER_PATCH=0 for debugging only. Called from shim_inject.c's
+ * deferred-init thread (after game-base is resolvable). */
+void shim_patch_get_format_callback(void);
 
 /* ---- Signal handlers (defined in shim_diagnostics.c; registered by
  *      shim_install_crash_handler in spi_shim.c) ---- */

@@ -102,7 +102,6 @@ TIMEOUT="${TIMEOUT:-0}"
 REAL_GL="${REAL_GL:-1}"
 FRAME_BRIDGE="${FRAME_BRIDGE:-1}"
 AUDIO_BRIDGE="${AUDIO_BRIDGE:-1}"
-SW_HEVC="${SW_HEVC:-1}"
 # FORWARD_DECODE=1: launch decode_daemon.py and route the game's
 # avcodec_send_packet/receive_frame to host NVDEC via AF_UNIX abstract socket
 # @spike3_decode. Default-on (Step 73b restored 2026-05-06). When the daemon
@@ -411,7 +410,6 @@ if [[ "$REAL_GL" == "1" ]]; then
 fi
 [[ "$FRAME_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_FRAME_BRIDGE=1")
 [[ "$AUDIO_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_AUDIO_BRIDGE=1")
-[[ "$SW_HEVC"          == "1" ]] && args+=(-E "SPIKE3_SW_HEVC=1")
 [[ "$FORWARD_DECODE"   == "1" ]] && args+=(-E "SPIKE3_FORWARD_DECODE=1")
 [[ "$SPI_QUIET"        == "1" ]] && args+=(-E "SPIKE3_SPI_QUIET=1")
 [[ "$SPI_DELAY_US"     != "0" ]] && args+=(-E "SPIKE3_SPI_DELAY_US=$SPI_DELAY_US")
@@ -458,7 +456,7 @@ fi
     printf '\n# invocation (raw shell)\n'
     printf '$ %s %s\n' "$0" "$*"
     printf '\n# env-toggle settings (final values)\n'
-    for v in TIMEOUT REAL_GL FRAME_BRIDGE AUDIO_BRIDGE SW_HEVC FORWARD_DECODE \
+    for v in TIMEOUT REAL_GL FRAME_BRIDGE AUDIO_BRIDGE FORWARD_DECODE \
              SPI_QUIET SPI_DELAY_US STATE_BRIDGE OFFLINE_MODE \
              VIEWER VIEWER_FULLSCREEN AUDIO_PLAYER TIMER  BOOT_DISPLAY \
              BOOT_DISPLAY_DURATION STALE_KILL DEBUG LOGFILE; do

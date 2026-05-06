@@ -195,6 +195,12 @@ static void *shim_discovery_init_thread(void *arg) {
     sleep(2);
     shim_discovery_init();
 
+    /* Decoder compatibility patch: NOP the b.ne at game VA 0x920cf0 so the
+     * game's get_format callback accepts NV12 from forward-decode (or from
+     * local SW hevc as a diagnostic). Must run after game-base is resolvable
+     * — the 2 s sleep above already handles that timing. Default-on; gate
+     * via SPIKE3_DECODER_PATCH=0. */
+    shim_patch_get_format_callback();
     return NULL;
 }
 

@@ -6,15 +6,16 @@
  *     dst NULL. Fixes the Godot error-logger path on the Stern/Radium
  *     DisplayRenderer thread, where Godot's TLS singletons are unregistered
  *     and vformat()/memcpy(NULL,…) would otherwise SEGV. Always-on.
- *   - libavcodec entry-point hooks: avcodec_find_decoder_by_name (with the
- *     SPIKE3_SW_HEVC=1 hevc_v4l2request → hevc remap), avcodec_get_hw_config,
- *     av_hwdevice_ctx_create, avcodec_send_packet, avcodec_receive_frame.
- *     All resolve real symbols via dlvsym and log activity. send/receive
- *     dispatch to shim_avforward.c when SPIKE3_FORWARD_DECODE=1.
- *   - Dummy-frame injection (Step 47b): when SPIKE3_INJECT_VIDEO=1 and the
- *     real decoder returns EAGAIN with pending packets, avcodec_receive_frame
- *     synthesises an NV12 1920×1080 black AVFrame so the game's renderer
- *     always has something current to upload.
+ *   - Decoder compatibility patches (renamed from SPIKE3_SW_HEVC):
+ *     decoder-name remap (hevc_v4l2request → hevc) + get_format callback
+ *     b.ne NOP. Default-on; gate via SPIKE3_DECODER_PATCH=0 for debugging.
+ *     These don't do software decoding — they enable the game to accept
+ *     ANY non-V4L2-stateless decoder, which is required for forward-decode.
+ *   - libavcodec entry-point hooks: avcodec_find_decoder_by_name,
+ *     avcodec_get_hw_config, av_hwdevice_ctx_create, avcodec_send_packet,
+ *     avcodec_receive_frame. send_packet / receive_frame dispatch to
+ *     shim_avforward.c when SPIKE3_FORWARD_DECODE=1 (default-on); on
+ *     bridge-unavailable they HARD-FAIL with -EIO. There is no SW fallback.
  *
  * Cross-TU deps (via spi_shim.h): SHIM_LOG macro.
  */
@@ -105,13 +106,20 @@ void *memcpy(void *dst, const void *src, size_t n) {
     return ret;
 }
 
-/* ========== moved from spi_shim.c (890-966): Step 64 get_format NOP patch ========== */
-/* ---- Step 64: software HEVC path ----
+/* ========== Decoder compatibility patches (Step 64 origin, restored 2026-05-06) ========== */
+/* Two pieces that together let the game's video pipeline accept any
+ * non-V4L2-stateless HEVC decoder — whether plain software hevc as a
+ * diagnostic, or NVDEC frames returned through the shim_avforward.c host
+ * bridge in normal operation:
  *
- * Two pieces: (1) swap the decoder name "hevc_v4l2request" → "hevc" at
- * avcodec_find_decoder_by_name; handled in that hook's body. (2) NOP the
- * b.ne in the game's get_format callback so it accepts the first pix_fmt
- * libavcodec offers, instead of insisting on DRM_PRIME (0xb3).
+ *   (1) avcodec_find_decoder_by_name remap: "hevc_v4l2request" → "hevc",
+ *       so the game's codec init succeeds even when no V4L2 m2m HEVC slice
+ *       device exists in our env. Handled inline in the hook below.
+ *
+ *   (2) get_format-callback NOP: NOPs the b.ne in the game's get_format
+ *       callback so it accepts the first pix_fmt libavcodec offers (NV12
+ *       in our flow), instead of insisting on DRM_PRIME (0xb3) which only
+ *       the real V4L2 stateless stack on production CM4 hardware can deliver.
  *
  * Callback layout at BN VA 0x920cd0 (extracted via objdump):
  *   920cd0  ldr  w0, [x1]          ; fmt = list[0]
@@ -125,21 +133,59 @@ void *memcpy(void *dst, const void *src, size_t n) {
  *   920cf0  b.ne 0x920ce0           ; no → loop
  *   920cf4  ret                     ; yes → return 0xb3
  *
- * Patching 920cf0 to NOP makes the callback always fall through to `ret`
- * with w0 holding whatever format was just loaded — i.e. the first
- * non-sentinel entry. For software hevc that's YUV420P (0) or NV12 (23).
+ * Patching 920cf0 to NOP makes the callback fall through to `ret` with w0
+ * holding whatever format was just loaded — the first non-sentinel entry.
  *
- * Gated by SPIKE3_SW_HEVC=1. When paired with the name-swap above it should
- * take software decode end-to-end until Radium's downstream code (which
- * expects DRM_PRIME descriptors in AVFrame->data[0]) hits a new wall.
+ * Default-on. The previous SPIKE3_SW_HEVC env name was misleading — these
+ * patches don't decode anything, they just enable a non-DRM_PRIME decoder
+ * to function. SPIKE3_DECODER_PATCH=0 disables for debugging only —
+ * without these, the game cannot allocate a working AVCodecContext in our
+ * env, and forward-decode is therefore also broken.
  */
-static int shim_sw_hevc_enabled(void) {
+#define GET_FORMAT_BNE_VA   0x920cf0
+#define AARCH64_NOP         0xd503201fu
+
+static int shim_decoder_patch_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        const char *s = getenv("SPIKE3_SW_HEVC");
-        cached = (s && s[0] == '1') ? 1 : 0;
+        const char *s = getenv("SPIKE3_DECODER_PATCH");
+        /* Default ENABLED. SPIKE3_DECODER_PATCH=0 to disable for debugging. */
+        cached = !(s && s[0] == '0');
     }
     return cached;
+}
+
+void shim_patch_get_format_callback(void) {
+    if (!shim_decoder_patch_enabled()) return;
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[decoder_patch] game_base unresolved; get_format patch aborted");
+        return;
+    }
+
+    uint32_t *instr = (uint32_t *)(game_base + GET_FORMAT_BNE_VA);
+    uintptr_t page = (uintptr_t)instr & ~(uintptr_t)4095;
+    if (mprotect((void *)page, 8192,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        SHIM_LOG("[decoder_patch] mprotect RWX @ %p failed: %s",
+                 (void *)page, strerror(errno));
+        return;
+    }
+
+    uint32_t old = *instr;
+    /* Safety: expect `b.ne 0x920ce0` (backward 3 instructions) encoded as
+     * 0x54ffff81. Refuse to patch if we see anything else — guards against
+     * binary drift. */
+    if (old != 0x54ffff81u) {
+        SHIM_LOG("[decoder_patch] REFUSED to patch @ %p: expected 0x54ffff81 (b.ne), got 0x%08x",
+                 (void *)instr, old);
+        return;
+    }
+    *instr = AARCH64_NOP;
+    __builtin___clear_cache((char *)instr, (char *)instr + 4);
+    SHIM_LOG("[decoder_patch] patched get_format b.ne @ %p: 0x%08x -> 0x%08x (NOP)",
+             (void *)instr, old, (unsigned)AARCH64_NOP);
 }
 
 /* ========== moved from spi_shim.c (1731-1866): libavcodec HW-accel bypass ========== */
@@ -225,14 +271,17 @@ const void *avcodec_find_decoder_by_name(const char *name) {
     }
     if (!real_avcodec_find_decoder_by_name) return NULL;
 
-    /* Step 64 (SPIKE3_SW_HEVC=1): redirect hardware HEVC decoder names to
-     * libavcodec's software "hevc". Paired with the get_format-callback
-     * NOP patch in shim_patch_get_format_callback. */
+    /* SPIKE3_DECODER_PATCH (default-on): redirect hardware HEVC decoder
+     * names to libavcodec's plain "hevc". Paired with the get_format
+     * NOP patch in shim_patch_get_format_callback. Required for both
+     * forward-decode and any diagnostic SW path to function — the V4L2
+     * stateless m2m HEVC slice device the game asks for doesn't exist
+     * in our env. */
     const char *lookup = name;
-    if (shim_sw_hevc_enabled() && name &&
+    if (shim_decoder_patch_enabled() && name &&
         (strcmp(name, "hevc_v4l2request") == 0 ||
          strcmp(name, "hevc_v4l2m2m")    == 0)) {
-        SHIM_LOG("[sw_hevc] remapping decoder name '%s' -> 'hevc'", name);
+        SHIM_LOG("[decoder_patch] remapping decoder name '%s' -> 'hevc'", name);
         lookup = "hevc";
     }
 
@@ -242,15 +291,15 @@ const void *avcodec_find_decoder_by_name(const char *name) {
     return ret;
 }
 
-/* Step 72i tried to force these to NULL/ENOSYS when SPIKE3_SW_HEVC=1.
- * RESULT: SIGABRT — Stern's video init at SpiVideoStreamDecoderBase.cpp:1830
- * has `assert(hw_decoder)` that requires get_hw_config + hwdevice_ctx_create
- * to BOTH succeed. There is no SW fallback at this level. Reverted to
- * passthrough. The visible "frozen attract" is NOT caused by decoder EAGAIN
- * (pre-fix: 50% receive_frame ok is normal SW HEVC latency, game tolerates
- * it) — it's caused by VideoPlayerSpi not being in the Godot scene tree
- * (can_process returns false → no _process() ticks → frames decoded but
- * never displayed). See JOURNAL Step 71 + Step 72j.
+/* Earlier work tried to force these to NULL/ENOSYS to prevent the game
+ * from picking the DRM hwaccel path. RESULT: SIGABRT — Stern's video
+ * init at SpiVideoStreamDecoderBase.cpp:1830 has `assert(hw_decoder)`
+ * that requires get_hw_config + hwdevice_ctx_create to BOTH succeed.
+ * There's no in-game SW fallback at this level. Kept as pure passthrough
+ * — the actual decoder-substitution work happens in
+ * shim_patch_get_format_callback (b.ne NOP) + the avcodec_find_decoder_by_name
+ * remap above, which together let the game accept NV12 frames from
+ * forward-decode (or local SW hevc as a diagnostic).
  */
 const void *avcodec_get_hw_config(const void *codec, int index) {
     if (!real_avcodec_get_hw_config) {
@@ -365,106 +414,57 @@ static void shim_init_dummy_frame(void) {
 static int shim_pending_dummies = 0;
 
 int avcodec_send_packet(void *avctx, const void *pkt) {
-    /* SPIKE3_FORWARD_DECODE=1: route to host decode_daemon over AF_UNIX. */
-    {
-        int fwd_ret = 0;
-        if (shim_avforward_send_packet(avctx, pkt, &fwd_ret)) {
-            av_send_count++;
-            if (fwd_ret == 0) shim_pending_dummies++;
-            if (av_send_count <= 8 || (av_send_count % 500) == 0) {
-                SHIM_LOG("avcodec_send_packet #%u (ctx=%p, pkt=%p) -> %d  [forward]",
-                         av_send_count, avctx, pkt, fwd_ret);
-            }
-            return fwd_ret;
+    /* SPIKE3_FORWARD_DECODE is the only decode path. Forward to host
+     * decode_daemon over AF_UNIX. If the bridge can't handle it (daemon
+     * down, all session slots in use, OPEN rejected), HARD-FAIL with -EIO.
+     * We deliberately do NOT fall back to local libavcodec SW HEVC — running
+     * a pinball video game's clips on the in-VM CPU is unviable, and we
+     * want bridge issues to surface loudly rather than be masked by silent
+     * 5-fps SW frames that look like a game bug. */
+    int fwd_ret = 0;
+    if (shim_avforward_send_packet(avctx, pkt, &fwd_ret)) {
+        av_send_count++;
+        if (av_send_count <= 8 || (av_send_count % 500) == 0) {
+            SHIM_LOG("avcodec_send_packet #%u (ctx=%p, pkt=%p) -> %d  [forward]",
+                     av_send_count, avctx, pkt, fwd_ret);
         }
+        return fwd_ret;
     }
-
-    if (!real_avcodec_send_packet)
-        real_avcodec_send_packet =
-            (real_avcodec_send_packet_t)shim_resolve_libav("avcodec_send_packet", "LIBAVCODEC_59");
-    if (!real_avcodec_send_packet) return -38;
-
-    int ret = real_avcodec_send_packet(avctx, pkt);
     av_send_count++;
-    if (ret == 0) shim_pending_dummies++;   /* packet accepted → frame coming */
     if (av_send_count <= 8 || (av_send_count % 500) == 0) {
-        SHIM_LOG("avcodec_send_packet #%u (ctx=%p, pkt=%p) -> %d  pending=%d",
-                 av_send_count, avctx, pkt, ret, shim_pending_dummies);
+        SHIM_LOG("avcodec_send_packet #%u (ctx=%p, pkt=%p) -> -EIO  "
+                 "[forward unreachable; SW fallback removed]",
+                 av_send_count, avctx, pkt);
     }
-    return ret;
+    return -5;  /* -EIO */
 }
 
 int avcodec_receive_frame(void *avctx, void *frame) {
-    /* SPIKE3_FORWARD_DECODE=1: pull frame from host decode_daemon. */
-    {
-        int fwd_ret = 0;
-        if (shim_avforward_receive_frame(avctx, frame, &fwd_ret)) {
-            av_recv_count++;
-            if (fwd_ret == 0) av_recv_ok_count++; else av_recv_err_count++;
-            if (av_recv_count <= 8 || (av_recv_count % 500) == 0) {
-                SHIM_LOG("avcodec_receive_frame #%u (ctx=%p, frame=%p) -> %d  [forward] (ok=%u err=%u)",
-                         av_recv_count, avctx, frame, fwd_ret,
-                         av_recv_ok_count, av_recv_err_count);
-            }
-            return fwd_ret;
+    /* SPIKE3_FORWARD_DECODE is the only decode path. See avcodec_send_packet
+     * above for the rationale on no-SW-fallback. */
+    int fwd_ret = 0;
+    if (shim_avforward_receive_frame(avctx, frame, &fwd_ret)) {
+        av_recv_count++;
+        if (fwd_ret == 0) av_recv_ok_count++; else av_recv_err_count++;
+        if (av_recv_count <= 8 || (av_recv_count % 500) == 0) {
+            SHIM_LOG("avcodec_receive_frame #%u (ctx=%p, frame=%p) -> %d  [forward] (ok=%u err=%u)",
+                     av_recv_count, avctx, frame, fwd_ret,
+                     av_recv_ok_count, av_recv_err_count);
         }
+        return fwd_ret;
     }
-
-    if (!real_avcodec_receive_frame)
-        real_avcodec_receive_frame =
-            (real_avcodec_receive_frame_t)shim_resolve_libav("avcodec_receive_frame", "LIBAVCODEC_59");
-    if (!real_avcodec_receive_frame) return -38;
-
-    int ret = real_avcodec_receive_frame(avctx, frame);
     av_recv_count++;
-    if (ret == 0) av_recv_ok_count++; else av_recv_err_count++;
-
-    /* Real decode returned EAGAIN AND we have a pending packet — inject
-     * a dummy frame instead of propagating EAGAIN.
-     * Step 52: gated behind SPIKE3_INJECT_VIDEO=1 so event-sweep runs default
-     * to the Step-45 stable-shutdown baseline (no injection → no DRM-prime SEGV). */
-    static int inject_enabled = -1;
-    if (inject_enabled < 0) {
-        const char *s = getenv("SPIKE3_INJECT_VIDEO");
-        inject_enabled = (s && s[0] == '1') ? 1 : 0;
-    }
-    if (inject_enabled && ret == -11 /* EAGAIN */ && shim_pending_dummies > 0) {
-        shim_init_dummy_frame();
-        if (shim_dummy_frame) {
-            real_av_frame_ref_t   aref   = shim_resolve_libav("av_frame_ref",   "LIBAVUTIL_57");
-            real_av_frame_unref_t aunref = shim_resolve_libav("av_frame_unref", "LIBAVUTIL_57");
-            if (aref && aunref) {
-                aunref(frame);
-                int rref = aref(frame, shim_dummy_frame);
-                if (rref == 0) {
-                    /* Stamp a valid monotonic PTS. The game asserts
-                     * `frame->pts != AV_NOPTS_VALUE` at
-                     * SpiVideoStreamDecoderBase.cpp:1490. A counter in the
-                     * codec's native timebase would be ideal; we don't know
-                     * it, so we just increment by 3000 per frame (=1/30 s in
-                     * a 1/90000 timebase, the H.264/H.265 default). */
-                    static int64_t next_pts = 0;
-                    int64_t pts_val = next_pts;
-                    next_pts += 3000;
-                    *(int64_t *)((char *)frame + AVFRAME_OFF_PTS)    = pts_val;
-                    *(int64_t *)((char *)frame + AVFRAME_OFF_PKTDTS) = pts_val;
-                    shim_pending_dummies--;
-                    av_recv_ok_count++;
-                    av_recv_err_count--;
-                    if (av_recv_count <= 8 || (av_recv_count % 500) == 0) {
-                        SHIM_LOG("avcodec_receive_frame #%u -> INJECTED dummy NV12 %dx%d pts=%lld (remaining=%d)",
-                                 av_recv_count, DUMMY_FRAME_W, DUMMY_FRAME_H,
-                                 (long long)pts_val, shim_pending_dummies);
-                    }
-                    return 0;
-                }
-            }
-        }
-    }
-
+    av_recv_err_count++;
     if (av_recv_count <= 8 || (av_recv_count % 500) == 0) {
-        SHIM_LOG("avcodec_receive_frame #%u (ctx=%p, frame=%p) -> %d  (ok=%u err=%u)",
-                 av_recv_count, avctx, frame, ret, av_recv_ok_count, av_recv_err_count);
+        SHIM_LOG("avcodec_receive_frame #%u (ctx=%p, frame=%p) -> -EIO  "
+                 "[forward unreachable; SW fallback removed]",
+                 av_recv_count, avctx, frame);
     }
-    return ret;
+    return -5;  /* -EIO */
 }
+
+/* (Step 47b dummy-frame injection path removed 2026-05-06 along with the
+ * libavcodec SW fallback in avcodec_receive_frame above. Forward-decode is
+ * now the only decode path; bridge-unreachable is a hard error. The
+ * shim_init_dummy_frame() machinery above is no longer called from anywhere
+ * — left in place to keep the diff minimal; can be removed in a follow-up.) */
