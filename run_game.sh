@@ -103,10 +103,6 @@ REAL_GL="${REAL_GL:-1}"
 FRAME_BRIDGE="${FRAME_BRIDGE:-1}"
 AUDIO_BRIDGE="${AUDIO_BRIDGE:-1}"
 SW_HEVC="${SW_HEVC:-1}"
-# FORWARD_DECODE=1: launch decode_daemon.py and route the game's
-# avcodec_send_packet/receive_frame to host NVDEC via AF_UNIX. Opt-in
-# (default 0) until validated against a full game run.
-FORWARD_DECODE="${FORWARD_DECODE:-0}"
 # FS_DIAG_VERBOSE=1: widen the [fs_diag] filter in the shim to match
 # any path containing "cache" or "shader" (in addition to /tmp/<X>).
 # Default off — safe to leave; opt in when investigating cache/shader
@@ -357,23 +353,6 @@ if [[ "$AUDIO_PLAYER" == "1" && "$AUDIO_BRIDGE" == "1" ]]; then
     fi
 fi
 
-if [[ "$FORWARD_DECODE" == "1" ]]; then
-    if command -v python3 >/dev/null; then
-        decode_log_target="$LATEST_DIR/decode_daemon.log"
-        # Daemon binds an abstract AF_UNIX socket (@spike3_decode); no file
-        # cleanup needed. Stays alive until cleanup_all kills it.
-        python3 -u "$SCRIPT_DIR/decode_daemon.py" \
-            >"$decode_log_target" 2>&1 &
-        HELPER_PIDS+=("$!"); HELPER_LABELS+=("decode daemon")
-        printf '[run_game] spawned decode daemon (pid %d) — log %s\n' \
-            "$!" "$decode_log_target" >&2
-        # Give it a beat to bind before the game's first send_packet.
-        sleep 0.3
-    else
-        printf '[run_game] FORWARD_DECODE=1 but python3 not found; skipping\n' >&2
-    fi
-fi
-
 if [[ "$TIMER" == "ON" ]]; then
     if command -v python3 >/dev/null; then
         # Marker writes go directly to runs/latest/game.log (raw O_APPEND in
@@ -418,7 +397,6 @@ fi
 [[ "$FRAME_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_FRAME_BRIDGE=1")
 [[ "$AUDIO_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_AUDIO_BRIDGE=1")
 [[ "$SW_HEVC"          == "1" ]] && args+=(-E "SPIKE3_SW_HEVC=1")
-[[ "$FORWARD_DECODE"   == "1" ]] && args+=(-E "SPIKE3_FORWARD_DECODE=1")
 [[ "$FS_DIAG_VERBOSE"  == "1" ]] && args+=(-E "SPIKE3_FS_DIAG_VERBOSE=1")
 [[ "${SPIKE3_FS_DIAG_ALL:-}" == "1" ]] && args+=(-E "SPIKE3_FS_DIAG_ALL=1")
 [[ "$SPI_QUIET"        == "1" ]] && args+=(-E "SPIKE3_SPI_QUIET=1")
@@ -466,7 +444,7 @@ fi
     printf '\n# invocation (raw shell)\n'
     printf '$ %s %s\n' "$0" "$*"
     printf '\n# env-toggle settings (final values)\n'
-    for v in TIMEOUT REAL_GL FRAME_BRIDGE AUDIO_BRIDGE SW_HEVC FORWARD_DECODE \
+    for v in TIMEOUT REAL_GL FRAME_BRIDGE AUDIO_BRIDGE SW_HEVC \
              FS_DIAG_VERBOSE SPI_QUIET SPI_DELAY_US STATE_BRIDGE OFFLINE_MODE \
              VIEWER VIEWER_FULLSCREEN AUDIO_PLAYER TIMER  BOOT_DISPLAY \
              BOOT_DISPLAY_DURATION STALE_KILL DEBUG LOGFILE; do

@@ -52,15 +52,6 @@ uintptr_t shim_resolve_game_base(void);
  * any shim TU that needs to call into libav* by name. */
 void *shim_resolve_libav(const char *sym, const char *version);
 
-/* ---- Forward-decode hooks (defined in shim_avforward.c) ----
- * Called from shim_patches.c's avcodec_send_packet / avcodec_receive_frame
- * when SPIKE3_FORWARD_DECODE=1. Each returns 1 if it handled the call (and
- * wrote the libav return code into *out_ret), or 0 if the caller should
- * fall through to the local-libavcodec passthrough. */
-int shim_avforward_enabled(void);
-int shim_avforward_send_packet(void *avctx, const void *avpkt, int *out_ret);
-int shim_avforward_receive_frame(void *avctx, void *frame, int *out_ret);
-
 /* ---- Signal handlers (defined in shim_diagnostics.c; registered by
  *      shim_install_crash_handler in spi_shim.c) ---- */
 void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext);
@@ -162,11 +153,6 @@ void shim_frame_start(void);              /* frame bridge; no-op unless SPIKE3_F
 void shim_frame_capture_at_page_flip(void); /* called from the DRM PAGE_FLIP ioctl handler */
 void shim_audio_start(void);              /* audio bridge; no-op unless SPIKE3_AUDIO_BRIDGE=1 */
 void shim_audio_emit(const uint8_t *buf, size_t bytes); /* called from snd_pcm_writei */
-
-extern volatile int       shim_sub_8edfe0_arm_channel;
-extern volatile uint64_t  shim_sub_8edfe0_arm_deadline_ms;
-extern volatile uint8_t   shim_sub_8edfe0_payload[8];
-void shim_sub_8edfe0_arm(int channel, const uint8_t payload[8], uint32_t hold_ms);
 
 /* ---- AF_UNIX abstract-namespace addressing ----
  * WSL2's 9P mount of /mnt/c/... does NOT support AF_UNIX bind (errno 95

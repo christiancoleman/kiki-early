@@ -37,7 +37,6 @@ SOURCES=(
     shim_io.c
     shim_ioctl.c
     shim_patches.c
-    shim_avforward.c
     shim_inject.c
     shim_net.c
 )

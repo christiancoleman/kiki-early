@@ -129,7 +129,30 @@ aarch64-linux-gnu-gcc -shared -fPIC -O2 \
     -o spi_shim.so spi_shim.c -ldl -lpthread
 ```
 
-`build.sh` cross-compiles the 11 shim TUs. The shim as checked in is already built — only rebuild after editing `spi_shim.c` or any `shim_*.c`.
+`build.sh` cross-compiles the shim TUs. The shim as checked in is already built — only rebuild after editing `spi_shim.c` or any `shim_*.c`.
+
+### One-time setup: bind-mount the sysroot to native paths
+
+The game is compiled to read absolute paths like `/games/pokemon_le/...`, `/connectivity/...`, `/data/...`. Rather than intercepting every filesystem call in the shim and rewriting these paths, we use kernel-level bind mounts so the paths resolve natively. **One-shot setup, persists until reboot:**
+
+```bash
+sudo _emulation/scripts/setup_bind_mounts.sh                  # default: pokemon_le
+sudo _emulation/scripts/setup_bind_mounts.sh /mnt/c/Workspace/starwars-le-0.85.0   # other Spike-3 game
+_emulation/scripts/setup_bind_mounts.sh --check               # verify (no sudo)
+sudo _emulation/scripts/setup_bind_mounts.sh --umount         # tear down
+sudo _emulation/scripts/setup_bind_mounts.sh --switch <sysroot>  # umount + remount elsewhere
+```
+
+After setup, `/games`, `/connectivity`, `/data` are kernel-resolved into the sysroot — game absolute-path references work without any LD_PRELOAD remapping. Idempotent (skips already-mounted), validates source dirs exist, refuses sysroots outside `/mnt/c/Workspace/`.
+
+**Why this matters:** before the bind-mount approach, the shim had ~50 path-related hooks (`open` / `__openat64_2` / `fopen` / `stat` / `__xstat64` / `opendir` / `readdir` / `getcwd` / `chmod` / `unlink` / `rename` / etc.) and a `remap_path` helper that prefixed every absolute path with `$SYSROOT`. Many of those hooks couldn't catch all libc-internal call paths — strace consistently showed the shim missing real `.radium` opens. With bind mounts, the **kernel** resolves the paths and every libc / direct-syscall / asm path goes through the same bind-mount table simultaneously. Result: more dependable runs, fewer phantom "file not found" issues.
+
+**Caveats:**
+- Bind mounts on `/mnt/c` (9p) only succeed at host level, not inside an unprivileged user namespace (verified — standard Linux user-namespace behavior, not a WSL quirk).
+- The shim's `remap_path` and most FS hooks have been removed (see §12 — only GPIO sysfs / libgpiod chardev FS-style hooks remain because those are hardware-related, not file-resolution).
+- The setup script creates `/games`, `/connectivity`, `/data` at root as zero-content mountpoint directories. They persist after `--umount`; remove with `sudo rmdir` if you want them gone.
+
+*Verified by:* `_emulation/scripts/setup_bind_mounts.sh` source; `findmnt /games /connectivity /data` against a live setup; JOURNAL Step 80 POC validation.
 
 ### `/etc/init.d/shared` env propagation
 
@@ -1682,7 +1705,7 @@ Other slots TBD. The remaining ~35 slots in the BDLMode vtable are likely mode-l
 
 ## 12. Hardware shim coverage reference
 
-The shim (`spi_shim.so`, built from 11 TUs) intercepts every device the game expects and emulates it in software. This section is a per-device coverage table for the shim, plus the underlying hardware reference for each.
+The shim (`spi_shim.so`) intercepts every device the game expects and emulates it in software. The bulk of FS-level path remapping has been moved out of the shim entirely (see PROTOCOL §2 "One-time setup: bind-mount the sysroot") — the kernel resolves `/games`, `/connectivity`, `/data` via the mount table, and the shim now focuses on hardware emulation.
 
 ### Per-device coverage
 
@@ -1707,7 +1730,7 @@ The shim (`spi_shim.so`, built from 11 TUs) intercepts every device the game exp
 | `avcodec_find_decoder_by_name` remap | `SPIKE3_SW_HEVC=1` | `"hevc_v4l2request"` / `"hevc_v4l2m2m"` → `"hevc"` so libavcodec's software HEVC decoder is selected when the game asks for the V4L2 hwaccel variant |
 | Dummy NV12 frame injection | `SPIKE3_INJECT_VIDEO=1` | when `avcodec_receive_frame` returns EAGAIN with pending packets, ref a 1920×1080 black frame with monotonic PTS so the game's render path always gets *something* |
 
-In addition to the gated patches above, `shim_patches.c` also installs unconditional **passthrough hooks** for `avcodec_get_hw_config`, `av_hwdevice_ctx_create`, `avcodec_send_packet`, `avcodec_receive_frame` — these resolve the real symbols via `dlvsym`, log call activity, and dispatch to either real libavcodec (default) or the host NVDEC daemon when `SPIKE3_FORWARD_DECODE=1` (the dispatch lives in `shim_avforward.c`).
+In addition to the gated patches above, `shim_patches.c` also installs unconditional **passthrough hooks** for `avcodec_get_hw_config`, `av_hwdevice_ctx_create`, `avcodec_send_packet`, `avcodec_receive_frame` — these resolve the real symbols via `dlvsym`, log call activity, and forward to real libavcodec.
 
 ### Other hooks (in `spi_shim.c` + `shim_net.c`)
 
