@@ -104,41 +104,55 @@ def write_marker(label_var, status_var, count_ref):
         pass
 
 
+_HELPER_PATTERNS = (
+    r"qemu-aarch64.*LD_PRELOAD",
+    r"python3.*frame_viewer\.py",
+    r"python3.*audio_subscriber\.py",
+    r"ffplay.*spike3_audio",
+)
+
+
 def kill_game(root, status_var):
-    """Two-stage kill of qemu: SIGTERM, then SIGKILL after 1.5s if still alive.
-    Uses pkill -f to match the qemu-aarch64 invocation that the shim is
-    LD_PRELOAD'd into. Helpers (frame viewer, audio) tear down via the
-    run_game.sh EXIT trap when qemu dies. Marker GUI stays up so the user
-    can see the status update — close it manually when done."""
+    """Layered kill: SIGTERM run_game.sh first so bash's `cleanup_all` trap
+    runs the well-tested graceful teardown (qemu → helpers → exit). After
+    a 2-second grace we SIGKILL the parent + every helper pattern by name,
+    in case the parent's `wait` got stuck (e.g. WSL2 SIGCHLD-mask deadlock).
+    Marker GUI kills itself last so the status line is visible."""
     try:
-        r = subprocess.run(
-            ["pkill", "-TERM", "-f", r"qemu-aarch64.*LD_PRELOAD"],
+        subprocess.run(
+            ["pkill", "-TERM", "-f", r"run_game\.sh"],
             capture_output=True, text=True, timeout=2,
         )
-        if r.returncode == 0:
-            status_var.set("SIGTERM sent to qemu. SIGKILL in 1.5s if still alive...")
-            line = f"{now_timestamp()} - [marker] KILL: SIGTERM to qemu\n"
-            append_to_game_log(line)
-            root.after(1500, lambda: _kill_followup(status_var))
-        elif r.returncode == 1:
-            status_var.set("KILL: no matching qemu process found.")
-        else:
-            status_var.set(f"KILL TERM rc={r.returncode}: {r.stderr.strip()}")
+        status_var.set("SIGTERM → run_game.sh (its trap kills qemu + helpers). "
+                       "SIGKILL fallback in 2 s.")
+        append_to_game_log(f"{now_timestamp()} - [marker] KILL: SIGTERM run_game.sh\n")
+        root.after(2000, lambda: _kill_followup(root, status_var))
     except Exception as e:
         status_var.set(f"KILL TERM failed: {e}")
 
 
-def _kill_followup(status_var):
+def _kill_followup(root, status_var):
+    """SIGKILL anything still alive — parent script first, then every
+    helper. Marker self-kill scheduled separately so the user sees the
+    final status line before the window disappears."""
     try:
-        r = subprocess.run(
-            ["pkill", "-KILL", "-f", r"qemu-aarch64.*LD_PRELOAD"],
-            capture_output=True, text=True, timeout=2,
-        )
-        if r.returncode == 0:
-            status_var.set("SIGKILL'd qemu (was still alive after TERM).")
-            append_to_game_log(f"{now_timestamp()} - [marker] KILL: SIGKILL fallback fired\n")
-        else:
-            status_var.set("Game shut down cleanly via SIGTERM.")
+        # Force-kill the parent script first (in case its `wait` was stuck
+        # — see WSL2 SIGCHLD-mask issue documented 2026-05-05).
+        subprocess.run(["pkill", "-KILL", "-f", r"run_game\.sh"],
+                       capture_output=True, timeout=1)
+        # Then every helper that might be a stale WSLg window or detached
+        # process. Each pattern's pkill is independent — a missing match
+        # (rc=1) is fine.
+        for pat in _HELPER_PATTERNS:
+            subprocess.run(["pkill", "-KILL", "-f", pat],
+                           capture_output=True, timeout=1)
+
+        status_var.set("SIGKILL'd parent + helpers. Marker closing in 1 s.")
+        append_to_game_log(f"{now_timestamp()} - [marker] KILL: SIGKILL fallback fired\n")
+        # Self-kill last, after the user has had a chance to see the
+        # status line. os._exit (vs sys.exit) avoids running atexit
+        # handlers that might block on Tk.
+        root.after(1000, lambda: os._exit(0))
     except Exception as e:
         status_var.set(f"KILL KILL failed: {e}")
 

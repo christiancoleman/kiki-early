@@ -1,16 +1,23 @@
 /*
- * shim_fs.c — GPIO sysfs fake-fd pool + libgpiod chardev stubs.
+ * shim_fs.c — open-family device-intercept wrappers + GPIO sysfs fake-fd
+ *             pool + libgpiod chardev stubs.
  *
- * Originally also held the LD_PRELOAD path-remap layer (`remap_path`) and
- * a comprehensive set of open/stat/access/etc. wrappers that prefixed
- * absolute paths with $SYSROOT. That layer became redundant with the
- * bind-mount approach (`_emulation/scripts/setup_bind_mounts.sh` — see
+ * The legacy LD_PRELOAD path-remap layer (`remap_path`) and the bulk of
+ * the open/stat/access wrappers were removed when the bind-mount approach
+ * became the default (`_emulation/scripts/setup_bind_mounts.sh` — see
  * PROTOCOL §2 "One-time setup: bind-mount the sysroot"): the kernel
  * resolves /games, /connectivity, /data via mount table, so no userspace
- * path-rewrite is needed. The FS hooks were removed in the cleanup pass
- * after Step 80's POC validation.
+ * path-rewrite is needed for ordinary files.
  *
- * What remains is hardware-related and unchanged by mount-table magic:
+ * What stays is hardware-related — paths the game opens that *must* be
+ * intercepted because they don't exist on the host filesystem:
+ *
+ *   - open / openat / open64 / openat64 — call `intercept_device(path)`
+ *     for absolute paths; if it returns a non-zero fd, that fd is the
+ *     answer (fake fd for SPI / I2C / V4L2 / GPIO, real socketpair fd for
+ *     DRM and UART). Otherwise fall through to real libc.
+ *   - __open_2 / __openat_2 / __open64_2 / __openat64_2 — FORTIFY_SOURCE
+ *     variants. Same intercept-then-fallthrough.
  *   - GPIO sysfs fake-fd pool (alloc / is_fake / free) — backs the
  *     synthetic /sys/class/gpio/* opens that shim_io.c serves.
  *   - libgpiod chardev stubs — fake the modern /dev/gpiochip* API the
@@ -24,9 +31,121 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <stdarg.h>
 #include <pthread.h>
+#include <dlfcn.h>
+#include <sys/types.h>
 
 #include "spi_shim.h"
+
+/* ---- Open-family device intercepts ----
+ * For each variant: if the path matches a known device, intercept_device()
+ * returns a non-zero fd we hand back to the caller. Otherwise pass through
+ * to the real libc symbol (resolved lazily via dlsym). */
+
+int open(const char *pathname, int flags, ...) {
+    if (!real_open) real_open = (real_open_t)dlsym(RTLD_NEXT, "open");
+    int fake = intercept_device(pathname);
+    if (fake) return fake;
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
+    }
+    return real_open(pathname, flags, mode);
+}
+
+typedef int (*real_openat_t)(int, const char *, int, ...);
+static real_openat_t real_openat = NULL;
+int openat(int dirfd, const char *pathname, int flags, ...) {
+    if (!real_openat) real_openat = (real_openat_t)dlsym(RTLD_NEXT, "openat");
+    if (pathname && pathname[0] == '/') {
+        int fake = intercept_device(pathname);
+        if (fake) return fake;
+    }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
+    }
+    return real_openat(dirfd, pathname, flags, mode);
+}
+
+typedef int (*real_open64_t)(const char *, int, ...);
+static real_open64_t real_open64 = NULL;
+int open64(const char *pathname, int flags, ...) {
+    if (!real_open64) real_open64 = (real_open64_t)dlsym(RTLD_NEXT, "open64");
+    int fake = intercept_device(pathname);
+    if (fake) return fake;
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
+    }
+    return real_open64(pathname, flags, mode);
+}
+
+typedef int (*real_openat64_t)(int, const char *, int, ...);
+static real_openat64_t real_openat64 = NULL;
+int openat64(int dirfd, const char *pathname, int flags, ...) {
+    if (!real_openat64) real_openat64 = (real_openat64_t)dlsym(RTLD_NEXT, "openat64");
+    if (pathname && pathname[0] == '/') {
+        int fake = intercept_device(pathname);
+        if (fake) return fake;
+    }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
+    }
+    return real_openat64(dirfd, pathname, flags, mode);
+}
+
+/* FORTIFY_SOURCE variants — glibc's INLINE_SYSCALL paths bypass the
+ * public symbols above when the caller compiled with _FORTIFY_SOURCE>=2,
+ * so we hook these too. Two-arg form (no mode) — FORTIFY refuses
+ * O_CREAT-without-mode and routes to the public symbol instead. */
+int __open_2(const char *pathname, int flags) {
+    int fake = intercept_device(pathname);
+    if (fake) return fake;
+    static int (*real)(const char *, int) = NULL;
+    if (!real) real = dlsym(RTLD_NEXT, "__open_2");
+    return real(pathname, flags);
+}
+int __open64_2(const char *pathname, int flags) {
+    int fake = intercept_device(pathname);
+    if (fake) return fake;
+    static int (*real)(const char *, int) = NULL;
+    if (!real) real = dlsym(RTLD_NEXT, "__open64_2");
+    return real(pathname, flags);
+}
+int __openat_2(int dirfd, const char *pathname, int flags) {
+    if (pathname && pathname[0] == '/') {
+        int fake = intercept_device(pathname);
+        if (fake) return fake;
+    }
+    static int (*real)(int, const char *, int) = NULL;
+    if (!real) real = dlsym(RTLD_NEXT, "__openat_2");
+    return real(dirfd, pathname, flags);
+}
+int __openat64_2(int dirfd, const char *pathname, int flags) {
+    if (pathname && pathname[0] == '/') {
+        int fake = intercept_device(pathname);
+        if (fake) return fake;
+    }
+    static int (*real)(int, const char *, int) = NULL;
+    if (!real) real = dlsym(RTLD_NEXT, "__openat64_2");
+    return real(dirfd, pathname, flags);
+}
 
 /* ========== moved from spi_shim.c: GPIO fake-fd pool state ==========
  * FAKE_FD_GPIO_BASE / FAKE_FD_GPIO_COUNT live in spi_shim.h so the I/O

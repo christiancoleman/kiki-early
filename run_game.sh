@@ -103,12 +103,6 @@ REAL_GL="${REAL_GL:-1}"
 FRAME_BRIDGE="${FRAME_BRIDGE:-1}"
 AUDIO_BRIDGE="${AUDIO_BRIDGE:-1}"
 SW_HEVC="${SW_HEVC:-1}"
-# FS_DIAG_VERBOSE=1: widen the [fs_diag] filter in the shim to match
-# any path containing "cache" or "shader" (in addition to /tmp/<X>).
-# Default off — safe to leave; opt in when investigating cache/shader
-# behavior or other "things hit the fan" debugging that wants maximum
-# fs-call visibility in discovery.log.
-FS_DIAG_VERBOSE="${FS_DIAG_VERBOSE:-0}"
 # SPI_QUIET=1: stop replying byte-2=0x04 ("ack/data-available") to every SPI
 # transfer; instead reply all-zeros. Per-cmd overrides via SPIKE3_SPI_RX_<HEX>=
 # still take precedence. T2 experiment per JOURNAL Step 75 — see if the game
@@ -281,7 +275,6 @@ if [[ "$BOOT_DISPLAY" == "1" ]]; then
         "$QEMU" -L "$SYSROOT" \
             -E "LD_PRELOAD=$SHIM" \
             -E "LD_LIBRARY_PATH=$OVERLAY:$SYSROOT/usr/lib64:$SYSROOT/usr/lib:$SYSROOT/lib64:$SYSROOT/lib" \
-            -E "SPIKE3_SYSROOT=$SYSROOT" \
             -E "SPIKE3_REAL_GL=$REAL_GL" \
             -E "LIBGL_DRIVERS_PATH=$DRIVERS" \
             -E "MESA_LOADER_DRIVER_OVERRIDE=swrast" \
@@ -374,7 +367,6 @@ args=(
     "$QEMU" -L "$SYSROOT"
     -E "LD_PRELOAD=$SHIM"
     -E "LD_LIBRARY_PATH=$OVERLAY:$SYSROOT/usr/lib64:$SYSROOT/usr/lib:$SYSROOT/lib64:$SYSROOT/lib"
-    -E "SPIKE3_SYSROOT=$SYSROOT"
 )
 # Inherit /etc/init.d/shared env (GAMES_PATH, BOOT_DISPLAY, GAME, etc.)
 if (( ${#INIT_SHARED_ENV[@]} > 0 )); then
@@ -397,8 +389,6 @@ fi
 [[ "$FRAME_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_FRAME_BRIDGE=1")
 [[ "$AUDIO_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_AUDIO_BRIDGE=1")
 [[ "$SW_HEVC"          == "1" ]] && args+=(-E "SPIKE3_SW_HEVC=1")
-[[ "$FS_DIAG_VERBOSE"  == "1" ]] && args+=(-E "SPIKE3_FS_DIAG_VERBOSE=1")
-[[ "${SPIKE3_FS_DIAG_ALL:-}" == "1" ]] && args+=(-E "SPIKE3_FS_DIAG_ALL=1")
 [[ "$SPI_QUIET"        == "1" ]] && args+=(-E "SPIKE3_SPI_QUIET=1")
 [[ "$SPI_DELAY_US"     != "0" ]] && args+=(-E "SPIKE3_SPI_DELAY_US=$SPI_DELAY_US")
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")
@@ -445,7 +435,7 @@ fi
     printf '$ %s %s\n' "$0" "$*"
     printf '\n# env-toggle settings (final values)\n'
     for v in TIMEOUT REAL_GL FRAME_BRIDGE AUDIO_BRIDGE SW_HEVC \
-             FS_DIAG_VERBOSE SPI_QUIET SPI_DELAY_US STATE_BRIDGE OFFLINE_MODE \
+             SPI_QUIET SPI_DELAY_US STATE_BRIDGE OFFLINE_MODE \
              VIEWER VIEWER_FULLSCREEN AUDIO_PLAYER TIMER  BOOT_DISPLAY \
              BOOT_DISPLAY_DURATION STALE_KILL DEBUG LOGFILE; do
         printf '  %-22s = %s\n' "$v" "${!v:-}"

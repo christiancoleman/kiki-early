@@ -311,6 +311,39 @@ static void shim_init_dirs(void) {
  * handler live in shim_inject.c. See spi_shim.h for the two public entry
  * points (shim_event_sweep, shim_inject_start). */
 
+/* SIGTRAP handler — every brk that fires in the game lands here.
+ *
+ * Primary use: shim_discovery.c installs `brk #0` at 8 game-code sites for
+ * diagnostic logging (scene loads, godot errors, nodebus init, etc.) and
+ * its handler knows how to emulate the overwritten instruction. We
+ * dispatch to it first; if it returns 1, the trap was claimed.
+ *
+ * Fallback: log PC + advance past the 4-byte brk + return. The default
+ * kernel action (SIG_DFL → terminate with core) would otherwise kill the
+ * game. Caps logging to first N traps + every Mth thereafter. */
+#include <ucontext.h>
+#include "shim_discovery.h"
+static void shim_sigtrap_handler(int sig, siginfo_t *info, void *uc) {
+    (void)sig; (void)info;
+    ucontext_t *ctx = (ucontext_t *)uc;
+    mcontext_t *mc = &ctx->uc_mcontext;
+    uintptr_t pc = mc->pc;
+
+    if (shim_discovery_handler(pc, uc)) return;
+
+    static int trap_count = 0;
+    int seq = __sync_fetch_and_add(&trap_count, 1);
+
+    if (seq < 16 || (seq % 1024) == 0) {
+        uintptr_t base = shim_resolve_game_base();
+        long va = base ? (long)(pc - base) : -1;
+        SHIM_LOG("[sigtrap] #%d pc=%p (BN VA 0x%lx) — UNCLAIMED brk, advancing past and continuing",
+                 seq, (void *)pc, va);
+    }
+    /* aarch64: brk #N is 4 bytes; advance past it. */
+    mc->pc = pc + 4;
+}
+
 __attribute__((constructor))
 static void shim_install_crash_handler(void) {
     struct sigaction sa;
@@ -340,6 +373,17 @@ static void shim_install_crash_handler(void) {
     sigaction(SIGINT,  &sa2, NULL);
     sigaction(SIGUSR1, &sa2, NULL);
     sigaction(SIGUSR2, &sa2, NULL);  /* Step 52: event sweep (signal path, usually swallowed by qemu) */
+
+    /* SIGTRAP handler — log PC + advance past the 4-byte brk + continue.
+     * The game evidently has at least one brk site that doesn't kill on
+     * real hardware (perhaps a probe / asserted-elsewhere check). Without
+     * this, qemu raises "uncaught target signal 5" and the game dies. */
+    struct sigaction sa_trap;
+    memset(&sa_trap, 0, sizeof(sa_trap));
+    sa_trap.sa_sigaction = shim_sigtrap_handler;
+    sa_trap.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa_trap.sa_mask);
+    sigaction(SIGTRAP, &sa_trap, NULL);
 
     /* Discovery module init is deferred — see shim_inject_start.
      * Calling shim_discovery_init() here would no-op because
@@ -499,34 +543,10 @@ int system(const char *cmd) {
         SHIM_LOG("BLOCKED system(): %.160s", cmd);
         return 0;
     }
-    /* /connectivity/ path rewrite — system() forwards to /bin/sh on the host,
-     * which doesn't have /connectivity/ at the root (sysroot lives at
-     * $SPIKE3_SYSROOT). The shim_fs.c remap_path() doesn't apply here because
-     * we're handing a string off to the host shell, not a libc syscall.
-     * Substring-replace /connectivity/ with $SYSROOT/connectivity/ before
-     * forwarding so commands like `echo > /connectivity/hostname` and
-     * `rm -rf /connectivity/files/...` land at the right place on disk. */
-    if (cmd && strstr(cmd, "/connectivity/")) {
-        const char *sr = getenv("SPIKE3_SYSROOT");
-        if (sr && *sr) {
-            static char rewritten[8192];
-            size_t sr_len = strlen(sr);
-            size_t out = 0;
-            const char *p = cmd;
-            while (*p && out + sr_len + 14 < sizeof(rewritten) - 1) {
-                if (strncmp(p, "/connectivity/", 14) == 0) {
-                    memcpy(rewritten + out, sr, sr_len);  out += sr_len;
-                    memcpy(rewritten + out, "/connectivity/", 14);  out += 14;
-                    p += 14;
-                } else {
-                    rewritten[out++] = *p++;
-                }
-            }
-            rewritten[out] = '\0';
-            SHIM_LOG("system() REWRITE: %.120s -> %.120s", cmd, rewritten);
-            return real_fn(rewritten);
-        }
-    }
+    /* `/connectivity/` paths in commands are resolved by the kernel's
+     * mount table (bind-mounted via setup_bind_mounts.sh). No userspace
+     * rewrite needed — host /bin/sh sees the same /connectivity/ as the
+     * game does. */
     SHIM_LOG("system(): %.160s", cmd ? cmd : "(null)");
     return real_fn(cmd);
 }

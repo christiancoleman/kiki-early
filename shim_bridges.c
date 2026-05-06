@@ -26,7 +26,6 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <netinet/in.h>
 #include <poll.h>
 #include <sys/time.h>
 #include <sys/mman.h>
@@ -35,56 +34,11 @@
 
 #include "spi_shim.h"
 
-/* Common listener creator for the three bridges. Two transport modes:
- *   1. Default — abstract AF_UNIX socket named `abstract_name`. Same-kernel
- *      subscribers (user-mode shim flow) connect directly.
- *   2. TCP override — when env-var `tcp_port_env` is set to a positive port
- *      number, create AF_INET listener on 0.0.0.0:PORT instead. This is the
- *      system-mode-spike path: a host-side subscriber reaches it via qemu
- *      user-net hostfwd (host:PORT → guest:PORT) so the abstract-namespace
- *      kernel-boundary problem is sidestepped.
- *
- * `tag` is used only in log messages.
- *
+/* Common listener creator for the three bridges. Creates an abstract
+ * AF_UNIX listener at `abstract_name`. `tag` is used only in log messages.
  * Returns the listening fd, or -1 on error. */
 static int shim_bridge_create_listener(const char *abstract_name,
-                                       const char *tcp_port_env,
                                        const char *tag) {
-    const char *port_str = getenv(tcp_port_env);
-    if (port_str && port_str[0]) {
-        long port = strtol(port_str, NULL, 0);
-        if (port <= 0 || port > 0xffff) {
-            SHIM_LOG("[%s] %s=%s out of range; falling back to abstract AF_UNIX",
-                     tag, tcp_port_env, port_str);
-        } else {
-            int fd = socket(AF_INET, SOCK_STREAM, 0);
-            if (fd < 0) {
-                SHIM_LOG("[%s] socket(AF_INET) failed: %s", tag, strerror(errno));
-                return -1;
-            }
-            int yes = 1;
-            (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-            struct sockaddr_in sa;
-            memset(&sa, 0, sizeof(sa));
-            sa.sin_family = AF_INET;
-            sa.sin_addr.s_addr = htonl(INADDR_ANY);
-            sa.sin_port = htons((uint16_t)port);
-            if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
-                SHIM_LOG("[%s] bind(0.0.0.0:%ld) failed: %s",
-                         tag, port, strerror(errno));
-                close(fd);
-                return -1;
-            }
-            if (listen(fd, 1) < 0) {
-                SHIM_LOG("[%s] listen() failed: %s", tag, strerror(errno));
-                close(fd);
-                return -1;
-            }
-            SHIM_LOG("[%s] listening on TCP 0.0.0.0:%ld (%s override)",
-                     tag, port, tcp_port_env);
-            return fd;
-        }
-    }
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         SHIM_LOG("[%s] socket(AF_UNIX) failed: %s", tag, strerror(errno));
@@ -285,7 +239,7 @@ void shim_bridge_start(void) {
     if (!enabled || enabled[0] != '1') return;
 
     shim_bridge_listen_fd = shim_bridge_create_listener(
-        ABSTRACT_BRIDGE_NAME, "SPIKE3_BRIDGE_TCP_PORT", "bridge");
+        ABSTRACT_BRIDGE_NAME, "bridge");
     if (shim_bridge_listen_fd < 0) return;
 
     shim_bridge_start_ms = shim_now_ms();
@@ -513,7 +467,7 @@ void shim_frame_start(void) {
     const char *enabled = getenv("SPIKE3_FRAME_BRIDGE");
     if (!enabled || enabled[0] != '1') return;
     shim_frame_listen_fd = shim_bridge_create_listener(
-        ABSTRACT_FRAME_NAME, "SPIKE3_FRAME_BRIDGE_TCP_PORT", "frame");
+        ABSTRACT_FRAME_NAME, "frame");
     if (shim_frame_listen_fd < 0) return;
     pthread_t t;
     if (pthread_create(&t, NULL, shim_frame_accept_thread, NULL) == 0) pthread_detach(t);
@@ -594,7 +548,7 @@ void shim_audio_start(void) {
     const char *enabled = getenv("SPIKE3_AUDIO_BRIDGE");
     if (!enabled || enabled[0] != '1') return;
     shim_audio_listen_fd = shim_bridge_create_listener(
-        ABSTRACT_AUDIO_NAME, "SPIKE3_AUDIO_BRIDGE_TCP_PORT", "audio");
+        ABSTRACT_AUDIO_NAME, "audio");
     if (shim_audio_listen_fd < 0) return;
     pthread_t t;
     if (pthread_create(&t, NULL, shim_audio_accept_thread, NULL) == 0) pthread_detach(t);
