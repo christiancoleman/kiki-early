@@ -28,9 +28,17 @@
 #   REAL_GL=<0|1>           [1]     forward EGL/GLES to Mesa vs return stubs
 #   FRAME_BRIDGE=<0|1>      [1]     emit RGBA frames on /tmp/spike3_frame.sock
 #   AUDIO_BRIDGE=<0|1>      [1]     emit S16_LE PCM on /tmp/spike3_audio.sock
-#   SW_HEVC=<0|1>           [1]     name-swap hevc_v4l2request → hevc in
-#                                   avcodec_find_decoder_by_name (libavcodec
-#                                   hook). No game-binary patching.
+#   FORWARD_DECODE=<0|1>    [1]     launch decode_daemon.py and route
+#                                   avcodec_send_packet/receive_frame to the
+#                                   host-side NVDEC bridge. No in-VM SW HEVC
+#                                   fallback — unreachable bridge returns
+#                                   -EIO and the game asserts.
+#   SPIKE3_DECODER_PATCH=<0|1> [1]  apply two HEVC-path compatibility patches:
+#                                   (1) NOP b.ne at game VA 0x920cf0 so
+#                                   get_format accepts NV12 instead of
+#                                   AV_PIX_FMT_DRM_PRIME; (2) name-swap
+#                                   hevc_v4l2request/hevc_v4l2m2m → hevc.
+#                                   Set =0 only to debug.
 #   STATE_BRIDGE=<0|1>      [0]     emit cmode JSON on /tmp/spike3_bridge.sock
 #   LOGFILE=<path>          []      redirect game stdout+stderr to a file
 #                                   (separate from --debug; only affects game)

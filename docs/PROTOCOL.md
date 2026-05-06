@@ -1722,15 +1722,47 @@ The shim (`spi_shim.so`) intercepts every device the game expects and emulates i
 | GPIO sysfs (`/sys/class/gpio/*/value`, `direction`, etc.) | fake fd pool `1000..1015` | direct GPIO access (e.g. for libgpiod) | Synthetic reads: `"0\n"` value, `"out\n"` direction. One-shot latch reset by `lseek(0)` |
 | libgpiod chardev (`/dev/gpiochip*`) | (Stub) | newer GPIO interface | output-only; reads not modeled |
 
+### Forward-decode bridge (host NVDEC)
+
+The game's HEVC video decode path is intercepted in-shim and routed to a host-side daemon over an abstract AF_UNIX socket, where it is decoded via NVDEC and the resulting NV12 frames are returned to the game.
+
+| Component | File | Role |
+|---|---|---|
+| Shim client | `_emulation/shim_avforward.c` | C library inside `spi_shim.so`. 8-slot session table; each `avcodec_open2(HEVC)` from the game allocates a slot and connects to `@spike3_decode`. `avcodec_send_packet` / `avcodec_receive_frame` (in `shim_patches.c`) dispatch into this TU |
+| Host daemon | `_emulation/decode_daemon.py` | AF_UNIX server. Per-connection `Session` opens an `av.codec.CodecContext.create("hevc_cuvid", "r")`. NVDEC outputs are downloaded via `frame.reformat(format="nv12")` + `to_ndarray` and sent back as `(Y_plane, UV_plane)` |
+| Launcher | `_emulation/run_game.sh` | When `FORWARD_DECODE=1` (default), launches the daemon before qemu and forwards `SPIKE3_FORWARD_DECODE=1` into the game env |
+
+**Wire protocol** (length-prefixed messages on `@spike3_decode`):
+
+| Direction | Message (opcode) | Payload |
+|---|---|---|
+| Game → daemon | `REQ_OPEN` (0x01) | session_id, extradata_size, extradata bytes |
+| | `REQ_PACKET` (0x02) | session_id, pts, dts, flags, packet bytes |
+| | `REQ_RECEIVE` (0x03) | session_id |
+| | `REQ_CLOSE` (0x04) | session_id |
+| Daemon → game | `REP_OPEN_OK` (0x81) | (no payload) |
+| | `REP_FRAME` (0x83) | width, height, pts, Y plane (W·H bytes), UV plane (W·H/2 bytes) |
+| | `REP_EAGAIN` (0xF1) | (no payload — packet queue empty, retry later) |
+
+**libavcodec ABI offsets** the shim pokes (defined in `shim_avforward.c`):
+- `AVPacket`: `pts=8`, `dts=16`, `data=24`, `size=32`, `flags=40`
+- `AVFrame`: `data[8]=0`, `linesize[8]=64`, `width=104`, `height=108`, `format=116`, `pts=136`, `pkt_dts=144`
+
+**No SW fallback.** When the daemon is unreachable, `avcodec_send_packet` and `avcodec_receive_frame` return `-EIO` directly with a rate-limited `[forward unreachable; SW fallback removed]` log line. The game's own error handling SIGABRTs at `SpiVideoStreamDecoderBase.cpp:1830`.
+
+*Verified by:* JOURNAL Step 85 (2026-05-06) — daemon round-trip 49 fps NVDEC against `Lake_01_22_26_h265.mp4` (1940×1100, extradata=2490B); real game run `runs/2026-05-06T12.45.39_hw_refactor` shows 449/551 frame/EAGAIN ratio across 1000 `avcodec_receive_frame` calls and zero `[forward unreachable]` log lines. Original implementation in JOURNAL Step 73b (2026-04-30); restoration after `efba162` deletion in Step 85.
+
 ### Runtime binary patches (`shim_patches.c`)
 
 | Patch | Gate | Target |
 |---|---|---|
 | memcpy NULL-guard | always on | silently no-op when src/dst NULL — fixes Godot DisplayRenderer thread crash on un-initialized TLS |
-| `avcodec_find_decoder_by_name` remap | `SPIKE3_SW_HEVC=1` | `"hevc_v4l2request"` / `"hevc_v4l2m2m"` → `"hevc"` so libavcodec's software HEVC decoder is selected when the game asks for the V4L2 hwaccel variant |
-| Dummy NV12 frame injection | `SPIKE3_INJECT_VIDEO=1` | when `avcodec_receive_frame` returns EAGAIN with pending packets, ref a 1920×1080 black frame with monotonic PTS so the game's render path always gets *something* |
+| `avcodec_find_decoder_by_name` remap | `SPIKE3_DECODER_PATCH=1` (default-on) | `"hevc_v4l2request"` / `"hevc_v4l2m2m"` → `"hevc"`. Defense-in-depth — under the bridge-active flow the game's lookup goes through codec_id, so this hook does not fire on real game runs |
+| `get_format` callback NOP | `SPIKE3_DECODER_PATCH=1` (default-on) | NOP the `b.ne 0x920ce0` instruction at game VA `0x920cf0` (`0x54ffff81` → `0xd503201f`). Without it, `get_format` loops looking for `AV_PIX_FMT_DRM_PRIME` (0xb3) and, finding nothing, fails `avcodec_open2` → game SIGABRTs at `SpiVideoStreamDecoderBase.cpp:1830`. Patched by `shim_patch_get_format_callback @ shim_patches.c:148-198`, called from `shim_inject.c::shim_discovery_init_thread` after the existing 2 s base-resolution sleep |
 
-In addition to the gated patches above, `shim_patches.c` also installs unconditional **passthrough hooks** for `avcodec_get_hw_config`, `av_hwdevice_ctx_create`, `avcodec_send_packet`, `avcodec_receive_frame` — these resolve the real symbols via `dlvsym`, log call activity, and forward to real libavcodec.
+In addition to the gated patches above, `shim_patches.c` installs:
+- **Passthrough hooks** for `avcodec_get_hw_config` and `av_hwdevice_ctx_create` — resolve via `dlvsym`, log call activity, forward to real libavcodec.
+- **Forward-decode interceptors** for `avcodec_send_packet` / `avcodec_receive_frame` — route to the host daemon via `shim_avforward.c` when `SPIKE3_FORWARD_DECODE=1` (default-on). Bridge unreachable returns `-EIO` (no in-VM SW HEVC fallback). See "Forward-decode bridge" above.
 
 ### Other hooks (in `spi_shim.c` + `shim_net.c`)
 
