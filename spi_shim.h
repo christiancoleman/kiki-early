@@ -52,6 +52,15 @@ uintptr_t shim_resolve_game_base(void);
  * any shim TU that needs to call into libav* by name. */
 void *shim_resolve_libav(const char *sym, const char *version);
 
+/* ---- Forward-decode hooks (defined in shim_avforward.c) ----
+ * Called from shim_patches.c's avcodec_send_packet / avcodec_receive_frame
+ * when SPIKE3_FORWARD_DECODE=1. Each returns 1 if it handled the call (and
+ * wrote the libav return code into *out_ret), or 0 if the caller should
+ * fall through to the local-libavcodec passthrough. */
+int shim_avforward_enabled(void);
+int shim_avforward_send_packet(void *avctx, const void *avpkt, int *out_ret);
+int shim_avforward_receive_frame(void *avctx, void *frame, int *out_ret);
+
 /* ---- Signal handlers (defined in shim_diagnostics.c; registered by
  *      shim_install_crash_handler in spi_shim.c) ---- */
 void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext);

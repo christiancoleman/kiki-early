@@ -365,6 +365,20 @@ static void shim_init_dummy_frame(void) {
 static int shim_pending_dummies = 0;
 
 int avcodec_send_packet(void *avctx, const void *pkt) {
+    /* SPIKE3_FORWARD_DECODE=1: route to host decode_daemon over AF_UNIX. */
+    {
+        int fwd_ret = 0;
+        if (shim_avforward_send_packet(avctx, pkt, &fwd_ret)) {
+            av_send_count++;
+            if (fwd_ret == 0) shim_pending_dummies++;
+            if (av_send_count <= 8 || (av_send_count % 500) == 0) {
+                SHIM_LOG("avcodec_send_packet #%u (ctx=%p, pkt=%p) -> %d  [forward]",
+                         av_send_count, avctx, pkt, fwd_ret);
+            }
+            return fwd_ret;
+        }
+    }
+
     if (!real_avcodec_send_packet)
         real_avcodec_send_packet =
             (real_avcodec_send_packet_t)shim_resolve_libav("avcodec_send_packet", "LIBAVCODEC_59");
@@ -381,6 +395,21 @@ int avcodec_send_packet(void *avctx, const void *pkt) {
 }
 
 int avcodec_receive_frame(void *avctx, void *frame) {
+    /* SPIKE3_FORWARD_DECODE=1: pull frame from host decode_daemon. */
+    {
+        int fwd_ret = 0;
+        if (shim_avforward_receive_frame(avctx, frame, &fwd_ret)) {
+            av_recv_count++;
+            if (fwd_ret == 0) av_recv_ok_count++; else av_recv_err_count++;
+            if (av_recv_count <= 8 || (av_recv_count % 500) == 0) {
+                SHIM_LOG("avcodec_receive_frame #%u (ctx=%p, frame=%p) -> %d  [forward] (ok=%u err=%u)",
+                         av_recv_count, avctx, frame, fwd_ret,
+                         av_recv_ok_count, av_recv_err_count);
+            }
+            return fwd_ret;
+        }
+    }
+
     if (!real_avcodec_receive_frame)
         real_avcodec_receive_frame =
             (real_avcodec_receive_frame_t)shim_resolve_libav("avcodec_receive_frame", "LIBAVCODEC_59");
