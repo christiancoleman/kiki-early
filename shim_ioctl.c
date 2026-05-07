@@ -1,11 +1,6 @@
 /*
  * shim_ioctl.c — ioctl dispatch + DRM page-flip event synthesis.
  *
- * Phase 7 of the refactor. Owns ioctl() for every fake/real socketpair fd
- * the shim exposes, plus the drm_synthesize_flip_event helper that pushes
- * DRM_EVENT_FLIP_COMPLETE events onto the shim side of the DRM socketpair
- * whenever MODE_PAGE_FLIP fires.
- *
  * Dispatch structure:
  *   UART fd   → termios ioctls (TCGETS/TCSETS/TIOCMGET/...), FIONREAD/TIOCOUTQ,
  *               rest passthrough
@@ -14,14 +9,6 @@
  *   DRM       → DRM_IOCTL_VERSION, MODE_GET*, CREATE_DUMB, ADDFB, PAGE_FLIP, ...
  *   V4L2 fds  → first-pass probe (log request, return ENOTTY)
  *   FAKE_FD_I2C → SET_SLAVE, RDWR, SMBUS
- *
- * Cross-TU dependencies resolved via spi_shim.h:
- *   - Device-state externs + fd predicates
- *   - real_ioctl / real_write pointers
- *   - FAKE_FD_* constants
- *   - FAKE_MODE_HDISPLAY / FAKE_MODE_VDISPLAY (DRM mode info)
- *   - shim_frame_capture_at_page_flip (called from MODE_PAGE_FLIP)
- *   - shim_resolve_game_base (called at ioctl entry to prime the cache)
  */
 
 #define _GNU_SOURCE
@@ -42,9 +29,6 @@
 
 #include "spi_shim.h"
 
-/* ========== moved from spi_shim.c (187-205): SPI ioctl defines + spi_ioc_transfer struct ========== */
-/* ---- SPI ioctl definitions ---- */
-
 #define SPI_IOC_WR_MODE          0x40016b01
 #define SPI_IOC_WR_MAX_SPEED_HZ  0x40046b04
 #define SPI_IOC_MESSAGE_1        0x40206b00
@@ -63,34 +47,24 @@ struct spi_ioc_transfer {
     uint8_t  pad;
 };
 
-/* ========== moved from spi_shim.c (207-212): I2C ioctl defines ========== */
-/* ---- I2C ioctl definitions ---- */
-
 #define I2C_SLAVE       0x0703
 #define I2C_SLAVE_FORCE 0x0706
 #define I2C_RDWR        0x0707
 #define I2C_SMBUS       0x0720
 
-/* ========== moved from spi_shim.c (214-230): DRM fake resource IDs + drm_next_dumb_handle / drm_next_fb_id ========== */
-/* ---- DRM fake resource IDs ----
- *
- * We expose: 1 CRTC (id 1), 1 encoder (id 20), 2 connectors (ids 10, 11).
- * First connector is "connected" with one 800x480@60 mode; second is
- * disconnected (just exists to satisfy the >=2 connector check the game
- * does before falling back to card0 — see BN analysis of sub_d01160).
- * No framebuffers initially.
- */
+/* DRM fake resource IDs: 1 CRTC, 1 encoder, 2 connectors. First connector
+ * is connected with one mode; second is disconnected (satisfies the >=2
+ * connector check before falling back to card0). FAKE_MODE_HDISPLAY /
+ * FAKE_MODE_VDISPLAY are in spi_shim.h. */
 
 #define FAKE_CRTC_ID       1
 #define FAKE_ENCODER_ID    20
-#define FAKE_CONNECTOR_A   10   /* connected, primary display */
-#define FAKE_CONNECTOR_B   11   /* disconnected, but exists */
-/* FAKE_MODE_HDISPLAY / FAKE_MODE_VDISPLAY in spi_shim.h */
+#define FAKE_CONNECTOR_A   10
+#define FAKE_CONNECTOR_B   11
 
 static uint32_t drm_next_dumb_handle = 1;
 static uint32_t drm_next_fb_id = 100;
 
-/* ========== moved from spi_shim.c (1298-1334): drm_synthesize_flip_event + shim_drm_event_vblank struct + drm_flip_sequence ========== */
 /* Synthesize a page-flip completion event on the shim side of the DRM
  * socketpair. Format matches `struct drm_event_vblank` from <drm/drm.h>
  * (32 bytes; libdrm reads the length field to know how much to consume,
@@ -129,16 +103,8 @@ static void drm_synthesize_flip_event(uint32_t crtc_id, uint64_t user_data) {
     }
 }
 
-/* ========== moved from spi_shim.c (1915-2318): ioctl() dispatch: UART termios, SPI, DRM, V4L2, I2C ========== */
-/* ---- Hooked: ioctl ---- */
-
 int ioctl(int fd, unsigned long request, ...) {
     resolve_all();
-
-    /* Step 52: prime the cached game_base from a guest-thread context.
-     * This hook is called constantly (SPI poll loop) so the cache gets
-     * populated very early — before the sweep timer thread needs it.
-     * shim_resolve_game_base() itself early-returns if already cached. */
     (void)shim_resolve_game_base();
 
     va_list args;
@@ -146,9 +112,6 @@ int ioctl(int fd, unsigned long request, ...) {
     void *arg = va_arg(args, void *);
     va_end(args);
 
-    /* ---- UART (real socketpair fd) — intercept the termios ioctls that
-     *      glibc tcXXX functions issue, plus FIONREAD/TIOCOUTQ which the
-     *      game calls directly; pass anything else through to the real fd. */
     if (is_uart_fd(fd)) {
         switch (request) {
         case TCGETS: {
@@ -189,12 +152,10 @@ int ioctl(int fd, unsigned long request, ...) {
         }
     }
 
-    /* ---- Pass through non-fake, non-DRM fds ---- */
     if (!is_fake_fd(fd) && !is_drm_fd(fd)) {
         return real_ioctl(fd, request, arg);
     }
 
-    /* ---- SPI ioctls ---- */
     if (fd == FAKE_FD_SPI) {
         switch (request) {
         case SPI_IOC_WR_MAX_SPEED_HZ: {
@@ -334,7 +295,6 @@ int ioctl(int fd, unsigned long request, ...) {
         }
     }
 
-    /* ---- DRM ioctls ---- */
     if (is_drm_fd(fd)) {
         switch (request) {
 
@@ -557,9 +517,6 @@ int ioctl(int fd, unsigned long request, ...) {
                 SHIM_LOG("DRM ioctl MODE_PAGE_FLIP #%u crtc=%u fb=%u flags=0x%x",
                          flip_count, p->crtc_id, p->fb_id, p->flags);
             }
-            /* Step 58.2: capture frame to the frame bridge at the present
-             * boundary. Runs in the game's thread, so the GL context the
-             * game made current is live — we can glReadPixels directly. */
             shim_frame_capture_at_page_flip();
             return 0;
         }

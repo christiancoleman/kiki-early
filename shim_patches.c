@@ -33,7 +33,6 @@
 
 #include "spi_shim.h"
 
-/* ========== moved from spi_shim.c (1662-1729): memcpy NULL-guard ========== */
 /* ---- memcpy NULL-guard (Step 45) ----
  *
  * Godot's error-logger path on the custom Stern/Radium DisplayRenderer
@@ -188,7 +187,6 @@ void shim_patch_get_format_callback(void) {
              (void *)instr, old, (unsigned)AARCH64_NOP);
 }
 
-/* ========== moved from spi_shim.c (1731-1866): libavcodec HW-accel bypass ========== */
 /* ---- libavcodec HW-accel bypass (Step 47) ----
  *
  * The game's spi_video_player uses libavcodec to decode HEVC. Its init

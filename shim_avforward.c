@@ -45,7 +45,6 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-/* ===== Wire opcodes ===== */
 #define REQ_OPEN      0x01u
 #define REQ_PACKET    0x02u
 #define REQ_RECEIVE   0x03u
@@ -83,7 +82,6 @@
 /* AVERROR_EOF — FFmpeg-specific. */
 #define AVERROR_EOF_VAL ((int)0xdfb9b0bbu)
 
-/* Resolved via shim_resolve_libav (declared in spi_shim.h via shim_patches.c). */
 extern void *shim_resolve_libav(const char *sym, const char *version);
 
 typedef void *(*real_avparams_alloc_t)(void);
@@ -92,13 +90,11 @@ typedef int   (*real_avparams_from_context_t)(void *par, const void *avctx);
 typedef int   (*real_av_frame_get_buffer_t)(void *frame, int align);
 typedef void  (*real_av_frame_unref_t)(void *frame);
 
-/* ===== Session table — one slot per AVCodecContext we've forwarded ===== */
-
 typedef struct {
-    void *avctx;        /* AVCodecContext identity; NULL = slot free */
-    int   sockfd;       /* AF_UNIX connection (-1 = closed) */
-    int   opened;       /* OPEN_OK received */
-    pthread_mutex_t mu; /* serializes msgs on this connection */
+    void *avctx;
+    int   sockfd;
+    int   opened;
+    pthread_mutex_t mu;
 } forward_sess_t;
 
 #define FORWARD_MAX_SESSIONS 8
@@ -113,8 +109,6 @@ int shim_avforward_enabled(void) {
     }
     return gate;
 }
-
-/* ===== Wire helpers ===== */
 
 static int write_all(int fd, const void *buf, size_t n) {
     const char *p = (const char *)buf;
@@ -167,7 +161,6 @@ static int send_msg(int fd, uint32_t type, const void *payload, uint32_t len) {
     return 0;
 }
 
-/* Drain `remaining` bytes from fd into nowhere. Used for error recovery. */
 static void drain_bytes(int fd, uint32_t remaining) {
     char buf[4096];
     while (remaining) {
@@ -176,8 +169,6 @@ static void drain_bytes(int fd, uint32_t remaining) {
         remaining -= n;
     }
 }
-
-/* ===== Session lifecycle ===== */
 
 static forward_sess_t *find_session_locked(void *avctx) {
     for (int i = 0; i < FORWARD_MAX_SESSIONS; i++) {
@@ -281,8 +272,6 @@ static int session_open_locked(forward_sess_t *s, void *avctx) {
     return 0;
 }
 
-/* ===== Public hooks ===== */
-
 /* Returns:
  *   1 = forward path handled it; *out_ret holds the libav return code
  *   0 = forward not engaged (caller should fall through to passthrough)
@@ -301,7 +290,7 @@ int shim_avforward_send_packet(void *avctx, const void *avpkt, int *out_ret) {
     if (!s->opened) {
         if (session_open_locked(s, avctx) != 0) {
             pthread_mutex_unlock(&s->mu);
-            return 0;  /* fall through to passthrough */
+            return 0;
         }
     }
 
@@ -357,7 +346,7 @@ int shim_avforward_receive_frame(void *avctx, void *frame, int *out_ret) {
     pthread_mutex_lock(&g_sessions_mu);
     forward_sess_t *s = find_session_locked(avctx);
     pthread_mutex_unlock(&g_sessions_mu);
-    if (!s || !s->opened) return 0;  /* no session open yet — fall through */
+    if (!s || !s->opened) return 0;
 
     pthread_mutex_lock(&s->mu);
     if (send_msg(s->sockfd, REQ_RECEIVE, NULL, 0) != 0) {
@@ -389,7 +378,6 @@ int shim_avforward_receive_frame(void *avctx, void *frame, int *out_ret) {
         return 1;
     }
 
-    /* Frame header */
     uint32_t remaining = rhdr[1];
     if (remaining < 24) {
         if (remaining) drain_bytes(s->sockfd, remaining);

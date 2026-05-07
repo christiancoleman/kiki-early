@@ -74,7 +74,6 @@ static void shim_fb0_blit(int src_w, int src_h, const uint8_t *src_rgba);
 #define ABSTRACT_FRAME_NAME   "pokemon_spike3_frame"
 #define ABSTRACT_AUDIO_NAME   "pokemon_spike3_audio"
 
-/* ========== moved from spi_shim.c (1446-1600): state bridge (comment + includes + globals + now_ms + emit + accept + poll) ========== */
 
 
 
@@ -231,7 +230,6 @@ static void *shim_bridge_poll_thread(void *arg) {
     return NULL;
 }
 
-/* ========== moved from spi_shim.c (1897-1943): shim_bridge_start ========== */
 /* Start the bridge: create listener socket, spawn accept + poll threads.
  * Called from the constructor; no-op unless SPIKE3_BRIDGE=1. */
 void shim_bridge_start(void) {
@@ -255,7 +253,6 @@ void shim_bridge_start(void) {
     SHIM_LOG("[bridge] threads ready");
 }
 
-/* ========== moved from spi_shim.c (1945-2063): frame bridge (comment + globals + accept + drop + send_all + send) ========== */
 /* ---- Step 58: frame bridge — glReadPixels → AF_UNIX stream → frame_viewer ----
  *
  * Separate socket from the JSON state bridge above because frames are
@@ -380,7 +377,6 @@ static void shim_frame_send(int w, int h, const uint8_t *rgba) {
     pthread_mutex_unlock(&shim_frame_lock);
 }
 
-/* ========== moved from spi_shim.c (2128-2220): shim_frame_capture_at_page_flip + shim_frame_start ========== */
 /* Capture the current read-framebuffer to the frame bridge at page-flip.
  *
  * Evolution of this function has proven that the "pick the biggest tracked

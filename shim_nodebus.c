@@ -91,7 +91,6 @@ static int nodebus_synth_fe_enabled(void) {
     return nodebus_synth_fe_state;
 }
 
-/* ========== moved from spi_shim.c (3898-4232): netbridge protocol: CRC32 + checksum + escape codec + send_response + synthesize_bridge_response ========== */
 /* ---- Bridge protocol response synthesis ----
  *
  * Per Sidekick Round 4 RE of sub_d164a0 (send_bridge_message_with_response)

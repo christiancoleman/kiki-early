@@ -34,7 +34,6 @@
 
 #include "spi_shim.h"
 
-/* ========== moved from spi_shim.c (369-963): diagnostics: SIGSEGV comment + safe_read + hexdump + dump_sound_globals + cmode_table + resolve_game_base + dump_cmodes + dump_dispatch_tables ========== */
 /* ---- SIGSEGV/SIGBUS backtrace handler ----
  *
  * QEMU user-mode currently reports `uncaught target signal 11` for every
@@ -630,7 +629,6 @@ static void shim_dump_dispatch_tables(void) {
     }
 }
 
-/* ========== moved from spi_shim.c (1358-1444): diagnostics: SIGSEGV handler + SIGTERM/INT/USR handler ========== */
 void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
     (void)ucontext;
 

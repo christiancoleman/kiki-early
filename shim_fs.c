@@ -2,15 +2,7 @@
  * shim_fs.c — open-family device-intercept wrappers + GPIO sysfs fake-fd
  *             pool + libgpiod chardev stubs.
  *
- * The legacy LD_PRELOAD path-remap layer (`remap_path`) and the bulk of
- * the open/stat/access wrappers were removed when the bind-mount approach
- * became the default (`_emulation/scripts/setup_bind_mounts.sh` — see
- * PROTOCOL §2 "One-time setup: bind-mount the sysroot"): the kernel
- * resolves /games, /connectivity, /data via mount table, so no userspace
- * path-rewrite is needed for ordinary files.
- *
- * What stays is hardware-related — paths the game opens that *must* be
- * intercepted because they don't exist on the host filesystem:
+ * Hardware-related paths the game opens that don't exist on the host:
  *
  *   - open / openat / open64 / openat64 — call `intercept_device(path)`
  *     for absolute paths; if it returns a non-zero fd, that fd is the
@@ -38,11 +30,6 @@
 #include <sys/types.h>
 
 #include "spi_shim.h"
-
-/* ---- Open-family device intercepts ----
- * For each variant: if the path matches a known device, intercept_device()
- * returns a non-zero fd we hand back to the caller. Otherwise pass through
- * to the real libc symbol (resolved lazily via dlsym). */
 
 int open(const char *pathname, int flags, ...) {
     if (!real_open) real_open = (real_open_t)dlsym(RTLD_NEXT, "open");
@@ -147,16 +134,9 @@ int __openat64_2(int dirfd, const char *pathname, int flags) {
     return real(dirfd, pathname, flags);
 }
 
-/* ========== moved from spi_shim.c: GPIO fake-fd pool state ==========
- * FAKE_FD_GPIO_BASE / FAKE_FD_GPIO_COUNT live in spi_shim.h so the I/O
- * hooks (still in spi_shim.c) can range-check fds against this pool.
- * The arrays are externed in the header — non-static here. */
 char     *gpio_fake_paths[FAKE_FD_GPIO_COUNT];
 uint8_t   gpio_fake_read_done[FAKE_FD_GPIO_COUNT];
 static pthread_mutex_t gpio_fake_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* ========== moved from spi_shim.c (1441-1474): GPIO sysfs helpers (is_gpio_sysfs_path / alloc / is_gpio_fake / free) ========== */
-/* ---- GPIO sysfs fake-fd pool ---- */
 
 int is_gpio_sysfs_path(const char *p) {
     return p && strncmp(p, "/sys/class/gpio/", 16) == 0;
@@ -192,19 +172,10 @@ void free_gpio_fake_fd(int fd) {
 }
 
 
-/* ========== libgpiod chardev stubs (2026-04-24) ==========
- * The game imports six symbols from libgpiod (the modern /dev/gpiochipN
- * character-device API). Known-gap: our shim only faked the legacy
- * /sys/class/gpio/ sysfs interface, so calls through libgpiod silently
- * fell through to real libgpiod, which then opened /dev/gpiochip* — that
- * doesn't exist on this host, so the opens errored and the game's
- * chip-select / interrupt-line logic never got its handshake.
- *
- * Stubs return opaque non-NULL handles (dynamically allocated tracking
- * structs) so pointer identity between open and close works naturally.
- * The game uses GPIO as output-only (only `gpiod_line_request_output` is
- * imported — no `_request_input` / `_get_value`) so we log value writes
- * but don't have to invent a read semantic.
+/* libgpiod chardev stubs. Stubs return opaque non-NULL handles (allocated
+ * tracking structs) so pointer identity between open and close works.
+ * Game uses GPIO output-only (only `gpiod_line_request_output` is imported
+ * — no `_request_input` / `_get_value`).
  *
  * The opaque `struct gpiod_chip` and `struct gpiod_line` in libgpiod's
  * public headers are ABI-compatible with our plain pointer return types.

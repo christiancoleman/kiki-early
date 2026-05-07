@@ -38,26 +38,6 @@
 
 #include "spi_shim.h"
 #include "shim_discovery.h"
-/* ========== moved from spi_shim.c (412-678): event-sweep machinery ========== */
-/* ---- Step 52: fire_event trampoline + event sweep ---------------------
- *
- * BN Step 52 revealed:
- *   fire_event @ 0x5c12a0: uint64_t(int32_t event_id, int64_t event_data)
- *     - bounds-checks event_id <= 0xce
- *     - walks linked list at data_485ea80[event_id*8]
- *     - each node: {callback_fn_ptr @ +0, priority @ +0x08, next @ +0x10}
- *     - calls callback(event_data); short-circuits on !(ret & 1)
- *
- * Trampoline pattern:
- *   fire_event_addr = game_base + 0x5c12a0
- *
- * Event sweep fires every event_id 0..0xce with event_data=0 and diffs
- * cmode state before/after. Events whose handlers dereference event_data
- * as a pointer will SEGV with fault_addr=0; we catch and recover.
- *
- * Triggered by SIGUSR2 (kept out of the main dump path so we can still
- * use SIGUSR1 for state snapshots without firing events).
- * ------------------------------------------------------------------------ */
 
 /* Sweep globals — read by shim_sigsegv_handler (in shim_diagnostics.c) to
  * longjmp back out of a faulting sweep iteration. Externed in spi_shim.h. */
@@ -131,7 +111,6 @@ void shim_event_sweep(void) {
             alarm(0);
             timed_out_events++;
         } else {
-            /* setjmp_result == 1 — came from SEGV */
             alarm(0);
             crashed_events++;
         }
@@ -167,7 +146,6 @@ void shim_event_sweep(void) {
                 ln = snprintf(line, sizeof(line),
                     "  event 0x%02x ret=%lu Δ=%d %s\n",
                     ev, (unsigned long)ret, delta_count, delta_buf);
-                /* Use post as new baseline for cumulative tracking */
                 memcpy(baseline, post, sizeof(baseline));
             } else {
                 ln = snprintf(line, sizeof(line),
@@ -187,9 +165,6 @@ void shim_event_sweep(void) {
 
 
 
-
-
-
 static void *shim_discovery_init_thread(void *arg) {
     (void)arg;
     sleep(2);
@@ -204,10 +179,6 @@ static void *shim_discovery_init_thread(void *arg) {
     return NULL;
 }
 
-/* ========== moved from spi_shim.c (836-977): alarm handler + timer threads ========== */
-/* Step 52: SIGALRM handler used to break out of hung event handlers during
- * the sweep. Installed in the constructor; blocked on all threads except
- * the sweep timer thread so alarm() delivers to the right place. */
 static void shim_event_sweep_alarm_handler(int sig, siginfo_t *info, void *uc) {
     (void)info; (void)uc;
     if (shim_event_fire_in_progress) {
@@ -219,16 +190,10 @@ static void shim_event_sweep_alarm_handler(int sig, siginfo_t *info, void *uc) {
         shim_event_fire_in_progress = 0;
         siglongjmp(shim_event_sweep_jmp, 2);
     }
-    /* else: unexpected SIGALRM outside the sweep — just ignore */
 }
 
 
 
-/* ---- Public entry point called from shim_install_crash_handler ----
- * Installs the SIGALRM handler used by shim_event_sweep's alarm-per-event
- * timeout, blocks SIGALRM on the main thread (so threads inherit the
- * block; sweep-callers unblock for themselves), then spawns the always-on
- * discovery init thread. */
 void shim_inject_start(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));

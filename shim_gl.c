@@ -73,7 +73,6 @@ void glEGLImageTargetTexture2DOES(unsigned, void *);
  * glEGLImageTargetTexture2DOES further down. */
 static void shim_frametex_record(unsigned target, int w, int h);
 
-/* ========== moved from spi_shim.c (1025-1088): frametex texture tracking (referenced by glEGLImageTargetTexture2DOES) ========== */
 
 /* ---- Step 58.2: frame capture tracking ----
  *
@@ -139,7 +138,6 @@ static void shim_frametex_record(unsigned target, int w, int h) {
     pthread_mutex_unlock(&shim_frametex_lock);
 }
 
-/* ========== moved from spi_shim.c (1574-1782): GBM: gbm_create_device through gbm_surface_has_free_buffers ========== */
 /* ---- Hooked: GBM library functions ----
  * libgbm's real gbm_create_device inspects the DRM fd's driver identity via
  * /sys and DRM_IOCTL_VERSION-derived driver-name matching. Our fake DRM fd
@@ -350,7 +348,6 @@ int gbm_surface_has_free_buffers(void *surface) {
     (void)surface; return 1;
 }
 
-/* ========== moved from spi_shim.c (1784-2401): EGL: constants, display/config/context/surface, KHR image + sync ========== */
 /* ---- Hooked: EGL ----
  * Once gbm_create_device returns our fake handle, mesa's libEGL would
  * dereference it — crash. We intercept the public EGL entry points the
@@ -970,7 +967,6 @@ static int stub_eglClientWaitSyncKHR(void *display, void *sync, int flags, uint6
     return 0x30F6;  /* EGL_CONDITION_SATISFIED_KHR */
 }
 
-/* ========== moved from spi_shim.c (2403-3108): GLES 3.x stubs: constants, objects, bindings, uniforms, draw, read ========== */
 /* ---- Hooked: GLES 3.x ----
  *
  * Two modes, selected by SPIKE3_REAL_GL env var (Step 56):
@@ -1678,7 +1674,6 @@ void glReadPixels(int x, int y, int w, int h, unsigned fmt, unsigned type, void 
 
 /* --- end GL stubs --- */
 
-/* ========== moved from spi_shim.c (3226-3271): eglGetProcAddress table ========== */
 typedef void (*pfn_t)(void);
 
 void (*eglGetProcAddress(const char *name))(void) {

@@ -1,8 +1,6 @@
 /*
  * shim_io.c — byte-level I/O hooks on the shim's fake fds.
  *
- * Phase 7 of the refactor. Owns: close / read / lseek / write.
- *
  * Dispatch order mirrors the intercept_device() contract:
  *   - GPIO fake fds (pool defined in shim_fs.c)
  *   - SPI / I2C / V4L2 fake fds (pure-fake fds, no backing socketpair)
@@ -11,16 +9,6 @@
  *   - DRM socketpair fd (real fd; shim_ioctl.c pushes synthesized page-flip
  *     events via real_write() which unblocks read() here)
  *   - everything else falls through to real libc
- *
- * Cross-TU dependencies resolved via spi_shim.h:
- *   - Device-state externs (spi_active, i2c_active, etc.)
- *   - fd predicates (is_fake_fd, is_uart_fd, is_drm_fd)
- *   - FAKE_FD_* constants
- *   - real_close / real_read / real_write function pointers
- *   - GPIO fake-fd pool (gpio_fake_paths, gpio_fake_read_done, FAKE_FD_GPIO_BASE,
- *     is_gpio_fake_fd, free_gpio_fake_fd)
- *   - synthesize_bridge_response (from shim_nodebus.c; called from write())
- *   - resolve_all (ensures real_* pointers are bound on first entry)
  */
 
 #define _GNU_SOURCE
@@ -34,9 +22,6 @@
 #include <sys/types.h>
 
 #include "spi_shim.h"
-
-/* ========== moved from spi_shim.c (1743-1913): I/O hooks: close / read / lseek / write ========== */
-/* ---- Hooked: close ---- */
 
 int close(int fd) {
     resolve_all();
@@ -91,20 +76,12 @@ int close(int fd) {
     return real_close(fd);
 }
 
-/* ---- Hooked: read ----
- *
- * UART reads go through to the real socketpair fd — they block until the
- * shim pushes bytes via uart_shim_fd (or forever, which is fine; the game
- * has its own pthread_cond_timedwait around these reads). We log a tally
- * when bytes actually arrive.
- */
-
 ssize_t read(int fd, void *buf, size_t count) {
     resolve_all();
 
     if (is_gpio_fake_fd(fd)) {
         int idx = fd - FAKE_FD_GPIO_BASE;
-        if (gpio_fake_read_done[idx]) return 0;  /* EOF on 2nd read (real sysfs behavior) */
+        if (gpio_fake_read_done[idx]) return 0;
         const char *p = gpio_fake_paths[idx];
         const char *resp = "";
         if (strstr(p, "/value"))          resp = "0\n";
@@ -152,11 +129,6 @@ ssize_t read(int fd, void *buf, size_t count) {
     return real_read(fd, buf, count);
 }
 
-/* ---- Hooked: lseek (GPIO polling only) ----
- * Some GPIO pollers keep one fd open and lseek(0) between reads. Clear the
- * once-read flag so the next read() re-emits the value. All other fds fall
- * through to libc. */
-
 typedef off_t (*real_lseek_t)(int, off_t, int);
 off_t lseek(int fd, off_t offset, int whence) {
     if (is_gpio_fake_fd(fd)) {
@@ -170,14 +142,10 @@ off_t lseek(int fd, off_t offset, int whence) {
     return real_fn(fd, offset, whence);
 }
 
-/* ---- Hooked: write ---- */
-
-
 ssize_t write(int fd, const void *buf, size_t count) {
     resolve_all();
 
     if (is_gpio_fake_fd(fd)) {
-        /* Swallow writes to export / direction / value / unexport. */
         return (ssize_t)count;
     }
 
@@ -206,7 +174,6 @@ ssize_t write(int fd, const void *buf, size_t count) {
     }
 
     if (fd == FAKE_FD_SPI && spi_active) {
-        /* SPI shouldn't use write() directly (uses ioctl), but just in case */
         return (ssize_t)count;
     }
 
@@ -229,34 +196,10 @@ ssize_t write(int fd, const void *buf, size_t count) {
     return real_write(fd, buf, count);
 }
 
-/* ---- LFS variants: lseek64 / pread64 / pwrite64 (defensive coverage) ----
- *
- * glibc's LFS (Large File Support) entry points are distinct PLT symbols from
- * their plain counterparts. On 64-bit aarch64 Linux they're functionally
- * identical (off_t is already 64-bit, so off64_t is the same width), but
- * SYMBOL resolution is separate, so code linked to the 64-bit variant bypasses
- * our plain-variant hooks entirely.
- *
- * ---- The pattern: "when you hook one variant, hook both" ----
- *
- * Any libc function with a 32/64 pair (`*64` suffix) can silently leak traffic
- * through the non-hooked variant. Before Phase 7.post we hooked only plain
- * `lseek`; `lseek64` / `pread64` / `pwrite64` were all invisible. Adding the
- * 64-bit hooks with a FIRST-CALL banner immediately caught `pread64` in use
- * (we'd been missing whatever file reads it was doing for the whole refactor).
- *
- * Remaining asymmetries worth closing later (listed in README "Known gaps"):
- *   - `pread`   — paired with `pread64` (hooked here); plain variant not hooked
- *   - `pwrite`  — paired with `pwrite64` (hooked here); plain variant not hooked
- *   - `fopen`   — paired with `fopen64` (hooked in shim_fs.c); plain variant
- *                 not hooked. This one's a path-taking function so the
- *                 asymmetry can leak un-remapped paths — highest priority of
- *                 the three to fix.
- *
- * When closing an asymmetry, keep the defensive first-call banner for the
- * newly-added variant for at least one smoke run so we observe whether it
- * fires. If it doesn't, the banner cost is essentially zero.
- */
+/* On 64-bit aarch64 the LFS entry points (lseek64 / pread64 / pwrite64) are
+ * functionally identical to their plain counterparts (off_t is already
+ * 64-bit), but PLT symbols are separate so callers using the 64-bit variant
+ * bypass the plain-variant hook. Hook both. */
 
 typedef off_t  (*real_lseek64_t)(int, off_t, int);
 typedef ssize_t (*real_pread64_t)(int, void *, size_t, off_t);
@@ -323,7 +266,6 @@ ssize_t pwrite64(int fd, const void *buf, size_t count, off_t offset) {
     (void)offset;  /* GPIO sysfs writes ignore position */
 
     if (is_gpio_fake_fd(fd)) {
-        /* Same swallow semantics as write() on GPIO fake fds. */
         return (ssize_t)count;
     }
     static real_pwrite64_t real_fn = NULL;
@@ -331,12 +273,6 @@ ssize_t pwrite64(int fd, const void *buf, size_t count, off_t offset) {
     return real_fn(fd, buf, count, offset);
 }
 
-/* ---- Hooked: pread / pwrite (plain — Phase-7 asymmetries closed 2026-04-24) ----
- *
- * On 64-bit aarch64 these are ABI-identical to pread64/pwrite64 (off_t is
- * already 64-bit), but PLT symbols are distinct so a caller using the
- * plain variant would bypass our pread64/pwrite64 hook. Mirror the
- * 64-bit bodies exactly so both paths land the same. */
 typedef ssize_t (*real_pread_t)(int, void *, size_t, off_t);
 typedef ssize_t (*real_pwrite_t)(int, const void *, size_t, off_t);
 
@@ -370,31 +306,13 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
     return real_fn(fd, buf, count, offset);
 }
 
-/* ---- Observation hooks: mmap / mmap64 / munmap (2026-04-24) ----
- *
- * The GAME BINARY doesn't import mmap in its dynsym — its code (if it uses
- * mmap at all) resolves the syscall inside glibc via INLINE_SYSCALL and
- * bypasses LD_PRELOAD. But other libraries in the process (Mesa's shader
- * cache, libavcodec, libcurl, dlopen's .so-loader) import mmap normally
- * and their calls DO go through the PLT → our override.
- *
- * So this hook's diagnostic value is: "what libs are doing mmap at
- * runtime," not "what the game is doing with main.pck." We filter out
- * anonymous mappings (malloc arenas, stack growth — pure noise) and log
- * only file-backed mappings (fd != -1) where the interesting activity
- * lives. First 8 + every 500th sampled, same pattern as pread64.
- *
- * All three functions pass through to real libc; we never intercept the
- * actual mapping. */
-
-#include <sys/mman.h>  /* MAP_ANONYMOUS, off64_t-via-_GNU_SOURCE */
+#include <sys/mman.h>
 
 typedef void * (*real_mmap_t)(void *, size_t, int, int, int, off_t);
 typedef void * (*real_mmap64_t)(void *, size_t, int, int, int, off64_t);
 typedef int    (*real_munmap_t)(void *, size_t);
 
 static const char *mmap_flag_summary(int flags) {
-    /* Return a short, non-allocating label for the most common cases. */
     if (flags & MAP_ANONYMOUS) return "ANON";
     if ((flags & MAP_PRIVATE) && (flags & MAP_FIXED)) return "PRIV|FIXED";
     if (flags & MAP_PRIVATE) return "PRIV";

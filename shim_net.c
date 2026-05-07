@@ -15,7 +15,6 @@
 
 #include "spi_shim.h"
 
-/* ---- gating ---- */
 static int shim_offline_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -24,8 +23,6 @@ static int shim_offline_enabled(void) {
     }
     return cached;
 }
-
-/* ---- destination decoder ---- */
 
 /* True if the sockaddr is a "local" destination (loopback IPv4/IPv6,
  * AF_UNIX, or any non-INET family). Used purely for log labelling —
@@ -40,13 +37,12 @@ static int shim_addr_is_local(const struct sockaddr *addr,
         if (addrlen < (socklen_t)sizeof(struct sockaddr_in)) return 1;
         const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
         uint32_t ip = ntohl(sin->sin_addr.s_addr);
-        return (ip >> 24) == 127;     /* 127.0.0.0/8 */
+        return (ip >> 24) == 127;
     }
     if (fam == AF_INET6) {
         if (addrlen < (socklen_t)sizeof(struct sockaddr_in6)) return 1;
         const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
         const uint8_t *b = sin6->sin6_addr.s6_addr;
-        /* ::1 */
         int loopback6 = 1;
         for (int i = 0; i < 15; i++) if (b[i]) { loopback6 = 0; break; }
         if (loopback6 && b[15] == 1) return 1;
@@ -58,11 +54,9 @@ static int shim_addr_is_local(const struct sockaddr *addr,
         }
         return 0;
     }
-    /* AF_UNIX, AF_NETLINK, AF_PACKET, etc. — not external network. */
     return 1;
 }
 
-/* Render a sockaddr to a human string for logs. */
 static void shim_addr_to_str(const struct sockaddr *addr, socklen_t addrlen,
                              char *buf, size_t buflen) {
     if (!addr) {
@@ -93,8 +87,6 @@ static void shim_addr_to_str(const struct sockaddr *addr, socklen_t addrlen,
     snprintf(buf, buflen, "AF_%u(unsupported)", (unsigned)fam);
 }
 
-/* ---- connect() override ---- */
-
 typedef int (*real_connect_t)(int, const struct sockaddr *, socklen_t);
 static real_connect_t shim_real_connect = NULL;
 
@@ -116,8 +108,6 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     errno = ENOSYS; return -1;
 }
 
-/* ---- getaddrinfo() override ---- */
-
 typedef int (*real_getaddrinfo_t)(const char *, const char *,
                                   const struct addrinfo *,
                                   struct addrinfo **);
@@ -126,7 +116,7 @@ static real_getaddrinfo_t shim_real_getaddrinfo = NULL;
 /* True if `node` resolves to a loopback target by syntax alone.
  * Used only for log labelling — never gates the call. */
 static int shim_node_is_local(const char *node) {
-    if (!node) return 1;          /* AI_PASSIVE / wildcard */
+    if (!node) return 1;
     if (strcmp(node, "localhost") == 0 ||
         strcmp(node, "ip6-localhost") == 0 ||
         strcmp(node, "ip6-loopback") == 0) return 1;
