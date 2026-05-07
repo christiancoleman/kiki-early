@@ -7619,5 +7619,65 @@ The decoder-name-remap log (`[decoder_patch] remapping decoder name 'hevc_v4l2re
 - `memory/feedback_search_over_recall.md` — NEW PILLAR feedback.
 - `memory/MEMORY.md` — VideoPlayerSpi index line replaced with the new PILLAR entry.
 
+## Step 86: PROTOCOL strict-philosophy audit + shim comment-hygiene pass (2026-05-07)
 
+### Why
 
+Wrapping up a multi-session push to land the strict-philosophy rule (`feedback_protocol_strict_philosophy.md`, Step 82) consistently across the codebase: PROTOCOL.md = verified facts only, code comments = vital + stable only. This Step bookends two parallel cleanup arcs — a code-comment hygiene pass over the `_emulation/` shim source files using `/code-review`, and a per-section PROTOCOL audit using the new `/protocol audit` skill plus `lore-keeper` subagent dispatch.
+
+### State at session start
+
+- 10 shim source files unreviewed for strict-philosophy compliance: `shim_gl.c`, `shim_diagnostics.c`, `shim_bridges.c`, `shim_nodebus.c`, `shim_patches.c`, `shim_discovery.c`, `spi_shim.c`, `spi_shim.h`, `decode_daemon.py`, `run_game.sh`. Cumulative: hundreds of section banners, Step refs, "Phase N moved to", and history-laden rationale blocks accumulated since Phase 5/8/9 refactors.
+- 12 PROTOCOL.md sections pending audit (§2, §3, §4, §5, §6, §7, §8, §9, §10, §11, §13, §14). §1 + §12 had been done in a prior session.
+- `spi_shim.so` baseline: 232256 bytes.
+
+### Phase 1 — `/code-review` pass over shim sources
+
+Ran the skill (heuristic + Qwen 2.5 7B grader) against each file. Applied STRIPs for section banners, history refs, restating-the-name comments, forward-looking advice, and deprecated Phase-N-moved-to history. KEEP-overrode comments documenting non-obvious invariants: ABI offsets, byte-layout, wire-protocol magic, env-var documentation, cross-file architecture. Build sanity-checked every 3-5 files; `spi_shim.so` stayed at exactly 232256 bytes throughout (comments don't affect compiled output).
+
+| File | Δ lines | Notes |
+|---|--:|---|
+| `shim_gl.c` | -66 | 31 strips. KEEP-overrode ASCII-tag macros (`/* "eglD" */`), `/* 32-bpp assumed */`, `/* dlsym miss */` control-flow note |
+| `shim_diagnostics.c` | -46 | Step refs, 8 cmode-table category banners, `/* CORRECTED from +0x30 */` history |
+| `shim_bridges.c` | -22 | Step 54/58 banners, `/* every 2nd flip */`. **Fixed stale `/tmp/spike3_bridge.sock` and `SPIKE3_BRIDGE_SOCKET` env-var refs** — code uses abstract-namespace AF_UNIX |
+| `shim_nodebus.c` | -19 | Bridge-protocol-synthesis banner (kept wire spec), Sidekick attribution. KEEP-overrode wire STX/ETX/`-5` annotations |
+| `shim_patches.c` | -35 | memcpy NULL-guard rationale block, libavcodec-bypass Step refs, dead `real_gst_element_factory_make_t` typedef |
+| `shim_discovery.c` | -6 | Qwen mostly wrong here — `/* Emulate <aarch64-instr> */` comments document non-obvious instruction semantics that names can't convey. Only 4 actual strips |
+| `spi_shim.c` | -80 | Phase 5/8/9 "moved to" history blocks, every `---- Hooked: X ----` banner |
+| `spi_shim.h` | -9 | Section banners. KEEP-overrode `real_*` cross-file tags + env-var docs |
+| `decode_daemon.py` | small | 3 strips (PyAV history, dead annotation). Override-kept docstrings, NV12 byte-layout doc, `# noqa` directive |
+| `run_game.sh` | small | Conservative per user prediction ("expect mostly KEEPs"). Fixed 3 stale `/tmp/spike3_*.sock` paths to "abstract AF_UNIX socket"; dropped `Step 73b restored 2026-05-06` and `Step 75` history. Help text body untouched |
+
+### Phase 2 — PROTOCOL.md per-section audit
+
+Workflow per section: `audit_section.py N` for anchors + tagged Steps; sections with >30 Steps got `lore-keeper` subagent dispatch (§4 32 Steps, §9 51 Steps, §10 52 Steps) so JOURNAL drift checks ran in their own context window. Edits applied via `Edit`; substantive content cuts summarized + applied per the strict-philosophy mandate.
+
+| § | Major actions |
+|---|---|
+| §3 | Stripped "What we still don't know" block (4 open questions), hedging speculation, Diag_1360 downstream-blocker hypothesis |
+| §4 | 5 Step refs, 2 history banners, TBD-row replacement (`TBD` → `—`), "Specific divergences" subsection, bridge-timeouts narrative compress |
+| §5 | "Earlier shim work guessed" history, external-observation "Use cases" subsection, Researcher C "main send" hypothesis subsection |
+| §6 | Hedges + TODO speculation about flag reconstruction |
+| §7 | Date stamps + Step ref + forward-looking advice |
+| §8 | Sidekick external attribution, Spike 2 era history. **Rebased `0xb321d0 → 0x7321d0`** |
+| §9 | "Earlier docs claimed" banner, Generification subsection, Refactor candidate subsection, godot-illegal disclaimer. **Rebased `0xbb76e0 / 0xbb81e4 / 0xbb7c30 → 0x7b*`** |
+| §10 | Step-24/27 framing, history observations. **Rebased entire VA reference table** (7 dual-base pairs collapsed to single-column rebased VAs) |
+| §11 | "Corrected understanding" banner, "Old shim_fire_switch" history. **Rebased `0x9c12a0 → 0x5c12a0`** (verified against `shim_inject.c`'s `fn = (fire_event_t)(game_base + 0x5c12a0)`) |
+| §2 | Step ref, "legacy Step-54 mode" history. **Fixed stale `remap_path` claim** — Step 80's bind-mount approach supersedes |
+| §13 | TBD → `—`, godot-illegal disclaimer, "Why this matters" engineering advice |
+| §14 | Date stamps, `feedback_system_mode_parity.md` memory-file ref |
+
+**+0x400000 base drift findings.** §9, §10, §11 carried explicit dual-base annotations the original author had noted but not fully propagated (`0xbb76e0 → equivalent in PLE: 0x7b76e0`; `0xa8ca40 → 0x68ca40 runtime`). `shim_discovery.c`'s `#define DISCOVERY_ADDR_ASSET_LOAD 0x7321d0` ground-truthed the rebase pattern, contradicting PROTOCOL §9's `0xb321d0`. Per `feedback_verify_every_address.md` PILLAR (any function VA ≥ 0x800000 is suspect), rebased addresses wherever the dual-base evidence was explicit in-doc.
+
+**Stale-claim fixes.** §2 said the shim's `remap_path` translates absolute paths on every `open()` — Step 80's bind-mount approach has superseded that; corrected. `run_game.sh` documentation references to `/tmp/spike3_*.sock` corrected to "abstract AF_UNIX socket" matching `shim_bridges.c`'s `ABSTRACT_*_NAME` constants.
+
+### State at session end
+
+- All 14 PROTOCOL sections strict-philosophy compliant. 12 remaining `JOURNAL Step N` references in the doc, all in canonical `*Verified by:*` footnotes (down from ~50+).
+- `spi_shim.so` builds clean at 232256 bytes.
+- 10 source files cleaned. Ratio across files: ~30% of flagged comments stripped, ~70% KEEP-overrode (vital + stable).
+
+### Open
+
+- **§11 deferred address rebases.** ~10 addresses fit the +0x400000 drift pattern but lack explicit dual-base notation in-doc, so they were not auto-rebased: `sub_a50850 / sub_a50350` (switch-state readers), `sub_b24f70` (Stage-1 switch-state reader), `sub_b25438` (call site), `sub_b129f0 / sub_bd39f0 / sub_b16f64 / sub_b82990 / sub_b12760` (event-firing callers), `_INIT_74 @ 0x8733c0`. Each needs a single BN MCP `function_at` lookup to confirm; if pattern holds, all subtract `0x400000`.
+- **Magic-number → named-constant rename pass** deferred from this session's comment-strip work (would be substantive code change, not just comment removal). Targets: ~26 magic-number-interpretation comments in `shim_ioctl.c` (DRM_MODE_*/TIOCM_*), ~30 in `shim_gl.c` (EGL_*/GL_*), a few in `shim_bridges.c` (GL_RGBA/GL_UNSIGNED_BYTE). Each replaced by including the proper system header (`<drm/drm_mode.h>`, `<linux/input.h>`, `<EGL/egl.h>`, etc.) and using the actual named constant.

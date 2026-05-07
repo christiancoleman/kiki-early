@@ -52,6 +52,78 @@ struct spi_ioc_transfer {
 #define I2C_RDWR        0x0707
 #define I2C_SMBUS       0x0720
 
+#define I2C_M_RD        0x0001
+
+/* Match kernel uapi struct layout — natural alignment, 2 bytes pad after len
+ * to align buf on 8 bytes; total 24 bytes per msg on aarch64. */
+struct shim_i2c_msg {
+    uint16_t addr;
+    uint16_t flags;
+    uint16_t len;
+    uint8_t  *buf;
+};
+
+struct shim_i2c_rdwr_ioctl_data {
+    struct shim_i2c_msg *msgs;
+    uint32_t             nmsgs;
+};
+
+#define I2C_SMBUS_READ              1
+#define I2C_SMBUS_WRITE             0
+#define I2C_SMBUS_QUICK             0
+#define I2C_SMBUS_BYTE              1
+#define I2C_SMBUS_BYTE_DATA         2
+#define I2C_SMBUS_WORD_DATA         3
+#define I2C_SMBUS_BLOCK_DATA        5
+#define I2C_SMBUS_I2C_BLOCK_BROKEN  6
+#define I2C_SMBUS_I2C_BLOCK_DATA    8
+#define I2C_SMBUS_BLOCK_MAX         32
+
+union shim_i2c_smbus_data {
+    uint8_t  byte;
+    uint16_t word;
+    uint8_t  block[I2C_SMBUS_BLOCK_MAX + 2];
+};
+
+struct shim_i2c_smbus_ioctl_data {
+    uint8_t                     read_write;
+    uint8_t                     command;
+    uint32_t                    size;
+    union shim_i2c_smbus_data  *data;
+};
+
+void shim_i2c_handle_write(uint8_t slave, const uint8_t *buf, size_t len) {
+    slave &= 0x7f;
+    if (len == 0 || !buf) return;
+    uint8_t reg = buf[0];
+    i2c_reg_pointer[slave] = reg;
+    /* buf[1..len-1] are payload bytes written at reg, reg+1, ... with the
+     * pointer advancing. Clamp at 256 to avoid wrapping unintentionally. */
+    for (size_t i = 1; i < len; i++) {
+        if (reg + (i - 1) >= 256) break;
+        i2c_regfile[slave][reg + (i - 1)] = buf[i];
+    }
+    if (len > 1) {
+        size_t advance = len - 1;
+        if ((size_t)reg + advance > 0xff) advance = 0xff - reg;
+        i2c_reg_pointer[slave] = (uint8_t)(reg + advance);
+    }
+}
+
+size_t shim_i2c_handle_read(uint8_t slave, uint8_t *buf, size_t len) {
+    slave &= 0x7f;
+    if (len == 0 || !buf) return 0;
+    uint8_t reg = i2c_reg_pointer[slave];
+    size_t n = len;
+    if ((size_t)reg + n > 256) n = 256 - reg;
+    for (size_t i = 0; i < n; i++) buf[i] = i2c_regfile[slave][reg + i];
+    if ((size_t)reg + n <= 0xff)
+        i2c_reg_pointer[slave] = (uint8_t)(reg + n);
+    else
+        i2c_reg_pointer[slave] = 0xff;
+    return n;
+}
+
 /* DRM fake resource IDs: 1 CRTC, 1 encoder, 2 connectors. First connector
  * is connected with one mode; second is disconnected (satisfies the >=2
  * connector check before falling back to card0). FAKE_MODE_HDISPLAY /
@@ -579,26 +651,121 @@ int ioctl(int fd, unsigned long request, ...) {
         return 0;
     }
 
-    /* ---- I2C ioctls ---- */
+    /* ---- I2C ioctls ----
+     * Modeled, not just accepted: the audio driver does write-then-readback
+     * verify on every register write, so the read side has to return what
+     * was just written. RDWR returns nmsgs (the kernel ABI), not 0 — the
+     * driver's verify path treats <=0 as failure. */
     if (fd == FAKE_FD_I2C) {
         i2c_ioctl_count++;
         switch (request) {
         case I2C_SLAVE:
         case I2C_SLAVE_FORCE: {
             unsigned long addr = (unsigned long)(uintptr_t)arg;
+            i2c_current_slave = (uint8_t)(addr & 0x7f);
             SHIM_LOG("I2C ioctl SET_SLAVE addr=0x%02lx", addr);
             return 0;
         }
-        case I2C_RDWR:
+        case I2C_RDWR: {
+            struct shim_i2c_rdwr_ioctl_data *r =
+                (struct shim_i2c_rdwr_ioctl_data *)arg;
+            if (!r || (!r->msgs && r->nmsgs > 0)) {
+                errno = EFAULT;
+                return -1;
+            }
+            for (uint32_t i = 0; i < r->nmsgs; i++) {
+                struct shim_i2c_msg *m = &r->msgs[i];
+                uint8_t slave = (uint8_t)(m->addr & 0x7f);
+                if (m->flags & I2C_M_RD) {
+                    shim_i2c_handle_read(slave, m->buf, m->len);
+                } else {
+                    shim_i2c_handle_write(slave, m->buf, m->len);
+                }
+            }
             if (i2c_ioctl_count <= 10) {
-                SHIM_LOG("I2C ioctl RDWR (transfer #%u)", i2c_ioctl_count);
+                SHIM_LOG("I2C ioctl RDWR (transfer #%u, %u msgs)",
+                         i2c_ioctl_count, r->nmsgs);
+            }
+            return (int)r->nmsgs;
+        }
+        case I2C_SMBUS: {
+            struct shim_i2c_smbus_ioctl_data *s =
+                (struct shim_i2c_smbus_ioctl_data *)arg;
+            if (!s) { errno = EFAULT; return -1; }
+            uint8_t slave = i2c_current_slave;
+            int is_read = (s->read_write == I2C_SMBUS_READ);
+            switch (s->size) {
+            case I2C_SMBUS_QUICK:
+                break;
+            case I2C_SMBUS_BYTE:
+                if (!s->data) break;
+                if (is_read) {
+                    shim_i2c_handle_read(slave, &s->data->byte, 1);
+                } else {
+                    /* For SMBUS_BYTE write, the byte is in command. */
+                    uint8_t b = s->command;
+                    shim_i2c_handle_write(slave, &b, 1);
+                }
+                break;
+            case I2C_SMBUS_BYTE_DATA:
+                if (!s->data) break;
+                if (is_read) {
+                    uint8_t reg = s->command;
+                    shim_i2c_handle_write(slave, &reg, 1);
+                    shim_i2c_handle_read(slave, &s->data->byte, 1);
+                } else {
+                    uint8_t buf[2] = { s->command, s->data->byte };
+                    shim_i2c_handle_write(slave, buf, 2);
+                }
+                break;
+            case I2C_SMBUS_WORD_DATA:
+                if (!s->data) break;
+                if (is_read) {
+                    uint8_t reg = s->command;
+                    uint8_t tmp[2] = {0, 0};
+                    shim_i2c_handle_write(slave, &reg, 1);
+                    shim_i2c_handle_read(slave, tmp, 2);
+                    s->data->word = (uint16_t)tmp[0] |
+                                    ((uint16_t)tmp[1] << 8);
+                } else {
+                    uint8_t buf[3] = {
+                        s->command,
+                        (uint8_t)(s->data->word & 0xff),
+                        (uint8_t)((s->data->word >> 8) & 0xff)
+                    };
+                    shim_i2c_handle_write(slave, buf, 3);
+                }
+                break;
+            case I2C_SMBUS_BLOCK_DATA:
+            case I2C_SMBUS_I2C_BLOCK_BROKEN:
+            case I2C_SMBUS_I2C_BLOCK_DATA:
+                if (!s->data) break;
+                if (is_read) {
+                    uint8_t reg = s->command;
+                    uint8_t blen = s->data->block[0];
+                    if (blen > I2C_SMBUS_BLOCK_MAX) blen = I2C_SMBUS_BLOCK_MAX;
+                    shim_i2c_handle_write(slave, &reg, 1);
+                    shim_i2c_handle_read(slave, &s->data->block[1], blen);
+                } else {
+                    uint8_t blen = s->data->block[0];
+                    if (blen > I2C_SMBUS_BLOCK_MAX) blen = I2C_SMBUS_BLOCK_MAX;
+                    uint8_t tmp[1 + I2C_SMBUS_BLOCK_MAX];
+                    tmp[0] = s->command;
+                    for (uint8_t i = 0; i < blen; i++)
+                        tmp[1 + i] = s->data->block[1 + i];
+                    shim_i2c_handle_write(slave, tmp, 1 + blen);
+                }
+                break;
+            default:
+                break;
+            }
+            if (i2c_ioctl_count <= 10) {
+                SHIM_LOG("I2C ioctl SMBUS (transfer #%u, %s size=%u cmd=0x%02x)",
+                         i2c_ioctl_count, is_read ? "R" : "W",
+                         s->size, s->command);
             }
             return 0;
-        case I2C_SMBUS:
-            if (i2c_ioctl_count <= 10) {
-                SHIM_LOG("I2C ioctl SMBUS (transfer #%u)", i2c_ioctl_count);
-            }
-            return 0;
+        }
         default:
             SHIM_LOG("I2C ioctl 0x%lx (#%u)", request, i2c_ioctl_count);
             return 0;

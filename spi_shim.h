@@ -113,6 +113,25 @@ extern uint32_t v4l2_ioctl_count;
 extern uint32_t uart_read_count;
 extern uint32_t uart_write_count;
 
+/* I2C virtual register file (defined in spi_shim.c). Read/written by the
+ * helpers below; both shim_ioctl.c (RDWR/SMBUS handlers) and shim_io.c
+ * (raw read/write on FAKE_FD_I2C) go through the helpers. */
+extern uint8_t  i2c_regfile[128][256];
+extern uint8_t  i2c_reg_pointer[128];
+extern uint8_t  i2c_current_slave;
+
+/* Apply a write transaction to the regfile.
+ * Convention: buf[0] sets the per-slave register pointer; buf[1..len-1]
+ * (if any) are written sequentially starting at that pointer with
+ * auto-increment. len==0 is accepted (zero-length quick-poll-style msg).
+ * slave is masked to 7 bits. */
+void shim_i2c_handle_write(uint8_t slave, const uint8_t *buf, size_t len);
+
+/* Apply a read transaction. Reads len bytes from regfile[slave] starting at
+ * the per-slave register pointer; advances the pointer past the read window
+ * (clamped at 256). Returns the number of bytes actually placed in buf. */
+size_t shim_i2c_handle_read(uint8_t slave, uint8_t *buf, size_t len);
+
 /* fd predicates (defined in spi_shim.c). Used by shim_io.c + shim_ioctl.c +
  * termios hooks still in spi_shim.c. */
 int is_fake_fd(int fd);

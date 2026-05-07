@@ -95,6 +95,13 @@ ssize_t read(int fd, void *buf, size_t count) {
         return (ssize_t)n;
     }
 
+    if (fd == FAKE_FD_I2C && i2c_active) {
+        /* Raw read on the I2C fd uses the slave addr most-recently set via
+         * I2C_SLAVE / I2C_SLAVE_FORCE; same regfile as the RDWR/SMBUS path. */
+        return (ssize_t)shim_i2c_handle_read(i2c_current_slave,
+                                             (uint8_t *)buf, count);
+    }
+
     if (is_uart_fd(fd)) {
         ssize_t n = real_read(fd, buf, count);
         uart_read_count++;
@@ -174,6 +181,12 @@ ssize_t write(int fd, const void *buf, size_t count) {
     }
 
     if (fd == FAKE_FD_SPI && spi_active) {
+        return (ssize_t)count;
+    }
+
+    if (fd == FAKE_FD_I2C && i2c_active) {
+        shim_i2c_handle_write(i2c_current_slave,
+                              (const uint8_t *)buf, count);
         return (ssize_t)count;
     }
 

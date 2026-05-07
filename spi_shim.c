@@ -235,6 +235,18 @@ uint32_t i2c_ioctl_count = 0;
 uint32_t uart_read_count = 0;
 uint32_t uart_write_count = 0;
 
+/* I2C virtual register file: last-write-wins per (7-bit slave, 8-bit register).
+ * Modeled because the audio driver does write-then-readback verify on every
+ * register write to TAS57XX (amp) and MAX9850 (headphone amp); without a
+ * register model the read returns garbage and the driver logs a flood of
+ * "write failed to verify at NN: reads back as ffffffff" lines. The model is
+ * agnostic to the chip — any sequence that writes reg N then reads reg N back
+ * gets a consistent value. Per-slave reg_pointer tracks the autoincrementing
+ * register address for repeat-START combined transactions. */
+uint8_t  i2c_regfile[128][256];
+uint8_t  i2c_reg_pointer[128];
+uint8_t  i2c_current_slave = 0;
+
 int is_drm_fd(int fd) { return drm_game_fd >= 0 && fd == drm_game_fd; }
 
 typedef int (*real_open_t)(const char *, int, ...);
