@@ -7891,3 +7891,133 @@ For shim purposes: any of these chip IDs in `response[4..7]` will make `mcp_node
 | SIGSEGV at game+0xe3e250 | crashes ~55 s | 0 (180 s clean) |
 | `bridge message ... Connection timed out` | 158 | 158 (unchanged, default off) |
 | Forward progress | scene loading | scene loading + 113k frames decoded + 16 BO/EGL imports |
+
+## Step 88: Per-slot chip-IDs land all Tech Alerts rows on "Not Initialized"; switch-press injection unsolved (2026-05-07)
+
+Direct continuation of Step 87. Goal: turn the Tech Alerts UI breakthrough (visible test menu showing "Check Node Board N : Invalid/Not Initialized") into something we can advance past. Outcome: per-slot chip-ID synth flips every alert row from "Invalid" to "Not Initialized" (visual proof via frame capture). The 200ms cipher response delay is now a hardcoded shim default, and `run_game.sh`'s env-toggle plumbing is back to a clean state. Two Sidekick-driven attempts at switch-press injection failed empirical test — the Tech Alerts "Press Select" dispatcher is not driven by `g_switch_state_array` writes nor by `translate_switch_state_changes(5, …)`. Switch-press path remains unsolved; chip-ID + cipher-delay work landed clean.
+
+### Step 88a — Per-slot chip-IDs flip "Invalid" → "Not Initialized"
+
+User screenshot at `_emulation/reference/tech_alerts.png` (no synth, smoke run baseline) shows 5 rows: slot 1 = "Not Initialized", slots 4/8/9/10 = "Invalid". Hypothesis: `mcp_node_query_status_and_classify @ 0x8f38e0` matches `response[4..7]` (LE u32 = chip_id) against `mcp_lpc_chip_vtable @ 0x42317c8`; mismatch → "Invalid", match-but-no-post-init-traffic → "Not Initialized".
+
+Verified the vtable layout via objdump dump of `.data.rel.ro` at file offset `0x42307c8` (= VA `0x42317c8`, accounting for the section's `0x1000` slide). Two chip IDs of interest are present:
+
+| vtable idx | chip_id | chip name (per PROTOCOL §5.4) |
+|---:|---|---|
+| 0  | `0x041E502B` | LPC1111FHN33/101 |
+| 15 | `0x00140040` | LPC1124JBD48/303 |
+| 21 | `0x3D01402B` | LPC1342FHN33 |
+
+Pokemon LE board mapping derived from the cabinet manual (the `high level informal description of Spike 3.txt` reference) plus the `.hex` firmware filenames in `games/pokemon_le/*.hex`:
+
+| Slot | Role | Firmware filename | chip_id chosen | vtable name |
+|---:|---|---|---|---|
+| 0  | CPU/bridge node     | (host-side bridge LPC)   | `0x00140040` | LPC1124JBD48/303 |
+| 1  | Cabinet Node        | (unverified)             | `0x041E502B` | LPC1111FHN33/101 (default) |
+| 4  | QR Reader (Bottom Arch) | `node4-LPC1124_303-1_31_0.hex` (vs. `node4-LPC812-1_31_0.hex`; LPC1124 chosen as primary) | `0x00140040` | LPC1124JBD48/303 |
+| 8  | Core Driver Lower Playfield | `coil4node-LPC1313-1_31_0.hex` | `0x3D01402B` | LPC1342FHN33 |
+| 9  | Core Driver Upper Playfield | same | `0x3D01402B` | LPC1342FHN33 |
+| 10 | SPI Servo Node Board | `tmc5041node-LPC1313-1_31_0.hex` / `tmc2590node-LPC1313-1_31_0.hex` | `0x3D01402B` | LPC1342FHN33 |
+
+Note the disagreement between the LPC1313 firmware filenames for slots 8/9/10 and the chip_id we send (`0x3D01402B` = LPC1342 in this game's vtable — the LPC1313 chip IDs in the table are `0x2C40102B` at entry 13/19 and `0x1830102B` at entry 14/20). The game accepts any in-vtable chip_id at this stage, so the "Not Initialized" flip is empirically verified regardless. Real-hardware-accurate per-slot chip naming for the playfield nodes is **unverified** — try `0x2C40102B` next session if a more faithful mapping is needed.
+
+User-supplied topology (manual): `0 → 10 → 9 → 8 → 4` (playfield daisy chain via CPU port CN22), `0 → 1` (separate cabinet branch via CPU port CN11). Slot 4 is at the *end* of the playfield chain, not on its own port. DIP switches on the same-hardware Core Driver nodes differentiate slot 8 (`OFF/OFF/OFF/OFF`) from slot 9 (`OFF/OFF/ON/OFF`), and slot 10 SPI Node has DIP `OFF/ON/OFF/OFF`.
+
+Implemented `nodebus_chip_id_for_slot()` in `shim_nodebus.c` returning the per-slot u32 chip_id for the FE-probe synth response. Run with viewer + frame capture (`/tmp/snap_frame.py` snapshotting the abstract-AF_UNIX frame bridge). Frame at +220s (Tech Alerts settled) shows **all five rows = "Not Initialized"**. Chip-ID hypothesis verified.
+
+### Step 88b — 200ms cipher synth delay is the new norm; env-var clutter removed
+
+Step 87e's NODEBUS_SYNTH_FE/NODEBUS_SYNTH_FE_DELAY_US env gates were running counter to the new "always-on" baseline. Two issues caught:
+
+1. `run_game.sh` only forwarded `NODEBUS_SYNTH_FE` to qemu — `NODEBUS_SYNTH_FE_DELAY_US` was silently dropped, so all "delay sweeps" earlier in the session were running at 0 ms.
+2. With `./run_game.sh` now expected to land on Tech Alerts directly, env gating adds zero value — the synth + 200ms delay is the new default.
+
+Fix: removed the `getenv` resolution in `shim_nodebus.c` for both vars. `usleep(NODEBUS_SYNTH_DELAY_US)` (a `#define` constant = 200000) inlines the pause before each `bridge_send_response` (FE, FA, key-fetch). Removed the corresponding `args+=(-E …)` lines and env-toggle table entries from `run_game.sh`. Plain `./run_game.sh` lands on "all-Not-Initialized" Tech Alerts.
+
+### Step 88c — `g_switch_state_array` layout verified, but writes don't drive UI
+
+Sidekick (BN AI assistant, since BN MCP was unreachable this session) claimed `g_switch_state_array @ 0x4480220` is a pointer to a heap array of 0x30-byte switch entries with state byte at `+0x28` (1=pressed, 0=released). Wrote a probe in `shim_inject.c` (env-gated under `SHIM_SWITCH_PROBE`) that resolves the pointer and dumps entries.
+
+Layout **partially confirmed** at runtime:
+
+| offset | size | content |
+|---:|---:|---|
+| `+0x00` | 8 | linked-list prev pointer (or 0 for first) |
+| `+0x10` | 8 | descriptor pointer (deref crashes on entries beyond ~3) |
+| `+0x20` | 2 | u16 switch_id (verified == array index for entries 1..11, 8, 69) |
+| `+0x22` | 2 | u16 prev_id |
+| `+0x24` | 4 | switch-type code (most entries = `0x04`; entry 69 = `0x09`) |
+| `+0x28` | 1 | state byte (most = `0x00`; entry 69 = `0x01`) |
+| `+0x29` | 1 | constant `0x01` |
+
+Entry 69 stands out structurally (different `+0x24` type code, `+0x28` already at 1, `+0x22` prev_id breaks the sequential chain). Sidekick offered both "switch_id 8" and "switch_id 69" as candidates for "Service Select".
+
+Empirical test failed for both candidates and both polarities:
+
+- Direct write `entry[8|69] +0x28 = 1; sleep; = 0` (pressed-then-released semantics) — no UI advance.
+- Inverted polarity `= 0; = 1` (pull-up: idle=HIGH, pressed=LOW) — no UI advance.
+- `SHIM_SWITCH_ALL_IDLE=1` writing `+0x28 = 1` to all entries 1..255 (pull-up theory: silence stuck-active spam) — runtime audio spam continues unchanged.
+
+**Conclusion**: `g_switch_state_array` is a derived cache, not the source of truth the Tech Alerts dispatcher reads. Writes to `+0x28` propagate nowhere observable.
+
+### Step 88d — Sidekick's channel-5 hypothesis empirically falsified
+
+Sidekick's follow-up analysis pointed at `g_channel_state_buffers @ 0x44804b8` (0xb0 stride per channel) as the actual edge-detection source, with `translate_switch_state_changes @ 0x651610` as the entry point that consumes a per-channel 8-byte buffer and updates `g_switch_state_array` only when edges are detected. Claimed Service Select sits on **channel 5, switch_id 8 within channel** (bit 8 = byte 1 bit 0 in the 8-byte buffer), routed in real hardware via the UART netbridge cmd `0x27` polling that we don't synthesize.
+
+Implemented direct calls from the shim's probe thread:
+
+```c
+typedef int64_t (*translate_fn)(uint8_t channel_id, const uint8_t *buffer);
+translate_fn translate = (translate_fn)(game_base + 0x651610);
+uint8_t buf[8] = {0};
+buf[1] = 0x01;          /* byte=1, bit=0 → switch_id 8 */
+translate(5, buf);
+usleep(180000);
+buf[1] = 0;
+translate(5, buf);
+```
+
+Targeted (byte=1, bit=0) — no UI advance. Brute-forced **all 64 bit positions** (8 bytes × 8 bits, ~2s per pulse, full 128s sweep at +200s into the run with frame capture) — no UI advance on any position. Frame hashes are stable Tech Alerts content with only minor cyan-pulse animation noise.
+
+**Conclusion**: either Sidekick's channel-5 mapping is wrong, or `translate_switch_state_changes` isn't the path the Tech Alerts scene's input handler reads from. Switch-press injection mechanism remains unsolved.
+
+### Step 88e — Code state at session end
+
+`shim_nodebus.c`:
+
+- `nodebus_chip_id_for_slot(uint8_t slot)` — switch statement returning the u32 chip_id per Step 88a table.
+- `NODEBUS_SYNTH_DELAY_US = 200000` `#define` constant; `usleep(NODEBUS_SYNTH_DELAY_US)` inlined before each FE/FA/key-fetch `bridge_send_response`.
+- All `getenv("NODEBUS_*")` calls removed.
+
+`run_game.sh`:
+
+- `NODEBUS_SYNTH_FE` and `NODEBUS_SYNTH_FE_DELAY_US` defaults + forwarding removed.
+- env-toggle table back to its pre-experiment state.
+
+`shim_inject.c`:
+
+- New `shim_select_press_thread` spawned from `shim_inject_start()`, gated behind `SHIM_SWITCH_PROBE=1`. No-op by default. When activated:
+  - sleeps `SHIM_SWITCH_PRESS_DELAY_S` seconds (default 30; needs ~200 to catch Tech Alerts),
+  - dumps probe entries 0/1/2/8/69 from `g_switch_state_array` to log,
+  - optionally writes `+0x28 = 1` to all entries 1..255 (`SHIM_SWITCH_ALL_IDLE=1`),
+  - calls `translate_switch_state_changes(5, …)` with either a single `(SHIM_CH5_BYTE, SHIM_CH5_BIT)` configuration or a `SHIM_CH5_SWEEP=1` 64-position brute force.
+
+`/tmp/snap_frame.py` (one-shot AF_UNIX frame snapper): saved separately at `_emulation/snap_frame.py` for reuse.
+
+### Open questions / next steps
+
+1. **What memory does the Tech Alerts scene's input handler actually read each frame to detect "Select pressed"?** Neither `g_switch_state_array[*]+0x28` nor channel-5 `translate_switch_state_changes` calls move the UI. Needs a real Ghidra/BN session — probably xref the "Press 'Select' for Node Bus Test" string at `0x35EC2C8`, follow up to its scene class, find the input poll routine.
+2. **Source of the runtime audio spam.** Force-all-idle to `g_switch_state_array[*]+0x28 = 1` had zero effect. The spam isn't gated on that array. Candidates: cipher-channel "node communication failed" alarm path, `fire_event` timer, or a separate raw per-node buffer.
+3. **"Not Initialized" → "OK"** for individual node rows. Distinct from the press question — would require firmware-flash protocol completion or richer FE-probe response payload. Out-of-scope until press is solved.
+4. **Verify slot 4 uses LPC1124 vs LPC812.** Two firmwares ship for node 4 (`node4-LPC1124_303` and `node4-LPC812`); we picked LPC1124 first and slot 4 row flipped to "Not Initialized" — but we never tested LPC812 to confirm that choice.
+
+### Reproducible state
+
+Plain `./run_game.sh --debug` (no env vars) lands on Tech Alerts at ~+200s with all five alert rows = "Not Initialized". Frame capture with `_emulation/snap_frame.py /tmp/snap N stride` confirms.
+
+To resume switch-injection investigation:
+
+```sh
+SHIM_SWITCH_PROBE=1 SHIM_SWITCH_PRESS_DELAY_S=200 ./run_game.sh \
+    --debug --note "switch_probe_resume"
+```

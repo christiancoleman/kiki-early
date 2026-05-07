@@ -194,6 +194,157 @@ static void shim_event_sweep_alarm_handler(int sig, siginfo_t *info, void *uc) {
 
 
 
+/* Switch-state probing & press injection — opt-in scaffolding for the
+ * unsolved Tech-Alerts → Node Bus Test transition.
+ *
+ * What we know empirically (this session):
+ *   - g_switch_state_array @ BN VA 0x4480220 resolves to a real heap array.
+ *     Layout: 0x30-byte stride, +0x20 = u16 switch_id (== array index),
+ *     +0x28 = state byte. But direct writes here don't drive UI.
+ *
+ * What we don't know:
+ *   - Which channel/switch the Tech Alerts screen actually listens to for
+ *     "Press Select". Sidekick's claim that channel 5, switch_id 8 within-
+ *     channel maps to Service Select did NOT advance the UI — neither via
+ *     direct array writes nor via translate_switch_state_changes(5, ...)
+ *     brute-forced across all 64 bit positions.
+ *
+ * Env-tunables (all opt-in; default is no-op):
+ *   SHIM_SWITCH_PROBE=1            — log array dump + run press path
+ *   SHIM_SWITCH_PRESS_DELAY_S=N    — wait N seconds before probing
+ *                                    (default 30; Tech Alerts needs ~200)
+ *   SHIM_CH5_BYTE / SHIM_CH5_BIT   — single targeted press on channel 5
+ *   SHIM_CH5_SWEEP=1               — sweep all 64 channel-5 bit positions
+ *   SHIM_SWITCH_ALL_IDLE=1         — force every entry's +0x28 to 1
+ */
+static void *shim_select_press_thread(void *arg) {
+    (void)arg;
+    const char *v = getenv("SHIM_SWITCH_PROBE");
+    if (!v || !v[0] || v[0] == '0') return NULL;
+
+    int sw_id = -1;
+    int delay_s = 30;
+    if ((v = getenv("SHIM_SWITCH_PRESS_ID")) != NULL && v[0]) sw_id = atoi(v);
+    if ((v = getenv("SHIM_SWITCH_PRESS_DELAY_S")) != NULL && v[0]) delay_s = atoi(v);
+
+    sleep((unsigned)delay_s);
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[switch_inject] game_base never resolved; skipping");
+        return NULL;
+    }
+
+    uintptr_t arr_ptr_loc = game_base + 0x4480220ULL;
+    SHIM_LOG("[switch_inject] game_base=0x%lx  arr_ptr_loc=0x%lx",
+             (unsigned long)game_base, (unsigned long)arr_ptr_loc);
+
+    uint8_t **arr_pp = (uint8_t **)arr_ptr_loc;
+    uint8_t *arr = *arr_pp;
+    SHIM_LOG("[switch_inject] *arr_ptr_loc = %p (heap pointer if non-null)", (void *)arr);
+    if (!arr) {
+        SHIM_LOG("[switch_inject] array pointer is NULL — wrong VA, or array not yet allocated");
+        return NULL;
+    }
+
+    /* Layout (verified):
+     *   +0x10 : descriptor pointer (deref-unsafe for some entries)
+     *   +0x20 : uint16 switch_id (== array index)
+     *   +0x28 : 1-byte state. Pinball pull-up: 1=idle, 0=pressed.
+     * Dump probe IDs to log for visibility. */
+    char line[512];
+    int probe_ids[] = { 0, 1, 2, 8, 69 };
+    for (size_t pi = 0; pi < sizeof(probe_ids)/sizeof(probe_ids[0]); pi++) {
+        int i = probe_ids[pi];
+        uint8_t *e = arr + ((size_t)i * 0x30u);
+        int n = snprintf(line, sizeof(line), "[switch_inject] entry %3d @ %p:", i, (void *)e);
+        for (int j = 0; j < 0x30 && n < (int)sizeof(line) - 4; j++)
+            n += snprintf(line + n, sizeof(line) - n, " %02x", e[j]);
+        SHIM_LOG("%s", line);
+    }
+
+    /* SHIM_SWITCH_ALL_IDLE=1 sets state=1 (idle/pulled-up) on every entry
+     * 1..255 to silence the "everything reads as pressed" stuck-switch spam.
+     * Skips entry 0 (looks uninitialized in dumps). */
+    const char *all_idle = getenv("SHIM_SWITCH_ALL_IDLE");
+    if (all_idle && all_idle[0] && all_idle[0] != '0') {
+        int touched = 0;
+        for (int i = 1; i < 256; i++) {
+            uint8_t *e = arr + ((size_t)i * 0x30u);
+            /* sanity: only touch entries whose +0x20 u16 actually equals i.
+             * Stops us writing if we walk off the end of the real array. */
+            uint16_t recorded_id = *(uint16_t *)(e + 0x20);
+            if (recorded_id != (uint16_t)i) break;
+            if (e[0x28] == 0) {
+                e[0x28] = 1;
+                touched++;
+            }
+        }
+        SHIM_LOG("[switch_inject] SHIM_SWITCH_ALL_IDLE: forced %d entries to state=1", touched);
+    }
+
+    /* Legacy SHIM_SWITCH_PRESS_ID is now superseded by the channel-5 path
+     * below (Sidekick analysis: g_switch_state_array is a derived cache;
+     * the source of truth for edge detection is g_channel_state_buffers,
+     * fed by translate_switch_state_changes per channel). */
+
+    /* Channel 5 = Service Select / operator-button channel (UART netbridge
+     * cmd 0x27 in real hardware, NOT polled in our shim). To inject a press
+     * we call translate_switch_state_changes(5, buffer) directly with the
+     * bit set for our target switch.
+     *
+     *   SHIM_CH5_BYTE / SHIM_CH5_BIT — single targeted press; default
+     *     byte=1 bit=0 per Sidekick's switch_id-8 educated guess.
+     *   SHIM_CH5_SWEEP=1 — brute-force all 64 bit positions (2s each),
+     *     watch viewer/log for the bit that advances Tech Alerts.
+     */
+    int ch5_byte = 1;
+    int ch5_bit  = 0;
+    int sweep    = 0;
+    if ((v = getenv("SHIM_CH5_BYTE")) != NULL && v[0]) ch5_byte = atoi(v);
+    if ((v = getenv("SHIM_CH5_BIT"))  != NULL && v[0]) ch5_bit  = atoi(v);
+    if ((v = getenv("SHIM_CH5_SWEEP")) != NULL && v[0] && v[0] != '0') sweep = 1;
+
+    typedef int64_t (*translate_fn)(uint8_t channel_id, const uint8_t *buffer);
+    translate_fn translate = (translate_fn)(game_base + 0x651610);
+
+    if (sweep) {
+        SHIM_LOG("[switch_inject] CH5 SWEEP starting (64 positions × 2s each)");
+        for (int b = 0; b < 8; b++) {
+            for (int k = 0; k < 8; k++) {
+                uint8_t buffer[8] = {0};
+                buffer[b] = (uint8_t)(1u << k);
+                SHIM_LOG("[switch_inject] CH5 sweep: byte=%d bit=%d PRESS", b, k);
+                translate(5, buffer);
+                usleep(800000);
+                buffer[b] = 0;
+                translate(5, buffer);
+                usleep(1200000);
+            }
+        }
+        SHIM_LOG("[switch_inject] CH5 sweep done");
+        return NULL;
+    }
+
+    if (sw_id >= 0) {
+        SHIM_LOG("[switch_inject] (legacy SHIM_SWITCH_PRESS_ID=%d ignored — channel 5 path used instead)",
+                 sw_id);
+    }
+
+    uint8_t buffer[8] = {0};
+    if (ch5_byte >= 0 && ch5_byte < 8 && ch5_bit >= 0 && ch5_bit < 8) {
+        buffer[ch5_byte] = (uint8_t)(1u << ch5_bit);
+    }
+    SHIM_LOG("[switch_inject] CH5 press byte=%d bit=%d (buffer[%d]=0x%02x)",
+             ch5_byte, ch5_bit, ch5_byte, buffer[ch5_byte]);
+    translate(5, buffer);
+    usleep(180000);
+    buffer[ch5_byte] = 0;
+    translate(5, buffer);
+    SHIM_LOG("[switch_inject] CH5 release done");
+    return NULL;
+}
+
 void shim_inject_start(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -210,4 +361,8 @@ void shim_inject_start(void) {
     pthread_t t;
     if (pthread_create(&t, NULL, shim_discovery_init_thread, NULL) == 0)
         pthread_detach(t);
+
+    pthread_t s;
+    if (pthread_create(&s, NULL, shim_select_press_thread, NULL) == 0)
+        pthread_detach(s);
 }

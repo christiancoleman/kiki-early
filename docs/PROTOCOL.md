@@ -912,6 +912,28 @@ Indices 13/19, 14/20, 21/22 share chip IDs across package variants — the chip-
 
 *Verified by:* JOURNAL Step 87f — direct binary read at file offset `0x42307c8` (VA `0x42317c8`, `.data.rel.ro` segment, off-by-`0x1000` from VA-equals-file-offset assumption), all 28 chip-name strings re-read from binary's own `.rodata` (not from BN annotation), plus public-source spot-checks: `0x041E502B` matches NXP LPC1111FHN33/101 datasheet; `0x411FD210` matches ARM Cortex-M33 r1p0 CPUID per ARM Technical Reference Manual.
 
+#### Per-slot chip-ID synth (Pokémon LE)
+
+`shim_nodebus.c::nodebus_chip_id_for_slot` returns the chip_id the shim writes into `response[4..7]` of every synthesized FE-probe reply. Mapping derived from the cabinet manual + the `.hex` firmware filenames in `games/pokemon_le/`:
+
+| Slot | Role (manual) | chip_id sent | vtable name | Source for choice |
+|---:|---|---|---|---|
+| 0  | CPU bridge LPC | `0x00140040` | LPC1124JBD48/303 (entry 15) | host-side bridge LPC on CPU board |
+| 1  | Cabinet Node | `0x041E502B` | LPC1111FHN33/101 (entry 0, default) | unverified — accepted by game |
+| 4  | QR Reader (Bottom Arch) | `0x00140040` | LPC1124JBD48/303 (entry 15) | `node4-LPC1124_303-1_31_0.hex` |
+| 8  | Core Driver Lower Playfield | `0x3D01402B` | LPC1342FHN33 (entry 21) | accepted by game; LPC1313 firmware filename suggests silicon mismatch — see note |
+| 9  | Core Driver Upper Playfield | `0x3D01402B` | LPC1342FHN33 (entry 21) | same as slot 8 (DIP-distinguished, identical hardware) |
+| 10 | SPI Servo Node Board | `0x3D01402B` | LPC1342FHN33 (entry 21) | accepted by game; `tmc5041node-LPC1313` / `tmc2590node-LPC1313` firmware filenames |
+| any other | — | `0x041E502B` | LPC1111FHN33/101 (entry 0) | default fallback |
+
+Result: with this mapping all five Tech Alerts rows on the operator-mode test screen (slots 1, 4, 8, 9, 10) read **"Not Initialized"** — chip_id matched against vtable entry, post-init handshake not yet completed. Without this mapping (or with a non-vtable chip_id), the same rows read **"Invalid"**.
+
+The disagreement between LPC1313 firmware filenames and the LPC1342 vtable name for `0x3D01402B` is unresolved. The LPC1313 chip_ids in the vtable are `0x2C40102B` (entries 13/19) and `0x1830102B` (entries 14/20); switching slots 8/9/10 to one of those is untested but a candidate for closer hardware fidelity. Topology per cabinet manual: `0 → 10 → 9 → 8 → 4` (playfield daisy chain via CPU CN22), `0 → 1` (separate cabinet branch via CPU CN11).
+
+Synth requires a wall-clock pause before each `bridge_send_response` to preserve the timeout-driven timing real hardware imposes — empirically 200 ms (`shim_nodebus.c::NODEBUS_SYNTH_DELAY_US`). Immediate replies regress the run from frame-decode-active to "Godot init never fires".
+
+*Verified by:* JOURNAL Step 88 — frame capture via `_emulation/snap_frame.py` of the Tech Alerts screen at +220 s into a `./run_game.sh` run shows all five rows transitioning from "Invalid" (no synth) to "Not Initialized" (per-slot chip-ID synth + 200 ms delay). Slot-row state confirmed by direct visual comparison against the no-synth baseline screenshot at `_emulation/reference/tech_alerts.png`.
+
 ---
 
 ## 6. image.bin file format

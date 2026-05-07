@@ -69,36 +69,29 @@ static uint8_t nodebus_cipher_keys[32][16] = {{0}};
  * on the response shape). 200ms matches what's needed in practice. */
 #define NODEBUS_SYNTH_DELAY_US 200000
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+/* Per-slot chip-ID assignment for fe_probe synthesis.
+ *
+ * mcp_lpc_chip_vtable @ 0x42317c8 is a 28-entry table of {uint32_t chip_id,
+ * void* fns[...]} (40 bytes per entry). mcp_node_query_status_and_classify
+ * @ 0x8f38e0 reads response[4..7] LE, and walks the vtable for a match;
+ * mismatch produces "Invalid" in the Tech Alerts UI; match (but no
+ * post-init traffic complete) produces "Not Initialized".
+ *
+ * Pokémon LE board mapping (from the LE manual + games/pokemon_le/*.hex
+ * filename conventions):
+ *
+ *   slot 0  : CPU/bridge node    → 0x00140040 (entry 15, LPC1124JBD48/303)
+ *   slot 4  : QR reader          → 0x00140040 (entry 15, LPC1124JBD48/303)
+ *   slot 8  : Core Driver Lower  → 0x3D01402B (entry 21, LPC1342FHN33)
+ *   slot 9  : Core Driver Upper  → 0x3D01402B (entry 21, LPC1342FHN33)
+ *   slot 10 : SPI Node Board     → 0x3D01402B (entry 21, LPC1342FHN33)
+ *   default : everything else    → 0x041E502B (entry 0,  LPC1111FHN33/101)
+ *
+ * The .hex firmware filenames (coil4node-LPC1313, tmc5041node-LPC1313, etc.)
+ * suggest LPC1313 silicon for slots 8/9/10, but the in-game chip vtable's
+ * 0x3D01402B is LPC1342 per PROTOCOL §5.4. The game accepts any vtable-
+ * matching chip_id at this stage — empirical: all five Tech Alerts rows
+ * flip from "Invalid" to "Not Initialized" with this mapping. */
 static uint32_t nodebus_chip_id_for_slot(uint8_t slot) {
     switch (slot) {
         case 0:  return 0x00140040u;  /* LPC1124_303 — CPU bridge */
