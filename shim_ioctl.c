@@ -92,6 +92,34 @@ struct shim_i2c_smbus_ioctl_data {
     union shim_i2c_smbus_data  *data;
 };
 
+/* Per-chip post-write transforms. Some registers are status registers whose
+ * read value differs from what was written: a write triggers a hardware
+ * sequence and the chip then reports the result via a status bit. The plain
+ * regfile would return the original written value forever, so the driver's
+ * polling loop times out. Each known (slave, register) gets a small case
+ * here that mutates regfile[slave][reg] right after the write.
+ *
+ * Add cases as new "polling never succeeds" symptoms appear. */
+static void shim_i2c_chip_post_write(uint8_t slave, uint8_t reg,
+                                     uint8_t /*unused*/ written) {
+    (void)written;
+    /* TAS5711 / TAS5755M digital amp at slave 0x1b.
+     *
+     * Register 0x1b is the OSC_TRIM register. Per TI SLAS502/SLAS589, writing
+     * any value triggers an oscillator self-calibration sequence that takes
+     * ~50–500 ms; the chip reports completion by setting bit 6
+     * (OSC_TRIM_DONE) read-back. The driver sleeps 50 ms then polls bit 6
+     * up to 10× at 10 ms intervals; without the bit set it logs
+     * "oscillator trim failed to lock" and falls through.
+     *
+     * On real hardware the bit is not instantaneous but for emulation we
+     * report "done" on the very next read — the driver's first poll after
+     * its initial usleep(50000) sees it, and forward progress is identical. */
+    if (slave == 0x1b && reg == 0x1b) {
+        i2c_regfile[slave][reg] = 0x40;
+    }
+}
+
 void shim_i2c_handle_write(uint8_t slave, const uint8_t *buf, size_t len) {
     slave &= 0x7f;
     if (len == 0 || !buf) return;
@@ -101,7 +129,9 @@ void shim_i2c_handle_write(uint8_t slave, const uint8_t *buf, size_t len) {
      * pointer advancing. Clamp at 256 to avoid wrapping unintentionally. */
     for (size_t i = 1; i < len; i++) {
         if (reg + (i - 1) >= 256) break;
-        i2c_regfile[slave][reg + (i - 1)] = buf[i];
+        uint8_t target_reg = (uint8_t)(reg + i - 1);
+        i2c_regfile[slave][target_reg] = buf[i];
+        shim_i2c_chip_post_write(slave, target_reg, buf[i]);
     }
     if (len > 1) {
         size_t advance = len - 1;

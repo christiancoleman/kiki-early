@@ -44,6 +44,7 @@
 #include <stdarg.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <sys/syscall.h>
 
 #include "spi_shim.h"
 
@@ -289,7 +290,26 @@ uint64_t gbm_bo_get_modifier(void *bo) {
     (void)bo; return 0; /* LINEAR */
 }
 int gbm_bo_get_fd(void *bo) {
-    (void)bo; return -1;
+    (void)bo;
+    /* Game's create_egl_framebuffer flow:
+     *   fd = gbm_bo_get_fd(bo);          <-- here
+     *   if (fd < 0) error("failed to get fd for bo");
+     *   image = eglCreateImageKHR(... fd ...);
+     *   close(fd);
+     *   ... build GL texture/framebuffer from image ...
+     *
+     * Our eglCreateImageKHR override doesn't dereference the fd — it parses
+     * the EGL attribute list (width/height/fourcc), allocates a sentinel,
+     * and the eventual glEGLImageTargetTexture2DOES gives the texture real
+     * storage via glTexImage2D. So the fd only has to satisfy "(fd >= 0)
+     * and close(fd) succeeds". A memfd is the simplest valid fd that
+     * survives close() cleanly under qemu-user. */
+    int fd = (int)syscall(SYS_memfd_create, "shim_dma_buf_stub", 1u /* MFD_CLOEXEC */);
+    if (fd < 0) {
+        SHIM_LOG("gbm_bo_get_fd: memfd_create failed (%s); returning -1",
+                 strerror(errno));
+    }
+    return fd;
 }
 uint32_t gbm_bo_get_handle_u(void *bo) {
     (void)bo; return 1;
