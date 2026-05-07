@@ -1,7 +1,7 @@
 /*
  * shim_diagnostics.c — crash/termination dumps, cmode table, BN VA resolver.
  *
- * Phase 3 of the refactor. Contents carved from spi_shim.c:
+ * Contents:
  *   - shim_safe_read / shim_hexdump_stderr (guest-memory dump helpers)
  *   - shim_dump_sound_globals (Pokemon LE sound registry snapshot)
  *   - shim_cmode_entry / shim_cmode_table / shim_cmode_table_count (the 42
@@ -34,13 +34,9 @@
 
 #include "spi_shim.h"
 
-/* ---- SIGSEGV/SIGBUS backtrace handler ----
- *
- * QEMU user-mode currently reports `uncaught target signal 11` for every
- * crash in the guest binary. Installing a guest-side sigaction lets us
- * catch the fault inside the guest process (the shim is loaded into the
- * guest's address space via LD_PRELOAD) and dump a backtrace before
- * chaining to the default handler for the core dump.
+/* SIGSEGV handler runs guest-side: the shim is LD_PRELOAD'd into the guest
+ * address space, so a sigaction here catches faults inside the guest
+ * process and can dump a backtrace before chaining to the default handler.
  *
  * Frame addresses are runtime addresses in the guest's address space.
  * `dladdr()` resolves each frame to module + offset, so we can translate
@@ -209,8 +205,6 @@ static void shim_dump_sound_globals(void) {
     shim_hexdump_stderr("rodata probe (SE_PK_FX_ATTACK_TYPE_BUG)",
                         game_base + 0x3607900, 0x40);
 
-    /* Parse the g_asset_registry _Hashtable header and walk into
-     * the first few nodes (registry head at ELF VA 0x44ca4d0). */
     uintptr_t reg_addr = game_base + 0x44ca4d0;
     uint64_t buckets_ptr = 0, bucket_count = 0, first_node = 0;
     uint64_t element_count = 0, next_resize = 0;
@@ -257,8 +251,8 @@ static void shim_dump_sound_globals(void) {
             char     magic[8];         // "SPK3ASR\0"
             uint64_t game_base;
             uint64_t registry_va;
-            uint64_t hashtable_bytes;  // 64
-            uint64_t node_size;        // NODE_SIZE
+            uint64_t hashtable_bytes;
+            uint64_t node_size;
             uint64_t node_count;       // filled after walk
             uint64_t bucket_count;
             uint64_t element_count;
@@ -270,17 +264,13 @@ static void shim_dump_sound_globals(void) {
         hdr.node_size = NODE_SIZE;
         hdr.bucket_count = bucket_count;
         hdr.element_count = element_count;
-        /* Placeholder — rewritten after walk. */
         u = (ssize_t)write(fd, &hdr, sizeof(hdr));
-        /* Pad to 64 bytes. */
         char pad[64];
         memset(pad, 0, sizeof(pad));
         u = (ssize_t)write(fd, pad, 64 - sizeof(hdr));
 
-        /* Dump the _Hashtable struct verbatim (64 bytes covers it). */
         u = (ssize_t)write(fd, (void*)reg_addr, 64);
 
-        /* Walk the chain. */
         char node_buf[128];
         uintptr_t node = (uintptr_t)first_node;
         while (node != 0 && node_count < 3000) {
@@ -316,9 +306,7 @@ static void shim_dump_sound_globals(void) {
     (void)node_count;
 }
 
-/* ---- cmode dump (Step 50) ----
- *
- * _INIT_74 registers 42 crule::cmode_* objects at fixed BN VA addresses.
+/* _INIT_74 registers 42 crule::cmode_* objects at fixed BN VA addresses.
  * Struct layout (verified from sub_90d840 decomp):
  *   +0x00  vtable ptr
  *   +0x08  mode_id          (uint32)
@@ -330,19 +318,9 @@ static void shim_dump_sound_globals(void) {
  *   +0x308 init_flag        (int — changes from 0 when mode activates)
  *
  * Runtime address = game_base + va.
- *
- * For 42 slots, dump (mode_id, type_flags, scene_ptr, init_flag) to give
- * us a live snapshot of the game's mode state. If static init ran
- * successfully these will all have the expected mode_id / type_flags
- * values matching PROTOCOL.md §11. If any init_flag is non-zero, that mode
- * has transitioned from static-registration to "activated" state.
  */
 
-/* struct shim_cmode_entry definition moved to spi_shim.h — the state bridge
- * (shim_bridges.c) reads this table. */
-
 const struct shim_cmode_entry shim_cmode_table[] = {
-    /* Simple/base modes (type_flags=0x01) — 20 entries */
     { 0x4456ae0, 0x00, 0x01, "base_00" },
     { 0x4456be0, 0x01, 0x01, "base_01" },
     { 0x4456ce0, 0x02, 0x01, "base_02" },
@@ -363,30 +341,24 @@ const struct shim_cmode_entry shim_cmode_table[] = {
     { 0x4457760, 0x11, 0x01, "base_11" },
     { 0x44577d0, 0x1e, 0x01, "base_1e" },
     { 0x4457950, 0x12, 0x01, "base_12" },
-    /* type_flags=0x08 utility modes */
     { 0x44579d0, 0x25, 0x08, "util_25" },
     { 0x4458360, 0x24, 0x08, "util_24" },
     { 0x4459288, 0x1c, 0x08, "util_1c" },
-    /* Battle environment modes (type_flags=0x48) */
     { 0x4457aa0, 0x20, 0x48, "battle_mountain" },
     { 0x4457cd0, 0x21, 0x48, "battle_forest" },
     { 0x4457f00, 0x22, 0x48, "battle_desert" },
     { 0x4458130, 0x23, 0x48, "battle_coast" },
-    /* Pokemon story modes (type_flags=0x28) */
     { 0x4458480, 0x13, 0x28, "story_bulbasaur_1" },
     { 0x44585e0, 0x14, 0x28, "story_bulbasaur_2" },
-    { 0x44586b8, 0x15, 0x28, "story_charmander_1" },  /* CONFIRMED */
+    { 0x44586b8, 0x15, 0x28, "story_charmander_1" },
     { 0x44587f8, 0x16, 0x28, "story_charmander_2" },
     { 0x4458900, 0x19, 0x28, "story_squirtle_1" },
     { 0x4458a50, 0x1a, 0x28, "story_squirtle_2" },
-    /* Pikachu modes (type_flags=0x24) */
     { 0x4458df0, 0x17, 0x24, "pikachu_1" },
     { 0x4458f90, 0x18, 0x24, "pikachu_2" },
-    /* Multiball family (type_flags=0x04) */
     { 0x4458b28, 0x09, 0x04, "mb_09" },
     { 0x4458c80, 0x26, 0x04, "mb_26" },
     { 0x4458d38, 0x27, 0x04, "mb_27" },
-    /* Multiball / wizard (type_flags=0x84) */
     { 0x44590a0, 0x28, 0x84, "rocket_mb_1" },
     { 0x4459160, 0x1b, 0x84, "rocket_mb_2" },
     { 0x4459368, 0x1d, 0x84, "rocket_mb_3" },
@@ -446,10 +418,8 @@ static void shim_dump_cmodes(void) {
         uint32_t mode_id = 0, type_flags = 0, init_flag = 0;
         uintptr_t scene_ptr = 0;
 
-        /* Direct memcpy — under QEMU user-mode the shim runs as guest code,
-         * so accessing guest VAs works (same as asset_registry dump). */
         memcpy(&mode_id,     (void*)(rt_va + 0x08), 4);
-        memcpy(&type_flags,  (void*)(rt_va + 0x0c), 4);   /* CORRECTED from +0x30 */
+        memcpy(&type_flags,  (void*)(rt_va + 0x0c), 4);
         memcpy(&scene_ptr,   (void*)(rt_va + 0x58), 8);
         memcpy(&init_flag,   (void*)(rt_va + 0x308), 4);
 
@@ -505,19 +475,13 @@ static void shim_dump_cmodes(void) {
         scene_ptrs[2], 0x80);
 }
 
-/* ---- Step 51: dispatch table dump ----
- *
- * From BN analysis (user-provided):
+/* Dispatch table addresses:
  *   data_4767b30 = cmode pointer registry (42 entries × 8 bytes = 336 bytes)
  *     Iterated by sub_950d60 (event handler) + sub_94f140 (update callback)
  *   data_485ea80 = event dispatch linked-list heads (207 slots × 8 bytes = 1656 bytes)
  *     206 event types, slot [event_id] -> head of callback linked list
  *   data_48c52c0 = update-type linked-list heads (5 slots × 8 bytes = 40 bytes)
  *   data_480eab0 = scene_data lookup table (40 entries × 0x1a0 = 16640 bytes)
- *
- * Dump: (a) the 42 cmode registry pointers and verify they match the .bss
- * addresses we already expect. (b) which event slots have handlers — a
- * histogram of "# events with ≥1 handler registered".
  */
 static void shim_dump_dispatch_tables(void) {
     uintptr_t game_base = shim_resolve_game_base();
@@ -527,7 +491,6 @@ static void shim_dump_dispatch_tables(void) {
         return;
     }
 
-    /* --- cmode registry at data_4767b30 --- */
     uintptr_t reg_rt = game_base + 0x4367b30;
     uintptr_t reg_end_rt = game_base + 0x4367c80;
     size_t reg_entries = (reg_end_rt - reg_rt) / 8;
@@ -576,7 +539,6 @@ static void shim_dump_dispatch_tables(void) {
         matched, reg_entries);
     u = write(STDERR_FILENO, sum, (size_t)sl); (void)u;
 
-    /* --- event handler histogram at data_485ea80 (207 slots) --- */
     uintptr_t evt_base = game_base + 0x445ea80;
     int populated = 0;
     int total_handlers = 0;
@@ -613,7 +575,6 @@ static void shim_dump_dispatch_tables(void) {
         populated, total_handlers);
     u = write(STDERR_FILENO, esum, (size_t)esl); (void)u;
 
-    /* --- update-type dispatch at data_48c52c0 (5 slots) --- */
     uintptr_t upd_base = game_base + 0x44c52c0;
     char upd_hdr[128];
     int uhl = snprintf(upd_hdr, sizeof(upd_hdr),
@@ -672,13 +633,8 @@ void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
         u = write(STDERR_FILENO, line, (size_t)ln);
     }
 
-    /* Dump sound-system globals for offline inspection (Step 42). */
     shim_dump_sound_globals();
-
-    /* Dump the 42 cmode objects from _INIT_74 (Step 50). */
     shim_dump_cmodes();
-
-    /* Dump dispatch tables: cmode registry, event handlers, update types (Step 51). */
     shim_dump_dispatch_tables();
 
     /* Chain to default handler so QEMU's "uncaught target signal 11"
@@ -808,7 +764,6 @@ void shim_sigabrt_handler(int sig, siginfo_t *info, void *ucontext) {
         }
     }
 
-    /* Chain to default so the process dies with exit code 134. */
     signal(sig, SIG_DFL);
     raise(sig);
 }

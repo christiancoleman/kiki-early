@@ -2,21 +2,18 @@
  * spi_shim.h — shared macros and forward declarations for the shim.
  *
  * Every translation unit that ends up in spi_shim.so should include this.
- * Phase 1 of the refactor: only the macros used across many call sites
- * (SHIM_LOG, FWD_*) are lifted here. Everything else stays in spi_shim.c
- * until subsequent phases carve out subsystem files.
  */
 #ifndef SPI_SHIM_H
 #define SPI_SHIM_H
 
-#include <stdio.h>     /* snprintf — for SHIM_LOG */
-#include <stddef.h>    /* size_t */
-#include <stdint.h>    /* uintptr_t, uint32_t, uint8_t */
+#include <stdio.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>    /* getenv — for shim_sysroot_tmp_path inline below */
 #include <unistd.h>    /* write, STDERR_FILENO — for SHIM_LOG single-syscall path */
 #include <dlfcn.h>     /* dlsym, RTLD_NEXT — for FWD_* */
 #include <signal.h>    /* sig_atomic_t, siginfo_t — for handler decls below */
-#include <setjmp.h>    /* sigjmp_buf */
+#include <setjmp.h>
 #include <sys/types.h> /* ssize_t — for real_read / real_write typedefs */
 
 /* Real-GL gate: when 1, FWD_* macros forward to the real Mesa/libGLES
@@ -24,13 +21,13 @@
  * Defined in spi_shim.c (eventually shim_common.c). */
 int is_real_gl(void);
 
-/* ---- Display constants ----
- * The resolution the shim advertises via fake DRM mode info, also the size
- * glReadPixels uses when capturing frames for the frame bridge. */
+/* Display constants. The resolution the shim advertises via fake DRM mode
+ * info, also the size glReadPixels uses when capturing frames for the frame
+ * bridge. */
 #define FAKE_MODE_HDISPLAY 1920
 #define FAKE_MODE_VDISPLAY 1080
 
-/* ---- Cmode registry (defined in spi_shim.c / eventually shim_diagnostics.c)
+/* Cmode registry (defined in shim_diagnostics.c).
  * BN-extracted table of 42 C-mode objects + their bit-field offsets. Used
  * by the state bridge poll thread for delta emission, and by dispatch-table
  * dumpers in diagnostics. `shim_cmode_table_count` companion is needed
@@ -44,15 +41,14 @@ struct shim_cmode_entry {
 extern const struct shim_cmode_entry shim_cmode_table[];
 extern const size_t                  shim_cmode_table_count;
 
-/* ---- Runtime helpers (defined in shim_diagnostics.c) ---- */
 uintptr_t shim_resolve_game_base(void);
 
-/* ---- libavcodec/libavutil symbol resolver (defined in shim_patches.c) ----
+/* libavcodec/libavutil symbol resolver (defined in shim_patches.c).
  * Tries dlvsym(version) → dlsym → dlopen-handle, in that order. Used by
  * any shim TU that needs to call into libav* by name. */
 void *shim_resolve_libav(const char *sym, const char *version);
 
-/* ---- Forward-decode hooks (defined in shim_avforward.c) ----
+/* Forward-decode hooks (defined in shim_avforward.c).
  * Called from shim_patches.c's avcodec_send_packet / avcodec_receive_frame
  * when SPIKE3_FORWARD_DECODE=1. Each returns 1 if it handled the call (and
  * wrote the libav return code into *out_ret), or 0 if the bridge couldn't
@@ -62,7 +58,7 @@ int shim_avforward_enabled(void);
 int shim_avforward_send_packet(void *avctx, const void *avpkt, int *out_ret);
 int shim_avforward_receive_frame(void *avctx, void *frame, int *out_ret);
 
-/* ---- Decoder compatibility patch (defined in shim_patches.c) ----
+/* Decoder compatibility patch (defined in shim_patches.c).
  * Patches the b.ne at game VA 0x920cf0 in the game's get_format callback
  * so it accepts NV12 instead of insisting on DRM_PRIME. Required for any
  * non-V4L2-stateless decoder to function — both the diagnostic SW hevc
@@ -84,26 +80,24 @@ extern sigjmp_buf            shim_event_sweep_jmp;
 extern volatile sig_atomic_t shim_event_fire_in_progress;
 extern volatile int          shim_current_sweep_event_id;
 
-/* Called from shim_term_dump_handler on SIGUSR2 (defined in shim_inject.c). */
 void shim_event_sweep(void);
 
-/* ---- Netbridge UART protocol (defined in shim_nodebus.c) ----
+/* Netbridge UART protocol (defined in shim_nodebus.c).
  * Called from the write() hook in shim_io.c when the game sends a frame on
  * the UART socketpair; synthesizes a response back to the shim side. */
 void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len);
 
-/* ---- Fake-fd constants (cross-TU) ----
- * SPI / I2C / V4L2 use pure fake fds (no backing socketpair). DRM and UART
- * use real socketpair fds and check via is_drm_fd() / is_uart_fd(). */
+/* Fake-fd constants. SPI / I2C / V4L2 use pure fake fds (no backing socketpair).
+ * DRM and UART use real socketpair fds and check via is_drm_fd() / is_uart_fd(). */
 #define FAKE_FD_SPI          1023
 #define FAKE_FD_I2C          1022
 #define FAKE_FD_V4L2_MEDIA   1021
 #define FAKE_FD_V4L2_VIDEO   1020
 #define FAKE_FD_BOOT_DISPLAY 1019  /* /dev/boot_display — Stern char device */
 
-/* ---- Device-layer state (defined in spi_shim.c) ----
- * intercept_device() writes these on open; the I/O and ioctl hooks in
- * shim_io.c / shim_ioctl.c read them to dispatch per-device. */
+/* Device-layer state (defined in spi_shim.c). intercept_device() writes
+ * these on open; the I/O and ioctl hooks in shim_io.c / shim_ioctl.c read
+ * them to dispatch per-device. */
 extern int      spi_active;
 extern int      i2c_active;
 extern int      v4l2_media_active;
@@ -140,8 +134,6 @@ extern real_ioctl_t  real_ioctl;   /* used by shim_ioctl.c ioctl() */
 extern real_read_t   real_read;    /* used by shim_io.c read() */
 extern real_write_t  real_write;   /* used by shim_io.c write() + shim_nodebus.c + shim_ioctl.c */
 
-/* ---- Filesystem layer (defined in shim_fs.c) ---- */
-
 /* GPIO sysfs fake-fd pool — each open("/sys/class/gpio/...") allocates one
  * of these slots. Pool size and base are exposed here because the I/O hooks
  * in spi_shim.c (read/write/close/lseek) check fds against this range. */
@@ -154,7 +146,7 @@ int  is_gpio_sysfs_path(const char *p);
 int  alloc_gpio_fake_fd(const char *path);
 void free_gpio_fake_fd(int fd);
 
-/* ---- Device intercept dispatcher (defined in spi_shim.c) ----
+/* Device intercept dispatcher (defined in spi_shim.c).
  * Called from the open family in shim_fs.c. Returns a fake-fd (or a real
  * socketpair fd for DRM/UART) if pathname matches a known device node,
  * or 0 to fall through to real open(). */
@@ -166,14 +158,13 @@ int intercept_device(const char *pathname);
  * so the first file open has real_open ready. */
 void resolve_all(void);
 
-/* ---- Bridge lifecycle (defined in shim_bridges.c) ---- */
 void shim_bridge_start(void);             /* state bridge; no-op unless SPIKE3_BRIDGE=1 */
 void shim_frame_start(void);              /* frame bridge; no-op unless SPIKE3_FRAME_BRIDGE=1 */
 void shim_frame_capture_at_page_flip(void); /* called from the DRM PAGE_FLIP ioctl handler */
 void shim_audio_start(void);              /* audio bridge; no-op unless SPIKE3_AUDIO_BRIDGE=1 */
 void shim_audio_emit(const uint8_t *buf, size_t bytes); /* called from snd_pcm_writei */
 
-/* ---- AF_UNIX abstract-namespace addressing ----
+/* AF_UNIX abstract-namespace addressing.
  * WSL2's 9P mount of /mnt/c/... does NOT support AF_UNIX bind (errno 95
  * EOPNOTSUPP). Putting sockets under $SYSROOT/tmp/ on /mnt/c is therefore
  * impossible. Putting them under host /tmp works (real tmpfs) but leaks
@@ -209,7 +200,7 @@ static inline socklen_t shim_unix_abstract_addr(struct sockaddr_un *out,
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len);
 }
 
-/* ---- Injection layer (defined in shim_inject.c) ----
+/* Injection layer (defined in shim_inject.c).
  * Sets up the SIGALRM handler, blocks SIGALRM on the main thread, and
  * spawns the six env-gated worker threads (sweep timer, switch firer,
  * gstreamer force-init, cmode poke, state-flag poke, vp-patch). Called

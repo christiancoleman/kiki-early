@@ -23,7 +23,7 @@ void discovery_log(const char *fmt, ...) {
         discovery_log_fd = open("_emulation/runs/latest/discovery.log",
                                 O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (discovery_log_fd < 0) {
-            discovery_log_fd = 2; /* stderr fallback */
+            discovery_log_fd = 2;
         }
     }
 
@@ -183,8 +183,6 @@ int shim_discovery_handler(uintptr_t pc, void *ucontext) {
         if (scene_id >= 0 && scene_id < 1024 && !seen_mask[scene_id]) {
             seen_mask[scene_id] = 1;
             if (bytecode) {
-                /* Dump 256 bytes split across multiple log lines: hex / ascii.
-                 * UTF-16-LE is just hex with a different lens, decode offline. */
                 discovery_log("scene_bytecode_BEGIN(scene_id=%d, asset_id=%d, ptr=%p)", scene_id, asset_id, bytecode);
                 for (int chunk = 0; chunk < 4; chunk++) {
                     char hex[260] = {0};
@@ -209,8 +207,6 @@ int shim_discovery_handler(uintptr_t pc, void *ucontext) {
     }
 
     if (pc == runtime_queue_scene) {
-        /* sub_731930(scene_id, ...) — wrapper around select_and_load_scene.
-         * lr at entry = caller's return address. */
         int scene_id = (int)mc->regs[0];
         uintptr_t lr = (uintptr_t)mc->regs[30];
         long caller_va = (long)(lr - game_base);
@@ -228,7 +224,6 @@ int shim_discovery_handler(uintptr_t pc, void *ucontext) {
          * game_base gives us the BN VA of the caller's site. */
         uintptr_t lr = (uintptr_t)mc->regs[30];
         long caller_va = (long)(lr - game_base);
-        /* Also log the asset_id from scene_config_table[scene_id] for context. */
         const uintptr_t TABLE_VA = 0x43fcf10;
         const uintptr_t STRIDE   = 32;
         int32_t aid = -1;

@@ -91,10 +91,8 @@ static int nodebus_synth_fe_enabled(void) {
     return nodebus_synth_fe_state;
 }
 
-/* ---- Bridge protocol response synthesis ----
- *
- * Per Sidekick Round 4 RE of sub_d164a0 (send_bridge_message_with_response)
- * and the parser in sub_d15aa8:
+/* Bridge response synthesis (parsed by netbridge.elf send_bridge_message_with_response
+ * + sub_d15aa8):
  *
  *   Request frame:  [0x02][CMD][ID][payload...][CKSUM][0x03]
  *   Response frame: [0x02][RESP_CMD][ID][payload...][CKSUM][0x03]
@@ -107,14 +105,14 @@ static int nodebus_synth_fe_enabled(void) {
  *   0x30 (expected CRC query)    -> 0x20 (4 payload bytes)
  *
  * For 0x30 we return the zlib CRC32 of netbridge.elf's .text+.rodata+
- * .binary_info sections, computed offline in Step 13.5 (journal).
+ * .binary_info sections.
  *
  * For 0x10 we return seven zero bytes. sub_d19580 interprets a zero
  * version as "Spike 1/2 board — use fallback, don't flash powerdist" —
  * which is exactly what we want in emulation (no real powerdist to flash).
  *
  * For 0x20 we return four zero bytes; the game stores the value into
- * data_490e644/data_490e648 without (as far as we've seen) validating.
+ * data_490e644/data_490e648 without validating.
  */
 
 #define NETBRIDGE_CRC32  0x357f5327u
@@ -125,22 +123,15 @@ static uint8_t bridge_checksum(const uint8_t *bytes, size_t len) {
     return (uint8_t)(-(int32_t)sum);
 }
 
-/* ---- Bridge frame escape encoding ----
- *
- * The Spike 3 bridge protocol reserves three byte values for framing:
+/* Bridge frame escape encoding. The Spike 3 bridge protocol reserves three
+ * byte values for framing:
  *   0x02 = STX (start of frame)
  *   0x03 = ETX (end of frame)
  *   0x1b = ESC (next data byte has bit 7 cleared)
  *
  * Any CMD/ID/PAYLOAD/CKSUM byte that equals one of these three values is
  * transmitted as `0x1b (byte | 0x80)`. The receiver's byte-by-byte parser
- * in sub_d15aa8 (see file 0x915c38 — the `cmp w0, #0x1b` and the
- * `bic w0, w0, w26` at 0x915c10) un-escapes by AND-ing with ~0x80.
- *
- * We discovered this via cmd 0x18 responses where id=0x02 (channel 2) was
- * sent by the game as `02 18 1b 82 cksum 03` (escape-encoded). Our naive
- * req[2] extraction read 0x1b as the channel and sent back a malformed
- * frame, which the receiver then rejected with "bridge rx checksum error".
+ * in netbridge.elf un-escapes by AND-ing with ~0x80.
  */
 
 /* Decode an incoming escape-encoded frame into its logical bytes. Returns
@@ -628,8 +619,8 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             uint8_t resp[64];
             int o = 0;
             resp[o++] = 0x02;            /* STX */
-            resp[o++] = 0x41;            /* echo response cmd */
-            resp[o++] = id;              /* echo channel id */
+            resp[o++] = 0x41;
+            resp[o++] = id;
             /* Response payload layout (mapping to query_status_and_classify
              * locals var_38..var_2e):
              *   payload[0]   = var_38, high bit = "node present"

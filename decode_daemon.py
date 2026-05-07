@@ -56,7 +56,6 @@ except ImportError:
     sys.exit(2)
 
 
-# Wire opcodes
 REQ_OPEN = 0x01
 REQ_PACKET = 0x02
 REQ_RECEIVE = 0x03
@@ -207,8 +206,6 @@ class Session:
             # next RECEIVE returns REP_EOF after any in-flight frames.
             self._eof_pending = True
         except Exception as exc:
-            # PyAV 14.x removed av.AVError; FFmpegError + plain Exception
-            # cover decode/packet errors uniformly.
             send_err(self.sock, -22, f"packet: {type(exc).__name__}: {exc}")
             return
         send_msg(self.sock, REP_PACKET_OK)
@@ -279,7 +276,7 @@ class Session:
             self.frames_decoded,
         )
 
-    _frame_queue: list = []  # populated in handle_packet
+    _frame_queue: list = []
     _eof_pending: bool = False
 
     def run(self) -> None:

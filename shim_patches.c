@@ -33,25 +33,14 @@
 
 #include "spi_shim.h"
 
-/* ---- memcpy NULL-guard (Step 45) ----
- *
- * Godot's error-logger path on the custom Stern/Radium DisplayRenderer
- * thread hits vformat()/memcpy(src=NULL, …) because Godot TLS singletons
- * (StringName pool, memory arena, OS::get_singleton) are unregistered on
- * that thread. The resulting NULL dereference inside aarch64 __memcpy_aarch64
- * (cpyfp) has been the Step-31 blocker since 2026-04-19.
- *
- * This override: when either pointer is NULL, silently no-op instead of
+/* memcpy NULL-guard: silently no-op when either pointer is NULL instead of
  * faulting. Real memcpy goes through dlsym(RTLD_NEXT, "memcpy") so hot-path
  * copies retain libc's SIMD-optimised implementation.
  *
- * Safety:
- *   - Thread-local `in_memcpy` guard breaks any recursion (e.g. if SHIM_LOG's
- *     internal printf happens to call back into memcpy).
+ *   - Thread-local `in_memcpy` guard breaks any recursion (dlsym path may
+ *     re-enter memcpy during its own resolution).
  *   - Byte-copy fallback if dlsym hasn't resolved yet (early ctor) or fails.
- *   - SHIM_LOG is called inside the non-null path; that's fine because we've
- *     already guarded the in_memcpy recursion flag.
- *   - Counts are atomics so concurrent threads don't corrupt the tally.
+ *   - Counts are atomic so concurrent threads don't corrupt the tally.
  */
 static volatile unsigned long shim_memcpy_null_count = 0;
 static void *(*real_memcpy)(void *, const void *, size_t) = NULL;
@@ -105,7 +94,6 @@ void *memcpy(void *dst, const void *src, size_t n) {
     return ret;
 }
 
-/* ========== Decoder compatibility patches (Step 64 origin, restored 2026-05-06) ========== */
 /* Two pieces that together let the game's video pipeline accept any
  * non-V4L2-stateless HEVC decoder — whether plain software hevc as a
  * diagnostic, or NVDEC frames returned through the shim_avforward.c host
@@ -148,7 +136,6 @@ static int shim_decoder_patch_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *s = getenv("SPIKE3_DECODER_PATCH");
-        /* Default ENABLED. SPIKE3_DECODER_PATCH=0 to disable for debugging. */
         cached = !(s && s[0] == '0');
     }
     return cached;
@@ -187,32 +174,14 @@ void shim_patch_get_format_callback(void) {
              (void *)instr, old, (unsigned)AARCH64_NOP);
 }
 
-/* ---- libavcodec HW-accel bypass (Step 47) ----
- *
- * The game's spi_video_player uses libavcodec to decode HEVC. Its init
- * sequence (per `nm -D --undefined-only game`) calls:
- *   avcodec_find_decoder_by_name  → looks up the decoder
- *   avcodec_get_hw_config         → probes HW configs
- *   av_hwdevice_ctx_create        → creates a DRM/V4L2 device context
- *   avcodec_open2                 → opens the codec
- *
- * On Spike 3 hardware this resolves to "hevc_v4l2request" + drm_prime.
- * Under QEMU user-mode we have no real V4L2 HEVC decoder, so hwaccel init
- * fails (Step 46) and `Error parsing NAL unit #0` follows — the game's
- * render path doesn't get usable frames. Rather than emulate V4L2 fully,
- * we intercept here and force the plain software HEVC decoder:
+/* libavcodec HW-accel bypass. Game's spi_video_player init calls
+ * avcodec_find_decoder_by_name → avcodec_get_hw_config → av_hwdevice_ctx_create
+ * → avcodec_open2; on Spike 3 hardware this resolves to "hevc_v4l2request" +
+ * drm_prime. Under QEMU we have no V4L2 HEVC, so we force plain SW HEVC:
  *
  *   - avcodec_find_decoder_by_name("hevc_v4l2request") → delegate to "hevc"
  *   - avcodec_get_hw_config(codec, idx) → always NULL  (no HW configs)
  *   - av_hwdevice_ctx_create(..., DRM, …) → AVERROR(ENOSYS)
- *
- * If the game's video module has a SW fallback path, it'll now take it and
- * libavcodec's software HEVC decoder produces frames into an AVFrame the
- * game uploads as a GL texture. No dummy frames needed — real decode.
- *
- * Risk: if the game hard-codes hwaccel (no fallback) these hooks don't
- * produce video, but they at least make the failure deterministic. We'll
- * see in the next run.
  */
 
 typedef const void *(*real_avcodec_find_decoder_by_name_t)(const char *name);
@@ -238,7 +207,6 @@ void *shim_resolve_libav(const char *sym, const char *version) {
     if (p) return p;
     p = dlsym(RTLD_NEXT, sym);
     if (p) return p;
-    /* Try explicit lib handle */
     static void *h_avcodec = NULL, *h_avutil = NULL;
     void **h = NULL;
     if (strstr(sym, "avcodec_")) h = &h_avcodec;
@@ -364,8 +332,6 @@ int avcodec_send_packet(void *avctx, const void *pkt) {
 }
 
 int avcodec_receive_frame(void *avctx, void *frame) {
-    /* SPIKE3_FORWARD_DECODE is the only decode path. See avcodec_send_packet
-     * above for the rationale on no-SW-fallback. */
     int fwd_ret = 0;
     if (shim_avforward_receive_frame(avctx, frame, &fwd_ret)) {
         av_recv_count++;

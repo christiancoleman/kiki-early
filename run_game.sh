@@ -26,8 +26,8 @@
 #   STALE_KILL=<0|1>        [1]     reap leftover qemu/helpers from prior runs
 #                                   before starting.
 #   REAL_GL=<0|1>           [1]     forward EGL/GLES to Mesa vs return stubs
-#   FRAME_BRIDGE=<0|1>      [1]     emit RGBA frames on /tmp/spike3_frame.sock
-#   AUDIO_BRIDGE=<0|1>      [1]     emit S16_LE PCM on /tmp/spike3_audio.sock
+#   FRAME_BRIDGE=<0|1>      [1]     emit RGBA frames on abstract AF_UNIX socket
+#   AUDIO_BRIDGE=<0|1>      [1]     emit S16_LE PCM on abstract AF_UNIX socket
 #   FORWARD_DECODE=<0|1>    [1]     launch decode_daemon.py and route
 #                                   avcodec_send_packet/receive_frame to the
 #                                   host-side NVDEC bridge. No in-VM SW HEVC
@@ -39,7 +39,7 @@
 #                                   AV_PIX_FMT_DRM_PRIME; (2) name-swap
 #                                   hevc_v4l2request/hevc_v4l2m2m → hevc.
 #                                   Set =0 only to debug.
-#   STATE_BRIDGE=<0|1>      [0]     emit cmode JSON on /tmp/spike3_bridge.sock
+#   STATE_BRIDGE=<0|1>      [0]     emit cmode JSON on abstract AF_UNIX socket
 #   LOGFILE=<path>          []      redirect game stdout+stderr to a file
 #                                   (separate from --debug; only affects game)
 #   QEMU=<bin>              [qemu-aarch64]     override qemu binary
@@ -112,20 +112,18 @@ FRAME_BRIDGE="${FRAME_BRIDGE:-1}"
 AUDIO_BRIDGE="${AUDIO_BRIDGE:-1}"
 # FORWARD_DECODE=1: launch decode_daemon.py and route the game's
 # avcodec_send_packet/receive_frame to host NVDEC via AF_UNIX abstract socket
-# @spike3_decode. Default-on (Step 73b restored 2026-05-06). When the daemon
-# can't be reached or PyAV is missing, the shim falls back gracefully to
-# local libavcodec passthrough — no errors propagated to the game.
+# @spike3_decode. When the daemon can't be reached or PyAV is missing, the
+# shim falls back gracefully to local libavcodec passthrough — no errors
+# propagated to the game.
 FORWARD_DECODE="${FORWARD_DECODE:-1}"
 # SPI_QUIET=1: stop replying byte-2=0x04 ("ack/data-available") to every SPI
 # transfer; instead reply all-zeros. Per-cmd overrides via SPIKE3_SPI_RX_<HEX>=
-# still take precedence. T2 experiment per JOURNAL Step 75 — see if the game
-# behaves differently when it stops getting universal-positive responses.
+# still take precedence.
 SPI_QUIET="${SPI_QUIET:-0}"
 # SPI_DELAY_US: sleep this many microseconds inside each SPI ioctl handler.
 # Real hardware's SPI poll loop runs at ~10kHz; qemu+shim handle each call in
 # microseconds, so the game polls millions/sec. Setting 100 caps at ~10kHz
-# (closer to realistic) and makes the log readable. T2-followup per JOURNAL
-# Step 75. Clamped 0..100000.
+# (closer to realistic) and makes the log readable. Clamped 0..100000.
 SPI_DELAY_US="${SPI_DELAY_US:-0}"
 STATE_BRIDGE="${STATE_BRIDGE:-0}"
 OFFLINE_MODE="${OFFLINE_MODE:-1}"

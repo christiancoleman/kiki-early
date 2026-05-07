@@ -62,7 +62,6 @@ static int shim_bridge_create_listener(const char *abstract_name,
  * the GL state into this TU. */
 extern volatile unsigned shim_last_draw_fbo;
 
-/* Forward decl — defined at end of file; called from frame-capture path. */
 static void shim_fb0_blit(int src_w, int src_h, const uint8_t *src_rgba);
 
 /* shim_unix_abstract_addr is defined as static inline in spi_shim.h —
@@ -74,36 +73,30 @@ static void shim_fb0_blit(int src_w, int src_h, const uint8_t *src_rgba);
 #define ABSTRACT_FRAME_NAME   "pokemon_spike3_frame"
 #define ABSTRACT_AUDIO_NAME   "pokemon_spike3_audio"
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+/* State bridge: subscriber connects to abstract AF_UNIX SOCK_STREAM; shim
+ * emits newline-delimited JSON events when cmode state changes.
+ *
+ * Emitted event format (one line, no pretty-printing):
+ *   {"t":"cmode","id":21,"name":"story_charmander_1","flags":40,
+ *    "init":0,"init_prev":1792,"ts_ms":12345}
+ *
+ * Where:
+ *   t         — event type ("cmode" for cmode state delta)
+ *   id        — mode_id (uint32)
+ *   name      — human-readable name from shim_cmode_table
+ *   flags     — type_flags (0x28 = Pokemon story, 0x48 = battle, etc.)
+ *   init      — current value of field at +0x308 (post-change)
+ *   init_prev — previous value (pre-change)
+ *   ts_ms     — monotonic ms since shim constructor ran
+ *
+ *   - Non-blocking subscriber socket — if no one's listening, we just log
+ *     less; shim doesn't stall the game.
+ *   - Listener socket lives for process lifetime; multiple connects OK
+ *     but we only accept ONE subscriber at a time for simplicity.
+ *   - Polls cmode state at 10 Hz. Enough for interactive feel, doesn't
+ *     burden the guest.
+ *   - Enabled when SPIKE3_BRIDGE=1 to keep bridge off by default.
+ */
 
 #include <sys/un.h>
 #include <poll.h>
@@ -120,7 +113,6 @@ static uint64_t shim_now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
-/* Write a JSON event to the subscriber if connected. Graceful on disconnect. */
 static void shim_bridge_emit(const char *json_line) {
     if (!json_line) return;
     size_t len = strlen(json_line);
@@ -161,7 +153,6 @@ static void *shim_bridge_accept_thread(void *arg) {
 
         SHIM_LOG("[bridge] subscriber connected on fd %d", fd);
 
-        /* Send a hello so the subscriber knows we're live. */
         char hello[256];
         int hn = snprintf(hello, sizeof(hello),
             "{\"t\":\"hello\",\"shim\":\"pokemon_le\",\"cmodes\":42,\"ts_ms\":%lu}\n",
@@ -171,7 +162,6 @@ static void *shim_bridge_accept_thread(void *arg) {
     return NULL;
 }
 
-/* Polling thread — samples 42 cmodes' +0x308 at 10 Hz, emits on deltas. */
 static void *shim_bridge_poll_thread(void *arg) {
     (void)arg;
 
@@ -189,7 +179,6 @@ static void *shim_bridge_poll_thread(void *arg) {
 
     size_t N = shim_cmode_table_count;
     uint64_t last[42];
-    /* Prime baseline */
     for (size_t i = 0; i < N; i++) {
         uintptr_t rt = game_base + shim_cmode_table[i].va;
         memcpy(&last[i], (void*)(rt + 0x308), 8);
@@ -199,7 +188,6 @@ static void *shim_bridge_poll_thread(void *arg) {
              game_base, N);
 
     for (;;) {
-        /* 100 ms between polls */
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
         nanosleep(&ts, NULL);
 
@@ -253,13 +241,7 @@ void shim_bridge_start(void) {
     SHIM_LOG("[bridge] threads ready");
 }
 
-/* ---- Step 58: frame bridge — glReadPixels → AF_UNIX stream → frame_viewer ----
- *
- * Separate socket from the JSON state bridge above because frames are
- * fundamentally different traffic: 8 MB binary each, 30-60 Hz, latency-
- * sensitive. Mixing them with newline-terminated JSON on the same socket
- * would force every subscriber to parse both framings. Two sockets, one
- * purpose each, is simpler.
+/* Frame bridge: glReadPixels → AF_UNIX stream → frame viewer.
  *
  * Wire protocol (little-endian, 16-byte header + W*H*4 payload):
  *     u32 magic       — 0xF00FBABA
@@ -356,7 +338,7 @@ static void shim_frame_send(int w, int h, const uint8_t *rgba) {
     uint16_t w16 = (uint16_t)w, h16 = (uint16_t)h;
     memcpy(hdr + 8,  &w16, 2);
     memcpy(hdr + 10, &h16, 2);
-    hdr[12] = 0;      /* format = RGBA8 */
+    hdr[12] = 0;
     hdr[13] = 0;      /* flags: 0 — Pokémon LE / Radium renders top-down into
                        * the FBO we read (confirmed 2026-04-24 by empirical
                        * orientation match). If a future build truly needs
@@ -410,7 +392,7 @@ void shim_frame_capture_at_page_flip(void) {
         fb0_env_cached = (e && e[0] == '1') ? 1 : 0;
     }
     if (shim_frame_client_fd < 0 && !fb0_env_cached) return;
-    if ((++shim_capture_flip_counter) & 1) return;  /* every 2nd flip */
+    if ((++shim_capture_flip_counter) & 1) return;
 
     static void (*real_glReadPixels)(int, int, int, int, unsigned, unsigned, void*) = NULL;
     static void (*real_glGetIntegerv)(unsigned, int*) = NULL;
@@ -469,8 +451,7 @@ void shim_frame_start(void) {
     if (pthread_create(&t, NULL, shim_frame_accept_thread, NULL) == 0) pthread_detach(t);
 }
 
-/* ========== Audio bridge (post-refactor addition, 2026-04-24) ==========
- * Mirrors the frame bridge: AF_UNIX SOCK_STREAM listener, one subscriber at
+/* Audio bridge: AF_UNIX SOCK_STREAM listener, one subscriber at
  * a time, blocking send-all with drop-on-hard-error. Subscriber receives
  * raw S16_LE interleaved stereo @ 44.1 kHz — no headers, no sequence
  * numbers. Format is fixed by the ALSA stub's configuration, so there's
@@ -551,8 +532,8 @@ void shim_audio_start(void) {
     SHIM_LOG("[audio] wire format: S16_LE 2ch 44.1 kHz raw");
 }
 
-/* ========== /dev/fb0 output (system-mode-spike — render game into qemu's
- * GTK window, no host-side subscriber needed). ==========
+/* /dev/fb0 output (system-mode-spike — render game into qemu's GTK window,
+ * no host-side subscriber needed).
  *
  * Gated by SPIKE3_FB0_OUTPUT=1. Lazy-init on first frame: open(/dev/fb0),
  * FBIOGET_VSCREENINFO to learn dims+format, mmap. Each frame: convert
@@ -633,7 +614,6 @@ static void shim_fb0_blit(int src_w, int src_h, const uint8_t *src_rgba) {
     const int bpp   = shim_fb0_bpp;
     const int swap  = shim_fb0_swap_rb;
 
-    /* Same-size 32bpp fast path */
     if (src_w == dst_w && src_h == dst_h && bpp == 4) {
         for (int y = 0; y < dst_h; y++) {
             const uint8_t *s = src_rgba + (size_t)y * (size_t)src_w * 4;
@@ -652,7 +632,6 @@ static void shim_fb0_blit(int src_w, int src_h, const uint8_t *src_rgba) {
         return;
     }
 
-    /* General path: nearest-neighbor scale + format convert. */
     for (int y = 0; y < dst_h; y++) {
         int sy = (y * src_h) / dst_h;
         const uint8_t *srow = src_rgba + (size_t)sy * (size_t)src_w * 4;
@@ -666,7 +645,7 @@ static void shim_fb0_blit(int src_w, int src_h, const uint8_t *src_rgba) {
                 drow[x*4 + 1] = g;
                 drow[x*4 + 2] = swap ? r : b;
                 drow[x*4 + 3] = 0xff;
-            } else { /* bpp == 2 → RGB565 */
+            } else {
                 uint16_t pix = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
                 memcpy(drow + x*2, &pix, 2);
             }

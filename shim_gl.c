@@ -1,8 +1,8 @@
 /*
  * shim_gl.c — OpenGL ES + EGL + GBM surface unified in one source file.
  *
- * Phase 6 of the refactor. Combines three historically-separate subsystems
- * into a single translation unit because they share a lot of state:
+ * Combines three subsystems into a single translation unit because they
+ * share state:
  *
  *   - GBM: fake gbm_device / gbm_bo / gbm_surface objects (so mesa's libgbm
  *     doesnt dereference our handles). Cheap stubs with a tiny per-BO side
@@ -47,8 +47,6 @@
 
 #include "spi_shim.h"
 
-/* ---- Cross-TU plumbing ---- */
-
 /* Exported so shim_bridges.c's frame capture can read the game's most recent
  * draw-FBO binding. Definition still lives with glBindFramebuffer inside
  * this file; extern decls in the other TUs pick it up. */
@@ -62,21 +60,16 @@ void glFramebufferTexture2D(unsigned, unsigned, unsigned, unsigned, int);
 void glFramebufferTextureLayer(unsigned, unsigned, unsigned, int, int);
 void glFramebufferRenderbuffer(unsigned, unsigned, unsigned, unsigned);
 
-/* EGL symbols referenced by eglGetProcAddress' return table. Defined below. */
 void *eglGetPlatformDisplayEXT(unsigned, void *, const int *);
 void *eglGetPlatformDisplay(unsigned, void *, const intptr_t *);
 void *eglCreateImageKHR(void *, void *, unsigned, void *, const int *);
 unsigned eglDestroyImageKHR(void *, void *);
 void glEGLImageTargetTexture2DOES(unsigned, void *);
 
-/* shim_frametex_record is defined in the frametex block below; called from
- * glEGLImageTargetTexture2DOES further down. */
 static void shim_frametex_record(unsigned target, int w, int h);
 
 
-/* ---- Step 58.2: frame capture tracking ----
- *
- * The game presents via DRM MODE_PAGE_FLIP, not eglSwapBuffers, so the
+/* The game presents via DRM MODE_PAGE_FLIP, not eglSwapBuffers, so the
  * capture trigger sits in the DRM ioctl path below. The target is whichever
  * GL texture the game's create_egl_framebuffer bound as an FBO color
  * attachment via glEGLImageTargetTexture2DOES — our override already runs
@@ -84,7 +77,6 @@ static void shim_frametex_record(unsigned target, int w, int h);
  * every texture we touched that way; at page-flip we read from the largest
  * one (assumed to be the main render target). */
 
-/* Forward decl — defined alongside the glBindFramebuffer hook. */
 extern volatile unsigned shim_last_draw_fbo;
 
 #define SHIM_FRAMETEX_MAX 32
@@ -96,12 +88,8 @@ struct shim_frametex {
 static struct shim_frametex shim_frametex[SHIM_FRAMETEX_MAX];
 static int shim_frametex_count = 0;
 static pthread_mutex_t shim_frametex_lock = PTHREAD_MUTEX_INITIALIZER;
-static unsigned shim_capture_fbo = 0;  /* lazily created at first capture */
-/* shim_capture_flip_counter moved to shim_bridges.c alongside the capture
- * function that owns it; shim_capture_fbo stays (was unused, harmless). */
+static unsigned shim_capture_fbo = 0;
 
-/* Upsert {tex_id, target, w, h} into the tracked list. Called from
- * glEGLImageTargetTexture2DOES right after we glTexImage2D'd the storage. */
 static void shim_frametex_record(unsigned target, int w, int h) {
     static void (*real_glGetIntegerv)(unsigned, int*) = NULL;
     if (!real_glGetIntegerv) real_glGetIntegerv = (void(*)(unsigned,int*))
@@ -138,8 +126,7 @@ static void shim_frametex_record(unsigned target, int w, int h) {
     pthread_mutex_unlock(&shim_frametex_lock);
 }
 
-/* ---- Hooked: GBM library functions ----
- * libgbm's real gbm_create_device inspects the DRM fd's driver identity via
+/* libgbm's real gbm_create_device inspects the DRM fd's driver identity via
  * /sys and DRM_IOCTL_VERSION-derived driver-name matching. Our fake DRM fd
  * has no backing /sys entry, so libgbm rejects it with EINVAL. We short-
  * circuit with fake handles so the game's "does GBM work" check succeeds.
@@ -166,10 +153,6 @@ static void *alloc_fake_gbm_object(void) {
     return p;
 }
 
-/* Minimal per-BO side table: track dimensions so gbm_bo_get_width/height/
- * stride/format return what the caller originally requested at create-time.
- * DMD-specific machinery (is_dmd, mapped tracking, frame dump) removed in
- * Step 56 — modern Spike 3 has no physical DMD. */
 #define GBM_BO_TABLE_SIZE   32
 
 struct gbm_bo_entry {
@@ -348,8 +331,7 @@ int gbm_surface_has_free_buffers(void *surface) {
     (void)surface; return 1;
 }
 
-/* ---- Hooked: EGL ----
- * Once gbm_create_device returns our fake handle, mesa's libEGL would
+/* Once gbm_create_device returns our fake handle, mesa's libEGL would
  * dereference it — crash. We intercept the public EGL entry points the
  * game uses (per BN analysis of glWindow::setGlContext) so no mesa code
  * runs against our fake GBM handle. Returns are fake but stable.
@@ -362,8 +344,6 @@ int gbm_surface_has_free_buffers(void *surface) {
 #define FAKE_EGL_IMAGE     ((void *)0x65676c49)  /* "eglI" */
 #define FAKE_EGL_SYNC      ((void *)0x65676c59)  /* "eglY" */
 
-/* EGL constants used in our stubs (from <EGL/egl.h>). Declared locally so
- * the shim doesn't need EGL headers installed. */
 #define EGL_SUCCESS          0x3000
 #define EGL_TRUE             1
 #define EGL_FALSE            0
@@ -377,20 +357,6 @@ int gbm_surface_has_free_buffers(void *surface) {
 #define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
 #define EGL_DEFAULT_DISPLAY          ((void *)0)
 
-/* Under SPIKE3_REAL_GL, translate the game's display query into a form Mesa
- * can actually satisfy on our overlay. Mesa 24.0.9 in surfaceless mode only
- * accepts EGL_PLATFORM_SURFACELESS_MESA (0x31DD) with a NULL native handle.
- * The game asks for EGL_PLATFORM_GBM_KHR (0x31D7) with a fake GBM device.
- * Translation: drop the game's platform/handle, ask Mesa for surfaceless.
- *
- * Fallback chain for resolving the real function:
- *   1. dlsym("eglGetPlatformDisplay[EXT]") — usually works for non-EXT,
- *      returns NULL for EXT (Mesa exports the EXT variant only via
- *      eglGetProcAddress, not as a direct dynamic symbol).
- *   2. dlsym("eglGetPlatformDisplay") — EGL 1.5 core, always exported.
- *   3. dlsym("eglGetDisplay") — EGL 1.0 legacy, last-ditch.
- * If none resolve, fall through to the stub body returning FAKE_EGL_DISPLAY. */
-
 /* Forward decls — defined alongside eglMakeCurrent further down. Captured
  * here so the fallback-pbuffer path at makeCurrent time has something to
  * pass to Mesa's eglCreatePbufferSurface(display, config, ...). */
@@ -398,7 +364,7 @@ extern void *shim_last_real_display;
 extern void *shim_last_real_config;
 extern void *shim_fallback_pbuf;
 
-static void *shim_real_platform_display(unsigned /*unused game-requested*/ platform) {
+static void *shim_real_platform_display(unsigned platform) {
     (void)platform;
     static void *(*real_1_5)(unsigned, void*, const intptr_t*) = NULL;
     if (!real_1_5) real_1_5 = (void *(*)(unsigned, void*, const intptr_t*))
@@ -407,7 +373,7 @@ static void *shim_real_platform_display(unsigned /*unused game-requested*/ platf
         void *d = real_1_5(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
         if (d) {
             SHIM_LOG("  → Mesa real display %p via eglGetPlatformDisplay(SURFACELESS)", d);
-            shim_last_real_display = d;  /* capture for later fallback-pbuffer creation */
+            shim_last_real_display = d;
             return d;
         }
     }
@@ -512,7 +478,6 @@ unsigned eglGetConfigs(void *display, void **configs, int config_size, int *num_
     return EGL_TRUE;
 }
 
-/* Map EGL attribute enum to a short readable name for the diagnostic log. */
 static const char *shim_egl_attr_name(int a) {
     switch (a) {
         case 0x3020: return "BUFFER_SIZE";
@@ -619,7 +584,6 @@ unsigned eglGetConfigAttrib(void *display, void *config, int attribute, int *val
     }
     (void)display; (void)config;
     if (!value) return EGL_FALSE;
-    /* EGL attribute constants from <EGL/egl.h>. */
     switch (attribute) {
     case 0x3020: *value = 32; break;                 /* EGL_BUFFER_SIZE */
     case 0x3021: *value = 8;  break;                 /* EGL_ALPHA_SIZE */
@@ -833,7 +797,7 @@ int eglGetError(void) {
 
 #define SHIM_EGL_IMAGE_MAP_SIZE 128
 static struct shim_egl_image_entry {
-    void    *egl_image;  /* sentinel returned by eglCreateImageKHR */
+    void    *egl_image;
     int      width;
     int      height;
     unsigned fourcc;     /* DRM FOURCC from EGL_LINUX_DRM_FOURCC_EXT */
@@ -948,7 +912,6 @@ void glEGLImageTargetTexture2DOES(unsigned target, void *image) {
     real_glTexImage2D(target, 0, 0x8058, w, h, 0, 0x1908, 0x1401, NULL);
     SHIM_LOG("glEGLImageTargetTexture2DOES(target=0x%x, image=%p) -> glTexImage2D %dx%d RGBA8",
              target, image, w, h);
-    /* Register for frame capture at MODE_PAGE_FLIP. */
     shim_frametex_record(target, w, h);
 }
 
@@ -967,13 +930,11 @@ static int stub_eglClientWaitSyncKHR(void *display, void *sync, int flags, uint6
     return 0x30F6;  /* EGL_CONDITION_SATISFIED_KHR */
 }
 
-/* ---- Hooked: GLES 3.x ----
- *
- * Two modes, selected by SPIKE3_REAL_GL env var (Step 56):
+/* Two modes, selected by SPIKE3_REAL_GL env var:
  *
  * 1. Unset (default): pure no-op stubs. Game's rendering calls all succeed
- *    with plausible values, no actual rendering happens. Used for all of
- *    Steps 1-55 — reaching steady state without needing a real GL stack.
+ *    with plausible values, no actual rendering happens — reaching steady
+ *    state without needing a real GL stack.
  *    - glGen* returns an incrementing handle
  *    - glGetShaderiv/glGetProgramiv return GL_TRUE for COMPILE_STATUS /
  *      LINK_STATUS
@@ -984,7 +945,7 @@ static int stub_eglClientWaitSyncKHR(void *display, void *sync, int flags, uint6
  * 2. Set: each stub forwards to the real Mesa implementation via
  *    dlsym(RTLD_NEXT, ...) (cached per-function). Expects the Mesa overlay
  *    at mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/ to be on
- *    LD_LIBRARY_PATH. See _emulation/docs/PROTOCOL.md §2 "Run the game".
+ *    LD_LIBRARY_PATH.
  */
 
 #define GL_NO_ERROR              0
@@ -1026,8 +987,6 @@ static int gl_log_budget_state         = 40;
         SHIM_LOG("GL " fmt, ##__VA_ARGS__); \
     } \
 } while (0)
-
-/* --- Query / error --- */
 
 unsigned glGetError(void) {
     FWD_RET(unsigned, glGetError, (void), ());
@@ -1113,8 +1072,6 @@ void glGetBooleanv(unsigned pname, unsigned char *params) {
     (void)pname;
 }
 
-/* --- Object creation --- */
-
 void glGenTextures(int n, unsigned *out) {
     FWD_VOID(glGenTextures, (int, unsigned*), (n, out));
     for (int i = 0; i < n; i++) out[i] = gl_next_tex_id++;
@@ -1133,8 +1090,6 @@ void glDeleteBuffers(int n, const unsigned *ids) {
     FWD_VOID(glDeleteBuffers, (int, const unsigned*), (n, ids));
     (void)n; (void)ids;
 }
-/* Step 58 debug: prove which FBO/texture paths the game actually exercises.
- * Each of these hooks logs its first few invocations then falls silent. */
 #define SHIM_GL_DBG_HOOK(NAME) \
     do { static uint64_t _c = 0; \
          if (__builtin_expect(is_real_gl(), 0) && ++_c <= 4) \
@@ -1191,8 +1146,6 @@ void glDeleteProgram(unsigned program) {
     (void)program;
 }
 
-/* --- Binding --- */
-
 void glBindTexture(unsigned target, unsigned tex) {
     FWD_VOID(glBindTexture, (unsigned, unsigned), (target, tex));
     (void)target; (void)tex;
@@ -1236,8 +1189,6 @@ void glActiveTexture(unsigned tex) {
     FWD_VOID(glActiveTexture, (unsigned), (tex));
     (void)tex;
 }
-
-/* --- Texture data / params --- */
 
 void glTexImage2D(unsigned target, int level, int internalfmt,
                   int w, int h, int border, unsigned format, unsigned type,
@@ -1292,8 +1243,6 @@ void glGenerateMipmap(unsigned target) {
     (void)target;
 }
 
-/* --- Buffer data --- */
-
 void glBufferData(unsigned target, intptr_t size, const void *data, unsigned usage) {
     FWD_VOID(glBufferData, (unsigned, intptr_t, const void*, unsigned),
              (target, size, data, usage));
@@ -1313,8 +1262,6 @@ unsigned char glUnmapBuffer(unsigned target) {
     FWD_RET(unsigned char, glUnmapBuffer, (unsigned), (target));
     (void)target; return GL_TRUE;
 }
-
-/* --- Shader --- */
 
 void glShaderSource(unsigned shader, int count, const char *const *string, const int *length) {
     FWD_VOID(glShaderSource, (unsigned, int, const char* const*, const int*),
@@ -1462,7 +1409,6 @@ void glUniformMatrix4fv(int loc, int count, unsigned char trans, const float *v)
     (void)loc; (void)count; (void)trans; (void)v;
 }
 
-/* Vertex attribs */
 void glVertexAttribPointer(unsigned idx, int size, unsigned type, unsigned char norm,
                            int stride, const void *ptr) {
     FWD_VOID(glVertexAttribPointer,
@@ -1478,8 +1424,6 @@ void glDisableVertexAttribArray(unsigned idx) {
     FWD_VOID(glDisableVertexAttribArray, (unsigned), (idx));
     (void)idx;
 }
-
-/* --- Framebuffer --- */
 
 void glFramebufferTexture2D(unsigned target, unsigned att, unsigned ttarget,
                             unsigned tex, int level) {
@@ -1522,8 +1466,6 @@ unsigned glCheckFramebufferStatus(unsigned target) {
     FWD_RET(unsigned, glCheckFramebufferStatus, (unsigned), (target));
     (void)target; return GL_FRAMEBUFFER_COMPLETE;
 }
-
-/* --- State --- */
 
 void glEnable(unsigned cap) {
     FWD_VOID(glEnable, (unsigned), (cap));
@@ -1628,8 +1570,6 @@ void glClear(unsigned mask) {
     (void)mask;
 }
 
-/* --- Draw --- */
-
 void glDrawArrays(unsigned mode, int first, int count) {
     SHIM_GL_DBG_HOOK(glDrawArrays);
     FWD_VOID(glDrawArrays, (unsigned, int, int), (mode, first, count));
@@ -1657,8 +1597,6 @@ void glVertexAttribDivisor(unsigned idx, unsigned divisor) {
     (void)idx; (void)divisor;
 }
 
-/* --- Sync --- */
-
 void glFinish(void) {
     FWD_VOID(glFinish, (void), ());
 }
@@ -1671,8 +1609,6 @@ void glReadPixels(int x, int y, int w, int h, unsigned fmt, unsigned type, void 
     (void)x; (void)y; (void)fmt; (void)type;
     if (data) memset(data, 0, (size_t)w * (size_t)h * 4);
 }
-
-/* --- end GL stubs --- */
 
 typedef void (*pfn_t)(void);
 
@@ -1688,8 +1624,6 @@ void (*eglGetProcAddress(const char *name))(void) {
      * dlsym(RTLD_NEXT, name) — every unstubbed extension is one we have
      * not proven fake-handle-safe. Names match BN's reading of
      * glWindow::setGlContext (KHR image/sync + GL_OES_EGL_image). */
-    /* Forward decls so we can put core-GL symbols in the table. Bodies are
-     * exported top-level functions elsewhere in this file. */
     extern void glFramebufferTexture2D(unsigned, unsigned, unsigned, unsigned, int);
     extern void glFramebufferTextureLayer(unsigned, unsigned, unsigned, int, int);
     extern void glFramebufferRenderbuffer(unsigned, unsigned, unsigned, unsigned);

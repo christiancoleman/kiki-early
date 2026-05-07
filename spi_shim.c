@@ -49,19 +49,16 @@ extern int mkdir(const char *, unsigned int);
 #include "spi_shim.h"
 #include "shim_discovery.h"
 
-/* ---- Path remapping: moved to shim_fs.c in Phase 5. ---- */
-
-/* ---- SPIKE3_REAL_GL env gate (Step 56) ----
+/* SPIKE3_REAL_GL env gate. When set (any non-empty value), the shim's
+ * EGL/GBM/GLES interceptors forward to the real library via dlsym(RTLD_NEXT,
+ * ...) instead of returning fake-success stubs. Let Mesa's real pipeline do
+ * the rendering.
  *
- * When set (any non-empty value), the shim's EGL/GBM/GLES interceptors
- * forward to the real library via dlsym(RTLD_NEXT, ...) instead of returning
- * fake-success stubs. Let Mesa's real pipeline do the rendering.
- *
- * Unset (default): preserves the Step 54 behavior — every interceptor is a
- * stub that returns plausible values, no Mesa ever runs. The bridge, switch,
- * UART, DRM-socketpair, ALSA, pthread_create, memcpy NULL-guard, system()
- * openocd block, /tmp/cache mkdir, shim_dump_* diagnostics all stay on
- * regardless of this flag — they are orthogonal to rendering.
+ * Unset (default): every interceptor is a stub that returns plausible values,
+ * no Mesa ever runs. The bridge, switch, UART, DRM-socketpair, ALSA,
+ * pthread_create, memcpy NULL-guard, system() openocd block, /tmp/cache
+ * mkdir, shim_dump_* diagnostics all stay on regardless of this flag — they
+ * are orthogonal to rendering.
  */
 static int spike3_real_gl_cached = -1;
 int is_real_gl(void) {
@@ -72,18 +69,14 @@ int is_real_gl(void) {
     return spike3_real_gl_cached;
 }
 
-/* SHIM_LOG and FWD_{RET,VOID}{,_V} macros moved to spi_shim.h — they're
- * used at 200+ sites across what will become multiple translation units. */
-
-/* ---- Step 59: dlopen/dlsym interception for dynamically-loaded libEGL ----
+/* dlopen/dlsym interception for dynamically-loaded libEGL.
  *
  * The game resolves key EGL/GLES symbols (eglCreateImageKHR,
  * glEGLImageTargetTexture2DOES, eglCreateContext) by dlopen'ing
  * libEGL.so.1 / libGLESv2.so.2 / libgbm.so.1 and dlsym'ing from the
  * returned handles. LD_PRELOAD doesn't intercept those handle-specific
  * lookups — only calls routed through the global PLT/GOT chain hit our
- * shim. Step 58's FWD trace was silent on eglCreateContext /
- * eglCreateImageKHR for exactly this reason.
+ * shim.
  *
  * We intercept dlopen to record handles for the three libraries of
  * interest, and intercept dlsym so that lookups against those handles
@@ -182,7 +175,6 @@ void *dlsym(void *handle, const char *symbol) {
             SHIM_LOG("[dlsym intercept] glEGLImageTargetTexture2DOES -> shim override");
             return (void*)glEGLImageTargetTexture2DOES;
         }
-        /* Log once per miss so we know what else the game is asking for. */
         SHIM_LOG("[dlsym] tracked handle %p wants %s (passthrough)", handle, symbol);
     }
     return real(handle, symbol);
@@ -191,9 +183,7 @@ void *dlsym(void *handle, const char *symbol) {
 
 
 
-/* ---- Fake fd assignments ----
- *
- * SPI and I2C are pure fake fds — all traffic is via ioctl(), which we
+/* SPI and I2C are pure fake fds — all traffic is via ioctl(), which we
  * intercept; read/write never happen on them, so no real fd is needed.
  *
  * UART is DIFFERENT. The game's bridge thread writes request frames and
@@ -213,8 +203,7 @@ void *dlsym(void *handle, const char *symbol) {
  * spi_shim.h (so shim_io.c + shim_ioctl.c can range-check fds). DRM and UART
  * use real socketpair fds; is_drm_fd() / is_uart_fd() predicates check them. */
 
-/* ---- V4L2 stub fds (Step 46) ----
- * libavcodec's v4l2_request HEVC decoder respects LIBVA_V4L2_REQUEST_MEDIA_PATH
+/* V4L2 stub fds. libavcodec's v4l2_request HEVC decoder respects LIBVA_V4L2_REQUEST_MEDIA_PATH
  * and LIBVA_V4L2_REQUEST_VIDEO_PATH env vars. We set both at run time to
  * these sentinel paths and intercept the open — no /dev/media0 on the host
  * means we must provide our own fake device. Path sentinels stay here
@@ -226,16 +215,13 @@ int      v4l2_video_active = 0;
 int      boot_display_active = 0;
 uint32_t v4l2_ioctl_count = 0;
 
-/* ---- GPIO sysfs stubs (Step 63) ----
- * The game uses legacy /sys/class/gpio/{export,gpio25/direction,gpio25/value}
+/* GPIO sysfs stubs. The game uses legacy /sys/class/gpio/{export,gpio25/direction,gpio25/value}
  * to bit-bang chip-select (or an interrupt line) for a SPI peripheral. Under
  * qemu-user the host's sysfs either has no gpio class or is not writable,
  * so the game sees EACCES on export and spins in a retry loop (687 failures
  * in a 185s run). We present each sysfs path as a small fake fd that swallows
  * writes and feeds back plausible reads ("0\n" for value, "out\n" for
  * direction). One fd per open() — the game re-opens on every poll. */
-
-/* ---- Device state ---- */
 
 int      spi_active = 0;
 int      i2c_active = 0;
@@ -249,13 +235,7 @@ uint32_t i2c_ioctl_count = 0;
 uint32_t uart_read_count = 0;
 uint32_t uart_write_count = 0;
 
-/* Predicates exported via spi_shim.h — called from shim_io.c, shim_ioctl.c,
- * and the termios hooks still in this file. */
 int is_drm_fd(int fd) { return drm_game_fd >= 0 && fd == drm_game_fd; }
-
-/* SHIM_LOG moved up to just after the macros — see the early definition. */
-
-/* ---- Real function pointers ---- */
 
 typedef int (*real_open_t)(const char *, int, ...);
 typedef int (*real_close_t)(int);
@@ -269,9 +249,7 @@ real_ioctl_t real_ioctl = NULL;   /* used by ioctl() hook in shim_ioctl.c */
 real_read_t  real_read  = NULL;   /* used by read() hook in shim_io.c */
 real_write_t real_write = NULL;   /* used by shim_nodebus.c + shim_io.c write() + shim_ioctl.c flip event */
 
-/* ---- Shim directory init ----
- *
- * Audio capture (_emulation/captures/audio/stream.s16le) is the only
+/* Audio capture (_emulation/captures/audio/stream.s16le) is the only
  * data-capture pipeline still in use — texture/shader/DMD capture was
  * removed in Step 56 (capture_hooks_note in README.md documents how to
  * restore them if ever needed)
@@ -292,24 +270,6 @@ static void shim_init_dirs(void) {
     mkdir("_emulation/captures/audio", 0755);
     mkdir("/tmp/cache",                0755);
 }
-
-
-/* ---- Pokémon LE switch manifest (Phase 9) moved to shim_inject.c ---- */
-
-/* ---- Event-sweep machinery (Phase 9) moved to shim_inject.c ----
- * Includes the sigjmp_buf / shim_event_fire_in_progress /
- * shim_current_sweep_event_id globals whose externs are declared
- * in spi_shim.h. */
-
-
-
-/* ---- Poke threads (Phase 9) moved to shim_inject.c ---- */
-
-/* ---- Patches (Phase 8) + injection threads (Phase 9) carved out ----
- * Runtime patches + libavcodec entry-point hooks live in shim_patches.c.
- * Env-gated worker threads, the event-sweep machinery, and the SIGALRM
- * handler live in shim_inject.c. See spi_shim.h for the two public entry
- * points (shim_event_sweep, shim_inject_start). */
 
 /* SIGTRAP handler — every brk that fires in the game lands here.
  *
@@ -372,7 +332,7 @@ static void shim_install_crash_handler(void) {
     sigaction(SIGTERM, &sa2, NULL);
     sigaction(SIGINT,  &sa2, NULL);
     sigaction(SIGUSR1, &sa2, NULL);
-    sigaction(SIGUSR2, &sa2, NULL);  /* Step 52: event sweep (signal path, usually swallowed by qemu) */
+    sigaction(SIGUSR2, &sa2, NULL);  /* event sweep (signal path, usually swallowed by qemu) */
 
     /* SIGTRAP handler — log PC + advance past the 4-byte brk + continue.
      * The game evidently has at least one brk site that doesn't kill on
@@ -399,9 +359,6 @@ static void shim_install_crash_handler(void) {
     /* Optional audio bridge — snd_pcm_writei → AF_UNIX raw stream (SPIKE3_AUDIO_BRIDGE=1). */
     shim_audio_start();
 
-    /* SIGALRM handler, main-thread SIGALRM block, and the six env-gated
-     * worker threads (sweep timer, switch firing, gstreamer force-init,
-     * cmode poke, state-flag poke, vp-patch) — all live in shim_inject.c. */
     shim_inject_start();
 }
 
@@ -414,8 +371,6 @@ void resolve_all(void) {
     if (!real_write) real_write = (real_write_t)dlsym(RTLD_NEXT, "write");
 }
 
-
-/* ---- Check if path is a device we intercept, return fake fd or 0 ---- */
 
 int intercept_device(const char *pathname) {
     if (!pathname) return 0;
@@ -525,8 +480,7 @@ int is_uart_fd(int fd) {
 }
 
 
-/* ---- Hooked: system ----
- * sub_d19580 shells out to `openocd ...` to flash the RP2040 netbridge if the
+/* sub_d19580 shells out to `openocd ...` to flash the RP2040 netbridge if the
  * CRC check fails. Under emulation there is no real RP2040; blocking the
  * openocd invocation (returning success) prevents the game from erroring out
  * on programming failure and lets init continue. The thread-ready flag
@@ -552,26 +506,19 @@ int system(const char *cmd) {
 }
 
 
-/* ---- Hooked: pthread_create (force inherit-sched) ----
- * The game spawns at least one worker thread with explicit SCHED_RR
- * attributes (seen in strace: `sched_setscheduler(3614, 2, ...) = EPERM`).
- * Under QEMU user-mode running as a regular user we lack CAP_SYS_NICE AND
- * ulimit -r is 0 (RT priority disabled at the kernel level). glibc's
- * pthread_create, when its internal setup-handshake call to
- * sched_setscheduler fails, signals the suspended child to exit WITHOUT
- * running its entry function. That thread was the dispatch-subsystem
- * worker whose code path ultimately sets `data_4882108` to 1 — the flag
- * polled by the orchestrator `sub_a78bc0` (file 0x678bc0) in a 480-iter
- * × 250 ms loop. Flag never gets set → orchestrator loops forever.
+/* pthread_create force inherit-sched. The game spawns worker threads with
+ * explicit SCHED_RR attributes; under QEMU user-mode running as a regular
+ * user we lack CAP_SYS_NICE. glibc's pthread_create signals the suspended
+ * child to exit WITHOUT running its entry function when its internal
+ * sched_setscheduler call fails.
  *
  * glibc uses INTERNAL_SYSCALL_CALL for sched_setscheduler inside
  * pthread_create, which bypasses LD_PRELOAD on the public wrapper (same
  * INLINE_SYSCALL pattern as access/stat). So we hook pthread_create itself:
- * if the caller passed an attr with PTHREAD_EXPLICIT_SCHED, copy it,
- * force PTHREAD_INHERIT_SCHED on the copy, and pass the copy through.
- * The child then inherits the parent's scheduling (SCHED_OTHER) — no
- * privileged syscall involved. Priority differences don't matter under
- * QEMU user-mode emulation anyway.
+ * if the caller passed an attr with PTHREAD_EXPLICIT_SCHED, copy it, force
+ * PTHREAD_INHERIT_SCHED on the copy, and pass the copy through. The child
+ * inherits parent SCHED_OTHER — no privileged syscall involved. Priority
+ * differences don't matter under QEMU user-mode emulation anyway.
  */
 
 typedef int (*real_pthread_create_t)(pthread_t *, const pthread_attr_t *,
@@ -599,9 +546,8 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 
 
 
-/* ---- Hooked: libasound (ALSA) ----
- *
- * Game has no fallback — under QEMU user-mode with no /dev/snd devices, the
+/* libasound (ALSA): game has no fallback — under QEMU user-mode with no
+ * /dev/snd devices, the
  * real `snd_pcm_open` fails, and although the game *does* check the
  * return code (BN: `alsa_pcm_init` at `0xce61e0` tests bit 31 at
  * `0xce6270`, jumps to error-7 path), it still crashes later when the
@@ -609,7 +555,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
  * every ALSA call so the audio thread runs, and capture the PCM
  * stream via `snd_pcm_writei`.
  *
- * Audio format (BN confirmed Step 25.6 research):
+ * Audio format:
  *   44100 Hz, 2 channels, S16_LE, interleaved. Default buffer = 2048
  *   frames = 8192 bytes = 46.4 ms. The audio thread is a tight loop
  *   around `snd_pcm_writei` with no sleep — if our stub returns
@@ -686,7 +632,6 @@ int snd_pcm_hw_params_get_rate(const void *params, unsigned *val, int *dir) {
 /* Return type is snd_pcm_sframes_t (signed long) — see alsa-lib. */
 long snd_pcm_writei(void *pcm, const void *buffer, unsigned long size) {
     (void)pcm;
-    /* Append the raw S16_LE interleaved buffer to the session stream. */
     if (buffer && size > 0) {
         size_t bytes = (size_t)size * 4; /* stereo × 2 bytes = 4 B/frame */
         pthread_mutex_lock(&alsa_capture_lock);
@@ -723,8 +668,7 @@ long snd_pcm_writei(void *pcm, const void *buffer, unsigned long size) {
 
 
 
-/* ---- Hooked: termios wrappers ----
- * glibc's tcsetattr / tcgetattr / tcflush / tcflow / tcdrain / tcsendbreak
+/* termios wrappers. glibc's tcsetattr / tcgetattr / tcflush / tcflow / tcdrain / tcsendbreak
  * use INLINE_SYSCALL to invoke the ioctl(TCSETS/TCGETS/TCFLSH/...) syscall
  * DIRECTLY, bypassing the libc ioctl() wrapper. Our LD_PRELOAD of ioctl()
  * therefore never fires for these calls — same bug class as access() /
@@ -736,7 +680,6 @@ long snd_pcm_writei(void *pcm, const void *buffer, unsigned long size) {
  * our fake UART fd; pass through to real functions for everything else.
  */
 
-/* ---- Diagnostic: log errno at perror() call site ---- */
 void perror(const char *s) {
     typedef void (*fn_t)(const char *);
     static fn_t real_fn = NULL;
@@ -838,39 +781,18 @@ int tcsendbreak(int fd, int duration) {
 
 
 
-/* ---- Runtime patches moved to shim_patches.c (Phase 8) ----
- * memcpy NULL-guard, libavcodec HW-accel bypass, dummy-frame injection.
- * See shim_patches.c's header comment for the full rationale. */
-
-/* ---- Step 53: GStreamer interception (passthrough + logging) ----------
- *
- * Goal: observe the game's GStreamer pipeline construction so we can
- * later redirect the sink element to appsink and route frames to a host-
- * renderable surface. This pass is OBSERVATION ONLY — every call falls
- * through to the real libgstreamer-1.0 after logging.
- *
- * Element creation:
- *   gst_element_factory_make(factory, name)
- *   gst_parse_launch(description, err)
- *
- * Pipeline assembly:
- *   gst_bin_add, gst_bin_add_many
- *   gst_element_link, gst_element_link_many
- *
- * Lifecycle:
- *   gst_element_set_state
- *
- * We also hook gst_init_check so we can confirm gstreamer initialises
- * cleanly under QEMU+sysroot (the gstreamer plugins live at
- * <sysroot>/usr/lib64/gstreamer-1.0/ — 36 plugins inc. libgstkms.so,
- * libgstapp.so, libgstisomp4.so, libgstvideoconvertscale.so).
+/* GStreamer interception (passthrough + logging). Every call falls through
+ * to the real libgstreamer-1.0 after logging. Hooks:
+ *   gst_element_factory_make, gst_parse_launch       (element creation)
+ *   gst_bin_add, gst_bin_add_many,
+ *   gst_element_link, gst_element_link_many          (pipeline assembly)
+ *   gst_element_set_state                            (lifecycle)
+ *   gst_init_check                                   (init verification)
  *
  * GStreamer opaque types are referenced as void* to avoid needing gst
- * headers in the shim build. The ABI is stable — enums are ints,
- * handles are pointers.
- * ------------------------------------------------------------------------ */
-
-typedef void (*real_gst_element_factory_make_t)(void);  /* placeholder; see below */
+ * headers in the shim build. The ABI is stable — enums are ints, handles
+ * are pointers.
+ */
 
 /* Real function pointers resolved lazily via dlsym(RTLD_NEXT). */
 static void *(*real_gst_element_factory_make)(const char *, const char *) = NULL;
@@ -941,7 +863,6 @@ void *gst_element_factory_make(const char *factory, const char *name) {
     void *r = real_gst_element_factory_make(factory, name);
     gst_factory_make_count++;
 
-    /* Flag sinks and decoders — we care most about those. */
     int is_sink = factory && strstr(factory, "sink") != NULL;
     int is_dec  = factory && (strstr(factory, "dec") != NULL ||
                               strstr(factory, "parse") != NULL);
@@ -1015,7 +936,6 @@ int gst_element_link(void *src, void *dest) {
     return r;
 }
 
-/* Variadic link_many — chain-links each neighbour pair. */
 int gst_element_link_many(void *first, void *second, ...) {
     if (!first || !second) return 0;
     if (!gst_element_link(first, second)) return 0;
