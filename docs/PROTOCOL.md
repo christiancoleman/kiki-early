@@ -35,7 +35,7 @@ Run the **Pokémon LE 0.81.0** game binary, an ARM aarch64 ELF originally writte
 
 ### Asset stores
 
-The game has **two independent asset containers**. Knowing which holds what is essential before searching:
+The game has **two independent asset containers**:
 
 | Store | Path | Size | Holds |
 |---|---|---|---|
@@ -56,14 +56,14 @@ Some categories live elsewhere on the filesystem (Radium scenes in `assets/lcd/`
 - Stern's audio pipeline (ALSA + sound-event registration)
 - Hardware shim coverage (DRM/GBM/EGL/GLES/V4L2/GPIO/ALSA/fontconfig)
 
-**Out of scope** for active investigation (Pokémon-port glue specific to this title's Godot bridge, per the 2026-05-02 directional pivot):
+**Out of scope** for active investigation (Pokémon-port glue specific to this title's Godot bridge):
 - `VideoPlayerSpi` `is_inside_tree()` errors and related vtable assertions
 - `ManualGodotScene`, `PokemonGodotScene`, `godot_switch_scene`
 - `GodotRenderer` pre-warm cycles
 - `/tmp/godot_logs` content
 - `./assets/godot/main.pck` internal structure beyond "this is the Godot PCK"
 
-The acid test: this emulator should boot **Star Wars LE 0.85.0** identically to PLE 0.81 because both run the same Stern Radium attract pipeline. SW LE has zero Godot — if our emulator can't get it to attract, the bug is in shared shim/node-bus code. See §13.
+**Star Wars LE 0.85.0** is the parity test target. It has zero Godot and runs the same Stern Radium attract pipeline as PLE 0.81. A SW-LE-to-attract failure points at shared shim/node-bus code rather than Pokémon-port glue. See §13.
 
 ---
 
@@ -158,7 +158,7 @@ After setup, `/games`, `/connectivity`, `/data` are kernel-resolved into the sys
 
 The script sources `$SYSROOT/etc/init.d/shared` and propagates every var via qemu's `-E` flag, exactly as real hardware would inherit them through init. The shim's `remap_path` then translates absolute paths like `/games/pokemon_le/...` to `$SYSROOT/games/pokemon_le/...` on every `open()`. One override applied: `BOOT_DISPLAY` is forced to `$GAMES_PATH/spike3/bin/boot_display` because the shared script's `[ -x ]` check runs on the host filesystem and would otherwise fall back to the wrong path.
 
-*Verified by:* `_emulation/run_game.sh` lines 187-209.
+*Verified by:* `_emulation/run_game.sh` source.
 
 ## 3. Boot sequence (host + game)
 
@@ -1143,7 +1143,7 @@ Game-side functions:
 
 #### Failure mode under un-shimmed QEMU
 
-Game calls `snd_pcm_open` which returns nonzero error (no `/dev/snd/*` in qemu-user-mode), ignores the return code, then calls `snd_pcm_prepare` with the uninitialized PCM pointer. Glibc's `snd_pcm_prepare` asserts `pcm != NULL` at `pcm.c:1239` and aborts. The shim's full ALSA stub (below) prevents this.
+Game calls `snd_pcm_open` which returns nonzero error (no `/dev/snd/*` in qemu-user-mode), ignores the return code, then calls `snd_pcm_prepare` with the uninitialized PCM pointer. Glibc's `snd_pcm_prepare` asserts `pcm != NULL` and aborts. The shim's full ALSA stub (below) prevents this.
 
 *Verified by:* direct observation of un-shimmed run (Step 25); BN decompile of `alsa_pcm_init` and `alsa_audio_thread`.
 
@@ -1748,21 +1748,21 @@ The game's HEVC video decode path is intercepted in-shim and routed to a host-si
 - `AVPacket`: `pts=8`, `dts=16`, `data=24`, `size=32`, `flags=40`
 - `AVFrame`: `data[8]=0`, `linesize[8]=64`, `width=104`, `height=108`, `format=116`, `pts=136`, `pkt_dts=144`
 
-**No SW fallback.** When the daemon is unreachable, `avcodec_send_packet` and `avcodec_receive_frame` return `-EIO` directly with a rate-limited `[forward unreachable; SW fallback removed]` log line. The game's own error handling SIGABRTs at `SpiVideoStreamDecoderBase.cpp:1830`.
+When the daemon is unreachable, `avcodec_send_packet` / `avcodec_receive_frame` return `-EIO` and the game raises `SIGABRT` from `SpiVideoStreamDecoderBase`.
 
-*Verified by:* JOURNAL Step 85 (2026-05-06) — daemon round-trip 49 fps NVDEC against `Lake_01_22_26_h265.mp4` (1940×1100, extradata=2490B); real game run `runs/2026-05-06T12.45.39_hw_refactor` shows 449/551 frame/EAGAIN ratio across 1000 `avcodec_receive_frame` calls and zero `[forward unreachable]` log lines. Original implementation in JOURNAL Step 73b (2026-04-30); restoration after `efba162` deletion in Step 85.
+*Verified by:* JOURNAL Step 85 — daemon round-trip 49 fps NVDEC against `Lake_01_22_26_h265.mp4` (1940×1100, extradata=2490B); real game run `runs/2026-05-06T12.45.39_hw_refactor` shows 449/551 frame/EAGAIN ratio across 1000 `avcodec_receive_frame` calls.
 
 ### Runtime binary patches (`shim_patches.c`)
 
 | Patch | Gate | Target |
 |---|---|---|
 | memcpy NULL-guard | always on | silently no-op when src/dst NULL — fixes Godot DisplayRenderer thread crash on un-initialized TLS |
-| `avcodec_find_decoder_by_name` remap | `SPIKE3_DECODER_PATCH=1` (default-on) | `"hevc_v4l2request"` / `"hevc_v4l2m2m"` → `"hevc"`. Defense-in-depth — under the bridge-active flow the game's lookup goes through codec_id, so this hook does not fire on real game runs |
-| `get_format` callback NOP | `SPIKE3_DECODER_PATCH=1` (default-on) | NOP the `b.ne 0x920ce0` instruction at game VA `0x920cf0` (`0x54ffff81` → `0xd503201f`). Without it, `get_format` loops looking for `AV_PIX_FMT_DRM_PRIME` (0xb3) and, finding nothing, fails `avcodec_open2` → game SIGABRTs at `SpiVideoStreamDecoderBase.cpp:1830`. Patched by `shim_patch_get_format_callback @ shim_patches.c:148-198`, called from `shim_inject.c::shim_discovery_init_thread` after the existing 2 s base-resolution sleep |
+| `avcodec_find_decoder_by_name` remap | `SPIKE3_DECODER_PATCH=1` (default-on) | `"hevc_v4l2request"` / `"hevc_v4l2m2m"` → `"hevc"` |
+| `get_format` callback NOP | `SPIKE3_DECODER_PATCH=1` (default-on) | At game VA `0x920cf0`, write `0xd503201f` (NOP) over `0x54ffff81` (`b.ne 0x920ce0`). Patched by `shim_patch_get_format_callback`, called from `shim_inject.c::shim_discovery_init_thread` after a 2 s sleep |
 
 In addition to the gated patches above, `shim_patches.c` installs:
 - **Passthrough hooks** for `avcodec_get_hw_config` and `av_hwdevice_ctx_create` — resolve via `dlvsym`, log call activity, forward to real libavcodec.
-- **Forward-decode interceptors** for `avcodec_send_packet` / `avcodec_receive_frame` — route to the host daemon via `shim_avforward.c` when `SPIKE3_FORWARD_DECODE=1` (default-on). Bridge unreachable returns `-EIO` (no in-VM SW HEVC fallback). See "Forward-decode bridge" above.
+- **Forward-decode interceptors** for `avcodec_send_packet` / `avcodec_receive_frame` — route to the host daemon via `shim_avforward.c` when `SPIKE3_FORWARD_DECODE=1` (default-on). Bridge unreachable returns `-EIO`. See "Forward-decode bridge" above.
 
 ### Other hooks (in `spi_shim.c` + `shim_net.c`)
 
