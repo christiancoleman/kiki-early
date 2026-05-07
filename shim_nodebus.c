@@ -63,34 +63,51 @@ extern real_write_t real_write;
  */
 static uint8_t nodebus_cipher_keys[32][16] = {{0}};
 
-/* Experimental cmd-0x41 inner-cmd response synthesis. Off by default — set
- * NODEBUS_SYNTH_FE=1 in the environment to enable. The shim will then emit a
- * bridge response for fe_probe traffic (decoded inner_cmd 0xFE / 0xFA) instead
- * of letting the game time out.
- *
- * Step 45 lesson stands: zero-length ACKs regressed progress. This response is
- * a STRUCTURED "node not present" payload — byte 0 has its high bit clear
- * (game reads that as "no node"), all other bytes zero. var_34 (the chip-ID
- * field at response offset 4) reads zero, which doesn't match any of the 28
- * mcp_lpc_chip_vtable entries — so the game falls through to the default at
- * data_42317a0 (NULL fps), exactly as it does today on timeout.
- *
- * Goal: shave the ~300ms-per-slot timeout by short-circuiting fe_probe with a
- * known-shape response, and confirm wire framing assumptions are right before
- * we attempt anything more interesting (claiming a specific chip type).
- *
- * We resolve the env var lazily on first cmd-0x41 frame so an unset shim
- * stays silent. Set once, stays cached for the process lifetime. */
-static int nodebus_synth_fe_state = -1;  /* -1 = unresolved, 0 = off, 1 = on */
-static int nodebus_synth_fe_enabled(void) {
-    if (nodebus_synth_fe_state == -1) {
-        const char *v = getenv("NODEBUS_SYNTH_FE");
-        nodebus_synth_fe_state = (v && v[0] && v[0] != '0') ? 1 : 0;
-        SHIM_LOG("nodebus: NODEBUS_SYNTH_FE=%s (env %s)",
-                 nodebus_synth_fe_state ? "ENABLED" : "disabled",
-                 v ? v : "<unset>");
+/* Per-response delay before sending a synthetic cipher reply. Without it the
+ * game races past Godot/Radium init (Step 45 "timeout is progress" — the path
+ * that worked relied on the wall-clock pause from real-hardware timeouts, not
+ * on the response shape). 200ms matches what's needed in practice. */
+#define NODEBUS_SYNTH_DELAY_US 200000
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+static uint32_t nodebus_chip_id_for_slot(uint8_t slot) {
+    switch (slot) {
+        case 0:  return 0x00140040u;  /* LPC1124_303 — CPU bridge */
+        case 4:  return 0x00140040u;  /* LPC1124_303 — QR reader */
+        case 8:  return 0x3D01402Bu;  /* LPC1313 — Core Driver Lower */
+        case 9:  return 0x3D01402Bu;  /* LPC1313 — Core Driver Upper */
+        case 10: return 0x3D01402Bu;  /* LPC1313 — SPI Node Board */
+        default: return 0x041E502Bu;  /* LPC1111_101 — default */
     }
-    return nodebus_synth_fe_state;
 }
 
 /* Bridge response synthesis (parsed by netbridge.elf send_bridge_message_with_response
@@ -649,25 +666,30 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             }
         }
 
-        /* fe_probe synthesis. Behind NODEBUS_SYNTH_FE env flag.
+        /* fe_probe synthesis (inner_cmd=0xFE).
          *
-         * The polling traffic that times out is mcp_nodebus_send_cmd_fe_probe_unsure
-         * sending cmd 0xFE (ilen=1) and 0xFA (ilen=2) for every slot — these
-         * are chip-identification probes. The hint byte sits at request payload
-         * offset (2 + ilen), in cleartext (per the no-encryption point above).
-         * Game's `mcp_nodebus_send_encrypted` reads `arg1[ilen+2]` and adds 2;
-         * if non-zero it expects a response of `hint` bytes (memcpy size).
+         * Polling traffic that times out is mcp_nodebus_send_cmd_fe_probe_unsure.
+         * cleartext hint at payload[2+inner_len]; game expects exactly `hint`
+         * bytes back per memcpy in mcp_nodebus_send_encrypted.
          *
          * Response framing per netbridge HOST_Update case 0x21:
          *   [STX][0x41][id][hint bytes payload][bridge_csum][ETX]
-         *   - first (hint - 1) bytes = data the node would have produced
+         *   - first (hint - 1) bytes = node data
          *   - last byte = bridgeStatus
          *
-         * For "no node present" semantics: all-zero payload (incl. final
-         * bridgeStatus = 0). Game sees response[0] = 0 → high-bit clear →
-         * "no node" → uses default chip vtable entry (data_42317a0). */
-        if (nodebus_synth_fe_enabled() &&
-            (inner_cmd == 0xFE || inner_cmd == 0xFA)) {
+         * Game-side parser is mcp_node_query_status_and_classify @ 0x8f38e0:
+         *   resp[0]   high bit = "node present" flag → output[0]
+         *   resp[1..3] form (b1<<16)|(b2<<8)|b3, > 0x011700 sets output[11]
+         *                   (likely "supported firmware version")
+         *   resp[1..8] bulk-copied to output[1..8]
+         *   resp[4..7] LE = 32-bit chip ID, matched against mcp_lpc_chip_vtable
+         *   resp[9..10] copied to output[9..10]
+         *   resp[hint-1] = bridgeStatus
+         *
+         * Send "node present + real chip ID" so vtable lookup lands on a
+         * non-default entry; resp[1..3] = (0x01,0x80,0x00) = 0x018000 to
+         * pass the fw-version threshold. */
+        if (inner_cmd == 0xFE) {
             int hint_idx = 2 + (int)inner_len;
             if (hint_idx >= payload_len) {
                 SHIM_LOG("bridge: synth fe_probe SKIP slot=%u (hint_idx=%d ≥ payload_len=%d)",
@@ -676,13 +698,13 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             }
             uint8_t hint = payload[hint_idx];
             if (hint == 0) {
-                SHIM_LOG("bridge: synth fe_probe SKIP slot=%u inner_cmd=0x%02x hint=0 (fire-and-forget)",
-                         slot, inner_cmd);
+                SHIM_LOG("bridge: synth fe_probe SKIP slot=%u hint=0 (fire-and-forget)",
+                         slot);
                 return;
             }
             if (hint > 32) {
-                SHIM_LOG("bridge: synth fe_probe SKIP slot=%u inner_cmd=0x%02x hint=%u (>32, sanity clamp)",
-                         slot, inner_cmd, hint);
+                SHIM_LOG("bridge: synth fe_probe SKIP slot=%u hint=%u (>32, sanity clamp)",
+                         slot, hint);
                 return;
             }
             uint8_t resp[64];
@@ -690,40 +712,69 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             resp[o++] = 0x02;            /* STX */
             resp[o++] = 0x41;
             resp[o++] = id;
-            /* Response payload layout (mapping to query_status_and_classify
-             * locals var_38..var_2e):
-             *   payload[0]   = var_38, high bit = "node present"
-             *   payload[1]   = var_37 (chip ID byte, contributes to fw version)
-             *   payload[2]   = var_36 (chip ID byte, fw version)
-             *   payload[3]   = var_35 (chip ID byte, fw version)
-             *   payload[4-7] = var_34, 32-bit chip ID matched against vtable
-             *   payload[9]   = var_2f
-             *   payload[hint-1] = bridgeStatus
-             *
-             * "Node not present" semantics: all-zero payload, byte 0 high bit
-             * clear → game's `var_38 & 0x80 == 0` branch treats slot as empty
-             * and falls back to default/null state. Equivalent in outcome to
-             * the existing 1-second timeout path (Step 45's "timeout-is-
-             * progress" lesson) but immediate. The earlier "node-present,
-             * default chip" variant (high bit set) regressed Godot init per
-             * Step 69 — game expects follow-up traffic for detected nodes
-             * that we don't yet synthesize. */
+            int payload_start = o;
             for (int i = 0; i < hint; i++)
                 resp[o++] = 0x00;
+            if (hint >= 8) {
+                uint32_t chip_id = nodebus_chip_id_for_slot(slot);
+                resp[payload_start + 0] = 0x80;
+                resp[payload_start + 1] = 0x01;
+                resp[payload_start + 2] = 0x80;
+                resp[payload_start + 3] = 0x00;
+                resp[payload_start + 4] = (uint8_t)(chip_id      );
+                resp[payload_start + 5] = (uint8_t)(chip_id >>  8);
+                resp[payload_start + 6] = (uint8_t)(chip_id >> 16);
+                resp[payload_start + 7] = (uint8_t)(chip_id >> 24);
+            }
             uint8_t cks = bridge_checksum(resp + 1, (size_t)(o - 1));
             resp[o++] = cks;
             resp[o++] = 0x03;            /* ETX */
-            SHIM_LOG("bridge: synth fe_probe RESP slot=%u inner_cmd=0x%02x hint=%u (node-not-present, timeout-equivalent)",
-                     slot, inner_cmd, hint);
+            SHIM_LOG("bridge: synth fe_probe RESP slot=%u hint=%u chip_id=0x%08x (node-present)",
+                     slot, hint, nodebus_chip_id_for_slot(slot));
+            usleep(NODEBUS_SYNTH_DELAY_US);
             bridge_send_response(resp, (size_t)o, 0x41, id);
             return;
         }
 
-        /* Cipher-key fetch synthesis. Behind the same NODEBUS_SYNTH_FE flag
-         * because key-fetch is the natural follow-up after fe_probe declares
-         * a node present. Step 69 documented the stall: with fe_probe synth
-         * on but no key-fetch synth, Godot fails to init because the game
-         * sits in mcp_nodebus_fetch_key_* waiting for 0xfc/0xfd/0xf9 replies.
+        /* fa_probe (inner_cmd=0xFA): 16-bit follow-up after fe_probe. Hint
+         * observed = 3 (too small to carry a chip ID). Semantics not RE'd —
+         * keep all-zero (status OK, no data) until a regression localizes
+         * the actual field meaning. */
+        if (inner_cmd == 0xFA) {
+            int hint_idx = 2 + (int)inner_len;
+            if (hint_idx >= payload_len) {
+                SHIM_LOG("bridge: synth fa_probe SKIP slot=%u (hint_idx=%d ≥ payload_len=%d)",
+                         slot, hint_idx, payload_len);
+                return;
+            }
+            uint8_t hint = payload[hint_idx];
+            if (hint == 0 || hint > 32) {
+                SHIM_LOG("bridge: synth fa_probe SKIP slot=%u hint=%u (out of range)",
+                         slot, hint);
+                return;
+            }
+            uint8_t resp[64];
+            int o = 0;
+            resp[o++] = 0x02;
+            resp[o++] = 0x41;
+            resp[o++] = id;
+            for (int i = 0; i < hint; i++)
+                resp[o++] = 0x00;
+            uint8_t cks = bridge_checksum(resp + 1, (size_t)(o - 1));
+            resp[o++] = cks;
+            resp[o++] = 0x03;
+            SHIM_LOG("bridge: synth fa_probe RESP slot=%u hint=%u (all-zero)",
+                     slot, hint);
+            usleep(NODEBUS_SYNTH_DELAY_US);
+            bridge_send_response(resp, (size_t)o, 0x41, id);
+            return;
+        }
+
+        /* Cipher-key fetch synthesis. Key-fetch is the natural follow-up after
+         * fe_probe declares a node present. Step 69 documented the stall:
+         * with fe_probe synth on but no key-fetch synth, Godot fails to init
+         * because the game sits in mcp_nodebus_fetch_key_* waiting for 0xfc/
+         * 0xfd/0xf9 replies.
          *
          * Fetcher chains (PROTOCOL §5.1 "Cipher-key fetchers"):
          *   - mcp_nodebus_fetch_key_basic       : 0xfd hint=12 → 0xfc hint=16
@@ -738,8 +789,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
          *
          * Hint values hardcoded above are confirmed via static RE of each
          * wrapper's strh of arg1[2..3] / arg1[4]; they don't vary per-call. */
-        if (nodebus_synth_fe_enabled() &&
-            (inner_cmd == 0xFC || inner_cmd == 0xFD || inner_cmd == 0xF9)) {
+        if (inner_cmd == 0xFC || inner_cmd == 0xFD || inner_cmd == 0xF9) {
             int hint_idx = 2 + (int)inner_len;
             if (hint_idx >= payload_len) {
                 SHIM_LOG("bridge: synth key-fetch SKIP slot=%u inner_cmd=0x%02x (hint_idx=%d ≥ payload_len=%d)",
@@ -764,6 +814,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             resp[o++] = 0x03;            /* ETX */
             SHIM_LOG("bridge: synth key-fetch RESP slot=%u inner_cmd=0x%02x hint=%u (zero key, status OK)",
                      slot, inner_cmd, hint);
+            usleep(NODEBUS_SYNTH_DELAY_US);
             bridge_send_response(resp, (size_t)o, 0x41, id);
             return;
         }

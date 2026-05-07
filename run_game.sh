@@ -422,8 +422,6 @@ fi
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")
 [[ "$OFFLINE_MODE"    == "1" ]] && args+=(-E "SPIKE3_OFFLINE=1")
 
-# Experimental shim feature flags — forward to qemu only if set in parent env.
-[[ -n "${NODEBUS_SYNTH_FE:-}" ]] && args+=(-E "NODEBUS_SYNTH_FE=$NODEBUS_SYNTH_FE")
 
 # Append any caller-supplied flags (post --debug-strip) and the game binary last.
 args+=("${POSITIONAL[@]+"${POSITIONAL[@]}"}" ./game)
