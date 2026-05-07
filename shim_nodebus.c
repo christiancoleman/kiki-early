@@ -36,6 +36,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <execinfo.h>
+#include <dlfcn.h>
 
 #include "spi_shim.h"
 
@@ -580,6 +582,73 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
         if (n > (int)sizeof(line)) n = (int)sizeof(line);
         (void)write(STDERR_FILENO, line, (size_t)n);
 
+        /* RAW wire dump for cipher channel — the entire cmd-0x41 bridge
+         * frame (post-escape decode), so we can see exactly what bytes
+         * the wrapper produced + what send_encrypted wrote on top
+         * (csum, encryption). One-shot per (slot, inner_cmd). */
+        {
+            static uint8_t raw_seen[32 * 256 / 8] = {0};
+            unsigned key = (unsigned)slot * 256u + (unsigned)inner_cmd;
+            unsigned byte = key >> 3;
+            unsigned bit  = key & 7;
+            if (!(raw_seen[byte] & (1u << bit))) {
+                raw_seen[byte] |= (uint8_t)(1u << bit);
+                char raw[512];
+                int rn = snprintf(raw, sizeof(raw),
+                    "[shim] bridge: RAW slot=%u inner_cmd=0x%02x req_len=%d:",
+                    slot, inner_cmd, req_len);
+                for (int i = 0; i < req_len && rn < (int)sizeof(raw) - 4; i++)
+                    rn += snprintf(raw + rn, sizeof(raw) - rn, " %02x", req[i]);
+                if (rn < (int)sizeof(raw) - 1) raw[rn++] = '\n';
+                if (rn > (int)sizeof(raw)) rn = (int)sizeof(raw);
+                (void)write(STDERR_FILENO, raw, (size_t)rn);
+            }
+        }
+
+        /* Caller-identification trace. Logs the first occurrence of each
+         * (slot, inner_cmd) pair with a backtrace, so we can resolve the
+         * specific wrapper function that emitted this command without
+         * having to chase strb sequences in the disasm. ONE-SHOT per pair —
+         * gated by a 256-bit table to avoid log flooding once we've ID'd
+         * a particular send site. Frames are logged as game-binary VAs
+         * (offset from libgame base) so they map directly to objdump /
+         * BN function lookups. */
+        {
+            static uint8_t cipher_trace_seen[32 /*slots*/ * 256 /*inner_cmds*/ / 8] = {0};
+            unsigned key = (unsigned)slot * 256u + (unsigned)inner_cmd;
+            unsigned byte = key >> 3;
+            unsigned bit  = key & 7;
+            if (!(cipher_trace_seen[byte] & (1u << bit))) {
+                cipher_trace_seen[byte] |= (uint8_t)(1u << bit);
+                /* dlopen / backtrace are imported via execinfo / dl — both
+                 * already linked because shim_sigsegv_handler uses them. */
+                extern int  backtrace(void **, int);
+                extern int  dladdr(const void *, Dl_info *);
+                void *bt[16];
+                int bt_n = backtrace(bt, 16);
+                char tline[1024];
+                int tn = snprintf(tline, sizeof(tline),
+                    "[shim] bridge: TRACE slot=%u inner_cmd=0x%02x — caller backtrace:\n",
+                    slot, inner_cmd);
+                for (int i = 0; i < bt_n && tn < (int)sizeof(tline) - 80; i++) {
+                    Dl_info di;
+                    if (dladdr(bt[i], &di) && di.dli_fname) {
+                        unsigned long off = (unsigned long)
+                            ((uintptr_t)bt[i] - (uintptr_t)di.dli_fbase);
+                        const char *base = strrchr(di.dli_fname, '/');
+                        base = base ? base + 1 : di.dli_fname;
+                        tn += snprintf(tline + tn, sizeof(tline) - tn,
+                            "[shim]   [%02d] %s+0x%lx\n", i, base, off);
+                    } else {
+                        tn += snprintf(tline + tn, sizeof(tline) - tn,
+                            "[shim]   [%02d] %p (no dladdr)\n", i, bt[i]);
+                    }
+                }
+                if (tn > (int)sizeof(tline)) tn = (int)sizeof(tline);
+                (void)write(STDERR_FILENO, tline, (size_t)tn);
+            }
+        }
+
         /* fe_probe synthesis. Behind NODEBUS_SYNTH_FE env flag.
          *
          * The polling traffic that times out is mcp_nodebus_send_cmd_fe_probe_unsure
@@ -631,21 +700,72 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
              *   payload[9]   = var_2f
              *   payload[hint-1] = bridgeStatus
              *
-             * Refined "node present, default chip" — set high bit on byte 0 so
-             * game sees node present, leave var_34 (offset 4-7) = 0 so the
-             * chip-ID match loop falls through to data_42317a0 default entry. */
+             * "Node not present" semantics: all-zero payload, byte 0 high bit
+             * clear → game's `var_38 & 0x80 == 0` branch treats slot as empty
+             * and falls back to default/null state. Equivalent in outcome to
+             * the existing 1-second timeout path (Step 45's "timeout-is-
+             * progress" lesson) but immediate. The earlier "node-present,
+             * default chip" variant (high bit set) regressed Godot init per
+             * Step 69 — game expects follow-up traffic for detected nodes
+             * that we don't yet synthesize. */
             for (int i = 0; i < hint; i++)
                 resp[o++] = 0x00;
-            /* Patch payload[0] high bit AFTER the zero-fill: position is
-             * (resp + 3) since we already wrote STX/cmd/id. */
-            if (hint >= 1)
-                resp[3] = 0x80;
             uint8_t cks = bridge_checksum(resp + 1, (size_t)(o - 1));
             resp[o++] = cks;
             resp[o++] = 0x03;            /* ETX */
-            SHIM_LOG("bridge: synth fe_probe RESP slot=%u inner_cmd=0x%02x hint=%u (node-present, default chip)",
+            SHIM_LOG("bridge: synth fe_probe RESP slot=%u inner_cmd=0x%02x hint=%u (node-not-present, timeout-equivalent)",
                      slot, inner_cmd, hint);
             bridge_send_response(resp, (size_t)o, 0x41, id);
+            return;
+        }
+
+        /* Cipher-key fetch synthesis. Behind the same NODEBUS_SYNTH_FE flag
+         * because key-fetch is the natural follow-up after fe_probe declares
+         * a node present. Step 69 documented the stall: with fe_probe synth
+         * on but no key-fetch synth, Godot fails to init because the game
+         * sits in mcp_nodebus_fetch_key_* waiting for 0xfc/0xfd/0xf9 replies.
+         *
+         * Fetcher chains (PROTOCOL §5.1 "Cipher-key fetchers"):
+         *   - mcp_nodebus_fetch_key_basic       : 0xfd hint=12 → 0xfc hint=16
+         *   - mcp_nodebus_fetch_key_with_serial : same as basic + sprintf
+         *   - mcp_nodebus_fetch_key_two_probes  : 0xf9 hint=16 → 0xf9 hint=16
+         *                                                     → 0xfc hint=16
+         * The 0xfc 16-byte response is memcpy'd directly into
+         * mcp_nodebus_cipher_keys[slot*16]. By returning all zeros we keep
+         * the BSS-state semantics: per-slot keys remain zero, and the
+         * existing decryptor (which assumes zero keys) still produces the
+         * correct cleartext for any subsequent encrypted traffic.
+         *
+         * Hint values hardcoded above are confirmed via static RE of each
+         * wrapper's strh of arg1[2..3] / arg1[4]; they don't vary per-call. */
+        if (nodebus_synth_fe_enabled() &&
+            (inner_cmd == 0xFC || inner_cmd == 0xFD || inner_cmd == 0xF9)) {
+            int hint_idx = 2 + (int)inner_len;
+            if (hint_idx >= payload_len) {
+                SHIM_LOG("bridge: synth key-fetch SKIP slot=%u inner_cmd=0x%02x (hint_idx=%d ≥ payload_len=%d)",
+                         slot, inner_cmd, hint_idx, payload_len);
+                return;
+            }
+            uint8_t hint = payload[hint_idx];
+            if (hint == 0 || hint > 32) {
+                SHIM_LOG("bridge: synth key-fetch SKIP slot=%u inner_cmd=0x%02x hint=%u (out of range)",
+                         slot, inner_cmd, hint);
+                return;
+            }
+            uint8_t resp[64];
+            int o = 0;
+            resp[o++] = 0x02;            /* STX */
+            resp[o++] = 0x41;
+            resp[o++] = id;
+            for (int i = 0; i < hint; i++)
+                resp[o++] = 0x00;        /* zero key bytes + bridgeStatus=0 */
+            uint8_t cks = bridge_checksum(resp + 1, (size_t)(o - 1));
+            resp[o++] = cks;
+            resp[o++] = 0x03;            /* ETX */
+            SHIM_LOG("bridge: synth key-fetch RESP slot=%u inner_cmd=0x%02x hint=%u (zero key, status OK)",
+                     slot, inner_cmd, hint);
+            bridge_send_response(resp, (size_t)o, 0x41, id);
+            return;
         }
         return;
     }

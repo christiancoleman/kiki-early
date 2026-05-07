@@ -7681,3 +7681,213 @@ Workflow per section: `audit_section.py N` for anchors + tagged Steps; sections 
 
 - **§11 deferred address rebases.** ~10 addresses fit the +0x400000 drift pattern but lack explicit dual-base notation in-doc, so they were not auto-rebased: `sub_a50850 / sub_a50350` (switch-state readers), `sub_b24f70` (Stage-1 switch-state reader), `sub_b25438` (call site), `sub_b129f0 / sub_bd39f0 / sub_b16f64 / sub_b82990 / sub_b12760` (event-firing callers), `_INIT_74 @ 0x8733c0`. Each needs a single BN MCP `function_at` lookup to confirm; if pattern holds, all subtract `0x400000`.
 - **Magic-number → named-constant rename pass** deferred from this session's comment-strip work (would be substantive code change, not just comment removal). Targets: ~26 magic-number-interpretation comments in `shim_ioctl.c` (DRM_MODE_*/TIOCM_*), ~30 in `shim_gl.c` (EGL_*/GL_*), a few in `shim_bridges.c` (GL_RGBA/GL_UNSIGNED_BYTE). Each replaced by including the proper system header (`<drm/drm_mode.h>`, `<linux/input.h>`, `<EGL/egl.h>`, etc.) and using the actual named constant.
+
+## Step 87: Hardware-emulation marathon: I2C regfile + TAS5711 + GBM bo_fd + DRM-prime workaround + cipher key-fetch + send_encrypted wire-format discovery (2026-05-07)
+
+Marathon session: five hardware-emulation fixes that compound into ~3 minutes of stable runtime past the previous SIGSEGV cliff, plus a wire-format discovery that corrects PROTOCOL §5.1 and a partial cipher-channel response synthesis (env-gated). All progress preserved without regressing the timeout-is-progress baseline.
+
+### Step 87a — I2C virtual regfile model
+
+Audio driver was emitting **11 distinct `write failed to verify at NN: reads back as ffffffff` lines** because our `I2C_RDWR` ioctl handler returned `0` (the kernel ABI requires returning **nmsgs**) and never populated the read msg buffers. Verified the failure path at game `0x919f70` via `ldr w9, [x6, x2]` instruction trace — when `i2c_smbus_read_byte_data`-style helpers see ≤0, the verify code prints `(int)-1` formatted with `%02x` → `ffffffff`.
+
+Fix: full `I2C_RDWR` and `I2C_SMBUS` handlers in `shim_ioctl.c` walking the `i2c_msg` array against a per-slave 256-byte regfile (`i2c_regfile[128][256]` + `i2c_reg_pointer[128]` + `i2c_current_slave` in `spi_shim.c`). Last-write-wins per `(slave, register)`, auto-incrementing register pointer for combined transactions. `read()`/`write()` on `FAKE_FD_I2C` route through the same regfile.
+
+Result: 11 → 0 verify errors. TAS57XX and MAX9850 amp init both reach "complete".
+
+### Step 87b — TAS5711 oscillator-trim post-write hook
+
+After 87a the verify spam was gone but `TAS57XX: oscillator trim failed to lock` still fired once per run. Disassembly at game `0x91bfb0`:
+
+1. Write `0x00` to register `0x1B` at slave `0x1B` (TAS5711 default I2C address).
+2. `usleep(50000)` (50 ms).
+3. Loop up to 10 times: read reg `0x1B`, check **bit 6** (`tbnz w0, #6` at `0x91c060`); if set → trim done.
+4. After 10 retries: error printf at `0x91c094`.
+
+Per TI SLAS502, register `0x1B` is OSC_TRIM with bit 6 = `OSC_TRIM_DONE` — write-to-trigger, read-to-poll status.
+
+Fix: added `shim_i2c_chip_post_write` hook in `shim_ioctl.c` that overrides `regfile[0x1B][0x1B] = 0x40` after any write to that slot/register. Driver's first poll sees bit 6 set → "trim done" → no error.
+
+Architecture note: keeping the hook list narrow (one entry today), expanding only as new "polling never succeeds" symptoms appear. Safer than shipping a broad chip-emulation framework on day one.
+
+### Step 87c — GBM `bo_get_fd` returns `memfd` instead of -1
+
+Function at game `0x900828` (`create_egl_framebuffer`-style):
+
+```
+bl gbm_bo_get_fd        @ 0x900848
+mov w22, w0             @ 0x90084c
+tbnz w0, #31, 0x9009f4  @ 0x900850   — branches on "fd < 0" → "failed to get fd for bo: -1"
+```
+
+Then on success the fd is passed to `eglCreateImageKHR` (vtable call at `0x9008e8`) and immediately `close()`d at `0x9008fc`. Our shim's `eglCreateImageKHR` is already a stub that parses the EGL attribute list and returns a sentinel without dereferencing the fd, so the fd just needs to satisfy `(fd >= 0)` and survive a clean `close()`.
+
+Fix: `gbm_bo_get_fd` in `shim_gl.c` now does `syscall(SYS_memfd_create, "shim_dma_buf_stub", MFD_CLOEXEC)`. Memfds are real fds with kernel lifecycle, close cleanly under qemu-user.
+
+Side effect: `gbm_bo_create` count = `eglCreateImageKHR` count = 16 in next run (was: `gbm_bo_create=16`, `eglCreateImageKHR=0`). Every BO now imports successfully.
+
+### Step 87d — DRM-prime consumer empty `AVDRMFrameDescriptor` redirect
+
+After 87c the run progressed past framebuffer setup and started decoding HEVC video via the avforward bridge. The third `[avforward] session OPEN` (codec_id=173, extradata=2453B) was followed within ~200 ms by SIGSEGV at game `0x e3e250`:
+
+```
+e3e248: smull x2, w2, w11      @ x2 = layers[0].planes[i].object_index * 24
+e3e250: ldr   w9, [x6, x2]     @ x6 = AVDRMFrameDescriptor.objects[0]; CRASH
+```
+
+`x13 = frame->data[0]` interpreted as `AVDRMFrameDescriptor*`. Field offsets:
+- `nb_objects` @ 0
+- `objects[4]` @ 8 (each 24 bytes)
+- `nb_layers` @ 104 (`[x13, #104]` ldr at `0x e3e1e4`)
+- `layers[4]` @ 112 (each 104 bytes)
+- `layers[i].nb_planes` @ +0x74
+- `layers[i].planes[j].object_index` @ +0x78 + j*24
+
+Crash chain consistent with **Step 47/85 wall**: get_format NOP makes `avcodec_open2` accept NV12, but downstream consumer still walks `frame->data[0]` as a DRM-prime descriptor. NV12 pixel bytes get dereferenced as struct → fault.
+
+Real fix (real DMA-BUF + GPU import) is out-of-scope under `MESA_LOADER_DRIVER_OVERRIDE=swrast` per Step 47 §47.5. Compat patch instead: in `shim_avforward_receive_frame`, after `av_frame_get_buffer` succeeds, redirect `frame->data[0]` to a static zero-initialized 1024-byte buffer (`shim_avforward_empty_drm_descriptor`). The consumer reads `nb_layers = 0`, takes `b.le 0xe3e4cc`, returns peacefully. `frame->buf[0]` still owns the real allocation so `av_frame_unref` cleans up correctly.
+
+Result: 0 SIGSEGV across 180 s timeout. Game processes 113k+ `avcodec_receive_frame` calls (579 frames decoded ok), reaches scene loading (`base_00`/`story_charmander_1`/`battle_mountain` scene_data dumps).
+
+### Step 87e — Cipher channel: key-fetch synth + send_encrypted wire-format discovery
+
+User asked to crack the nodebus cipher channel. Lore-keeper confirmed: timeouts are structural (Step 45 + Step 67 + Step 69 baseline), not a tunable knob. The path forward is real per-(slot, inner_cmd) response synthesis.
+
+**87e.1 — Key-fetch synth (env-gated under `NODEBUS_SYNTH_FE`)**
+
+Added handlers for inner_cmd `0xfc` / `0xfd` / `0xf9` in `shim_nodebus.c` case `0x41`. Hint values confirmed by static RE of the wrappers:
+
+- `mcp_nodebus_fetch_key_basic @ 0x8f3484` — sends `0xfd hint=12` then `0xfc hint=16`
+- `mcp_nodebus_fetch_key_two_probes @ 0x8f36b0` — sends `0xf9 hint=16` (×2 with payloads `0x10000000` / `0x10001f00`) then `0xfc hint=16`
+- `mcp_nodebus_fetch_key_with_serial @ 0x8f355c` — same as basic + `sprintf("%09d", ...)`
+
+Synth zero-fills `hint` bytes (key bytes = 0, bridgeStatus = 0). Matches BSS state of `mcp_nodebus_cipher_keys @ 0x44fcfb8` so subsequent encrypted traffic decrypts identically.
+
+**87e.2 — Wire format correction: `send_encrypted` increments ilen by 1**
+
+Added one-shot per-`(slot, inner_cmd)` backtrace + raw wire dump to the cipher decode path. Captured runtime samples:
+
+| Wire (post-bridge-strip) | Sender wrapper |
+|---|---|
+| `80 02 f1 8d 00` | `mcp_nodebus_node_reset @ 0x8f0c20` (cmd `0xf1` ilen=1 hint=0) |
+| `80 03 f0 22 6b 00` | `0x8f1100` (cmd `0xf0` ilen=2 payload byte=0x22 hint=0) |
+| `80 03 f0 11 7c 00` | `0x8f1020` (cmd `0xf0` ilen=2 payload byte=0x11 hint=0) |
+| `81 02 fe 7f 0d` | `mcp_nodebus_send_cmd_fe_probe_unsure @ 0x8ed870` (cmd `0xfe` ilen=1 hint=0x0d) |
+
+Disassembly of `mcp_nodebus_send_encrypted @ 0x8ec410` reveals the buffer manipulation:
+
+```
+0x8ec500: w4 = local_buffer[2]    @ cmd byte
+0x8ec504: w0 = local_buffer[1]    @ wrapper's ilen
+0x8ec514: w0 += 1                  @ ilen + 1
+0x8ec52c: strb w0, [sp, #25]       @ local_buffer[1] = wrapper_ilen + 1   ← INCREMENT
+0x8ec538: strb wzr, [x7, w1]       @ zero local_buffer[wrapper_ilen + 2]
+0x8ec544..570: csum loop summing local_buffer[0..wrapper_ilen+1]
+0x8ec56c: strb w4, [x7, x2]        @ csum at local_buffer[wrapper_ilen + 2]
+0x8ec5e8: w22 += 4                  @ wire length = wrapper_ilen + 4
+0x8ec614: bl mcp_nodebus_send_raw  @ length = wrapper_ilen + 4 = wire_ilen + 3
+```
+
+**Corrected wire format** (post-bridge-strip, encrypted path):
+
+```
+[0]                       = slot byte (slot | 0x80)
+[1]                       = wire_ilen = wrapper_ilen + 1
+[2]                       = inner_cmd
+[3 .. 2 + wrapper_ilen-1] = payload bytes (wrapper_ilen - 1 of them)
+[2 + wrapper_ilen]        = csum (negated sum of [0..2+wrapper_ilen-1])
+[3 + wrapper_ilen]        = hint (caller's expected_response_len, or 0)
+total length              = wrapper_ilen + 4
+```
+
+PROTOCOL §5.1 currently states csum at `[2 + inner_len]` where `inner_len` is the wire byte. That's off by 1 — actual csum is at `[2 + (wire_ilen - 1)]` because send_encrypted incremented the on-wire ilen byte after copying the buffer. Verified by computing csums against captured wires; only the corrected formula matches all four samples.
+
+**Implication for our shim's existing decoder**: `payload[hint_idx]` reads at `2 + inner_len` but `inner_len` here is wire_ilen, so hint_idx is one byte PAST the actual hint position. For cmd `0xfe` ilen=1 hint=0x0d: shim reads `payload[4]` = 0x0d (correct hint). The wrappers happen to put hint at the same offset post-increment because send_encrypted writes hint+2 (or 0) at exactly that position. So shim's existing fe_probe synth code reads the right byte by accident.
+
+The cosmetic `payload=[N M]` log line in shim mislabels csum bytes as payload. Inconsequential for behavior; can be cleaned up next session.
+
+**87e.3 — fe_probe synth tested (both "node present" and "node not present"); both regress video**
+
+Tried current code's `resp[3] |= 0x80` ("node present, default chip" — Step 69's choice). Run with `NODEBUS_SYNTH_FE=1`: 153 → 0 cmd-0x41 timeouts, but **avcodec_receive_frame count drops from 113k → 0**. Game stalls on slot-13 fe_probe loop instead of progressing to video.
+
+Tried inverted variant (no high-bit patch — "node not present" semantics, timeout-equivalent). Same regression: 0 timeouts but 0 frames decoded. Run gets to GL extensions enumeration but never opens an avforward HEVC session.
+
+Step 45's "timeout-is-progress" lesson is still load-bearing — the 1000 ms × ~150-frame timeout window is implicitly the time other threads need to bring up Godot/Radium/decode pipeline. Killing the timeouts races the main thread past that init window.
+
+For now: kept fe_probe synth logic in place but reverted the high-bit "node present" patch to "node not present" semantics (timeout-equivalent payload). Still env-gated; off by default. The key-fetch additions are safe to leave on with the env var since key-fetch traffic only fires after fe_probe declares a node present.
+
+### Step 87f — Chip vtable structure (corrected via screenshot reference/87f.png)
+
+`mcp_lpc_chip_vtable @ 0x42317c8`, 28 entries × 0x28 bytes. First `u32` of each entry is the chip ID matched against `response[4..7]` (var_34) of cmd `0xfe` response. Default entry at `0x42317a0` has zero chip_id and `data_42317a8` → `sub_35f3790` as the only non-null pointer (matches Step 69 "NULL fps" framing — var_34=0 hits this entry and most function-pointer slots are zero).
+
+Initial Python read used incorrect file offset (forgot `.data.rel.ro` segment maps VA `0x422dc10` → file `0x422cc10`, off by `0x1000`). Re-read with correct offset (file `0x42307c8` for VA `0x42317c8`) confirmed by BN screenshot `_emulation/reference/87f.png` shows entry 0 = `2b 50 1e 04 00 00 00 00` followed by name pointer to `"LPC1111FHN33/101"` string.
+
+Per-entry layout (40 bytes):
+
+| offset | size | meaning |
+|---:|---:|---|
+| 0  | 4 | chip ID (matches real NXP `Part identification number` register at `0x400483F4` for LPC11xx, or analogous for LPC8xx / RP2350) |
+| 4  | 4 | padding (zero) |
+| 8  | 8 | pointer to chip-name string in `.rodata` |
+| 16 | 4 | (config word 0 — meaning unverified) |
+| 20 | 4 | RAM/flash size (entry 0 = `0x2000` = 8 KB, matches LPC1111/101 flash) |
+| 24 | 4 | RAM size or address (entry 0 = `0x800` = 2 KB, matches LPC1111/101 SRAM) |
+| 28 | 4 | RAM start or sector address (entry 0 = `0x02dc6c00`) |
+| 32 | 4 | flash sector size (entry 0 = `0x1000` = 4 KB, matches LPC11xx 4 KB sectors) |
+| 36 | 4 | (unused / zero in entry 0) |
+
+Full chip ID + name table:
+
+| idx | chip_id | chip name |
+|---:|---|---|
+| 0  | `0x041E502B` | LPC1111FHN33/101 |
+| 1  | `0x2516902B` | LPC1111FHN33/202 |
+| 2  | `0x042D502B` | LPC1112FHN33/101 |
+| 3  | `0x2524D02B` | LPC1112FHN33/102 |
+| 4  | `0x00020023` | LPC1112FHN33/103 |
+| 5  | `0x0425502B` | LPC1112FHN33/201 |
+| 6  | `0x2524902B` | LPC1112FHN33/202 |
+| 7  | `0x00020022` | LPC1112FHN33/203 |
+| 8  | `0x0434502B` | LPC1113FHN33/201 |
+| 9  | `0x2532902B` | LPC1113FHN33/202 |
+| 10 | `0x0434102B` | LPC1113FBD48/301 |
+| 11 | `0x2532102B` | LPC1113FBD48/302 |
+| 12 | `0x00030030` | LPC1113FBD48/303 |
+| 13 | `0x2C40102B` | LPC1313FHN33 |
+| 14 | `0x1830102B` | LPC1313FHN33/01 |
+| 15 | `0x00140040` | LPC1124JBD48/303 |
+| 16 | `0x08018542` | LPC1346FHN33/FBD48 |
+| 17 | `0x2C42502B` | LPC1311FHN33 |
+| 18 | `0x1816902B` | LPC1311FHN33/01 |
+| 19 | `0x2C40102B` | LPC1313FBD48 |
+| 20 | `0x1830102B` | LPC1313FBD48/01 |
+| 21 | `0x3D01402B` | LPC1342FHN33 |
+| 22 | `0x3D01402B` | LPC1342FBD48 |
+| 23 | `0x3D00002B` | LPC1343[FHN33\|FBD48] |
+| 24 | `0x00008120` | LPC812M101JDH16 |
+| 25 | `0x00008121` | LPC812M101JD20 |
+| 26 | `0x00008122` | LPC812M101[JDH20\|JTB16] |
+| 27 | `0x411FD210` | RP235x |
+
+These are real silicon chip IDs (low byte `0x2B` = LPC11/13xx Cortex-M0 family marker; `0x40` family = LPC1124; `0x42` = LPC1346; `0x81xx` = LPC812; `0x411F...` = ARM Cortex-M33 part-number convention used by RP2350). Indices 13/19 and 14/20 share chip IDs — those pairs differ only by package (FHN33 vs FBD48) which the chip ID register can't distinguish, so the chip-classify code treats them identically and matches the first occurrence. Indices 21/22 likewise share `0x3D01402B` between FHN33 and FBD48 LPC1342 packages.
+
+For shim purposes: any of these chip IDs in `response[4..7]` will make `mcp_node_query_status_and_classify @ 0x8f38e0` find a real (non-default) vtable entry, avoiding the NULL-deref on default entry. Picking an LPC1124 (idx 15, `0x00140040`) for slot 0 (the bridge node) and LPC1111/1112 variants for downstream coil/switch/lamp boards would mirror what real Spike 3 hardware would report — but the per-slot chip assignment for Pokemon LE specifically still needs verification against a real wire capture.
+
+### What's left for next session
+
+- **fe_probe response synthesis with timing**: keep response shape but artificially delay (~50–100 ms) so other threads catch up. Test whether matching real-hardware response cadence unlocks progress without the regression.
+- **Per-slot chip ID assignment**: read Pokemon LE Lite manual for which LPC variant lives at each node, set `response[4..7]` per slot to that chip's vtable entry. Then synth the per-chip init responses (cmd `0x14` family).
+- **Verify chip-ID values**: compare our vtable bytes against a real cabinet's cmd-`0xfe` response if any user has access.
+- **Update PROTOCOL §5.1**: correct the csum/hint position formulas per the wrapper_ilen vs wire_ilen distinction. Keep the existing prose for what was already right.
+- **Cosmetic**: shim cipher decoder's `payload=[...]` log line includes the csum byte. Adjust to `payload=` (real bytes only) and `csum=` (1 byte) for clarity in future runs.
+
+### Cumulative metrics across all 5 fixes
+
+| Symptom | Pre | Post |
+|---|---|---|
+| `failed to verify at NN: reads back as ffffffff` | 11 | 0 |
+| `oscillator trim failed to lock` | 1 | 0 |
+| `failed to get fd for bo: -1` | 1 | 0 |
+| `failed to create framebuffer` | 1 | 0 |
+| SIGSEGV at game+0xe3e250 | crashes ~55 s | 0 (180 s clean) |
+| `bridge message ... Connection timed out` | 158 | 158 (unchanged, default off) |
+| Forward progress | scene loading | scene loading + 113k frames decoded + 16 BO/EGL imports |

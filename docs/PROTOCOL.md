@@ -611,22 +611,25 @@ The caller hands `mcp_nodebus_send_encrypted` an input frame:
 
 ```
 arg1[0]   = (slot & 0x1F) | 0x80    ; 5-bit slot + encrypt-flag high bit
-arg1[1]   = inner_len                ; number of bytes after this header
+arg1[1]   = inner_len                ; cmd-byte + payload-byte count
 arg1[2]   = inner_cmd                ; the command byte the destination node sees
 arg1[3..] = payload bytes            ; inner_len-1 bytes of inner-cmd payload
-arg1[2 + inner_len] = expected_response_len  ; last byte before checksum slot
+arg1[2 + inner_len] = expected_response_len  ; hint byte — bridge replies with N bytes
 ```
 
-After cipher + checksum, the on-the-wire payload (which becomes the cmd-0x41 frame's payload, then the bridge wraps STX/CMD/ID/CSUM/ETX around it) is:
+`send_encrypted` copies this to a working buffer, **increments the ilen byte by one** at `local[1]`, conditionally encrypts the cmd-and-payload range (per "Encryption is conditional" below), writes the negated sum-checksum at `local[2 + inner_len]`, echoes the hint byte (with `+2` if non-zero) at `local[2 + inner_len + 1]`, and ships `inner_len + 4` bytes via `mcp_nodebus_send_raw`. The cmd-0x41 frame's payload (before bridge STX/CMD/ID/CSUM/ETX wrapping) is:
 
 ```
-out[0]   = arg1[0]                       ; UNENCRYPTED (slot id)
-out[1]   = arg1[1]                       ; UNENCRYPTED (inner_len)
-out[2..2+inner_len-1] = encrypted(inner_cmd, payload)
-out[2 + inner_len]    = sum_checksum(out[0..2+inner_len-1])
+out[0]                       = arg1[0]                       ; UNENCRYPTED (slot id)
+out[1]                       = arg1[1] + 1                   ; UNENCRYPTED (incremented ilen byte)
+out[2 .. 2 + inner_len - 1]  = encrypted(inner_cmd, payload) ; inner_len bytes
+out[2 + inner_len]           = sum_checksum                  ; negated sum of out[0..2+inner_len-1]
+out[2 + inner_len + 1]       = expected_response_len echo    ; hint+2 if hint!=0, else 0
 ```
 
-The trailing `expected_response_len` byte from the input frame is **overwritten** by the sum-checksum. Total length on the wire = `inner_len + 3` bytes.
+Total length on the wire = `inner_len + 4` bytes. The hint byte at `arg1[2 + inner_len]` is consumed before the wire is built; it travels to the bridge in the trailing echo slot, not the encrypted region.
+
+*Verified by:* JOURNAL Step 87e — disassembly of `send_encrypted` at `0x8ec52c` (`strb w0, [sp, #25]` writes `inner_len + 1`) and `0x8ec5e8` (length `inner_len + 4` passed to `send_raw`), plus four captured wire samples (cmd `0xfe`, `0xfa`, `0xf0`, `0xf1`) cross-checked with computed sum-checksums.
 
 #### Cipher algorithm
 
@@ -853,6 +856,63 @@ When scanning `games/pokemon_le/game`, several functions trip individual polynom
 | `sub_11ed6f0`, `sub_11f172c` | Many `MOVZ #0x8001` + `MOVK #0x8000 lsl#16` pairs (loading `0x80008001`) | libpng `png_compose` / channel-loss check. `0x80008001` is the magic-number divider for `x / 0xFFFF`. Identified by `png_error` strings + `png_get_channels` calls |
 | `sub_1042214` | `SUB W6, W8, W8, LSL #11` (the only self-shift `SUB-LSL-#11` in the binary) AND `MOVN W14, #0x07FE` (loading `0xFFFFF801`) | Signed Q-format audio-sample saturation. `x - (x << 11) = x * -0x7FF` is being used as a Q-format magnitude scaler; `0xf801` halfword stores are bit-pack endpoints of the +/-0x7FF saturation range |
 | `sub_9b7590`, `sub_9b9820`, `sub_9bba80`, `sub_9bd9a8` | `MOVZ #0x7FFF` + `MOVN #0x7FFE` register-paired loads, plus X-reg `LSR #10` + `LSR #16` shift co-locations | Bespoke audio codec rounds. `MOVZ #0x7FFF` / `MOVN #0x7FFE` load the +/-0x7FFF saturation clamps for 15-bit signed PCM samples. The `0x4000` rounding bias and `(1 << (width-1)) - 1` overflow check give it away as a sample bit-width normalizer. The `0x1b` constants nearby are GF(2^8) reduction (AES MixColumns coefficient) |
+
+### 5.4 LPC chip vtable — supported node MCUs
+
+Each downstream node on the RS-485 bus reports a 32-bit chip ID via the cmd `0xfe` "fe_probe" response (in `response[4..7]`, var_34). `mcp_node_query_status_and_classify @ 0x8f38e0` matches that ID against `mcp_lpc_chip_vtable @ 0x42317c8`, a 28-entry × 0x28-byte table of supported node MCUs. A miss falls through to the default entry at `0x42317a0` (most function-pointer slots NULL) — synthesizing a fake "node present" response without a matching chip ID hits a NULL deref on subsequent vtable dispatch.
+
+#### Per-entry layout (40 bytes)
+
+| offset | size | meaning |
+|---:|---:|---|
+| 0  | 4 | chip ID (NXP `Part identification number` register for LPC parts; ARM CPUID register for Cortex-M33 parts like RP2350) |
+| 4  | 4 | padding (zero across all 28 entries) |
+| 8  | 8 | pointer to chip-name string in `.rodata` |
+| 16 | 4 | config word (unverified meaning) |
+| 20 | 4 | flash size — entry 0: `0x2000` = 8 KB, matches LPC1111/101 |
+| 24 | 4 | RAM size — entry 0: `0x800` = 2 KB, matches LPC1111/101 |
+| 28 | 4 | RAM start / sector address (entry 0: `0x02dc6c00`) |
+| 32 | 4 | flash sector size — entry 0: `0x1000` = 4 KB, LPC11xx convention |
+| 36 | 4 | (zero in entry 0) |
+
+#### Supported chips
+
+| idx | chip ID | name |
+|---:|---|---|
+| 0  | `0x041E502B` | LPC1111FHN33/101 |
+| 1  | `0x2516902B` | LPC1111FHN33/202 |
+| 2  | `0x042D502B` | LPC1112FHN33/101 |
+| 3  | `0x2524D02B` | LPC1112FHN33/102 |
+| 4  | `0x00020023` | LPC1112FHN33/103 |
+| 5  | `0x0425502B` | LPC1112FHN33/201 |
+| 6  | `0x2524902B` | LPC1112FHN33/202 |
+| 7  | `0x00020022` | LPC1112FHN33/203 |
+| 8  | `0x0434502B` | LPC1113FHN33/201 |
+| 9  | `0x2532902B` | LPC1113FHN33/202 |
+| 10 | `0x0434102B` | LPC1113FBD48/301 |
+| 11 | `0x2532102B` | LPC1113FBD48/302 |
+| 12 | `0x00030030` | LPC1113FBD48/303 |
+| 13 | `0x2C40102B` | LPC1313FHN33 |
+| 14 | `0x1830102B` | LPC1313FHN33/01 |
+| 15 | `0x00140040` | LPC1124JBD48/303 |
+| 16 | `0x08018542` | LPC1346FHN33/FBD48 |
+| 17 | `0x2C42502B` | LPC1311FHN33 |
+| 18 | `0x1816902B` | LPC1311FHN33/01 |
+| 19 | `0x2C40102B` | LPC1313FBD48 |
+| 20 | `0x1830102B` | LPC1313FBD48/01 |
+| 21 | `0x3D01402B` | LPC1342FHN33 |
+| 22 | `0x3D01402B` | LPC1342FBD48 |
+| 23 | `0x3D00002B` | LPC1343[FHN33\|FBD48] |
+| 24 | `0x00008120` | LPC812M101JDH16 |
+| 25 | `0x00008121` | LPC812M101JD20 |
+| 26 | `0x00008122` | LPC812M101[JDH20\|JTB16] |
+| 27 | `0x411FD210` | RP235x |
+
+Indices 13/19, 14/20, 21/22 share chip IDs across package variants — the chip-ID register can't distinguish FHN33 vs FBD48 packaging, so the lookup matches the first occurrence regardless. Entry 27's `0x411FD210` is the ARM Cortex-M33 CPUID register value (used because RP2350 doesn't expose an NXP-style part-ID register); this is what `netbridge.elf` would report as its own chip ID since it runs on RP2350 silicon (per `_emulation/.../netbridge/spike3-swd.cfg` + `rp2040.cfg`).
+
+*Verified by:* JOURNAL Step 87f — direct binary read at file offset `0x42307c8` (VA `0x42317c8`, `.data.rel.ro` segment, off-by-`0x1000` from VA-equals-file-offset assumption), all 28 chip-name strings re-read from binary's own `.rodata` (not from BN annotation), plus public-source spot-checks: `0x041E502B` matches NXP LPC1111FHN33/101 datasheet; `0x411FD210` matches ARM Cortex-M33 r1p0 CPUID per ARM Technical Reference Manual.
+
+---
 
 ## 6. image.bin file format
 

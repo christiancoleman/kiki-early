@@ -82,6 +82,12 @@
 /* AVERROR_EOF — FFmpeg-specific. */
 #define AVERROR_EOF_VAL ((int)0xdfb9b0bbu)
 
+/* Zero-initialized empty AVDRMFrameDescriptor used to satisfy the game's
+ * post-decode descriptor consumer (see receive-frame end for full rationale).
+ * Read-only after init; safe to share across all decoded frames and threads.
+ * Sized 1024 for paranoia — the real struct is 528 bytes on aarch64. */
+static uint8_t shim_avforward_empty_drm_descriptor[1024] = {0};
+
 extern void *shim_resolve_libav(const char *sym, const char *version);
 
 typedef void *(*real_avparams_alloc_t)(void);
@@ -477,6 +483,28 @@ int shim_avforward_receive_frame(void *avctx, void *frame, int *out_ret) {
 
     *(int64_t *)((char *)frame + AVFRAME_OFF_PTS)    = fpts;
     *(int64_t *)((char *)frame + AVFRAME_OFF_PKTDTS) = fpts;
+
+    /* DRM-prime consumer compatibility shim. JOURNAL Step 47 / Step 85:
+     * Step 85's NOP at game VA 0x920cf0 made get_format accept non-DRM-PRIME
+     * pix_fmts (so avcodec_open2 succeeds with the SW decoder), but a
+     * downstream consumer at game+0xe3e15c still walks frame->data[0] as
+     * AVDRMFrameDescriptor* — reading nb_layers at offset 104, then iterating
+     * planes[i].object_index*24 into objects[].fd. With our NV12 pixel bytes
+     * in data[0] the consumer faults on `ldr w9, [x6, x2]` at +0xe3e250.
+     *
+     * Step 47 §47.5/§47.8 ruled out the proper fix (real DMA-BUF + GPU
+     * import) as out-of-scope under MESA_LOADER_DRIVER_OVERRIDE=swrast.
+     *
+     * Compat patch: redirect frame->data[0] to a zero-initialized buffer
+     * large enough for an AVDRMFrameDescriptor (528 bytes; we use 1024 for
+     * paranoia). nb_layers reads as 0 → consumer's `cmp w0, #0; b.le` at
+     * game+0xe3e204 branches to the early-out → no crash. Pixel data still
+     * lives in frame->buf[0] / data[1] (chroma); buf[0]'s AVBufferRef owns
+     * the original allocation and av_frame_unref frees it correctly even
+     * though data[0] points elsewhere. */
+    *(uint8_t **)((char *)frame + AVFRAME_OFF_DATA0) =
+        shim_avforward_empty_drm_descriptor;
+
     pthread_mutex_unlock(&s->mu);
     *out_ret = 0;
     return 1;
