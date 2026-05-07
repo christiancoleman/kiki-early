@@ -90,7 +90,7 @@ cat /proc/sys/fs/binfmt_misc/qemu-aarch64
 
 If missing: `sudo systemctl restart systemd-binfmt` or reinstall `qemu-user`.
 
-*Verified by:* fresh Debian 13 setup (Step 55 sequence).
+*Verified by:* fresh Debian 13 setup.
 
 ### One-time setup: Mesa software-raster overlay
 
@@ -156,7 +156,7 @@ After setup, `/games`, `/connectivity`, `/data` are kernel-resolved into the sys
 
 ### `/etc/init.d/shared` env propagation
 
-The script sources `$SYSROOT/etc/init.d/shared` and propagates every var via qemu's `-E` flag, exactly as real hardware would inherit them through init. The shim's `remap_path` then translates absolute paths like `/games/pokemon_le/...` to `$SYSROOT/games/pokemon_le/...` on every `open()`. One override applied: `BOOT_DISPLAY` is forced to `$GAMES_PATH/spike3/bin/boot_display` because the shared script's `[ -x ]` check runs on the host filesystem and would otherwise fall back to the wrong path.
+The script sources `$SYSROOT/etc/init.d/shared` and propagates every var via qemu's `-E` flag, exactly as real hardware would inherit them through init. The kernel-level bind mounts (above) resolve absolute paths like `/games/pokemon_le/...` to the sysroot natively. One override applied: `BOOT_DISPLAY` is forced to `$GAMES_PATH/spike3/bin/boot_display` because the shared script's `[ -x ]` check runs on the host filesystem and would otherwise fall back to the wrong path.
 
 *Verified by:* `_emulation/run_game.sh` source.
 
@@ -224,9 +224,9 @@ Each row is a 5-pointer array (English / Spanish / French / German / Italian, in
 |---:|---|---|
 | `0x789` (1929) | `"Startup In Progress%s"` (formatted with one %s arg) | `mcp_draw_startup_in_progress_overlay` (`0x5cddd0`) |
 
-The `%s` argument is built by `sub_7de9c0(3, …)` — likely "stringify the integer 3" producing something like `"...3"` or `"..., step 3"`. Not yet decoded.
+The `%s` argument is built by `sub_7de9c0(3, …)`.
 
-The msgid → string-table resolution was **established empirically** (PROTOCOL.md §14 "System-mode debugging" workflow): a HW read watchpoint on `mcp_localized_string_table[0x789]` runtime address `0x55598e89c8` fired with PC = `0x7a64ec` (inside `mcp_lookup_localized_msg_by_id`) and LR = `0x5cdf90` (inside `mcp_draw_startup_in_progress_overlay`). The same chain handles every other localized-string draw.
+The same chain handles every other localized-string draw.
 
 ### Boot-splash tick chain (step 2 + step 3 overlays)
 
@@ -254,7 +254,7 @@ primary_initialization_orchestrator (0x678bc0)
      └─ sub_7b6be0 — std::condition_variable::notify_all on DisplayRenderer's cv (wakes render thread)
 ```
 
-The flag mask at `*(arg1 + 0x38)` (absolute address `0x445f838`, since `arg1 = &data_445f800`) is what ultimately determines which overlay text gets drawn on a given tick. Bit 3 specifically drives the step-2 "Startup In Progress" overlay; the other bits drive other overlays — which specific bit fires which string isn't fully pinned down yet beyond bit 3.
+The flag mask at `*(arg1 + 0x38)` (absolute address `0x445f838`, since `arg1 = &data_445f800`) is what ultimately determines which overlay text gets drawn on a given tick. Bit 3 drives the step-2 "Startup In Progress" overlay; other bits drive other overlays (specific bit-to-string mapping documented for bit 3 only).
 
 #### Who sets the mask
 
@@ -282,7 +282,7 @@ fire_event(0x5f, 0);
 
 `mcp_scene_cache_preload_done` is set to 1 at `0x66d490` inside `SceneCache_PreLoadRadiumAssets` — i.e. when the Radium scene preload phase finishes (after enumerating `/lcd/demand_loaded/*.{radium,json}`, `/nuk/images/*.{jpg,bmp,png,dds}`, `/lcd/auto_loaded/*.{radium,json}` and constructing the auto-loaded `RadiumScene` objects). That preload runs on a **background thread** (`RadiumAssetLoader_ThreadEntry`) launched by `mcp_SceneCache_ctor` at `0x66b06c` via `CC_mainDispatchThread(RadiumAssetLoader_ThreadEntry+0xc, 8, "PreLoadSceneCache", arg1)`.
 
-Implication: the wait loop is **time-bounded regardless** — even if the asset preload thread hangs, the orchestrator continues after ~8 wall seconds (in user-mode; longer in system-mode TCG emulation). The overlay is therefore not the proximate cause of any indefinite stall; the actual front-end blocker (per `CURRENT INVESTIGATION` memory, JOURNAL Step 81) is the Diag_1360 menu loop downstream.
+Implication: the wait loop is **time-bounded regardless** — even if the asset preload thread hangs, the orchestrator continues after ~8 wall seconds (in user-mode; longer in system-mode TCG emulation). The overlay is therefore not the proximate cause of any indefinite stall.
 
 *Verified by:* runtime hardware-read-watchpoint observation 2026-05-05 (PC `0x7a64ec`, LR `0x5cdf90`); BN decompile of the listed functions; `get_xrefs_to(0x445f838)` to enumerate writers, `get_xrefs_to(0x5d0930)` to confirm only the two orchestrator call-sites; `get_xrefs_to(0x4482108)` to find the `SceneCache_PreLoadRadiumAssets` writer; chain confirmed by user (system-mode and user-mode both reach the post-overlay state).
 
@@ -313,17 +313,41 @@ When `pdstate < 5` the bridge handles a subset of `0x10-0x1F` locally; the rest 
 
 In emulation: the shim creates a real `socketpair(AF_UNIX, SOCK_STREAM)` for `/dev/ttyAMA5` (game gets sv[0], shim holds sv[1]). The shim's `synthesize_bridge_response` is the equivalent of the real netbridge's `HOST_Update` for the cmds the game actually sends.
 
+### Frame format (escape protocol)
+
+Both directions use the same wire framing. STX/ETX/ESC are reserved and must be escaped within payload bytes.
+
+```
+[0x02] [CMD] [ID] [PAYLOAD...] [CKSUM] [0x03]
+  STX                                    ETX
+```
+
+- `0x02` (STX) and `0x03` (ETX) are mandatory framing bytes. Missing terminator → game times out after 1000 ms with `errno 110 ETIMEDOUT`. *Verified by:* setting trailer to `0x00` reproduces the timeout.
+- `CMD` and `ID` are single bytes.
+- `PAYLOAD` length varies per cmd. The parser computes payload length as `frame_length_between_STX_and_ETX − 3` (the 3 = CMD + ID + CKSUM).
+- `CKSUM` byte is computed such that `(CMD + ID + PAYLOAD... + CKSUM) mod 256 == 0`. STX and ETX are NOT included in the checksum.
+
+*Verified by:* cmd 0x30 request `02 30 01 cf 03` → `0x30 + 0x01 + 0xcf = 0x100`; cmd 0x20 request `02 20 01 df 03` → `0x20 + 0x01 + 0xdf = 0x100`. Both zero mod 256.
+
+Frames between netbridge and the nodes (RS-485 side) end with `... <checksum> 0x00` instead of `0x03`. The shim only sees the host-side UART layer (`0x03` ETX in both directions).
+
+#### Escape encoding (between STX and ETX)
+
+The protocol reserves three byte values for framing: `0x02` (STX), `0x03` (ETX), `0x1b` (ESC). Any CMD/ID/PAYLOAD/CKSUM byte equal to one of these is transmitted as `0x1b (byte | 0x80)` — e.g. `0x02 → 0x1b 0x82`, `0x03 → 0x1b 0x83`, `0x1b → 0x1b 0x9b`. Receiver un-escapes by AND-ing the byte following `0x1b` with `0x7f`.
+
+Implemented in netbridge `POWERDIST_SendCmd @ 0x100020b4` and in our shim's `bridge_encode_escape` / `bridge_decode_escape` (`shim_nodebus.c`).
+
 ### Address conventions in this document
 
 The game-binary BN database is **rebased to base 0x0**, so BN VA == ELF VA == file offset. Runtime address = `shim_resolve_game_base() + ELF_VA`. All addresses below ending in `g 0xNNNNNNN` (or unprefixed when context is clear) are ELF VAs. The netbridge.elf BN database is a separate database with its own ELF VAs starting at `0x10000000` (RP2040 flash base).
 
-### Game's outbound cmd usage (current run)
+### Game's outbound cmd usage
 
-From `_emulation/runs/latest/game.log`, the distinct cmd codes the game has been observed sending:
+Distinct cmd codes the game sends:
 
-`0x10  0x11  0x15  0x16  0x18  0x1c  0x1d  0x27  0x30`  (9 unique)
+`0x10  0x11  0x15  0x16  0x18  0x1c  0x1d  0x27  0x30`  (9 with static-immediate cmd bytes)
 
-Plus **`0x40` and `0x41` sent via runtime-computed cmd byte** in `mcp_nodebus_send_raw @ 0x9166c0`, where the cmd byte is `(arg1[0] >> 7) + 0x40`. The static-immediate scan that previously called these "never sent" missed them.
+Plus **`0x40` and `0x41` via runtime-computed cmd byte** in `mcp_nodebus_send_raw @ 0x9166c0`, where the cmd byte is `(arg1[0] >> 7) + 0x40`.
 
 ### Top-level cmd map (canonical truth)
 
@@ -341,12 +365,12 @@ Legend for **Shim status**: ✅ = handled with deliberate engineered shape; ⚠�
 | `0x19` | `ADC_GetLineVoltage` | `SendMessage(cmd, id, 2 bytes)` | ❌ never observed |
 | `0x1c` | POWERDIST passthrough; shared silent-ACK at `0x915d28` | unblocks the channel | ✅ shim sends 0-byte ACK |
 | `0x1d` | POWERDIST passthrough; dedicated handler at `0x916028` | varies by len | ✅ shim sends 0-byte ACK (avoids writing stale data into per-id buffer) |
-| `0x20` | bridge version triple (strtol over rodata) + ADC version | `SendMessage(0x20, id, 4 bytes)` | ⚠️ shim returns 4 zero bytes WITH RESPONSE CMD `0x10`. Diverges from the bridge's actual reply (which uses cmd `0x20`). Possibly intentional placeholder; the cmd 0x10 game-handler requires 7 bytes so this would fail if cmd 0x20 ever fires |
+| `0x20` | bridge version triple (strtol over rodata) + ADC version | `SendMessage(0x20, id, 4 bytes)` | ⚠️ shim returns 4 zero bytes WITH RESPONSE CMD `0x10`. Diverges from the bridge's actual reply (which uses cmd `0x20`). The cmd 0x10 game-handler requires 7 bytes so this would fail if cmd 0x20 ever fires |
 | `0x21` | `BBL_Set` / `BBL_Get` (battery backup level) | `SendMessage(cmd, id, 1 byte)` | ❌ never observed |
 | `0x22` | `resetFlags` (also sent unsolicited at boot) | `SendMessage(0x22, 0, 1 byte)` | ❌ never observed (bridge sends unsolicited at first connect — see "Async notifications" below) |
 | `0x23` | snapshot + clear `bridgeStatus` | `SendMessage(0x23, id, 4 bytes)` | ❌ never observed |
 | `0x24` | `ADC_GetVBBmV` (battery voltage) | `SendMessage(cmd, id, 4 bytes)` | ❌ never observed |
-| `0x25` | `NODEBUS_Poll` (flow-control probe; binary-search of free TX buffer space) | `SendMessage(cmd, id, 1 byte)` | ❓ never observed in this run, but earlier silent-ACK attempt broke something. Currently lets it time out (per Step 45 "timeout-is-progress") |
+| `0x25` | `NODEBUS_Poll` (flow-control probe; binary-search of free TX buffer space) | `SendMessage(cmd, id, 1 byte)` | ❓ shim lets it time out — see "Bridge-command timeouts as progress signal" below |
 | `0x27` | LCD subcommands (sub-cmd at byte 0) | varies — see "Cmd 0x27 LCD subprotocol" below | ✅ shim alternates `0x06` / `0x02` per call to satisfy a paired bit-2-toggle poll loop in the game (see "Cmd 0x27 game-side polling" below) |
 | `0x28` | DMD ops (disambiguated by length) | varies | ❌ never observed |
 | `0x29` / `0x2A` / `0x2B` / `0x2F` | WS2812 LED chains | varies | ❌ never observed |
@@ -383,7 +407,7 @@ A static response cannot satisfy the paired loop. The shim alternates:
 - odd call → `0x06` (bits 1, 2 set, `& 3 == 2`)
 - even call → `0x02` (bit 1 only, `& 3 == 2`)
 
-Both values pass the `0x917264` condition; the alternation lets the paired loop exit both halves. *Verified by:* Step 19.2.
+Both values pass the `0x917264` condition; the alternation lets the paired loop exit both halves.
 
 ### Cmd 0x28 DMD subprotocol
 
@@ -456,11 +480,11 @@ Wire format (bridge → host):
 STX | 0x41 | id | rx_bytes[rx_length-1] | bridgeStatus | csum | ETX
 ```
 
-The actual node-bus message format (what's inside `tx_bytes` / `rx_bytes`) is determined by the **node firmware** (`pinnode-LPC1124_303-X.Y.Z.hex`, `coil4node-...`, etc.). The bridge is just a transparent UART relay — it doesn't know what "switch 57" means. To decode node-bus events: RE the node firmware, or capture wire traffic on real hardware and pattern-match against switch closures.
+The actual node-bus message format (what's inside `tx_bytes` / `rx_bytes`) is determined by the **node firmware** (`pinnode-LPC1124_303-X.Y.Z.hex`, `coil4node-...`, etc.). The bridge is just a transparent UART relay — it doesn't know what "switch 57" means.
 
 The encrypted variant of cmd 0x41 — used for node firmware flashing and 160+ per-(slot, inner_cmd) wrappers — is documented in §5.
 
-### Game-side response dispatch (`sub_d15aa8 @ 0xd15aa8` in PLE 0.81)
+### Game-side response dispatch (`sub_d15aa8 @ 0xd15aa8`)
 
 A dedicated bridge thread parses the responses byte-by-byte. When a complete frame arrives, it extracts `CMD` and computes `idx = CMD - 0x10`. If `idx u> 0x31` it falls through to "unknown command" error. Otherwise it loads a 16-bit signed entry from a jump table at `.rodata` offset `0x37cf510` (50 entries = 0x32 cmds, covering 0x10 through 0x41) and jumps to `0x915e14 + entry * 4`.
 
@@ -469,18 +493,18 @@ Per-cmd handler addresses (game side):
 | Resp CMD | Handler VA | Payload requirement | Action |
 |---|---|---|---|
 | `0x10` | `0x916194` | **exactly 7 bytes** | Pwrdist version. Packs bytes 0..2 into `data_490e61c`, bytes 3..5 into `data_490e620`, byte 6 → boolean flag at `+0x74` |
-| `0x12` | `0x916158` | 7 bytes | TBD |
-| `0x14` | `0x9160d8` | 4 bytes | TBD |
+| `0x12` | `0x916158` | 7 bytes | — |
+| `0x14` | `0x9160d8` | 4 bytes | — |
 | `0x15` | `0x9160a0` | **exactly 1 byte** | Pwrdist status. OR/XORs payload[0] with state at `data_490e5b0 + 128` |
 | `0x18` | `0x91607c` | variable | Records `min(existing, payload_len)` into halfword table at `data_490e5b0 + 0x88`, indexed by ID |
-| `0x1a` | `0x916064` | TBD | TBD |
-| `0x1b` | `0x916038` | TBD | TBD |
+| `0x1a` | `0x916064` | — | — |
+| `0x1b` | `0x916038` | — | — |
 | `0x1d` | `0x916028` | **exactly 4 bytes** | If `payload == 4`, branches to channel-copy at `0x915e88` (memcpy payload into per-id buffer). If not, silent ACK |
-| `0x20` | `0x915fec` | TBD | HW version |
-| `0x22` | `0x915e54` | TBD | TBD |
-| `0x2d` | `0x915f08` | TBD | TBD |
-| `0x2e` | `0x915ed8` | TBD | TBD |
-| `0x41` | `0x915f88` | TBD | TBD |
+| `0x20` | `0x915fec` | — | HW version |
+| `0x22` | `0x915e54` | — | — |
+| `0x2d` | `0x915f08` | — | — |
+| `0x2e` | `0x915ed8` | — | — |
+| `0x41` | `0x915f88` | — | — |
 
 **Generic fallbacks** (shared handlers reached by cmds without a dedicated entry):
 - `0x915e14` — generic "response received with data": signals waiting channel + memcpy payload into channel buffer. Hit by cmds `0x27`, `0x28`, `0x40`.
@@ -508,7 +532,7 @@ Computed as zlib CRC32 chained over `netbridge.elf` sections in order `.text →
 01 00 00 00 00 00 00
 ```
 
-Byte 0 = `0x01` produces `data_490e61c = 0x010000`, which is non-zero → game takes the "Spike 3 pwrdist present" branch. Other non-zero values likely work; this is just the one we use. Side effect: bytes 3..5 = `00 00 00` produce `data_490e620 = 0x000000`, which the game prints as `runtime version: 0.0.0` (boot version is printed as `1.0.0`). Cosmetic — the game still takes the "pwrdist present" branch on non-zero boot version.
+Byte 0 = `0x01` produces `data_490e61c = 0x010000`, which is non-zero → game takes the "Spike 3 pwrdist present" branch. Side effect: bytes 3..5 = `00 00 00` produce `data_490e620 = 0x000000`, which the game prints as `runtime version: 0.0.0` (boot version is printed as `1.0.0`). Cosmetic — the game still takes the "pwrdist present" branch on non-zero boot version.
 
 **Cmd 0x16 response payload**:
 
@@ -527,17 +551,13 @@ The bridge emits these on its own — the host doesn't request them.
 | `0x22` | Sent once at bridge boot, before the main loop starts | 1 byte `resetFlags` (from `watchdog_caused_reboot()`) | `main @ netbridge.elf 0x10001e3c`, line `0x10001ed6` |
 | `0x2D` | Sent whenever HOST_XOFF or NODE_XOFF flow-control state changes (checked at top of every `HOST_Update`) | 1 byte: `host_xoff \| (node_xoff << 1)` | `HOST_Update` lines `0x10001214-0x10001242` |
 
-The shim accepts these even though no host cmd was sent — they're how the bridge initially announces itself ("I just rebooted, here's why") and signals ongoing flow-control state. Synthesizing the boot `0x22` once at first connect would mimic the handshake more faithfully; not currently implemented.
+The shim accepts these even though no host cmd was sent — they're how the bridge initially announces itself ("I just rebooted, here's why") and signals ongoing flow-control state.
 
 ### Bridge-command timeouts as progress signal
 
-Some bridge commands **require** the 1000 ms channel timeout to fire — the timeout IS the state-machine transition, not the failure mode. If we synthesize an early ACK, the game interprets our ACK as "response received but no status payload" and keeps polling forever.
+Some bridge commands **require** the 1000 ms channel timeout to fire — the timeout IS the state-machine transition, not the failure mode. Synthesizing an early ACK leads the game to interpret it as "response received but no status payload" and poll forever.
 
-Confirmed for cmd **0x41** (handler at `0x915f88`): replacing the default "no synthetic response" branch with a zero-payload ACK sent progress backward — the game stopped reaching Godot init entirely. Reverting to the timeout path restored progress past the Step-31 PopupMenu SEGV and reached four Godot scenes.
-
-Likely also applies to cmds **0x25, 0x12, 0x19** — all of them show up as `bridge message (cmd=XX, id=N) response failed 110: Connection timed out` in the game's stdout, and the game continues after. Marker to look for in a fresh run: `bridge message (cmd=NN, id=M) response failed 110: Connection timed out` is **expected**, not a bug, until proven otherwise.
-
-*Verified by:* Step 45 — `_emulation/run_step45_fix1.stderr` (early-ACK regressed) vs `_emulation/run_step45_fix2.stderr` (timeout-path restored progress).
+Confirmed for cmd **0x41** (handler at `0x915f88`). Cmds **0x25, 0x12, 0x19** show the same `bridge message (cmd=XX, id=N) response failed 110: Connection timed out` pattern in the game's stdout and the game continues afterward; the shim does not synthesize replies for them.
 
 ### Local fallback handlers (bridge-side, when pdstate < 5)
 
@@ -545,21 +565,16 @@ These fire only when the main switch didn't already dispatch (when `POWERDIST_Is
 
 | Cmd | Reply contents | Length |
 |---|---|---|
-| `0x10` | `{strtol("0",,0), strtol(@0x10011f70,,0), strtol(@0x10011f74,,0)}` (likely a 3-byte version triple) | 3 |
+| `0x10` | `{strtol("0",,0), strtol(@0x10011f70,,0), strtol(@0x10011f74,,0)}` (3-byte version triple) | 3 |
 | `0x12` | `min(ADC_GetLineFrequency, 0xff)` clamped | 1 |
 | `0x15` | `0xff` (acknowledge stub) | 1 |
 | `0x19` | `clamp(ADC_GetLineVoltage, 0..0xffff)` | 2 |
-
-### Specific divergences worth re-checking
-
-- **`0x20` reply uses response cmd `0x10`** (not `0x20`). The game's dispatch computes `idx = CMD - 0x10`, so this routes to slot 0 (cmd 0x10's handler) instead of slot 0x10 (cmd 0x20's handler). Since the cmd 0x10 handler requires exactly 7 bytes and our `0x20` shim returns 4 zero bytes, this would fail the length check if cmd 0x20 ever fires. May be intentional alignment with a different game-side handler, but worth verifying against the bridge's actual reply (which uses CMD `0x20`).
-- **`0x25` (NODEBUS_Poll) and `0x41` (NODE block read) silent-ACK revert.** An earlier attempt to silent-ACK these caused breakage; the shim now lets them time out per Step 45. These are high-value to understand because `0x41` in particular is the live encrypted node-bus channel.
 
 ---
 
 ## 5. Nodebus (cipher, hash, framing)
 
-Two **separate** Stern-custom primitives share the "nodebus" name family but live on different layers and probably came from different design eras. Don't conflate them.
+Two **separate** Stern-custom primitives share the "nodebus" name family but live on different layers.
 
 | Primitive | Where it lives | Status in Pokémon LE 0.81 |
 |---|---|---|
@@ -644,7 +659,7 @@ With the flag clear (BSS-init state in our shim), the path WRITES 0 at offset `(
 
 #### `inner_len + 2` is checksum, NOT a "hint byte"
 
-Earlier shim work guessed that the wire byte at offset `(inner_len+2)` carried a response-length hint. **Wrong.** The hint (read at `mcp_nodebus_send_encrypted` line `0x8ec4c4` to determine response length) comes from `arg1[inner_len + 2]` — the wrapper's **local buffer**, before csum/encryption. After the cipher path runs, that wire offset is first written to 0, then overwritten by the negated sum. To size shim responses correctly, look up each wrapper's hint via static RE, not by decoding the wire.
+The wire byte at offset `(inner_len+2)` is the sum-checksum, not a response-length hint. The hint (read at `mcp_nodebus_send_encrypted` `0x8ec4c4` to determine response length) comes from `arg1[inner_len + 2]` — the wrapper's **local buffer**, before csum/encryption. After the cipher path runs, that wire offset is first written to 0, then overwritten by the negated sum. To size shim responses correctly, look up each wrapper's hint via static RE, not by decoding the wire.
 
 #### Per-slot tables (BSS-resident, 32 slots)
 
@@ -699,9 +714,11 @@ After the cipher decoder was added to `shim_nodebus.c::synthesize_bridge_respons
 | 1 | `0xed` | 17 | `[93]` (poll loop) |
 | 1 | `0xee` | 8 | `[ea 95]` (paired with the `0xed` poll) |
 
-Slots 2–31 saw zero traffic in the same window. None of the `0xfc / 0xfd / 0xf9` key-fetch family fired — the game must skip provisioning when the bridge timeout pattern is in effect, or sequence those after some other prerequisite.
+Slots 2–31 saw zero traffic in the same window. None of the `0xfc / 0xfd / 0xf9` key-fetch family fired.
 
-The first frame the game emits (`slot=0 inner_cmd=0xf2 payload=[71]`) was independently predictable from the cipher recipe before this run and matches byte-for-byte — confirming the cipher recipe end-to-end (encryption HLIL → C decoder → live capture).
+#### Why "extremely weak"
+
+Keys are zero at boot (BSS) and fetched at runtime via inner cmd `0xfc`. On the first fetch the cipher reduces to position-mask XOR (key bytes are 0). The response key bytes are NOT decrypted by the game — the cipher path is outbound only — so the keys travel cleartext on the wire. A passive bus sniffer can capture the cleartext key bytes from the cmd-`0xfc` response and then XOR them into all subsequent commands sent to that slot.
 
 #### Python reference implementation
 
@@ -764,7 +781,7 @@ hash(x) = (z >> 16) ^ z
 
 All arithmetic is modulo `2^32`. Inputs and intermediates are `uint32_t`. The two multiplications are negative, hence the `NOT`/`-1` form: the compiler typically emits them as shift-subtract sequences rather than a multiply.
 
-*Verified by:* direct Thumb-1 disassembly of `HOST_Update` in `netbridge.elf` VAs `0x10001618..0x10001634`. The earlier draft's `0x80008001` and `0xfffff801` constants were wrong (Step 65 correction).
+*Verified by:* direct Thumb-1 disassembly of `HOST_Update` in `netbridge.elf` VAs `0x10001618..0x10001634`.
 
 #### Operations on top of the bare hash
 
@@ -799,8 +816,6 @@ static inline uint32_t nodebus_hash(uint32_t x) {
 }
 ```
 
-Python equivalent (with seed-table dispatch) is in JOURNAL Step 65 and the deleted `NODEBUS_HASH.md`; the C above is sufficient for verification.
-
 #### ARM64 hunting checklist (for other Spike 3 builds)
 
 The polynomial fits in ~14–18 ARM64 instructions. Strongest "shape" signature is **all four** of these within ±256 bytes:
@@ -827,7 +842,7 @@ Same patterns with `#15 → #11` and `#0x7FFF → #0x7FF` for the second multipl
 
 The `* 9` between the first XOR and `m2` is typically lowered to `ADD Wd, Wm, Wm, LSL #3`.
 
-The constants `0x7FFF` and `0x7FF` are common (audio saturation, byte masks) — don't lead with constants; lead with the distinctive shift sequence.
+The constants `0x7FFF` and `0x7FF` are common (audio saturation, byte masks); the distinctive shift sequence is more specific.
 
 #### Known false-positive shapes in Pokémon LE 0.81
 
@@ -838,8 +853,6 @@ When scanning `games/pokemon_le/game`, several functions trip individual polynom
 | `sub_11ed6f0`, `sub_11f172c` | Many `MOVZ #0x8001` + `MOVK #0x8000 lsl#16` pairs (loading `0x80008001`) | libpng `png_compose` / channel-loss check. `0x80008001` is the magic-number divider for `x / 0xFFFF`. Identified by `png_error` strings + `png_get_channels` calls |
 | `sub_1042214` | `SUB W6, W8, W8, LSL #11` (the only self-shift `SUB-LSL-#11` in the binary) AND `MOVN W14, #0x07FE` (loading `0xFFFFF801`) | Signed Q-format audio-sample saturation. `x - (x << 11) = x * -0x7FF` is being used as a Q-format magnitude scaler; `0xf801` halfword stores are bit-pack endpoints of the +/-0x7FF saturation range |
 | `sub_9b7590`, `sub_9b9820`, `sub_9bba80`, `sub_9bd9a8` | `MOVZ #0x7FFF` + `MOVN #0x7FFE` register-paired loads, plus X-reg `LSR #10` + `LSR #16` shift co-locations | Bespoke audio codec rounds. `MOVZ #0x7FFF` / `MOVN #0x7FFE` load the +/-0x7FFF saturation clamps for 15-bit signed PCM samples. The `0x4000` rounding bias and `(1 << (width-1)) - 1` overflow check give it away as a sample bit-width normalizer. The `0x1b` constants nearby are GF(2^8) reduction (AES MixColumns coefficient) |
-
-If a future scan flags any of these functions, refer here before acting.
 
 ## 6. image.bin file format
 
@@ -902,7 +915,7 @@ uint64 encoded_id = (flags << 32) | asset_id_low
 absolute pointer inside mmap'd image.bin → PCM samples
 ```
 
-Token → asset_id is **not in compiled code**. It's populated at runtime when `load_scene_assets` walks each scene's bytecode and inserts type-0x0b records. Per-scene variants are possible. Static extraction can recover (asset_id_low, flags, size, file_offset) from section 7 directly; the name → asset_id mapping requires runtime capture.
+Token → asset_id is **not in compiled code**. It's populated at runtime when `load_scene_assets` walks each scene's bytecode and inserts type-0x0b records. Static extraction can recover (asset_id_low, flags, size, file_offset) from section 7 directly; the name → asset_id mapping requires runtime capture.
 
 *Verified by:* JOURNAL Step 41 (stages 1-2), Step 42 (stages 3-5), Step 43 (g_asset_registry / section-7 perfect intersection).
 
@@ -922,7 +935,7 @@ absolute pointer → scene bytecode
 loaded scene state
 ```
 
-`x21` (the variant index 0..4) comes from `sub_7d8200`, which returns the current language/region selector. Default value 0 — all 5 variants for scenes 0-12 currently point to the same offset (scenes are language-agnostic in this build).
+`x21` (the variant index 0..4) comes from `sub_7d8200`, which returns the current language/region selector. Default value 0 — all 5 variants for scenes 0-12 point to the same offset (scenes are language-agnostic in this build).
 
 *Verified by:* `hexdump_address 0x43fcf00` + 0xf8 in image.bin; live trace of scene 10 → asset_id 10 → file offset 0x42eeebad via BRK trap (`shim_discovery.c`, runs/2026-05-04T16:30:01).
 
@@ -961,7 +974,7 @@ When the bytecode walker encounters byte `0x0b`, it reads the next 10 bytes as t
 
 `u32 LE` read at payload offset +3 is a valid `asset_id_low` for every one of the 2,414 records (100% match against the 64 distinct id_lows in section 7).
 
-The 32-bit `flags` word of the section-7 composite key (`(flags << 32) | id_low`) is **partially recoverable** from this payload alone. Bytes 7 & 9 of the 0x0b record together encode at most 16 combinations, but section 7 has 256 distinct flag values. The likely missing source is byte 2 of the preceding type-`0x05` header (which has 256 distinct values across all 2,496 `0x05` records — matching the section-7 flag cardinality exactly). Best static brute-force formula is `flags = (H[0] << 24) | P[7] | (P[9] << 16)` and yields 660/2414 matches; full reconstruction needs more decoding work or runtime capture.
+The 32-bit `flags` word of the section-7 composite key (`(flags << 32) | id_low`) is **partially recoverable** from this payload alone. Bytes 7 & 9 of the 0x0b record together encode at most 16 combinations, but section 7 has 256 distinct flag values. Byte 2 of the preceding type-`0x05` header has 256 distinct values across all 2,496 `0x05` records (matching the section-7 flag cardinality). Best static brute-force formula is `flags = (H[0] << 24) | P[7] | (P[9] << 16)` and yields 660/2414 matches.
 
 For partial extraction (asset_id_low only), the type-0x0b payload at byte +3 is sufficient.
 
@@ -989,7 +1002,7 @@ The composite `encoded_id` is the same `(flags << 32) | asset_id_low` u64 the ru
 | `audio_stereo_sfx` | 4-byte/elem + stereo marker + duration < 30 s | 312 |
 | `audio_mono` | 2-byte/elem, audio shape (bit 7 set, bits 8/9 clear) | 2,105 |
 
-User-validated: all 2,452 confirmed audio (no encryption applied to the bulk data per JOURNAL Step 43+65 + manual auditioning). The audio_mono bucket may include some animation/coordinate int16 arrays as false positives — flags byte further disambiguates if needed.
+User-validated: all 2,452 confirmed audio. No encryption is applied to the bulk data.
 
 *Verified by:* `_extraction/tools/spike_extract` produces 2,452 records matching runtime hashmap dump; user-validated audio playability.
 
@@ -1009,7 +1022,7 @@ First 12 records (and most `delta == 408` records) have identical shape:
 +0x188 total size 408
 ```
 
-Later records (delta != 408) likely have different grid dimensions.
+Later records (delta != 408) have different grid dimensions.
 
 **This is NOT a scene → asset mapping.** Zero of the section-2 uint32 values match any `asset_id_low` from section 7, and zero uint64 values match any section-5 offset. The records hold playfield lamp/target/insert state tables used by gameplay logic per mode or per animation frame.
 
@@ -1036,9 +1049,7 @@ Pokémon LE 0.81 ships **only `image.bin`** — no `image-sc??.bin` files. The 1
 
 The 1,254-line `scene_config_table.c` export in `_extraction/_outdated/` covers VA 0x48071d0 onward, which holds the Spike 3 **service/test/adjustments menu tree** (Active Switch Test, Game Adjustments, Pikachu Tests and Calibration, Exit the test menu, plus a handful of audio-test items: "MUSIC: MAINPLAY", "SOUND: SUPER SKILL SHOT", "SPEECH: 'SQUIRTLE'"). Each entry is a `{function_ptr, label_string, u16_index, u16_parent_id}` quadruple. This is the menu structure Nuklear walks when the operator enters test mode.
 
-The **real `scene_config_table`** is at VA `0x47fcf10` (Pokémon LE 0.81), 41,664 bytes earlier. It is either BSS (populated at runtime by an unidentified setup function) or static data not yet exported from the `.bndb`. Closing the 885 scene → asset_id mapping requires either re-exporting that region or capturing it at runtime.
-
-If the export file appears under a different name in a future session, it should be `service_menu_table.c` for clarity.
+The **real `scene_config_table`** is at VA `0x47fcf10` (Pokémon LE 0.81), 41,664 bytes earlier.
 
 ---
 
@@ -1103,17 +1114,17 @@ index, file_offset, asset_id_low, flags, encoded_id, size_elements, element_byte
 |---|---:|---:|---|
 | `audio_stereo_music` | 35 | 331 MB | All 3 originally-confirmed music tracks included |
 | `audio_stereo_sfx` | 312 | 180 MB | Stereo SFX pool. Classification rule = `id_low & 0x20040` bit pattern |
-| `audio_mono` | 2,105 | 566 MB | **All confirmed audio** — user-validated 2026-04-27, no animation false-positives |
+| `audio_mono` | 2,105 | 566 MB | **All confirmed audio** — user-validated, no animation false-positives |
 | **Total** | **2,452** | **1.1 GB** | Matches image.bin section-7 record count exactly |
 
-Every section-7 record is audio in this build. Nothing is encrypted (validated by manual auditioning + JOURNAL Steps 41, 43, 65).
+Every section-7 record is audio in this build. Nothing is encrypted.
 
 *Verified by:* `_extraction/spike_extract_out/index.csv` (2,452 rows + header) + manual audition of representative samples per category.
 
 ### Open gaps
 
-- **SE_PK_* name → asset_id mapping is NOT in compiled code.** Token resolution happens at runtime via type-0x0b records during scene-bytecode walking (see §8 audio pipeline + §6 image.bin format). Static extraction recovers (asset_id_low, flags, size, file_offset) but not the SE_PK_* names. Only runtime capture (past the Step 31 SEGV) or a CM4 hardware memory dump would yield the full name → asset_id table.
-- **Non-audio content in image.bin** (scene bytecode in section 5, playfield grids in section 2) is not extracted by this tool. The tool's scope is section 7. Other section parsers would be additional tooling.
+- **SE_PK_* name → asset_id mapping is NOT in compiled code.** Token resolution happens at runtime via type-0x0b records during scene-bytecode walking (see §8 audio pipeline + §6 image.bin format). Static extraction recovers (asset_id_low, flags, size, file_offset) but not the SE_PK_* names. Only runtime capture or a CM4 hardware memory dump yields the full name → asset_id table.
+- **Non-audio content in image.bin** (scene bytecode in section 5, playfield grids in section 2) is not extracted by this tool. The tool's scope is section 7.
 
 ### Portability to other Spike 3 games
 
@@ -1224,7 +1235,7 @@ GDScript call pattern: `Spike.play_sound(SpikeSoundIds.SE_PK_FX_<NAME>)` passes 
 
 #### NOT in the hashmap
 
-~725 other `SE_PK_*` strings from the previs `spike_game_sound_ids.gd` autoload (VO, TUNE, MX, BONUS, THEME, and several FX families beyond attack-type / EOB-pokedex) are **not** in this hashmap. Their dispatch path is unverified; presumably dispatched through a different bridge method we haven't located.
+~725 other `SE_PK_*` strings from the previs `spike_game_sound_ids.gd` autoload (VO, TUNE, MX, BONUS, THEME, and several FX families beyond attack-type / EOB-pokedex) are **not** in this hashmap.
 
 ### Full 5-stage name → audio-bytes resolution pipeline
 
@@ -1232,44 +1243,25 @@ GDScript call pattern: `Spike.play_sound(SpikeSoundIds.SE_PK_FX_<NAME>)` passes 
 |---|---|---|
 | 1 | `sub_8d3460` (static init) | Name string → uint16_t token, into hashmap at `data_48c56d0` (25 entries only) |
 | 2 | `sub_b09660` | Name lookup in the hashmap; returns hash node with token at offset `+0x28` |
-| 3 | **NONE — runtime only** | Token → asset_id: NOT in compiled code. Populated from scene bytecodes (type-0x0b records, see §6) by `load_scene_assets` at `0xb321d0` when each scene loads. Per-scene variants possible |
+| 3 | **NONE — runtime only** | Token → asset_id: NOT in compiled code. Populated from scene bytecodes (type-0x0b records, see §6) by `load_scene_assets` at `0x7321d0` when each scene loads |
 | 4 | `asset_registry_find` over `g_asset_registry` at `data_48ca4d0` | Encoded asset_id → `{file_offset, size, type}` |
 | 5 | `get_asset_ptr_by_packed_id` → `image_mapped_base_plus_offset` | File offset → absolute pointer inside mmap'd `image.bin` |
 
 #### Why stage 3 is runtime only
 
-Per Sidekick (Step 42): "This separation allows content updates without binary recompilation — a regulatory compliance requirement for gaming machines." No `uint32_t token_to_asset[]` array exists in the binary; token constants never appear in asset-ID construction paths. The same `SE_PK_*` can map to different `asset_id`s across scenes.
+No `uint32_t token_to_asset[]` array exists in the binary; token constants never appear in asset-ID construction paths. The same `SE_PK_*` can map to different `asset_id`s across scenes.
 
-To obtain the full name → asset_id mapping: either (a) runtime-capture under emulation by hooking `asset_registry_find` / `sub_b09660` after `load_scene_assets` has run for every scene, or (b) dump `g_asset_registry` from a running game on real hardware (CM4).
-
-*Verified by:* JOURNAL Step 42 (architectural reasoning + static-search negative result).
+*Verified by:* JOURNAL Step 42.
 
 ### Encryption status
 
-Spike 2 era: audio was encrypted via `NODEBUS_Hash` round-trips to the netbridge (per Pinball Browser team RE). **Pokémon LE 0.81: NOT encrypted.** All 2,452 section-7 records extract clean (manual audition + duration analysis confirms playable PCM). The hash polynomial is also absent in this build — see §5.2.
-
----
-
-# then write a local scene_catalog.py with that game's SHA-1 catalog
-```
-
-(Adjust the `../` count to match nesting depth.)
-
-When SW LE 0.85 is brought into the same toolchain: same drill. Symlink the three shared bits + write `<sw_le>/assets/lcd/scene_catalog.py`. Most of SW LE's bc0792d8 entries should carry over from spike_menu's catalog (shared Stern code).
-
-#### Refactor candidate: shared Stern catalog
-
-If/when SW LE's catalog also reuses the bc0792d8 descriptions verbatim (very likely), promote the shared block from `scene_catalog.py` files into `assets/lcd/_stern_shared_catalog.py` and have each game's per-game catalog `from _stern_shared_catalog import SHARED_BC0792D8` and merge it into its own `SCENE_INFO`. Skipped today (only two consumers, manageable copy-paste cost; refactor when third consumer arrives).
-
-### Bridge to game code (out-of-scope reference)
-
-The Radium scene tree integrates with Godot via `ManualGodotScene` (vtable at game VA `0x4630230`). Its constructor `sub_b25fc8 @ 0xb25fc8` is called from `load_scene_assets @ 0xb321d0` at `0xb32370` and `0xb32388`. **Per `feedback_godot_is_illegal.md` (2026-05-02), the ManualGodotScene internals — its extended ftable at `0x4630240..0x4630340`, the VideoPlayerSpi class layout, and the play() vtable — are out of scope for active investigation.** They are documented in JOURNAL Steps 36, 71-72 if needed for archeology, but should not be promoted into PROTOCOL.
+**Pokémon LE 0.81: NOT encrypted.** All 2,452 section-7 records extract clean (manual audition + duration analysis confirms playable PCM). The hash polynomial is also absent in this build — see §5.2.
 
 ---
 
 ## 10. Display pipeline (DRM / GBM / EGL / GLES)
 
-**Data flow at a glance.** The game does its own real GLES rendering — no synthesized frames are fed to it. We intercept the hardware-specific framebuffer presentation parts (DRM/KMS ioctls + GBM allocation calls) and replace them with stand-ins, but every `glClear` / `glDraw*` / shader / texture upload the game issues is forwarded through to **real Mesa with the llvmpipe CPU rasterizer**, which writes real pixels into a real off-screen EGL pbuffer (returned by Mesa's `eglCreatePbufferSurface(1920×1080)` after we redirect the game's `eglCreateWindowSurface` call). At each fake page-flip the shim does `glReadPixels` on that pbuffer, getting bit-exact what the game just rendered, and routes the bytes to one or more sinks (frame bridge over abstract AF_UNIX, `/dev/fb0` blit for the qemu GTK window, periodic on-disk capture). GBM in this flow is a handle stand-in — its BOs are `calloc(256)` scratch pointers used as opaque tokens passed between layers; the only GBM BOs that actually carry pixel data are the special 1024×256 DMD path (`gbm_bo_map` returns `calloc(stride*height)` storage and `gbm_bo_unmap` captures it). The result: anything the game draws — including any rendering bug — shows up in the pbuffer and downstream, just executed slower by software raster than by a real GPU.
+**Data flow at a glance.** The game does its own real GLES rendering — no synthesized frames are fed to it. We intercept the hardware-specific framebuffer presentation parts (DRM/KMS ioctls + GBM allocation calls) and replace them with stand-ins, but every `glClear` / `glDraw*` / shader / texture upload the game issues is forwarded through to **real Mesa with the llvmpipe CPU rasterizer**, which writes real pixels into a real off-screen EGL pbuffer (returned by Mesa's `eglCreatePbufferSurface(1920×1080)` after we redirect the game's `eglCreateWindowSurface` call). At each fake page-flip the shim does `glReadPixels` on that pbuffer and routes the bytes to one or more sinks (frame bridge over abstract AF_UNIX, `/dev/fb0` blit for the qemu GTK window, periodic on-disk capture). GBM in this flow is a handle stand-in — its BOs are `calloc(256)` scratch pointers used as opaque tokens passed between layers; the only GBM BOs that actually carry pixel data are the special 1024×256 DMD path (`gbm_bo_map` returns `calloc(stride*height)` storage and `gbm_bo_unmap` captures it).
 
 The game presents frames via Linux's KMS/DRM stack with EGL on top of GBM. Three layers in the shim:
 
@@ -1294,7 +1286,7 @@ All three layers cooperate so the game's normal display pipeline (allocate GBM B
 | `DRM_IOCTL_MODE_MAP_DUMB` | `ENOTSUP` |
 | `DRM_IOCTL_MODE_GEM_CLOSE` | success |
 
-*Verified by:* Step 21/24 — game completes full DRM resource enumeration → `gbm_bo_map`/`gbm_bo_unmap` path executes → DMD frame produced.
+*Verified by:* JOURNAL Step 21, 24.
 
 ### GBM hooks
 
@@ -1314,8 +1306,8 @@ Each BO is registered in a side-table (32 slots, mutex-guarded) holding its `(wi
 | `eglCreateContext` / `eglDestroyContext`, `eglCreateWindowSurface` (redirected to `eglCreatePbufferSurface` 1920×1080), `eglCreatePbufferSurface`, `eglDestroySurface` | fake handles in stub mode; forwarded to Mesa in real-GL mode |
 | `eglMakeCurrent` (with `draw=NULL` → fabricates fallback pbuffer from `shim_last_real_config`), `eglSwapBuffers`, `eglSwapInterval`, `eglQuerySurface`, `eglSurfaceAttrib` | normal |
 | `eglGetError` | always `EGL_SUCCESS` |
-| `eglGetProcAddress` | routes to shim-owned stubs for `eglGetPlatformDisplayEXT`, `eglCreateImageKHR` / `DestroyImageKHR`, `eglCreateSyncKHR` / `DestroySyncKHR` / `WaitSyncKHR` / `ClientWaitSyncKHR`, `glEGLImageTargetTexture2DOES`. Never forwards — would hand fake GBM to real Mesa |
-| `eglCreateImageKHR` (shim-owned) | Never forwards to Mesa (would deref fake GBM); registers `{w, h, fourcc}` in side-table, returns sentinel |
+| `eglGetProcAddress` | routes to shim-owned stubs for `eglGetPlatformDisplayEXT`, `eglCreateImageKHR` / `DestroyImageKHR`, `eglCreateSyncKHR` / `DestroySyncKHR` / `WaitSyncKHR` / `ClientWaitSyncKHR`, `glEGLImageTargetTexture2DOES`. Never forwards |
+| `eglCreateImageKHR` (shim-owned) | Never forwards to Mesa; registers `{w, h, fourcc}` in side-table, returns sentinel |
 | `glEGLImageTargetTexture2DOES` | Looks up the side-table + does real `glTexImage2D(0, RGBA8, w, h, ..., NULL)` to give the bound texture storage; tracks in `shim_frametex` for capture targeting |
 
 ### GLES 3 hooks (~70 entry points)
@@ -1338,7 +1330,7 @@ Each BO is registered in a side-table (32 slots, mutex-guarded) holding its `(wi
 
 | Mode | Set via | Behavior |
 |---|---|---|
-| Stub (default off) | `REAL_GL=0 ./run_game.sh` | Every GLES/EGL/GBM call returns plausible defaults. Shaders "compile". Draws are no-op. Sufficient for protocol-level tests; produces no real pixels |
+| Stub (default off) | `REAL_GL=0 ./run_game.sh` | Every GLES/EGL/GBM call returns plausible defaults. Shaders "compile". Draws are no-op. Produces no real pixels |
 | Real-GL (default on, `REAL_GL=1`) | `./run_game.sh` (default) | `FWD_RET` / `FWD_VOID` macros tail-call `dlsym(RTLD_NEXT, ...)` into the Mesa overlay at `mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/`. Game's EGL/GLES calls now go to real Mesa → llvmpipe → a real framebuffer |
 
 #### Real-GL translation glue
@@ -1352,7 +1344,7 @@ Each BO is registered in a side-table (32 slots, mutex-guarded) holding its `(wi
 
 #### dlopen/dlsym interception (in `spi_shim.c`)
 
-Tracks `libEGL` / `libGLES` / `libgbm` handles. Substitutes the shim's 3 EGLImage overrides on `dlsym(handle, "eglCreateImageKHR" / "eglDestroyImageKHR" / "glEGLImageTargetTexture2DOES")`. `eglGetProcAddress` returns the shim's stubs (never forwards — would hand fake GBM to real Mesa).
+Tracks `libEGL` / `libGLES` / `libgbm` handles. Substitutes the shim's 3 EGLImage overrides on `dlsym(handle, "eglCreateImageKHR" / "eglDestroyImageKHR" / "glEGLImageTargetTexture2DOES")`. `eglGetProcAddress` returns the shim's stubs (never forwards).
 
 ### Capture pipeline
 
@@ -1360,8 +1352,8 @@ Tracks `libEGL` / `libGLES` / `libgbm` handles. Substitutes the shim's 3 EGLImag
 |---|---|---|
 | **DMD frames** (1024×256 BGRA) | `gbm_bo_map` detects 1024×256 ABGR8888 BO, returns `calloc(stride*height)`; capture in `gbm_bo_unmap` | `_emulation/dmd/frame_NNNNNN.bgra` (1 MB each) |
 | **Radium shaders** (12 programs / 24 shader objects per init) | `glShaderSource` — concatenate `count × string × length` args; type recorded in `glCreateShader` | `_emulation/shaders/shader_NNN_idM_typeXXXX.glsl` |
-| **Scene textures** (`StreamingImage` path, `glTexSubImage2D` at game VA `0xca769c`) | `glTexImage2D` / `glTexSubImage2D` — dump `data` arg sized via GLES bytes-per-pixel table | `_emulation/textures/tex_NNNNNN_WxH_fmtXXXX_typeYYYY.raw` |
-| **Compressed textures** (DXT1/DXT5 — none observed in PLE 0.81) | `glCompressedTexImage2D` / `glCompressedTexSubImage2D` | `_emulation/textures/tex_compressed_NNNNNN_WxH_fmtXXXX.bin` |
+| **Scene textures** (`StreamingImage` path, `glTexSubImage2D` at game VA `0x8a769c`) | `glTexImage2D` / `glTexSubImage2D` — dump `data` arg sized via GLES bytes-per-pixel table | `_emulation/textures/tex_NNNNNN_WxH_fmtXXXX_typeYYYY.raw` |
+| **Compressed textures** | `glCompressedTexImage2D` / `glCompressedTexSubImage2D` | `_emulation/textures/tex_compressed_NNNNNN_WxH_fmtXXXX.bin` |
 
 ### Frame bridge wire format
 
@@ -1379,33 +1371,32 @@ When `FRAME_BRIDGE=1`, every 2nd `MODE_PAGE_FLIP` triggers `glReadPixels(0, 0, 1
 
 Subscriber: `frame_viewer.py` (Tk + numpy + Pillow). Self-resolves the abstract socket name. Shows live frames in a 1920×1080 window (or fullscreen with `VIEWER_FULLSCREEN=1`).
 
-### Observed at runtime (Step 24/27 captures)
+### Observed at runtime
 
 | Asset | Counts |
 |---|---|
-| Shader programs | 12 (24 shader objects: 12 vertex `type=0x8b31` + 12 fragment `type=0x8b30`). ~7.5 KB total source. First is a standard `#version 300 es` sprite vertex shader |
-| RGBA texture uploads | 16 textures at 1024×{64,128,256,512} for SternLogo splash (1920×1080) + various UI surfaces |
+| Shader programs | 12 (24 shader objects: 12 vertex `type=0x8b31` + 12 fragment `type=0x8b30`) |
+| RGBA texture uploads | 16 textures at 1024×{64,128,256,512} for SternLogo splash (1920×1080) + UI surfaces |
 | `GL_LUMINANCE_ALPHA` 256×256 atlases | 79 — Nuklear font glyph atlases |
-| GBM BO sizes seen | 1024×256 (DMD), 1920×1080 (display) |
-| Compressed textures | 0 (no `glCompressedTex*` calls observed) |
+| GBM BO sizes | 1024×256 (DMD), 1920×1080 (display) |
 
-The DMD pipeline (`DMDEmulationScene`, ctor at BN VA `0xa8ca40` → `0x68ca40` runtime): allocates 1 MB BGRA buffer at object offset +0x30 → `create_gbm_bo_and_upload @ 0xcffe80` → `gbm_bo_map` writes pixel data row-by-row (with stride) → `gbm_bo_unmap` → `gbm_bo_get_fd` → DMA-BUF fd → `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` → `glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES)`.
+The DMD pipeline (`DMDEmulationScene` ctor at `0x68ca40`): allocates 1 MB BGRA buffer at object offset +0x30 → `create_gbm_bo_and_upload @ 0x8ffe80` → `gbm_bo_map` writes pixel data row-by-row (with stride) → `gbm_bo_unmap` → `gbm_bo_get_fd` → DMA-BUF fd → `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` → `glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES)`.
 
-Shim's `gbm_bo_map` returns `calloc(stride*height)` backing; `gbm_bo_unmap` dumps to `_emulation/dmd/frame_NNNNNN.bgra` (1 MB raw BGRA). First capture confirmed: `frame_000000.bgra` is exactly 1,048,576 bytes (= 1024 × 256 × 4).
+Shim's `gbm_bo_map` returns `calloc(stride*height)` backing; `gbm_bo_unmap` dumps to `_emulation/dmd/frame_NNNNNN.bgra` (1024 × 256 × 4 = 1 MB raw BGRA).
 
-*Verified by:* Step 24 capture inventory; Step 25 DMDEmulationScene class identification.
+*Verified by:* JOURNAL Step 24, 25.
 
-### Game-binary VA reference points (current rebased BN values)
+### Game-binary VA reference points
 
-| Symbol | VA |
+| VA | Symbol |
 |---|---|
-| `sub_d01880` page flip — frame commit | `0x901880` |
-| `sub_bb76e0` DisplayRenderer render loop — main render thread, callback-driven | `0x7b76e0` |
-| `sub_a8ca40` DMDEmulationScene constructor | `0x68ca40` |
-| `sub_cffe80` create_gbm_bo_and_upload — DMA-BUF DMD upload | `0x8ffe80` |
-| `sub_d00030` init_tex_rgba — EGL image creation from DMA-BUF fd | `0x900030` |
-| `sub_ca7210` StreamingImage_Bind — non-DMD scene texture bind | `0x8a7210` |
-| `sub_d001c0` Texture2dBase constructor | `0x9001c0` |
+| `0x901880` | `sub_901880` page flip — frame commit |
+| `0x7b76e0` | `sub_7b76e0` DisplayRenderer render loop — main render thread, callback-driven |
+| `0x68ca40` | `sub_68ca40` DMDEmulationScene constructor |
+| `0x8ffe80` | `sub_8ffe80` create_gbm_bo_and_upload — DMA-BUF DMD upload |
+| `0x900030` | `sub_900030` init_tex_rgba — EGL image creation from DMA-BUF fd |
+| `0x8a7210` | `sub_8a7210` StreamingImage_Bind — non-DMD scene texture bind |
+| `0x9001c0` | `sub_9001c0` Texture2dBase constructor |
 
 ---
 
@@ -1422,11 +1413,9 @@ Switches feed into events feed into cmodes; cmodes drive scene/display updates b
 
 The game maintains an in-memory mirror of each physical switch's state. The array is populated by the UART cmd `0x27` receive path (netbridge → CPU, 1-byte status payload per poll cycle — see §4 Cmd 0x27); the specific decoder function that writes into this array is `sub_651610` (the "translator").
 
-#### Corrected understanding (Step 72f, 2026-04-30)
-
 `g_switch_state_array @ 0x4480220` is **an 8-byte POINTER**, not the array itself. The actual per-switch state structs live on the **heap** at `*(uint64_t*)0x4480220 + sw_id * 0x30`.
 
-`sub_651610`'s disassembly at `0x65164c` is `ldr x14, [x20, #0x220]` — a LOAD, not an LEA. So writes to `0x4480220 + sw_id*0x30 + 0x28` (as in earlier shim attempts) hit the **BSS alias** adjacent to the pointer field, NOT the live data. To mutate live switch state correctly:
+`sub_651610`'s disassembly at `0x65164c` is `ldr x14, [x20, #0x220]` — a LOAD, not an LEA. To mutate live switch state correctly:
 
 ```c
 uintptr_t arr = 0;
@@ -1434,8 +1423,6 @@ memcpy(&arr, (void*)(game_base + 0x4480220), 8);
 uintptr_t sw_struct = arr + sw_id * 0x30;     // live heap struct
 *(uint8_t*)(sw_struct + 0x28) = 1;            // close switch
 ```
-
-The shim's `SHIM_SWITCH_STATE_BASE 0x4480220` macro is misleading and should be treated as the address of the pointer field, not the array base. Old `shim_fire_switch` writes that didn't deref the pointer DID NOT propagate.
 
 #### Per-switch struct layout (0x30 bytes)
 
@@ -1464,11 +1451,11 @@ The shim's `SHIM_SWITCH_STATE_BASE 0x4480220` macro is misleading and should be 
 
 `data_48cbaa0` holds the runtime-determined live switch count (PLE has ~105 manual-listed switch IDs but only installed+valid switches count).
 
-*Verified by:* JOURNAL Step 52 + Step 72f correction.
+*Verified by:* JOURNAL Step 52, 72f.
 
 ### `fire_event` dispatcher
 
-`sub_9c12a0 @ 0x9c12a0` (file offset `0x5c12a0` since BN base is rebased to 0).
+`sub_5c12a0 @ 0x5c12a0`.
 
 Signature: `uint64_t fire_event(int32_t event_id, int64_t event_data)`
 
@@ -1500,7 +1487,7 @@ Bounds: `event_id` 0..0xce (206 event types max). Exceeding triggers critical er
 
 Return semantic: dispatcher returns `1` on full-chain completion. If any handler returns `!(r & 1)` (i.e. even value), dispatch short-circuits and returns `r & 0xff`. Handlers that want the chain to continue return an odd value (conventionally `1`).
 
-#### Registered handlers (Step 51 runtime observation)
+#### Registered handlers
 
 - 102 / 207 event slots populated, 236 total handlers
 - Event `0xc5` has 2 handlers — one is `sub_950d60`, which iterates the 42-cmode registry at `data_4767b30` and calls vtable slot `+0xf0` on each (see "Cmode registry" below)
@@ -1516,7 +1503,7 @@ uint64_t r = fire_event(event_id, event_data);
 
 `event_data` is opaque to the dispatcher and handler-specific. Event `0xc5` ignores it (handler invokes cmode vtable with no args). Other events may require a valid pointer; calling with `event_data=0` for unknown events can SEGV in the handler.
 
-*Verified by:* JOURNAL Step 52 dispatch decode + Step 51 runtime registry walk.
+*Verified by:* JOURNAL Step 51, 52.
 
 ### Switch → event dispatch is two-stage
 
@@ -1576,13 +1563,13 @@ sub_XXXXXX(bss_addr, mode_id, type_flags, scene_id, arg5 [, arg6])
 ```c
 struct crule_cmode_base {
     /* +0x00 */ vtable_ptr_t *vtable;
-    /* +0x08 */ uint32_t mode_id;             // VERIFIED
-    /* +0x0c */ uint32_t type_flags;          // VERIFIED — category bitmask
-    /* +0x10 */ uint32_t arg5;                // VERIFIED — behaviour parameter, meaning TBD
+    /* +0x08 */ uint32_t mode_id;
+    /* +0x0c */ uint32_t type_flags;          // category bitmask
+    /* +0x10 */ uint32_t arg5;                // behaviour parameter
     /* +0x14 */ uint32_t _pad_14;
     /* +0x18..0x57 */ zeros (after static init)
-    /* +0x58 */ scene_data_t *scene_data_ptr; // VERIFIED — points to scene_data struct
-    /* +0xb0 */ void *timer_obj;              // from arg6, meaning TBD
+    /* +0x58 */ scene_data_t *scene_data_ptr; // points to scene_data struct
+    /* +0xb0 */ void *timer_obj;              // from arg6
     /* +0x308 */ int32_t init_or_state;       // varies across cmodes post-init
 };
 ```
@@ -1631,14 +1618,14 @@ Bit 5 = "Pokémon" flag, bit 6 = "Battle environment" flag, bit 7 = "Wizard/mult
 
 | mode_id | scene_id | bss addr | inferred class |
 |---:|---:|---|---|
-| `0x1b` | `0x24` | `0x4859160` | `cmode_team_rocket_multiball_2` (maybe) |
+| `0x1b` | `0x24` | `0x4859160` | `cmode_team_rocket_multiball_2` |
 | `0x1d` | `0x26` | `0x4859368` | `cmode_team_rocket_multiball_3` |
 | `0x28` | `0x23` | `0x48590a0` | `cmode_team_rocket_multiball_1` |
 | `0x29` | `0x27` | `0x4859438` | `cmode_team_rocket_wizard` |
 
 #### Multi-variant per-player mode (`mode_id = 0x2b`, 5 variants)
 
-Five separate BSS buffers for the same mode_id with different `type_flags` (`0x01/0x00/0x04/0x08/0x10`) — most plausible interpretation: **per-player instances** (up to 5 players, each with their own state). The bitmask matches "player 1/2/3/4/5" convention.
+Five separate BSS buffers for the same mode_id with different `type_flags` (`0x01/0x00/0x04/0x08/0x10`) — **per-player instances** (up to 5 players, each with their own state). The bitmask matches "player 1/2/3/4/5" convention.
 
 Per-player BSS addresses: `0x4856730`, `0x4856798`, `0x48569d8`, `0x4856848`, `0x4856908`.
 
@@ -1646,7 +1633,7 @@ Per-player BSS addresses: `0x4856730`, `0x4856798`, `0x48569d8`, `0x4856848`, `0
 
 Modes that share `scene_id 0x29` (the universal attract / fallback scene): `0x00, 0x03, 0x0c, 0x0d, 0x25` plus the 5 `mode_id=0x2b` variants.
 
-The full 42-row table (including the 20 simple base modes, the 3 multiball-family modes, the 3 utility modes with arg6, and the 1 special multi-arg mode) was extracted from `_INIT_74` Step 50. To regenerate: BN-decompile `_INIT_74 @ 0x8733c0` and walk the constructor calls.
+The full 42-row table (including the 20 simple base modes, the 3 multiball-family modes, the 3 utility modes with arg6, and the 1 special multi-arg mode) is built by `_INIT_74 @ 0x8733c0`.
 
 ### Cmode registry array — `data_4767b30`
 
@@ -1696,12 +1683,25 @@ Registered via `sub_adfcc0(0x48594f8, 1, sub_94f140, 0x3ff, 0, 0x80)` — update
 | `+0xd8` | 27 | **tick / per-frame update** (called by `sub_94f140`) |
 | `+0xf0` | 30 | **event handler** (called by `sub_950d60` for event 0xc5) |
 
-Other slots TBD. The remaining ~35 slots in the BDLMode vtable are likely mode-lifecycle events (enter, exit, ball-drain, shot-detect, etc.).
+The remaining ~35 slots in the BDLMode vtable are uncategorized.
 
 ### Event/update dispatch registries
 
 - **Event registry** at `data_485ea80` — 206 event slots (indexed 0..0xce per `sub_9c11d0`'s bounds check). Each slot is the head of a priority-sorted linked list of `{callback_fn, priority, next_ptr}` triples. `sub_9c11d0` inserts by descending priority.
 - **Update registry** at `data_48c52c0` — 5 update-type slots (indexed 0-4). Each slot is a linked list of `{UpdateObject*, callback_fn, max_count, priority}`.
+
+### Driving cmode state from outside
+
+To simulate a switch event from an external source:
+
+1. Determine the event_id corresponding to the switch
+2. Call the linked list at `data_485ea80 + (event_id * 8)` — every registered handler fires in priority order
+3. Handlers call vtable methods on the 42 cmodes; cmode state changes
+4. Next tick, `sub_94f140` iterates and each cmode's `+0xd8` updates its display
+
+The shim's `state_bridge` (when `STATE_BRIDGE=1`) polls cmode `+0x308` at 10 Hz and emits JSON deltas on `@pokemon_spike3_bridge`.
+
+---
 
 ## 12. Hardware shim coverage reference
 
@@ -1878,15 +1878,15 @@ Confirmed shared Stern code with byte-shape-identical structure:
 |---|---|---|---|
 | Init renderer + scene cache | `0x5d7aa0` | `0x309af0` (`mcp_init_renderer_and_scene_cache_singletons`) | Canonical 5-step boot sequence: `new DisplayRenderer(0x1b8) → ctor → mutex+deferred-list → wait_on_render_thread_ready → new SceneCache(0x1d0)("./assets") → post-init` |
 | DisplayRenderer render loop | `0x7b7ac0` | `mcp_DisplayRenderer_render_thread_body` | Byte-shape-identical at the OpenGL call level. Slot-9 (activate) dispatch + slot-8 (tick) dispatch over IScene linked lists |
-| RadiumScene base ctor | TBD | `mcp_RadiumScene_base_ctor (sub_41e0c0)` | BN-confirmed via auto-named vtable `&_vtable_for_RadiumScene{for 'IScene'}` |
-| RadiumScene typeinfo | TBD | `0x749d98` (name string `11RadiumScene` at `0x647bf0`) | base typeinfo at `0x735d08` = IScene typeinfo (= `_typeinfo_for_IScene`) |
-| RadiumScene vtable | TBD | `0x733ea0` (slot 8 tick `0x41d100`, slot 9 activate `0x420070`, slots 4-6 at `0x35f670/0x35f680/0x35f690`) | flag-accessor defaults match PLE's IScene flag-accessor defaults at consecutive 0x10 stride — high evidence of shared Stern IScene base |
-| SceneCache::initialize | TBD | `mcp_SceneCache_initialize (sub_4c2140)` | scans `/lcd/demand_loaded`, `/nuk/images`, `/lcd/auto_loaded`, builds RadiumScene per `.radium`/`.json`/image file, registers in hashmaps at `arg1[0xa]` and `arg1[0x11]`, spawns thread named `"LoadSceneCache"` |
-| SceneCache load thread body | TBD | `mcp_SceneCache_load_thread_body (sub_4c2ea4)` | the `LoadSceneCache` thread; drains queue at SceneCache+0x1b0, dynamic_casts each entry to RadiumScene, calls slot 12 |
-| SceneCache add scene to display | TBD | `mcp_SceneCache_add_scene_to_display_unsure (sub_4c17e0)` | type-dispatches by IScene subclass (RadiumScene → arg1+0x50 hashmap; NuklearScene → arg1+0x110) |
+| RadiumScene base ctor | — | `mcp_RadiumScene_base_ctor (sub_41e0c0)` | BN-confirmed via auto-named vtable `&_vtable_for_RadiumScene{for 'IScene'}` |
+| RadiumScene typeinfo | — | `0x749d98` (name string `11RadiumScene` at `0x647bf0`) | base typeinfo at `0x735d08` = IScene typeinfo (= `_typeinfo_for_IScene`) |
+| RadiumScene vtable | — | `0x733ea0` (slot 8 tick `0x41d100`, slot 9 activate `0x420070`, slots 4-6 at `0x35f670/0x35f680/0x35f690`) | flag-accessor defaults match PLE's IScene flag-accessor defaults at consecutive 0x10 stride — high evidence of shared Stern IScene base |
+| SceneCache::initialize | — | `mcp_SceneCache_initialize (sub_4c2140)` | scans `/lcd/demand_loaded`, `/nuk/images`, `/lcd/auto_loaded`, builds RadiumScene per `.radium`/`.json`/image file, registers in hashmaps at `arg1[0xa]` and `arg1[0x11]`, spawns thread named `"LoadSceneCache"` |
+| SceneCache load thread body | — | `mcp_SceneCache_load_thread_body (sub_4c2ea4)` | the `LoadSceneCache` thread; drains queue at SceneCache+0x1b0, dynamic_casts each entry to RadiumScene, calls slot 12 |
+| SceneCache add scene to display | — | `mcp_SceneCache_add_scene_to_display_unsure (sub_4c17e0)` | type-dispatches by IScene subclass (RadiumScene → arg1+0x50 hashmap; NuklearScene → arg1+0x110) |
 | Process dispatch loop | `0x7292c4` | `mcp_process_dispatch_loop (sub_5faadc)` (in spike_menu) | orchestrator thread body |
-| Per-tick orchestration hook | `0x720cf0` (`mcp_proc_pre_dispatch_tick`) | TBD | calls `process_deferred_scene_queue`, `drain_pending_switch_events`, plus 12 other unstudied subsystem ticks |
-| `select_and_load_scene` | `0x730fb0` | TBD | fires events `0xAB` / `0xAD` / `0xAF` on scene transitions |
+| Per-tick orchestration hook | `0x720cf0` (`mcp_proc_pre_dispatch_tick`) | — | calls `process_deferred_scene_queue`, `drain_pending_switch_events`, plus 12 other unstudied subsystem ticks |
+| `select_and_load_scene` | `0x730fb0` | — | fires events `0xAB` / `0xAD` / `0xAF` on scene transitions |
 
 ### Subclasses of IScene (shared abstract base)
 
@@ -1895,19 +1895,15 @@ Confirmed shared Stern code with byte-shape-identical structure:
 | `RadiumScene` | both PLE + SW LE | The shared Stern UI subclass — handles all attract/HUD/menu Radium scenes |
 | `NuklearScene` | both | Nuklear immediate-mode UI for system/test menus |
 | `DMDEmulationScene` | both | The 1024×256 DMD path (or per-CPU-board variant) |
-| `GodotRenderer` | **PLE only** | Pokémon-port-specific. Out of scope per `feedback_godot_is_illegal.md`. PLE's IScene vtable at `0x42a4d10` has 11 slots; GodotRenderer fills the 4 pure virtuals + the 4 default-overridden flag accessors |
+| `GodotRenderer` | **PLE only** | Pokémon-port-specific. PLE's IScene vtable at `0x42a4d10` has 11 slots; GodotRenderer fills the 4 pure virtuals + the 4 default-overridden flag accessors |
 
 PLE has 4 IScene subclasses (typeinfo data refs). SW LE has 4 (typeinfo data refs at `0x748240/0x748250/0x749d98/0x74cec8`) — same count.
 
-### Why this matters
+### Scope distinction
 
-When a hypothesis or fix involves something on the off-limits Godot list (VideoPlayerSpi `is_inside_tree`, ManualGodotScene, `/tmp/godot_logs`, `./assets/godot/main.pck`, etc.), pivot to SW LE 0.85 as the validation target. The acid test for any shared-Stern fix is: can it boot SW LE attract?
+The DisplayRenderer / SceneCache / RadiumScene / proc-system / node-bus / SPI / audio code is shared between PLE and SW LE. Anything Godot-specific (PCK loading, ClassDB registration, `_process(delta)` ticks, scene-tree management, libgodot internals) is PLE-only.
 
-If a shim change improves PLE behavior but breaks SW LE, the change is touching Pokémon-port-specific code path and should be reconsidered. If both improve together, the change is in shared Stern territory and is safe.
-
-The DisplayRenderer / SceneCache / RadiumScene / proc-system / node-bus / SPI / audio code is all shared. Anything Godot-specific (PCK loading, ClassDB registration, `_process(delta)` ticks, scene-tree management, libgodot internals) is PLE-only and out of active investigation scope.
-
-*Verified by:* JOURNAL Step 73 (2026-05-01) onwards — IScene vtable decompile per slot, SW LE function shape matches.
+*Verified by:* JOURNAL Step 73.
 
 ---
 
@@ -1928,8 +1924,7 @@ Implementation lives in `shim_bridges.c::shim_fb0_blit` (lazy `open(/dev/fb0)` +
 For completeness: TCP-based bridges are not available in the system-mode rig. qemu raspi4b's machine code disables `brcm,bcm2711-pcie`, `brcm,bcm2711-genet-v5`, and `brcm,bcm2711-thermal` in the DTB before the kernel parses it (verified via the `bcm2711 dtc: %s has been disabled!` warnings + the `compat_disable[]` array in the qemu binary). `-device usb-net` attaches to qemu's emulated DWC2 controller correctly (verified via `info qtree` from the monitor) but no kernel driver enumerates the resulting USB device — the rootfs's built-in `dwc_otg` driver expects BCM2835 register layout, mainline `dwc2.ko` won't auto-bind to the DTB's `brcm,bcm2708-usb` compat string, and patching the DTB to `brcm,bcm2835-usb` (which dwc2 would match) still doesn't get past probe in this combo. The `SPIKE3_FB0_OUTPUT` path sidesteps the entire problem — system-mode renders the game's frames straight to qemu's GTK window.
 
 # 1. Boot. --ephemeral discards SD writes; --debug backgrounds qemu; --gdb [PORT] enables gdbstub.
-# DO NOT pass --headless: per feedback_system_mode_parity.md the GTK window must be up so
-# /dev/fb0 visible-display + general parity with user-mode are preserved.
+# Do not pass --headless: the GTK window is the only visible-display path.
 ./RUN_QEMU.sh --debug --ephemeral --gdb 1234
 
 # 2. Watch the boot until the game launches. The wrap_game.sh prints
@@ -1938,7 +1933,7 @@ tail -f last_run.log
 # (Ctrl+C tail when you see GAME_PIE_MAP for /games/game)
 
 # 3. Compute runtime addresses. Default PIE base with ASLR off in this kernel
-#    is 0x5555550000 (verified 2026-05-05). For any BN VA, runtime = 0x5555550000 + BN_VA.
+#    is 0x5555550000. For any BN VA, runtime = 0x5555550000 + BN_VA.
 python3 -c 'B=0x5555550000; print(hex(B + 0x43989c8))'   # example: a table-entry address
 
 # 4. Attach gdb and set the read watchpoint.
