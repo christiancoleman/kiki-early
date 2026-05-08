@@ -664,27 +664,18 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
 
         /* fe_probe synthesis (inner_cmd=0xFE).
          *
-         * Polling traffic that times out is mcp_nodebus_send_cmd_fe_probe_unsure.
-         * cleartext hint at payload[2+inner_len]; game expects exactly `hint`
-         * bytes back per memcpy in mcp_nodebus_send_encrypted.
-         *
-         * Response framing per netbridge HOST_Update case 0x21:
-         *   [STX][0x41][id][hint bytes payload][bridge_csum][ETX]
-         *   - first (hint - 1) bytes = node data
-         *   - last byte = bridgeStatus
-         *
-         * Game-side parser is mcp_node_query_status_and_classify @ 0x8f38e0:
-         *   resp[0]   high bit = "node present" flag → output[0]
-         *   resp[1..3] form (b1<<16)|(b2<<8)|b3, > 0x011700 sets output[11]
-         *                   (likely "supported firmware version")
-         *   resp[1..8] bulk-copied to output[1..8]
-         *   resp[4..7] LE = 32-bit chip ID, matched against mcp_lpc_chip_vtable
-         *   resp[9..10] copied to output[9..10]
-         *   resp[hint-1] = bridgeStatus
-         *
-         * Send "node present + real chip ID" so vtable lookup lands on a
-         * non-default entry; resp[1..3] = (0x01,0x80,0x00) = 0x018000 to
-         * pass the fw-version threshold. */
+         * Wire `hint` byte the shim parses is actually __n in the game's
+         * FUN_008ec410 (= original game-side hint + 2; FUN_008ec410 bumps
+         * ilen by 1 and appends __n at index ilen+3 before transmit). Game
+         * expects exactly `hint` inner bytes back. Layout the validator wants:
+         *   bytes [0..hint-3] = node data (game reads bytes[0..hint-3], with
+         *                       FUN_008f38e0 using byte[0] node-present flag,
+         *                       bytes[1..3] version (>0x011700 sets out[11]),
+         *                       bytes[4..7] LE chip-id vs mcp_lpc_chip_vtable).
+         *   byte  [hint-2]    = inner checksum: sum(bytes[0..hint-2]) == 0
+         *                       mod 256 (FUN_008ec410 fails with code 3 else).
+         *   byte  [hint-1]    = inner status; bits 2,3 must be clear (else
+         *                       FUN_008ec410 fails with code 1/2). */
         if (inner_cmd == 0xFE) {
             int hint_idx = 2 + (int)inner_len;
             if (hint_idx >= payload_len) {
@@ -709,24 +700,42 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             resp[o++] = 0x41;
             resp[o++] = id;
             int payload_start = o;
-            for (int i = 0; i < hint; i++)
+            int inner_size = (int)hint;
+            for (int i = 0; i < inner_size; i++)
                 resp[o++] = 0x00;
-            if (hint >= 8) {
+            if (hint >= 10) {
                 uint32_t chip_id = nodebus_chip_id_for_slot(slot);
-                resp[payload_start + 0] = 0x80;
+                /* byte[0] bit 7 is the boot-mode flag in FUN_008f38e0
+                 * (output[0] = resp[0] >> 7). FUN_00674680 routes
+                 * (local_88 & 1) != 0 → status 3 (Boot); we want clear so
+                 * the chip_id classification path runs → status 2/4/6/7.
+                 *
+                 * bytes [1..3] are the firmware version (major, minor, build).
+                 * FUN_00674680 compares them against record-reported version
+                 * via FUN_008f88b0; mismatch → status 7 (Version Mismatch).
+                 * All 6 shipped pinnode/node4/ws2812node .hex files in CWD
+                 * are version 1_31_0, so (1, 31, 0) matches every slot's
+                 * firmware-record. */
+                resp[payload_start + 0] = 0x00;
                 resp[payload_start + 1] = 0x01;
-                resp[payload_start + 2] = 0x80;
+                resp[payload_start + 2] = 0x1F;
                 resp[payload_start + 3] = 0x00;
                 resp[payload_start + 4] = (uint8_t)(chip_id      );
                 resp[payload_start + 5] = (uint8_t)(chip_id >>  8);
                 resp[payload_start + 6] = (uint8_t)(chip_id >> 16);
                 resp[payload_start + 7] = (uint8_t)(chip_id >> 24);
             }
+            if (inner_size >= 2) {
+                uint32_t inner_sum = 0;
+                for (int i = 0; i < inner_size - 2; i++)
+                    inner_sum += resp[payload_start + i];
+                resp[payload_start + inner_size - 2] = (uint8_t)(-(int32_t)inner_sum);
+            }
             uint8_t cks = bridge_checksum(resp + 1, (size_t)(o - 1));
             resp[o++] = cks;
             resp[o++] = 0x03;            /* ETX */
-            SHIM_LOG("bridge: synth fe_probe RESP slot=%u hint=%u chip_id=0x%08x (node-present)",
-                     slot, hint, nodebus_chip_id_for_slot(slot));
+            SHIM_LOG("bridge: synth fe_probe RESP slot=%u hint=%u inner_sz=%d chip_id=0x%08x (node-present)",
+                     slot, hint, inner_size, nodebus_chip_id_for_slot(slot));
             usleep(NODEBUS_SYNTH_DELAY_US);
             bridge_send_response(resp, (size_t)o, 0x41, id);
             return;
