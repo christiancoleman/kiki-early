@@ -95,6 +95,9 @@ static uint8_t nodebus_cipher_keys[32][16] = {{0}};
 static uint32_t nodebus_chip_id_for_slot(uint8_t slot) {
     switch (slot) {
         case 0:  return 0x00140040u;  /* LPC1124_303 — CPU bridge */
+        case 1:  return 0x042D502Bu;  /* LPC1112_101 — Cabinet Node (pinnode family
+                                         per runtime probe key1=0xdcc6afb2;
+                                         pinnode-LPC1112_101-1_31_0.hex is shipped) */
         case 4:  return 0x00140040u;  /* LPC1124_303 — QR reader */
         case 8:  return 0x3D01402Bu;  /* LPC1313 — Core Driver Lower */
         case 9:  return 0x3D01402Bu;  /* LPC1313 — Core Driver Upper */

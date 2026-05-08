@@ -345,6 +345,90 @@ static void *shim_select_press_thread(void *arg) {
     return NULL;
 }
 
+/* SHIM_NODE_PROBE=1 — one-shot dump of nodebus runtime state to log:
+ *   - .got entries 0x4350200 / 0x434f2f0 / 0x4351748 (firmware-image config
+ *     table base + count pointer + board-type metadata table)
+ *   - first ~8 entries of firmware-image config table (slot byte at +0x1a,
+ *     firmware index at +0x18, flags at +0x00)
+ *   - linked list of loaded firmware records at DAT_044df838 (key1, key2,
+ *     filename) — each record is the 88-byte calloc'd struct from
+ *     mcp_node_firmware_glob @ 0x840a40
+ *   - per-slot Tech Alerts struct (slots 0..15) at 0x44cc290+slot*0xf0:
+ *     slot id (+0x00), flag word (+0x04), status u32 (+0x20),
+ *     firmware-kind key (+0x60), config ptr (+0x10), board-type ptr (+0x18)
+ *
+ * Purpose: ground-truth the static analysis for Phase A of project_node1_init —
+ * tells us what slot 1's firmware-kind key needs to be in a synthetic record.
+ *
+ * SHIM_NODE_PROBE_DELAY_S=N — wait N seconds before dumping (default 60;
+ * needs ~50+ to ensure mcp_node_record_table_init @ 0x7dae30 has run). */
+static void *shim_node_records_probe_thread(void *arg) {
+    (void)arg;
+    const char *v = getenv("SHIM_NODE_PROBE");
+    if (!v || !v[0] || v[0] == '0') return NULL;
+
+    int delay_s = 60;
+    if ((v = getenv("SHIM_NODE_PROBE_DELAY_S")) != NULL && v[0]) delay_s = atoi(v);
+    sleep((unsigned)delay_s);
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[node_probe] game_base unresolved; skipping");
+        return NULL;
+    }
+    SHIM_LOG("[node_probe] === START === game_base=0x%lx", (unsigned long)game_base);
+
+    uint64_t fw_cfg_base  = *(uint64_t *)(game_base + 0x4350200ULL);
+    uint64_t fw_cnt_addr  = *(uint64_t *)(game_base + 0x434f2f0ULL);
+    uint64_t bt_meta_base = *(uint64_t *)(game_base + 0x4351748ULL);
+    uint64_t fw_count = fw_cnt_addr ? *(uint64_t *)fw_cnt_addr : 0;
+    SHIM_LOG("[node_probe] PTR_PTR_04350200 -> 0x%lx (static-derived would be 0x%lx)",
+             (unsigned long)fw_cfg_base, (unsigned long)(game_base + 0x436b680ULL));
+    SHIM_LOG("[node_probe] PTR_DAT_0434f2f0 -> 0x%lx  count=%lu",
+             (unsigned long)fw_cnt_addr, (unsigned long)fw_count);
+    SHIM_LOG("[node_probe] PTR_DAT_04351748 -> 0x%lx", (unsigned long)bt_meta_base);
+
+    int show = (int)(fw_count + 2);
+    if (show < 4) show = 4;
+    if (show > 16) show = 16;
+    for (int i = 0; fw_cfg_base && i < show; i++) {
+        uint8_t *e = (uint8_t *)(uintptr_t)(fw_cfg_base + (uint64_t)i * 0x20);
+        char line[300];
+        int n = snprintf(line, sizeof(line),
+            "[node_probe] fw_cfg[%2d] @ 0x%lx slot=%u fw_idx=%u flags=0x%08x bytes:",
+            i, (unsigned long)(uintptr_t)e,
+            e[0x1a], *(uint16_t *)(e + 0x18), *(uint32_t *)(e + 0x00));
+        for (int j = 0; j < 0x20 && n < (int)sizeof(line) - 4; j++)
+            n += snprintf(line + n, sizeof(line) - n, " %02x", e[j]);
+        SHIM_LOG("%s", line);
+    }
+
+    uint8_t **head_loc = (uint8_t **)(game_base + 0x44df838ULL);
+    uint8_t *cur = *head_loc;
+    SHIM_LOG("[node_probe] DAT_044df838 = %p", (void *)cur);
+    int n_records = 0;
+    while (cur && n_records < 32) {
+        uint32_t key1 = *(uint32_t *)(cur + 0x00);
+        uint32_t key2 = *(uint32_t *)(cur + 0x04);
+        char *fname = *(char **)(cur + 0x08);
+        SHIM_LOG("[node_probe] fw_record[%d] @ %p key1=0x%08x key2=%u file=\"%s\"",
+                 n_records, (void *)cur, key1, key2, fname ? fname : "(null)");
+        cur = *(uint8_t **)(cur + 0x50);
+        n_records++;
+    }
+    SHIM_LOG("[node_probe] %d firmware records loaded", n_records);
+
+    for (int slot = 0; slot < 16; slot++) {
+        uint8_t *s = (uint8_t *)(game_base + 0x44cc290ULL + (uint64_t)slot * 0xf0ULL);
+        SHIM_LOG("[node_probe] slot[%2d] @ %p id=%u flag=0x%08x status=%u fw_key=0x%08x fw_cfg=%p bt=%p",
+                 slot, (void *)s, s[0x00], *(uint32_t *)(s + 0x04),
+                 *(uint32_t *)(s + 0x20), *(uint32_t *)(s + 0x60),
+                 *(void **)(s + 0x10), *(void **)(s + 0x18));
+    }
+    SHIM_LOG("[node_probe] === END ===");
+    return NULL;
+}
+
 void shim_inject_start(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -365,4 +449,8 @@ void shim_inject_start(void) {
     pthread_t s;
     if (pthread_create(&s, NULL, shim_select_press_thread, NULL) == 0)
         pthread_detach(s);
+
+    pthread_t n;
+    if (pthread_create(&n, NULL, shim_node_records_probe_thread, NULL) == 0)
+        pthread_detach(n);
 }

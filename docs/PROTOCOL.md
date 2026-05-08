@@ -1783,6 +1783,112 @@ To simulate a switch event from an external source:
 
 The shim's `state_bridge` (when `STATE_BRIDGE=1`) polls cmode `+0x308` at 10 Hz and emits JSON deltas on `@pokemon_spike3_bridge`.
 
+### Tech Alerts row dispatcher
+
+The service-mode "Tech Alerts" UI lists per-slot node-bus issues. Each row is formatted by `sub_7da460` as `"Check Node Board %d : %s"` (msgid `0x37f`). The screen reads from a per-slot struct array, applies a filter, and indexes into a 10-entry msgid table for the status string.
+
+#### Per-slot Tech Alerts struct
+
+Array base `data_44cc290`, 32 slots × `0xf0` byte stride. Initialized by `mcp_node_record_table_init @ 0x7dae30` with `memset(0)` then per-slot field population from `*PTR_PTR_04350200`. Per-slot accessor: `sub_7da710(slot)` returns `&data_44cc290 + slot * 0xf0`.
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| `+0x00` | u8 | slot ID | matches array index |
+| `+0x04` | u32 | flag word | bit 0 set on configured slots; bit 1 additionally set on slots with both-bits-required behavior; bit 14 drives the secondary `sub_7da2f0` alerter (msgid `0x37c`) |
+| `+0x10` | ptr | firmware-image config entry | within `*PTR_PTR_04350200` table |
+| `+0x18` | ptr | board-type metadata entry | within `*PTR_DAT_04351748` table |
+| `+0x20` | u32 | **status code** | the value Tech Alerts displays (see enum below) |
+| `+0x60` | u32 | firmware-kind key | = `sub_8f8ab0(0, board_family_name, len)`; lookup key for `sub_840d30` |
+| `+0x88` | ptr | optional 9-byte expansion-order array | allocated by `sub_7dad70` when board has expansion |
+
+#### Status code enum (10 states)
+
+Status u32 at `+0x20` indexes into a 10-entry u16 msgid table at `data_37c9ef0`:
+
+| status | msgid | string | shown in Tech Alerts? |
+|---:|---:|---|---|
+| 0 | 0x36a | Invalid | yes |
+| 1 | 0x36b | Unused | yes |
+| 2 | 0x36c | Ok | filtered out (when flag bits 0+1 both set) |
+| 3 | 0x36d | Boot | yes |
+| 4 | 0x36e | Runtime Info | yes |
+| 5 | 0x36f | Checksum | yes |
+| 6 | 0x370 | Hex Image Version not Found | yes |
+| 7 | 0x371 | Version Mismatch | filtered out |
+| 8 | 0x372 | Not Initialized | yes |
+| 9 | 0x373 | Collision | yes |
+
+Filter (in `sub_7da460`): row counted as alert if `(status != 7 && status != 2) OR (per-slot u64 at +0x00 has bits 32-33 != 0b11 AND PTR_DAT_043525c0 != 0)`. Status==2 has a special override that picks msgid `0x374` ("Not Registered") if flag bit 0 clear, msgid `0x375` ("Not Responding") if flag bit 1 clear, `0` (empty) if both bits set.
+
+#### Status writer = `sub_674680` (`mcp_nodebus_node_probe_5x_unsure`)
+
+Called per slot from the periodic node-bus management thread `sub_675f00`. Runs 5 outer × 5 inner FE-probe (cmd `0xfe`) retries; if 5 inner-consistent responses found, enters validation chain → status 2/3/4/6/7. If outer retries exhausted, sets status to 8 (only failures), 9 (response drift), or leaves at default 0.
+
+Validation chain (when 5 inner responses are byte-equal):
+1. If FE response byte 0 bit 0 is set → status = 3 ("Boot").
+2. Else `sub_840d30(slot[+0x60], chip_type_index)` walks linked list at `data_44df838`:
+   - lookup fails or record `+0x20`/`+0x40` zero → status = 4
+   - `sub_8f88b0` returns 0 → status = 6
+   - record's stored version bytes ≠ FE response bytes [1/2/3] → status = 7
+   - extra version-byte equality fails → status = 6
+   - all match → **status = 2 ("Ok")**
+
+#### Firmware-image lookup chain
+
+```
+PTR_PTR_04350200 → 0x436b680 (.data, 12 entries × 0x20-byte stride, compile-time-baked)
+   each entry:
+      +0x00 : u32 flags (bit 2 gates filter)
+      +0x18 : ushort firmware_idx ─┐
+      +0x1a : byte slot_id          │
+                                    ▼
+                    PTR_DAT_04351748 → 0x43c3b68 (.flash, 0x28-byte stride board-type metadata)
+                       +0x10 : opaque 8-byte handle
+                                    │
+                                    ▼ sub_840ce0(handle) returns u32 firmware-kind key
+                                    │
+                                    ▼ stored in slot_struct[+0x60]
+                                    │
+                                    ▼ sub_840d30(key, chip_type_index) walks linked list
+                                    │
+                       data_44df838 (linked-list head, populated at startup by sub_840a40)
+                          each node, 0x58-byte calloc'd, linked via +0x50 next-pointer:
+                             +0x00 : u32 key1 (= sub_8f8ab0 hash of board family name)
+                             +0x04 : u32 key2 (= chip-type-index 1..7 from sub_8ede20)
+                             +0x08 : char *filename
+```
+
+#### Firmware-image loader (`sub_840a40`)
+
+At startup, iterates 7 chip-type indices (1..7), for each runs `glob64("./<family>-<sub_8ede20(idx)>-<major>_<minor>_[0-9]*.hex")` (with fallback `./<family>-<chip>-[0-9]*_[0-9]*_[0-9]*.hex`). Per match, allocates an 88-byte record and links to `data_44df838` head with key1=hash(family), key2=idx, filename=ptr.
+
+Pokémon LE ships 17 `.hex` files in `games/pokemon_le/`: `coil4_lednode-LPC1313`, `coil4node-{LPC1112_101,LPC1112_201,LPC1313}`, `hdminode-LPC1313`, `hdmi_ws2812node-LPC1313`, `lcdnode-LPC1113_302`, `magsensornode-LPC812`, `node4-{LPC1124_303,LPC812}`, `pinnode-{LPC1112_101,LPC1112_201,LPC1313}`, `tmc2590node-LPC1313`, `tmc5041node-LPC1313`, `ws2812node-LPC1313`, `ws2812pinnode-LPC1313`. Files are Intel HEX line format with encrypted data bytes; decryption format unverified.
+
+**chip-type-index ↔ chip-name map** (from `sub_8ede20`, observed via runtime probe):
+
+| key2 | chip name (used in glob) | example chip ID (from `mcp_lpc_chip_vtable @ 0x42317c8`) |
+|---:|---|---|
+| 1 | LPC1112_101 | 0x042D502B (vtable entry 2) |
+| 2 | LPC1112_201 | 0x0425502B (vtable entry 5) |
+| 4 | LPC1124_303 | 0x00140040 (vtable entry 15) |
+| 5 | LPC1313 | 0x2C40102B (vtable entries 13/19) |
+| 6 | LPC812 | 0x00008120 (vtable entry 24) |
+
+**Pokémon LE per-slot board-family map** (from runtime probe of slot[+0x60]):
+
+| slot | family (from key1) | role (from cabinet manual) |
+|---:|---|---|
+| 1 | pinnode | Cabinet Node |
+| 2 | ws2812node | (LED node) |
+| 4 | node4 | QR Reader (Bottom Arch) |
+| 7 | ws2812node | (LED node) |
+| 8 | pinnode | Core Driver Lower Playfield |
+| 9 | pinnode | Core Driver Upper Playfield |
+| 10 | pinnode | SPI Servo Node |
+| 12, 13, 14 | (mixed) | (configured but FUN_00674680 not yet run during early boot) |
+
+*Verified by:* JOURNAL Step 91 — objdump-cross-checked string table at `0x37c9ef0`; Ghidra decompile of `sub_7da460`/`sub_7dae30`/`sub_674680`/`sub_840a40`/`sub_840d30`/`sub_8f88b0`; runtime probe of `shim_node_records_probe_thread` capturing fw_key per slot at +60s into a plain `./run_game.sh --debug` baseline.
+
 ---
 
 ## 12. Hardware shim coverage reference

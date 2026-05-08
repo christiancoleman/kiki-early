@@ -8021,3 +8021,181 @@ To resume switch-injection investigation:
 SHIM_SWITCH_PROBE=1 SHIM_SWITCH_PRESS_DELAY_S=200 ./run_game.sh \
     --debug --note "switch_probe_resume"
 ```
+
+## Step 91: Tech Alerts dispatcher mapped — natural protocol path to Node 1 = "Ok" identified, blocked at FE-probe retry (2026-05-08)
+
+Direct continuation of Step 90. Goal: advance Node 1 (Cabinet Node) past "Not Initialized" via the natural protocol path rather than direct memory override, per user's framing of nodebus communication completeness as a side-quest goal. Outcome: full mapping of the Tech Alerts row dispatcher, status enum, and firmware-image lookup chain — landing on a clear next-blocker ("`FUN_00674680`'s 5×5 FE-probe retry loop runs `iVar12++` despite synth always responding, mechanism uncharted") rather than the originally planned shim hook.
+
+### Step 91a — Tech Alerts row dispatcher and 10-state status enum
+
+**`FUN_007da460 @ 0x7da460`** is the Tech Alerts row formatter (formats one alert as the param_2-th alert, returns 1 on success). Built `"Check Node Board %d : %s"` (msgid `0x37f`). The status-code → msgid table is at **`0x37c9ef0`** (10 u16 entries indexed by per-slot status 0..9; verified via `objdump`/`readelf`-style file reads following user's cross-check rule):
+
+| status | msgid | string | Tech Alerts behavior |
+|---:|---:|---|---|
+| 0 | 0x36a | Invalid | shown |
+| 1 | 0x36b | Unused | shown |
+| **2** | **0x36c** | **Ok** | filtered out (when flag word's bits 0+1 both set) |
+| 3 | 0x36d | Boot | shown |
+| 4 | 0x36e | Runtime Info | shown |
+| 5 | 0x36f | Checksum | shown |
+| 6 | 0x370 | Hex Image Version not Found | shown |
+| 7 | 0x371 | Version Mismatch | filtered out |
+| **8** | **0x372** | **Not Initialized** | shown ← Step 90's current state for slots 1/4/8/9/10 |
+| 9 | 0x373 | Collision | shown |
+
+Filter logic in dispatcher: `(status != 7 && status != 2) OR (per-slot-flag-bits-32-33 != 0b11 AND PTR_DAT_043525c0 != 0)` → row counted as alert. Status==2 has a special override that turns it into "Not Registered" (msgid `0x374`) or "Not Responding" (msgid `0x375`) text based on flag-word bits 0/1.
+
+**Per-slot Tech Alerts struct** at `&DAT_044cc290` (32 slots × 0xf0 = 7680 bytes). Key offsets:
+- `+0x00`: slot ID byte
+- `+0x04`: u32 flag word (drives status==2 textual override + bit 14 alerting)
+- `+0x10`: pointer to firmware-image config entry
+- `+0x18`: pointer to board-type metadata
+- `+0x20`: u32 status (the value Tech Alerts displays)
+- `+0x60`: u32 firmware-kind key (= hash of board-family name)
+
+Initializer at **`FUN_007dae30 @ 0x7dae30`** does `memset(&DAT_044cc290, 0, 0x1e00)` (clears all status to 0) then iterates `*PTR_DAT_0434f2f0` (= 12) firmware-image entries to populate per-slot fields.
+
+### Step 91b — Status writer = `FUN_00674680` (= `mcp_nodebus_node_probe_5x_unsure` per Step 68)
+
+The natural status mutator wasn't found via Ghidra xref to `0x44cc290` (writes go through stride arithmetic on a register-held base). Resolved by following callers of FE-probe (`FUN_008f38e0 @ 0x8f38e0`) — the status writer is the long-named function from Step 68's BN renaming.
+
+`FUN_00674680(slot_struct, force_flag)` runs:
+1. **5 outer retries**, each:
+   - FE-probe; if fails → `iVar12++`
+   - Else 5 inner retries verifying response consistency (response bytes drift → `iVar13++`, break inner)
+   - If inner found 5 consistent responses (`iVar13 == 0`): enter VALIDATION CHAIN and **return** (success path — no more outer retries)
+2. **Validation chain** (only reached when inner consistent):
+   - If `FE_byte_0 & 1 != 0`: status = 3 ("Boot")
+   - Else: lookup `FUN_00840d30(slot[+0x60], chip-type-index)`:
+     - lookup fails: status = 4 ("Runtime Info")
+     - record's `+0x20`/`+0x40` zero: status = 4
+     - `FUN_008f88b0` returns 0: status = 6 ("Hex Image Version not Found")
+     - version bytes mismatch FE response: status = 7 ("Version Mismatch")
+     - extra version-byte check fails: status = 6
+     - all match: **status = 2 ("Ok")**
+3. **5 outer retries exhausted** without inner-consistent path:
+   - `iVar13 != 0`: status = 9 ("Collision")
+   - `iVar12 != 0`: status = 8 ("Not Initialized") ← Step 90's current state
+   - else: status stays 0 ("Invalid")
+
+### Step 91c — Firmware-image lookup chain
+
+Three levels of indirection between slot config and runtime firmware lookup:
+
+```
+PTR_PTR_04350200 → 0x436b680 (.data, compile-time-baked firmware-image config table)
+   each entry, 0x20-byte stride:
+      +0x00 : u32 flags (bit 2 gates filter in FUN_007da460)
+      +0x18 : ushort firmware_idx ──────┐
+      +0x1a : byte slot_id              │
+                                        ▼
+                       PTR_DAT_04351748 → 0x43c3b68 (.flash board-type metadata)
+                          each entry, 0x28-byte stride:
+                             +0x10 : opaque 8-byte handle
+                                        │
+                                        ▼ FUN_00840ce0(handle)
+                                        │
+                                        ▼ stored in slot_struct[+0x60] = u32 firmware-kind key
+
+At runtime: FUN_00840d30(key, chip-type-index) walks linked list at DAT_044df838:
+   each node, 0x58-byte calloc'd struct:
+      +0x00 : u32 key1 (= FUN_008f8ab0 hash of board family name)
+      +0x04 : u32 key2 (= chip-type-index 1..7 from FUN_008ede20)
+      +0x08 : char *filename
+      +0x10..0x4f: zero-initialized (post-load fields, populated elsewhere)
+      +0x50 : pointer to next record
+```
+
+### Step 91d — Loader chain (`.hex` files in CWD)
+
+`FUN_00840a40 @ 0x840a40` iterates 7 board-type indices (`iVar7 = 1..7`), for each calling `FUN_008ede20(iVar7)` to get chip-type-name string and globbing:
+
+```
+./<family>-<chip_type_name>-<major>_<minor>_[0-9]*.hex
+```
+
+Falls back to `./<family>-<chip_type_name>-[0-9]*_[0-9]*_[0-9]*.hex` on no match. Per match, calloc a 0x58-byte node and link to head of `DAT_044df838` linked list with `key1=hash(family)`, `key2=iVar7`, `filename=ptr`.
+
+Shipped `.hex` files in `games/pokemon_le/`: 17 files across 12 families (`coil4_lednode`, `coil4node`, `hdminode`, `hdmi_ws2812node`, `lcdnode`, `magsensornode`, `node4`, `pinnode`, `tmc2590node`, `tmc5041node`, `ws2812node`, `ws2812pinnode`). Files appear to be encrypted (Intel HEX line format with high-entropy data bytes).
+
+### Step 91e — Runtime probe instrumentation
+
+Added `shim_node_records_probe_thread` (env-gated `SHIM_NODE_PROBE=1`, default delay 60 s) to `shim_inject.c`. Spawns from `shim_inject_start`. Probe dumps:
+- GOT entries 0x4350200 / 0x434f2f0 / 0x4351748 (resolved at runtime)
+- First 16 entries of firmware-image config table (slot byte at +0x1a)
+- Linked list at DAT_044df838 (key1, key2, filename)
+- Per-slot Tech Alerts struct for slots 0..15 (id, flag, status, fw_key, fw_cfg, bt pointers)
+
+**Runtime data captured (probe at +60 s, plain `./run_game.sh --debug` baseline):**
+
+Family-name hashes (key1 from `FUN_008f8ab0`, ground-truth from probe):
+| Family | key1 |
+|---|---|
+| `pinnode` | 0xdcc6afb2 |
+| `node4` | 0xf585d1cf |
+| `ws2812node` | 0xd2a9be05 |
+
+chip-type-index ↔ chip-name (key2 mapping observed):
+| key2 | chip name |
+|---:|---|
+| 1 | LPC1112_101 |
+| 2 | LPC1112_201 |
+| 4 | LPC1124_303 |
+| 5 | LPC1313 |
+| 6 | LPC812 |
+
+Six firmware records loaded into linked list (only families with both `.hex` shipped AND a registered slot in PTR_PTR_04350200): pinnode-LPC1313, pinnode-LPC1112_201, pinnode-LPC1112_101, node4-LPC812, node4-LPC1124_303, ws2812node-LPC1313.
+
+Per-slot fw_key map (post-init):
+| slot | id | flag | status | fw_key | implied family |
+|---:|---:|---:|---:|---|---|
+| 0 | 0 | 0x3 | **2 (Ok)** | 0 | CPU bridge — flag=3 → row hidden |
+| 1 | 1 | 0x1 | 8 (Not Init) | 0xdcc6afb2 | **pinnode** ← Cabinet Node! |
+| 2 | 2 | 0x1 | 8 | 0xd2a9be05 | ws2812node |
+| 4 | 4 | 0x1 | 8 | 0xf585d1cf | node4 |
+| 7 | 7 | 0x1 | 8 | 0xd2a9be05 | ws2812node |
+| 8 | 8 | 0x1 | 8 | 0xdcc6afb2 | pinnode |
+| 9 | 9 | 0x1 | 8 | 0xdcc6afb2 | pinnode |
+| 10 | 10 | 0x1 | 8 | 0xdcc6afb2 | pinnode |
+| 12 | 12 | 0x1 | 0 (Invalid) | 0xd2a9be05 | ws2812node — FUN_00674680 not run yet |
+| 13 | 13 | 0x1 | 0 | 0xdcc6afb2 | pinnode |
+| 14 | 14 | 0x1 | 0 | 0xd2a9be05 | ws2812node |
+| 3, 5, 6, 11, 15 | — | 0 | 0 | 0 | (vacant) |
+
+**Major correction to Step 90a's mapping**: slots 8/9/10 use family **pinnode** (not coil4node as inferred from `.hex` filenames in Step 90a). The compile-time PTR_PTR_04350200 table assigns slots 8/9/10 to pinnode regardless of the manual's coil4node implication.
+
+### Step 91f — `nodebus_chip_id_for_slot(1)` change to LPC1112_101 — no observable status change
+
+Changed `nodebus_chip_id_for_slot(1)` from `0x041E502B` (LPC1111FHN33/101, no shipped pinnode firmware) to `0x042D502B` (LPC1112FHN33/101, vtable entry 2; matches shipped `pinnode-LPC1112_101-1_31_0.hex`). Re-ran with probe — slot 1 STILL at status=8 after +60 s.
+
+Why no change: `FUN_00674680` lands on the "5 outer retries exhausted, iVar12 != 0, iVar13 == 0" exit BEFORE reaching the chip_id-driven validation chain. The retry loop is tripping on something *prior* to chip_id classification.
+
+### Step 91g — FE-probe synth confirmed not the cause
+
+Logged FE-probe synth events from same run: 0 SKIPs, ~10 RESPs per slot at hint=12 (one wrapper) AND ~10 at hint=13 (`mcp_nodebus_send_cmd_fe_probe_unsure` = ilen=1 hint=0x0d per Step 89e). Synth always responds with non-empty payload + node-present status byte + chip_id from `nodebus_chip_id_for_slot()`. So the `iVar12++` cause is not a missed/skipped synth response.
+
+Remaining hypotheses (untested):
+1. **`FUN_008ed870` (= the cmd-0xfe send wrapper inside `FUN_008f38e0`) does additional response validation** beyond just "got bytes back" — checksum, length, or some field that our synth doesn't fully populate. Returns 0 on validation failure → propagates to `FUN_008f38e0` returning 0 → `iVar12++`.
+2. **Bridge-thread serialization**: shim's 200 ms `usleep` per FE-probe means 5 inner probes take 1 s, AND the periodic poll loop also calls FE-probe on its own thread; if both threads contend on the same bridge state, some calls might fail.
+3. **Probe-window short**: `FUN_00674680` may not have completed enough cycles by +60 s for status to settle. Untested at longer windows.
+
+### Step 91h — Open + retired threads
+
+**Retired** (this Step):
+- "Cabinet Node uses cabinet/node1 family" — falsified; it uses pinnode (key1=0xdcc6afb2).
+- "Drop synthetic `cabinet-LPC1111_101-X.hex` file" — this was Path A4 option (c) from `project_node1_init.md`; falsified because slot 1's family is pinnode and there are pinnode files but for different chip variants.
+- "Direct shim write to status u32 makes row vanish" — partially-falsified; status=2 alone shows "Not Responding" per the dispatcher's flag-bit override. To truly hide the row, must ALSO set flag word's bits 0+1 (currently only bit 0 set for slot 1).
+
+**Open** (next session):
+1. **Decompile `FUN_008ed870 @ 0x8ed870`** (`mcp_nodebus_send_cmd_fe_probe_unsure`) — what response validation does it do? Likely a checksum or specific-byte check our synth misses.
+2. **Re-run probe at longer delay** (180 s, 240 s) to confirm status settles vs continuously updating.
+3. **HW watchpoint `(game_base + 0x44cc3a0)`** in system-mode per PROTOCOL §14 to capture every write to slot-1 status — gives the runtime answer for what code path writes status=8 and when.
+4. **`FUN_007da920` callers** — identify what sets flag word's bits 0+1 (only slot 0 has both set). For Tech Alerts row to truly hide on status=2, slot 1 needs flag = 0x3.
+
+### Files touched
+- `_emulation/shim_inject.c`: added `shim_node_records_probe_thread` (env-gated), spawned from `shim_inject_start`. +~85 lines.
+- `_emulation/shim_nodebus.c`: changed `nodebus_chip_id_for_slot(1)` from `0x041E502B` → `0x042D502B`. +1 case to switch.
+- Build: `spi_shim.so` 232256 B → 298400 B (+66 KB; matches probe code growth).
+
+### Reproducible state
+Plain `./run_game.sh --debug` (no env) lands on Tech Alerts at +200 s with same alert rows as Step 90. Diagnostic dump: `SHIM_NODE_PROBE=1 SHIM_NODE_PROBE_DELAY_S=60 ./run_game.sh --debug --note "node_probe"` then grep `node_probe|fw_record|slot\[` in `runs/<TS>/game.log`.
