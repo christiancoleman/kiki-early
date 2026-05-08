@@ -99,15 +99,24 @@ static uint8_t nodebus_cipher_keys[32][16] = {{0}};
  * flip from "Invalid" to "Not Initialized" with this mapping. */
 static uint32_t nodebus_chip_id_for_slot(uint8_t slot) {
     switch (slot) {
-        case 0:  return 0x00140040u;  /* LPC1124_303 — CPU bridge */
-        case 1:  return 0x042D502Bu;  /* LPC1112_101 — Cabinet Node (pinnode family
-                                         per runtime probe key1=0xdcc6afb2;
-                                         pinnode-LPC1112_101-1_31_0.hex is shipped) */
+        case 0:  return 0x00140040u;  /* LPC1124_303 (vtable[15], type_idx=4) — CPU bridge */
+        case 1:  return 0x042D502Bu;  /* LPC1112_101 (vtable[2], type_idx=1) — Cabinet */
         case 4:  return 0x00140040u;  /* LPC1124_303 — QR reader */
-        case 8:  return 0x3D01402Bu;  /* LPC1313 — Core Driver Lower */
-        case 9:  return 0x3D01402Bu;  /* LPC1313 — Core Driver Upper */
-        case 10: return 0x3D01402Bu;  /* LPC1313 — SPI Node Board */
-        default: return 0x041E502Bu;  /* LPC1111_101 — default */
+        /* Pinnode slots — LPC1112_101 takes the simple chip_id path. */
+        case 8:  return 0x042D502Bu;  /* Core Driver Lower */
+        case 9:  return 0x042D502Bu;  /* Core Driver Upper */
+        case 10: return 0x042D502Bu;  /* SPI Node Board */
+        case 13: return 0x042D502Bu;  /* Topper-Servo (pinnode firmware) */
+        /* ws2812node slots — only LPC1313 firmware shipped, so chip_id must
+         * classify as type_idx=5. vtable[13] = 0x2c40102b → type_idx=5.
+         * Earlier guess 0x3D01402B was vtable[21]/[22] with type_idx=0 →
+         * FUN_008edd80 returned entry with +0x10=0 → uVar9=0 → lookup miss
+         * → status=4. Verified via runtime vtable dump. */
+        case 2:  return 0x2c40102Bu;  /* LPC1313 — Cabinet-Express */
+        case 7:  return 0x2c40102Bu;  /* LPC1313 — Speaker-Expression */
+        case 12: return 0x2c40102Bu;  /* LPC1313 — Topper-Lamps */
+        case 14: return 0x2c40102Bu;  /* LPC1313 — Universal Topper */
+        default: return 0x041E502Bu;  /* LPC1111_101 (vtable[0], type_idx=0) — default */
     }
 }
 
@@ -590,7 +599,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
          * pinnode-LPC1112_101, slot 4 node4-LPC1124_303). After enumeration
          * completes, FUN_007da920(list, 32, 2) sets flag bit 1 for those
          * slots → row truly hides at Tech Alerts. */
-        static const uint8_t enum_seq[] = { 1, 4, 0 };
+        static const uint8_t enum_seq[] = { 1, 2, 4, 7, 8, 9, 10, 12, 13, 14, 0 };
         uint8_t next = (nodebus_enum_idx < (int)sizeof(enum_seq))
             ? enum_seq[nodebus_enum_idx++]
             : 0;

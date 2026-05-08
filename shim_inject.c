@@ -441,6 +441,24 @@ static void *shim_node_records_probe_thread(void *arg) {
     }
     SHIM_LOG("[node_probe] %d firmware records loaded", n_records);
 
+    /* LPC chip vtable @ 0x42317c8 — 28 entries × 0x28. Each entry has the
+     * 32-bit chip_id at +0x00 and the chip-type-index (key2) at +0x10.
+     * Dumping these lets us pick chip_ids for nodebus_chip_id_for_slot()
+     * without guessing — especially for chip-type-index 5 (LPC1313) used
+     * by ws2812node, where guessing the wrong chip_id makes FUN_008edd80
+     * return the default entry → uVar9=0 → lookup miss → status=4. */
+    {
+        uint8_t *vt = (uint8_t *)(game_base + 0x42317c8ULL);
+        for (int i = 0; i < 28; i++) {
+            uint32_t chip_id  = *(uint32_t *)(vt + i * 0x28 + 0x00);
+            uint32_t type_idx = *(uint32_t *)(vt + i * 0x28 + 0x10);
+            if (chip_id != 0 || type_idx != 0) {
+                SHIM_LOG("[node_probe] vtable[%2d] chip_id=0x%08x type_idx=%u",
+                         i, chip_id, type_idx);
+            }
+        }
+    }
+
     for (int slot = 0; slot < 16; slot++) {
         uint8_t *s = (uint8_t *)(game_base + 0x44cc290ULL + (uint64_t)slot * 0xf0ULL);
         SHIM_LOG("[node_probe] slot[%2d] @ %p id=%u flag=0x%08x status=%u fw_key=0x%08x fw_cfg=%p bt=%p",
