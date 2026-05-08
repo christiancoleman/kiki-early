@@ -47,6 +47,11 @@ extern int uart_shim_fd;
 typedef ssize_t (*real_write_t)(int, const void *, size_t);
 extern real_write_t real_write;
 
+/* Cursor for bridge cmd 0x25 (node-enumeration). Reset to 0 when the game
+ * sends FUN_008f1100(0, 0) → cmd 0x41 inner cmd 0xF0 with slot=0 and
+ * payload byte 0x22. Detected and reset in the cmd 0x41 dispatcher below. */
+static int nodebus_enum_idx = 0;
+
 /* Per-slot 16-byte cipher key blocks for the encrypted cmd-0x41 channel.
  * Mirrors the game binary's mcp_nodebus_cipher_keys @ 0x44fcfb8 (32 slots ×
  * 16 bytes). Zero at init = the boot state. The shim doesn't synthesize
@@ -570,6 +575,36 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
      * runtime-computed. We don't synthesize responses, but we DO decrypt the
      * outbound payload here for visibility — see cases below + PROTOCOL.md §5.1.
      */
+    case 0x25: {
+        /* Bridge node-enumeration. mcp_nodebus_init_orchestrator
+         * (FUN_00675110) calls FUN_008ede50 in a loop; each call sends bridge
+         * cmd 0x25 (no payload) and expects a 1-byte response = next detected
+         * slot ID. Bridge yields detected slots in sequence; 0 terminates.
+         *
+         * The orchestrator wraps each enumeration cycle in
+         * FUN_008f1100(0, 0) reset calls (cmd 0x41 inner cmd 0xF0 with
+         * slot=0, payload byte 0x22). We reset the cursor when we observe
+         * that signature in the cmd 0x41 path below.
+         *
+         * Slot list = nodes our FE-probe synth advances to status=2 (slot 1
+         * pinnode-LPC1112_101, slot 4 node4-LPC1124_303). After enumeration
+         * completes, FUN_007da920(list, 32, 2) sets flag bit 1 for those
+         * slots → row truly hides at Tech Alerts. */
+        static const uint8_t enum_seq[] = { 1, 4, 0 };
+        uint8_t next = (nodebus_enum_idx < (int)sizeof(enum_seq))
+            ? enum_seq[nodebus_enum_idx++]
+            : 0;
+        resp[0] = 0x02;
+        resp[1] = 0x25;
+        resp[2] = id;
+        resp[3] = next;
+        resp[4] = bridge_checksum(resp + 1, 3);
+        resp[5] = 0x03;
+        SHIM_LOG("bridge: synth cmd 0x25 yield slot=%u (idx=%d)",
+                 next, nodebus_enum_idx);
+        bridge_send_response(resp, 6, cmd, id);
+        return;
+    }
     case 0x40: {
         /* Cleartext bridge sub-protocol. payload[0] is the sub-cmd byte.
          * Today known: 0x05 = snapshot+clear bridgeStatus,
@@ -637,6 +672,20 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
          * (0xED/0xDD/0x8D/etc) — those were artifacts of XOR'ing 0xFE with
          * (slot<<4)|((ilen+1)&F). Now we treat wire as plaintext. */
         uint8_t inner_cmd = payload[2];
+
+        /* Detect FUN_008f1100(0, 0) reset signal: cmd 0x41 frame with
+         * slot=0, inner_cmd=0xF0, payload[3]=0x22. Resets the cmd 0x25
+         * enumeration cursor so the orchestrator's retry cycles each get
+         * a fresh slot list (else FUN_007da920 would clear flag bit 1 on
+         * any cycle that finds an empty enumeration). */
+        if (slot == 0 && inner_cmd == 0xF0 && inner_len >= 2 &&
+            payload_len >= 4 && payload[3] == 0x22) {
+            if (nodebus_enum_idx != 0) {
+                SHIM_LOG("bridge: cmd 0xF0 reset (enum_idx %d → 0)",
+                         nodebus_enum_idx);
+                nodebus_enum_idx = 0;
+            }
+        }
         char line[512];
         int n = snprintf(line, sizeof(line),
                          "[shim] bridge: cmd 0x41 slot=%u inner_cmd=0x%02x ilen=%u payload=[",
