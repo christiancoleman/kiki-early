@@ -635,7 +635,7 @@ int ioctl(int fd, unsigned long request, ...) {
         }
     }
 
-    /* ---- V4L2 media controller + video device ioctls (Step 46 probe) ----
+    /* ---- V4L2 media controller + video device ioctls (Step 44 probe) ----
      *
      * First-pass probe: log every ioctl request number with arg pointer,
      * return -1 with errno=ENOTTY. This tells libavcodec "this device does

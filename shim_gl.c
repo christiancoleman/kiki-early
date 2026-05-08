@@ -530,7 +530,7 @@ unsigned eglChooseConfig(void *display, const int *attrib_list,
          * EGL_SURFACE_TYPE = EGL_WINDOW_BIT (0x4) → EGL_PBUFFER_BIT (0x1).
          * Mesa surfaceless only advertises PBUFFER configs, so a WINDOW_BIT
          * ask returns zero matches. Our eglCreateWindowSurface interceptor
-         * already redirects to eglCreatePbufferSurface (Step 56.4), so this
+         * already redirects to eglCreatePbufferSurface (Step 55.4), so this
          * translation is end-to-end consistent — the game sees a "window"
          * surface at its API but gets a pbuffer backing it. */
         int patched[128];
@@ -640,7 +640,7 @@ unsigned eglDestroyContext(void *display, void *context) {
 
 void *eglCreateWindowSurface(void *display, void *config, void *native_window,
                              const int *attrib_list) {
-    /* Step 56.2 — in real-GL mode, window surfaces don't work because our
+    /* Step 55.2 — in real-GL mode, window surfaces don't work because our
      * "native_window" is a fake GBM surface that Mesa's GBM platform cannot
      * consume (no real DRM device). Redirect to a surfaceless pbuffer of
      * screen size. Game sees an EGL surface and doesn't know the difference;
@@ -764,7 +764,7 @@ unsigned eglMakeCurrent(void *display, void *draw, void *read, void *context) {
 }
 
 unsigned eglSwapBuffers(void *display, void *surface) {
-    /* Plain forward — capture trigger moved to MODE_PAGE_FLIP (Step 58.2)
+    /* Plain forward — capture trigger moved to MODE_PAGE_FLIP (Step 57.2)
      * because this game uses DRM page-flip for presentation and never
      * actually calls eglSwapBuffers in practice. Left in place as a pure
      * forward so any future code path that DOES call it still works. */
@@ -803,7 +803,7 @@ int eglGetError(void) {
 
 /* Extension stubs resolved via eglGetProcAddress AND exported top-level so
  * direct PLT calls from the game also land here. The KHR image/sync family
- * plus glEGLImageTargetTexture2DOES are never forwarded to Mesa (Step 57's
+ * plus glEGLImageTargetTexture2DOES are never forwarded to Mesa (Step 56's
  * invariant): Mesa's real impls would dereference fake GBM handles.
  *
  * eglCreateImageKHR in particular has a real job under SPIKE3_REAL_GL: the
@@ -1636,7 +1636,7 @@ void (*eglGetProcAddress(const char *name))(void) {
     /* Never forwarded to Mesa, even under SPIKE3_REAL_GL. Mesa's real
      * eglCreateImageKHR / eglCreateSyncKHR / glEGLImageTargetTexture2DOES
      * would be handed our fake GBM BOs and fake sync handles and SEGV on
-     * the first deref (Step 56.6 diagnosis). The KHR stubs below accept
+     * the first deref (Step 55.6 diagnosis). The KHR stubs below accept
      * those handles silently. eglGetPlatformDisplay[EXT] returns our own
      * trampoline; forwarding happens *inside* its body via FWD_RET_V,
      * where the fake display the game stores matches our other interceptors.
@@ -1657,7 +1657,7 @@ void (*eglGetProcAddress(const char *name))(void) {
         { "eglWaitSyncKHR",                   (pfn_t)stub_eglWaitSyncKHR },
         { "eglClientWaitSyncKHR",             (pfn_t)stub_eglClientWaitSyncKHR },
         { "glEGLImageTargetTexture2DOES",     (pfn_t)glEGLImageTargetTexture2DOES },
-        /* FBO attach functions — Step 58.post.3 pivot. Route these here so
+        /* FBO attach functions — Step 62 pivot. Route these here so
          * the EXTERNAL_OES→TEXTURE_2D swap inside our wrapper applies even
          * if the game resolves these via eglGetProcAddress instead of PLT. */
         { "glFramebufferTexture2D",           (pfn_t)glFramebufferTexture2D },

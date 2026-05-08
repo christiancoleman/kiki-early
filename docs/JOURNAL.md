@@ -2193,10 +2193,10 @@ If the `can't create directory '/data/'` spam disappears AND `res://` paths star
 
 66.4 seconds of real-time audio captured, format verified by ffplay. User reports playing the file produces no audible sound — most likely early-init silence (the game was still resolving resources and never started its audio source stream). Verify via `xxd _emulation/audio/stream.s16le | head -5`: if all `0000`, the game wrote all-zero buffers (expected during init); if non-zero, real samples are in there and playback is a local WSL-audio issue rather than a capture issue.
 
-## Step 29–31: shader fix, SIGSEGV handler, crash localized to PopupMenu logger (2026-04-19)
+## Step 29: shader fix, SIGSEGV handler, crash localized to PopupMenu logger (2026-04-19)
 
 ### 29: `glGetIntegerv` filled in for GLES 3.x caps
-Added `GL_MAX_VARYING_VECTORS=15`, `_COMPONENTS=60`, vertex/fragment uniform sizes, texture unit counts, render-target limits, etc. "Too many varyings" errors went from many → 6. Adding `GL_MAX_VERTEX_OUTPUT_COMPONENTS=64` and `GL_MAX_FRAGMENT_INPUT_COMPONENTS=60` in Step 30 drove it to **0**. All 58 captured shaders now compile from Godot's perspective.
+Added `GL_MAX_VARYING_VECTORS=15`, `_COMPONENTS=60`, vertex/fragment uniform sizes, texture unit counts, render-target limits, etc. "Too many varyings" errors went from many → 6. Adding `GL_MAX_VERTEX_OUTPUT_COMPONENTS=64` and `GL_MAX_FRAGMENT_INPUT_COMPONENTS=60` in Step 29 drove it to **0**. All 58 captured shaders now compile from Godot's perspective.
 
 ### 30: Still same runtime cap
 With shaders compiling, runtime extended ~3× (audio grew from 66 s → 188 s) but capture counts plateaued (DMD=1, shaders=58, textures=445) — the game ran much longer but didn't progress past a new wall. Added a one-shot logger to `glGetIntegerv` for unknown pnames; unknowns found were cosmetic (`GL_BLEND_SRC_ALPHA`, `GL_NUM_EXTENSIONS`).
@@ -2223,7 +2223,7 @@ User observation: the `Node not found: "AnimationPlayer" (relative to "/root/pok
 - None of those give us meaningful asset-capture progress beyond what we already have (445 textures, 58 shaders, 1 DMD frame, 66–188 s audio across runs).
 - Parking it. If we need to push past later, register dump from the SIGSEGV handler is the cheap diagnostic to try first.
 
-## Step 32: System UI architecture discovered — NUK = Nuklear, service_s_worker = Service S daemon (2026-04-19)
+## Step 30: System UI architecture discovered — NUK = Nuklear, service_s_worker = Service S daemon (2026-04-19)
 
 Pivot away from live emulation to static investigation of the non-Radium pieces of the platform. User flagged that the interesting understanding is in `/lcd` (Radium) and `/nuk` (Spike 3 system UI). Started with `/nuk` because it has less of a chance of duplicating existing `_extraction/` work.
 
@@ -2297,9 +2297,9 @@ With NUK architecturally understood, moving to `assets/lcd/` — Radium scenes. 
 - `_extraction/CLAUDE.md` — loader call chain (`select_and_load_scene → load_image_bin_file → get_image_section_ptr → get_asset_by_id → load_scene_assets → initialize_scene_asset`)
 - External observations on asset containers and an audio-encryption hypothesis. [Redacted: private source identities, paths and wording.]
 
-Step 33+ will cover that work.
+Step 31+ will cover that work.
 
-## Step 33: Radium scene format — decoded structure, display layout, integration model (2026-04-19)
+## Step 31: Radium scene format — decoded structure, display layout, integration model (2026-04-19)
 
 ### 33.1: Scope of `/lcd/`
 
@@ -2366,7 +2366,7 @@ Within `Bitmap.Image.Buffer` and `Video.Buffer[NAME]`:
 
 - `ManualGodotScene` (vtable at game VA `0x04630230`, per `_extraction/README.md`) wraps a Radium scene as a Godot Node.
 - `initialize_scene_asset` (pseudo-C in `_extraction/`) is the entry point: scene ID → mmap'd image.bin bytes / `/lcd/*/scene.radium` → `ManualGodotScene` → Godot's scene tree.
-- Godot's `_process(dt)` tick advances Radium's animation by dt (updates the keyframe state per Element), and Radium's renderer emits GLES 3.x draw calls — the 58 GLSL shaders captured in Step 27/30 are what Radium uses to composite Text/Sprite/Bitmap/Shape onto GL.
+- Godot's `_process(dt)` tick advances Radium's animation by dt (updates the keyframe state per Element), and Radium's renderer emits GLES 3.x draw calls — the 58 GLSL shaders captured in Step 27/29 are what Radium uses to composite Text/Sprite/Bitmap/Shape onto GL.
 - The LCD DMD (1024×256 ABGR8888) we captured in Step 25 is rendered by a different Radium path (the `DMDEmulationScene` from Step 23) — this is Radium-for-DMD, rendering at the small resolution. The 454×256 Radium scene found here may feed that.
 
 ### 33.7: Open questions / next-sessions threads
@@ -2374,14 +2374,14 @@ Within `Bitmap.Image.Buffer` and `Video.Buffer[NAME]`:
 1. **Which scene is which gameplay mode?** Grep each of the 36 SHA-1s in the game binary, identify enclosing functions in BN, name each scene.
 2. **The `_BW` variants** — confirm whether they're DMD-specific (renderer picks based on display target).
 3. **`Format` integer in Bitmap.Image** — seen values 4 and 5. Need to map these to pixel formats (RGBA8, RGB8, etc.) from the Radium decoder source.
-4. **How does `ManualGodotScene` actually tick and render?** BN dig — same expected scope as the Nuklear question (Step 32.4).
+4. **How does `ManualGodotScene` actually tick and render?** BN dig — same expected scope as the Nuklear question (Step 30.4).
 5. **What does `454 × 256` mean** — is that a third LCD panel, or a rendering intermediate?
 
 ### 33.8: Proven-fact additions for PROTOCOL
 
 - Radium scene layout, object taxonomy, FrameSize distribution, content-addressed SHA-1 lookup.
 
-## Step 34: Every Radium scene classified — each SHA-1 to a role (2026-04-19)
+## Step 32: Every Radium scene classified — each SHA-1 to a role (2026-04-19)
 
 ### 34.1: Method
 
@@ -2513,7 +2513,7 @@ The fonts in `assets/nuk/fonts/` (Hack-Regular, Stern_FjallaOne, Stern_WorkSans)
   3. Reconstruct the full scene-event graph — which gameplay mode loads which Radium overlay, when. Binding clues: the `PokeballCounter01_Instance` and `NetScoreFrameOverlay` names show up in rodata alongside the HUD scene SHA-1s, which means the game code binds to those by name at runtime.
 - The analysis script (`/tmp/radium_xref/analyze.py`) is reusable — if the user wants a persistent copy, it can be moved into the repo (`_extraction/tools/` or similar).
 
-## Step 35: Binding index — which function binds which Radium scene, via rodata clustering (2026-04-19)
+## Step 33: Binding index — which function binds which Radium scene, via rodata clustering (2026-04-19)
 
 Goal: identify, per Radium scene, the **C++ function in the game binary** that loads it and walks its element tree. The technique is binding-path clustering:
 
@@ -2527,8 +2527,8 @@ So: cluster the binary's rodata "A.B.C" strings by offset proximity; locate the 
 
 Scripts preserved at `games/pokemon_le/_extraction/tools/`:
 
-- `radium_scene_xref.py` — per-scene binary-occurrence analysis (Step 34).
-- `radium_bindings.py` — builds a binding index from all 407 diagnostic scene element-names (Step 35).
+- `radium_scene_xref.py` — per-scene binary-occurrence analysis (Step 32).
+- `radium_bindings.py` — builds a binding index from all 407 diagnostic scene element-names (Step 33).
 - `radium_rodata_clusters.py` — finds dotted-path string clusters by offset proximity (≥3 strings, gap ≤ 400 bytes).
 - `radium_mode_xref.py` — exploratory pass for `res://scenes/*.tscn` callsites (proved they're all in one static scene-registry table, so not distinguishing).
 
@@ -2581,9 +2581,9 @@ Moved to the repo so future sessions can re-run:
 
 ```
 games/pokemon_le/_extraction/tools/
-├── radium_scene_xref.py          # per-scene content + SHA-1 xref analysis (Step 34)
-├── radium_bindings.py            # all-scene element-name → binary binding index (Step 35)
-├── radium_rodata_clusters.py     # dotted-path proximity clustering (Step 35)
+├── radium_scene_xref.py          # per-scene content + SHA-1 xref analysis (Step 32)
+├── radium_bindings.py            # all-scene element-name → binary binding index (Step 33)
+├── radium_rodata_clusters.py     # dotted-path proximity clustering (Step 33)
 └── radium_mode_xref.py           # res://scenes/*.tscn callsite dump (exploratory)
 ```
 
@@ -2594,7 +2594,7 @@ games/pokemon_le/_extraction/tools/
 - Binding function #3 ("End-of-mode") owns a run of 1360×768 panels + the 454×256 Pokeball textbox scene.
 - The 14 non-Radium clusters in the binary's dotted-path universe are all Godot engine internals.
 
-## Step 36: reference-player-v2.py — dt-paced playback + Pokemon attract driver + binding API stub (2026-04-19)
+## Step 34: reference-player-v2.py — dt-paced playback + Pokemon attract driver + binding API stub (2026-04-19)
 
 Goal: get Reference tool A's player playing Pokémon Radium scenes at the correct speed and with proper clip sequencing — and design the API surface for a future "drive from Godot" bridge.
 
@@ -2675,10 +2675,10 @@ Deferred until the current fix is validated.
 
 - v2 file: `[REFERENCE_TOOL_A]/reference-player-v2.py` — parses clean, 2230 lines, 7 inline `# v2:` edits + 3 new top-level constructs.
 - Original untouched: `[REFERENCE_TOOL_A]/reference-player.py` — 1900 lines, preserved as-is per user's "maintain history without git" request.
-- JOURNAL Step 36 (this entry) — records BN-derived facts + the v2 design.
+- JOURNAL Step 34 (this entry) — records BN-derived facts + the v2 design.
 - PROTOCOL — to be updated with the three BN-proven facts (vsync-locked timing model, attract sequencer semantics, ManualGodotScene extended-ftable layout) after the v2 test run validates the dt fix actually works.
 
-## Step 37: First v2 test run — video-decoder gap + graceful fallback + docs (2026-04-19)
+## Step 35: First v2 test run — video-decoder gap + graceful fallback + docs (2026-04-19)
 
 ### 37.1: What happened
 
@@ -2749,7 +2749,7 @@ To get actual attract-video rendering on this system, options in order of effort
 
 Deferred until the user has a concrete need to see attract video — the timer-driven state machine is already proving the sequencer is correct.
 
-## Step 38: PyAV video backend + blob auto-heal (2026-04-19)
+## Step 36: PyAV video backend + blob auto-heal (2026-04-19)
 
 User hit a new failure on the boot-progress scene (`036fe928…` under `bc0792d8…`): `FileNotFoundError: /tmp/blob_4d91043d18.bin`. And they installed PyAV (`pip install av`), so we can now do proper video playback.
 
@@ -2812,7 +2812,7 @@ With PyAV installed (confirmed: user has `av 14.2.0`, pyglet 2.0.17, ffmpeg 7.1.
 - `[REFERENCE_TOOL_A]/README.v2.md` — Video decoder section rewritten; PyAV promoted from TODO to "primary recommended path".
 - This journal entry.
 
-## Step 39: Static-frame freeze — fixes the "5× too fast" state-oscillation (2026-04-19)
+## Step 37: Static-frame freeze — fixes the "5× too fast" state-oscillation (2026-04-19)
 
 User reported that even after the dt fix, "some scenes still cycle their assets way too fast" with a good intuition: "maybe when they're used properly you're supposed to instantiate them with one of the assets and frame the game that way."
 
@@ -2890,7 +2890,7 @@ Radium scenes are **closer to Flash MovieClip templates** than standalone animat
 Our player now supports (2) via `RadiumBinding`, (3) via `--static-frame` / `--static-label`, and (4) per-scene drivers like `PokemonAttractDriver`. Still missing: per-element frame control and the IPC layer for (2) from a Godot process. Both deferred to follow-up sessions.
 
 
-## Step 40: Video actually renders — chased `no-player` to a ptrs-duplicate + shipped `--play-clip` (2026-04-19)
+## Step 38: Video actually renders — chased `no-player` to a ptrs-duplicate + shipped `--play-clip` (2026-04-19)
 
 Previous step's attract run showed PyAV successfully opening H.264 streams and `PokemonAttractDriver` cycling its state machine, but the window stayed a solid black rectangle — no actual video pixels reached the texture. This step traces that end-to-end and lands a generic clip-player on top.
 
@@ -3009,7 +3009,7 @@ Added two commands to the interactive menu:
 | `c off` | Clear `--play-clip`. |
 | `clips N` | Read scene N's `scene.radium.json`, walk for Video-shaped dicts, print their Character.Name and Buffer keys. Pure-Python read, no player launch. |
 
-A new `scene_clips(scene_path)` helper mirrors `scene_labels(scene_path)` (Step 39) — same ptr_wrapper walker, collects `{Character.Name: sorted-set-of-buffer-keys}`. Merges duplicates under one key (the same Radium duplicate-ptrs quirk).
+A new `scene_clips(scene_path)` helper mirrors `scene_labels(scene_path)` (Step 37) — same ptr_wrapper walker, collects `{Character.Name: sorted-set-of-buffer-keys}`. Merges duplicates under one key (the same Radium duplicate-ptrs quirk).
 
 Footer now mentions: "See _emulation/VIDEO_CLIPS.md for the full 229-entry clip catalog".
 
@@ -3027,7 +3027,7 @@ Still missing (punch-list for future sessions):
 - **Driver per non-attract mode**. GenericClipDriver is adequate for inspection but a real Main HUD driver would need to drive 9 scenes + ~75 element paths from cluster 1, not just play a video loop.
 - **The JSON-over-IPC bridge** from a Godot process — stubbed in `RadiumBinding` but no consumer yet. Once audio lands, this is the next thing that would make the player drivable as a real front-end.
 
-## Step 41: Sound-event mapping — `sub_8d3460` registers 25 strings; hashmap path found, token→asset_id gap remains (2026-04-19)
+## Step 39: Sound-event mapping — `sub_8d3460` registers 25 strings; hashmap path found, token→asset_id gap remains (2026-04-19)
 
 Goal: map 231 extracted PCM WAVs + 303 `_tf2_w4` candidates to `SE_PK_*` sound IDs in the previs `spike_game_sound_ids.gd` autoload (~750 constants) so standalone Godot previs plays the right SFX from `res://sfx/<SOUND_ID>.wav`.
 
@@ -3117,7 +3117,7 @@ All three are untested.
 - `ASSETS.md → Audio` — new row for tf2_w4 candidates + Sound-event registration subsection.
 - `memory/project_audio_next.md` — music-encryption hypothesis rolled back; state reflects 41.1–41.8.
 
-## Step 42: Full pipeline traced — token→asset_id is runtime-only; static extraction dead (2026-04-19)
+## Step 40: Full pipeline traced — token→asset_id is runtime-only; static extraction dead (2026-04-19)
 
 Final Sidekick round on audio. User flagged BN budget exhausted after this one. Result closes the question: the token → asset_id step is **intentionally** not in compiled code.
 
@@ -3125,7 +3125,7 @@ Final Sidekick round on audio. User flagged BN budget exhausted after this one. 
 
 | Stage | Function | Effect |
 |---|---|---|
-| 1. String registration (static init) | `sub_8d3460` | Inserts 25 `SE_PK_FX_*` strings → uint16_t tokens into hashmap at `data_48c56d0` (documented Step 41) |
+| 1. String registration (static init) | `sub_8d3460` | Inserts 25 `SE_PK_FX_*` strings → uint16_t tokens into hashmap at `data_48c56d0` (documented Step 39) |
 | 2. Name lookup | `sub_b09660` | `std::_Hash_bytes` seed `0xc70f6907`; returns hash node with token at offset `+0x28` |
 | 3. **Token → asset_id** | NOT IN COMPILED CODE | Populated at runtime from scene bytecodes (image-sc*.bin / image.bin scene 0) via `load_scene_assets` (0xb321d0) — the type-0x0b records registering into `g_asset_registry` |
 | 4. Asset registry lookup | `asset_registry_find` over `g_asset_registry` at `data_48ca4d0` | Encoded asset_id → `{file_offset, size, type}` |
@@ -3149,7 +3149,7 @@ Practical consequences:
 
 ### 42.4: Still-viable paths
 
-- **(A) Runtime capture under emulation.** Get past Step 31's PopupMenu TLS SEGV, then hook `asset_registry_find` (file offset `0x8ca4d0` neighborhood) to log (packed_asset_id, file_offset, size) tuples as scenes load, and hook `sub_b09660` to correlate names → tokens. Gated on resolving the Godot-TLS crash that's been parked since Step 31. High eng cost.
+- **(A) Runtime capture under emulation.** Get past Step 29's PopupMenu TLS SEGV, then hook `asset_registry_find` (file offset `0x8ca4d0` neighborhood) to log (packed_asset_id, file_offset, size) tuples as scenes load, and hook `sub_b09660` to correlate names → tokens. Gated on resolving the Godot-TLS crash that's been parked since Step 29. High eng cost.
 - **(B) CM4 hardware memory dump.** User owns CM4 + Pi carrier (per memory `hardware_inventory.md`). Boot real filesystem on CM4 (no 48V needed), attach gdb/perf to running game, dump `g_asset_registry` once scenes have loaded. One-shot capture. Low eng cost, moderate logistics.
 - **(C) Manual triage.** Audition 231 + 303 WAV candidates against the ~750 `SE_PK_*` names; tag what we recognize. Zero eng cost, high user time cost. Can be accelerated with a small play/tag TUI.
 
@@ -3170,9 +3170,9 @@ Going with (C). Starting points:
 - `PROTOCOL.md → Sound event registration` — extended with stages 3–5 + rationale.
 - `memory/project_audio_next.md` — updated with final state: static path dead; triage is now the official plan.
 
-## Step 43: Standalone extractor built — image.bin section 7 is all we need (2026-04-20)
+## Step 41: Standalone extractor built — image.bin section 7 is all we need (2026-04-20)
 
-Pivoted the mapping problem into a *generic extraction* problem after Step 42 closed the SE_PK_* → asset_id avenue. User's architectural ask: a **standalone** extractor that operates on `(game binary, image.bin)` alone, modeled on Pinball Browser — no runtime emulation, no shim dependency. Deliverable: `games/pokemon_le/_extraction/tools/spike_extract/`.
+Pivoted the mapping problem into a *generic extraction* problem after Step 40 closed the SE_PK_* → asset_id avenue. User's architectural ask: a **standalone** extractor that operates on `(game binary, image.bin)` alone, modeled on Pinball Browser — no runtime emulation, no shim dependency. Deliverable: `games/pokemon_le/_extraction/tools/spike_extract/`.
 
 ### 43.1: Walked the `g_asset_registry` hashmap at runtime
 
@@ -3277,7 +3277,7 @@ Output: `_extraction/spike_extract_out/` (1.1 GB, 2452 WAV files + `index.csv`).
 
 The section-7 format is stable across Stern's Spike 3 codebase. Parser should work on any `image.bin` from any Spike 3 game (Jurassic Park Pro, Stranger Things, etc.). Per-game tuning is only the classification heuristic — different games may use different `flags` encodings and the 64 `asset_id_low` category codes may shift. The file-structure parser is universal.
 
-Future: accept `--registry-va 0x48ca4d0` as CLI flag (default for Pokémon LE 0.81) for scanning other builds' game binaries; extend `image_bin.py` to handle `image-sc*.bin` scene-specific subfiles via the RB-tree-of-mmaps pattern documented in `load_image_bin_file` at BN `0xc47210` (decomp captured in Step 43 session notes).
+Future: accept `--registry-va 0x48ca4d0` as CLI flag (default for Pokémon LE 0.81) for scanning other builds' game binaries; extend `image_bin.py` to handle `image-sc*.bin` scene-specific subfiles via the RB-tree-of-mmaps pattern documented in `load_image_bin_file` at BN `0xc47210` (decomp captured in Step 41 session notes).
 
 ### 43.6: What the shim's role is now
 
@@ -3290,9 +3290,9 @@ The shim stays in the repo as the emulation-investigation tool (Steps 14–42). 
 - `games/pokemon_le/_emulation/spi_shim.c` — SIGSEGV handler now includes hashmap struct parse + linked-list walk + file-based dump.
 - PROTOCOL.md — new `g_asset_registry` section with the verified struct layout and validation record.
 
-## Step 44: Section 2 + Section 5 probed; 0x0b bytes 3-6 decoded; 885 scene map still open (2026-04-21)
+## Step 42: Section 2 + Section 5 probed; 0x0b bytes 3-6 decoded; 885 scene map still open (2026-04-21)
 
-Context: user's architecture ask — go after both Section 2 and Section 5 in parallel to close the static 885 scene → asset_id mapping gap that Step 43 confirmed is not runtime-cached anywhere special. Pinball-Browser-style metadata extraction tools want this mapping to present "what plays during which game state."
+Context: user's architecture ask — go after both Section 2 and Section 5 in parallel to close the static 885 scene → asset_id mapping gap that Step 41 confirmed is not runtime-cached anywhere special. Pinball-Browser-style metadata extraction tools want this mapping to present "what plays during which game state."
 
 Three probe scripts under `games/pokemon_le/_extraction/tools/`:
 - `probe_sections.py` — baseline layout enumeration.
@@ -3371,9 +3371,9 @@ Renaming `scene_config_table.c` → `service_menu_table.c` is warranted but defe
 **Closed:**
 - Per-asset flags/type/size (section 7).
 - Per-asset bytecode descriptor including mlock hints (section 5).
-- Asset category classification (mono/stereo/music via id_low bits 6 and 17) — Step 43.
-- Radium scene → asset bindings via the 6 rodata clusters — Step 35.
-- Attract video sequencer state machine — Step 36.
+- Asset category classification (mono/stereo/music via id_low bits 6 and 17) — Step 41.
+- Radium scene → asset bindings via the 6 rodata clusters — Step 33.
+- Attract video sequencer state machine — Step 34.
 
 **Still open:**
 - 885 scene_id → asset_id list. The runtime BSS table at 0x47fcf10 is the authoritative answer but we haven't captured it.
@@ -3383,7 +3383,7 @@ Renaming `scene_config_table.c` → `service_menu_table.c` is warranted but defe
 ### 44.7: Next options
 
 1. **Binary Ninja re-export of VA 0x47fcf10.** If the 885-entry table is static data, exporting it from the current .bndb gives us the mapping directly. Cheapest next step.
-2. **Runtime capture** under the emulation shim. Step 43 already dumps `g_asset_registry`; extending the SIGSEGV handler to also dump `scene_config_table` would close the mapping under QEMU without clearing Step 31's PopupMenu crash — the crash fires after scene table is populated.
+2. **Runtime capture** under the emulation shim. Step 41 already dumps `g_asset_registry`; extending the SIGSEGV handler to also dump `scene_config_table` would close the mapping under QEMU without clearing Step 29's PopupMenu crash — the crash fires after scene table is populated.
 3. **Full decode of the 0x05 byte 2 field** to finish the static flag encoding. Would let us recover (asset_id_low, flags) pairs purely from image.bin without registry.
 4. **CM4 hardware dump** — user owns the hardware and the LUKS key is already extracted. On-device gdb or /proc/*/maps dump of the running `game` process is the cleanest one-shot capture of the real table.
 
@@ -3395,13 +3395,13 @@ Renaming `scene_config_table.c` → `service_menu_table.c` is warranted but defe
 - `games/pokemon_le/_extraction/tools/probe_sections_v4.py` — full bytecodes + 0x05/0x09 distribution + section-2 record structure.
 - PROTOCOL.md — new "Section 5 scene bytecode" section with the 0x0b layout and known-open flag encoding.
 
-## Step 45: Step 31 unblocked — memcpy NULL-guard lands, game reaches 4 Godot scenes (2026-04-21)
+## Step 43: Step 29 unblocked — memcpy NULL-guard lands, game reaches 4 Godot scenes (2026-04-21)
 
 User pivoted from asset extraction back to emulation. Goal: unpark the Step-31 PopupMenu TLS SEGV and see what's next.
 
 ### 45.1: Fresh-run triage (`run_step45.*`)
 
-Ran the current shim (last rebuilt 2026-04-20 with Step 43's SIGSEGV+registry-dump additions) unchanged. Same crash signature as Step 31 — `SEGV_MAPERR fault_addr=0x40` at `./game+0x7b7c3c` (1372 bytes into `sub_bb76e0` DisplayRenderer render loop), crashing in glibc's `cpyfp` (aarch64 __memcpy_aarch64) from a NULL memcpy inside Godot's `_err_print_error` logger.
+Ran the current shim (last rebuilt 2026-04-20 with Step 41's SIGSEGV+registry-dump additions) unchanged. Same crash signature as Step 29 — `SEGV_MAPERR fault_addr=0x40` at `./game+0x7b7c3c` (1372 bytes into `sub_bb76e0` DisplayRenderer render loop), crashing in glibc's `cpyfp` (aarch64 __memcpy_aarch64) from a NULL memcpy inside Godot's `_err_print_error` logger.
 
 Stderr (17,876 lines) — upstream errors preceding the crash, sorted by proximity:
 
@@ -3409,7 +3409,7 @@ Stderr (17,876 lines) — upstream errors preceding the crash, sorted by proximi
 |---|---|---|
 | immediate | `bridge: no synthetic response for cmd 0x41` | shim default branch, no handler |
 | close | `bridge: no synthetic response for cmd 0x25` | same |
-| close | `ERROR: Node not found: "AnimationPlayer" (relative to "/root/pokemon_battle_scene")` | Radium dynamic-attach gap, parked Step 31.1 — user confirms the AnimationPlayer absence also appears when building the extracted Godot project, so it's genuinely missing from the scene on disk. |
+| close | `ERROR: Node not found: "AnimationPlayer" (relative to "/root/pokemon_battle_scene")` | Radium dynamic-attach gap, parked Step 29.1 — user confirms the AnimationPlayer absence also appears when building the extracted Godot project, so it's genuinely missing from the scene on disk. |
 | medium | `[Radium Error] VideoStreamDecoder: Cannot open input file ''` | Radium expected an asset we haven't provided |
 | medium | `can't create directory '/data/'` (×9) | game's own mkdir fails even though sysroot has /data/ |
 | medium | `Can't create shader cache folder: /tmp/cache` | Godot wants /tmp/cache |
@@ -3450,9 +3450,9 @@ Rebuild + rerun. Exit code **4** (Godot's own exit, not SIGSEGV). stderr 19,055 
 - **libavcodec's HEVC decoder** — `[hevc @ ...] Failed to find a V4L2 device for H265`, `Failed setup for format drm_prime`, `Error parsing NAL unit #0`. The game tries to hardware-decode `res://gfx/bknd/*/…_h265.mp4` via V4L2. Our QEMU user-mode sandbox has no `/dev/video*`, so the decoder falls back (unsuccessfully). This is the expected next blocker for video playback on-host.
 - **`@export`, `@icon`, `@export_range`, `@export_multiline`, `@warning_ignore*`** — GDScript annotation StringNames dying at shutdown. These are Godot's exit-time "BUG: Unreferenced static string to 0" diagnostics (core/string/string_name.cpp:144), plus "Pages in use exist at exit in PagedAllocator: Variant::Pools::Bucket{Large,Medium,Small}" (paged_allocator.h:170). Both indicate the shutdown wasn't clean — objects outlived the Variant pools — which is normal when a process is tearing down mid-activity.
 
-**Capture counts after Step 45:**
+**Capture counts after Step 43:**
 
-| Artifact | Step 27/30 | Step 45 | Δ |
+| Artifact | Step 27/29 | Step 43 | Δ |
 |---|---:|---:|---:|
 | textures | 445 | 507 | +62 |
 | shaders | 58 | 74 | +16 (8 new programs × 2) |
@@ -3467,7 +3467,7 @@ The audio file grew disproportionately because the game, once past the PopupMenu
 - **Do not conflate "no crash" with "progress"** — the 90 s cmd-0x41 polling loop survived without crashing but went nowhere. Exit 124 from `timeout` is a red flag, not a green one; verify capture counts and scene-load milestones actually advanced.
 - **memcpy NULL-guard should stay on.** It's cheap, it's catching real NULL dereferences in Godot's error path, and it doesn't affect performance (in-memcpy flag + dlsym-resolved real memcpy for the non-NULL hot path).
 
-### 45.5: Next blockers visible at Step 45 exit state
+### 45.5: Next blockers visible at Step 43 exit state
 
 Sorted roughly by how much progress each could unlock:
 
@@ -3483,14 +3483,14 @@ Sorted roughly by how much progress each could unlock:
 - `_emulation/spi_shim.so` — rebuilt, 150,576 bytes.
 - `_emulation/run_step45.{stdout,stderr}` — crash-signature baseline.
 - `_emulation/run_step45_fix1.{stdout,stderr}` — regression run with cmd 0x41 ACK; useful only to prove the ACK stalls init.
-- `_emulation/run_step45_fix2.{stdout,stderr}` — **the unblock run**. Use this as the baseline for Step 46 onwards.
+- `_emulation/run_step45_fix2.{stdout,stderr}` — **the unblock run**. Use this as the baseline for Step 44 onwards.
 - `memory/project_emulation_progress.md` — updated to reflect Track A is no longer parked.
 - `memory/project_animation_player_gap.md` — user confirmation that the Godot extract has the same AnimationPlayer absence.
 - PROTOCOL.md — next update should add a note that cmd 0x41 (and 0x25, and presumably 0x12/0x19 now) rely on 1000 ms timeout as their progress signal until their response payload is reversed.
 
-## Step 46: V4L2 HEVC decoder probe — env vars readable, but open() never called (2026-04-21)
+## Step 44: V4L2 HEVC decoder probe — env vars readable, but open() never called (2026-04-21)
 
-User picked the "fake V4L2 HEVC decoder via shim ioctl hooks" option from Step 45's next-step list. Hypothesis: if libavcodec thinks it has a V4L2-stateless HEVC decoder, the game's `spi_video_player` module gets decoded frames and the res://gfx/bknd/*/…_h265.mp4 environment backdrops render.
+User picked the "fake V4L2 HEVC decoder via shim ioctl hooks" option from Step 43's next-step list. Hypothesis: if libavcodec thinks it has a V4L2-stateless HEVC decoder, the game's `spi_video_player` module gets decoded frames and the res://gfx/bknd/*/…_h265.mp4 environment backdrops render.
 
 ### 46.1: Scoping the libavcodec V4L2 probe
 
@@ -3563,9 +3563,9 @@ Scope-wise, option 2 is the most likely one-session win.
 
 ### 46.7: Decision
 
-Parking V4L2 emulation at this checkpoint. The shim infrastructure (fake paths, ioctl logger) stays in place for when either BN budget opens up or someone picks option 2 (libavcodec API hooks) in a future session. Documented as Step 46 so next time we pick this up we don't re-run the same three experiments.
+Parking V4L2 emulation at this checkpoint. The shim infrastructure (fake paths, ioctl logger) stays in place for when either BN budget opens up or someone picks option 2 (libavcodec API hooks) in a future session. Documented as Step 44 so next time we pick this up we don't re-run the same three experiments.
 
-## Step 47: libavcodec API hooks + dummy frame injection — stopped at AVFrame format mismatch (2026-04-21)
+## Step 45: libavcodec API hooks + dummy frame injection — stopped at AVFrame format mismatch (2026-04-21)
 
 User picked the "highest excitement-per-hour" option: hook libavcodec's codec-API calls (not V4L2 ioctls) so decode pipeline produces *something* for the game's video renderer even without real HEVC hardware.
 
@@ -3599,9 +3599,9 @@ Reverted to passthrough logging (with `dlvsym("symbol","LIBAVCODEC_59")` for ver
 - `avcodec_send_packet` returns 0 → packets accepted.
 - `avcodec_receive_frame` returns -11 (EAGAIN) consistently → no decoded frames produced.
 
-Clean exit 4. Game handles EAGAIN gracefully — just doesn't render video. Critical architectural finding: **Pokemon LE uses DRM-prime HEVC decode via `/dev/dri/card1`, NOT V4L2 request**. The entire Step 46 V4L2 probe rabbit hole was barking up the wrong tree for this game.
+Clean exit 4. Game handles EAGAIN gracefully — just doesn't render video. Critical architectural finding: **Pokemon LE uses DRM-prime HEVC decode via `/dev/dri/card1`, NOT V4L2 request**. The entire Step 44 V4L2 probe rabbit hole was barking up the wrong tree for this game.
 
-Unresolved mystery: `avcodec_find_decoder_by_name` hook never logged despite other hooks firing. Suspected cause: game static-init resolves the decoder pointer before the shim's constructor runs, or uses a cached pointer from somewhere else. Inconsequential for Step 47 since passthrough = same behavior as no-hook.
+Unresolved mystery: `avcodec_find_decoder_by_name` hook never logged despite other hooks firing. Suspected cause: game static-init resolves the decoder pointer before the shim's constructor runs, or uses a cached pointer from somewhere else. Inconsequential for Step 45 since passthrough = same behavior as no-hook.
 
 ### 47.3: Dummy frame injection — NV12 1920×1080 black
 
@@ -3630,7 +3630,7 @@ Interpretation: when `av_hwdevice_ctx_create(AV_HWDEVICE_TYPE_DRM)` succeeds, th
 - LD_PRELOAD hooks for libavcodec symbols work (with `dlvsym("symbol","LIBAVCODEC_59")` for versioned resolution).
 - AVFrame offsets 104/108/116/136/144 (width/height/format/pts/pkt_dts) are correct for libavutil 57.
 - Dummy frame injection mechanism works — game accepts 4 frames in a row with valid PTS.
-- **Game uses DRM-prime decode**, not V4L2-request. Step 46's V4L2 emulation path is unnecessary for THIS game.
+- **Game uses DRM-prime decode**, not V4L2-request. Step 44's V4L2 emulation path is unnecessary for THIS game.
 
 **Not yet done:**
 - Fabricate a valid `AVDRMFrameDescriptor` for `AV_PIX_FMT_DRM_PRIME` frames. Would require:
@@ -3638,27 +3638,27 @@ Interpretation: when `av_hwdevice_ctx_create(AV_HWDEVICE_TYPE_DRM)` succeeds, th
   - A real DMA-BUF fd (from `memfd_create` or via host-side `udmabuf`/`sw_sync`) that EGL can import via `EGL_EXT_image_dma_buf_import`.
   - Or: a fake fd routed through the shim's `/dev/dri/card1` socketpair with enough ioctl-level emulation to satisfy `glEGLImageTargetTexture2DOES` with our existing GL stubs.
 
-That second path is plausible but bigger than Step 47's "excitement-per-hour" budget. The existing GL shim already captures `glTexImage2D` / `glTexSubImage2D`, so we'd need the consumer's `glEGLImageTargetTexture2DOES` path to silently no-op and some other texture-upload path to deliver pixels.
+That second path is plausible but bigger than Step 45's "excitement-per-hour" budget. The existing GL shim already captures `glTexImage2D` / `glTexSubImage2D`, so we'd need the consumer's `glEGLImageTargetTexture2DOES` path to silently no-op and some other texture-upload path to deliver pixels.
 
 ### 47.6: Capture counts final state
 
-| Artifact | Step 45 | Step 47c (dummy NV12 no pts) | Step 47d (dummy NV12 + pts) |
+| Artifact | Step 43 | Step 45c (dummy NV12 no pts) | Step 45d (dummy NV12 + pts) |
 |---|---:|---:|---:|
 | textures | 507 | 513 | 513 |
 | shaders | 74 | 74 | 74 |
 | DMD | 1 | 1 | 1 |
 
-No shader/texture diff from Step 45 — the crash happens before the video consumer creates new GL resources.
+No shader/texture diff from Step 43 — the crash happens before the video consumer creates new GL resources.
 
 ### 47.7: What to keep in the shim
 
-All the Step 47 hooks stay. They're the load-bearing investigation infrastructure:
+All the Step 45 hooks stay. They're the load-bearing investigation infrastructure:
 - `shim_resolve_libav(sym, version)` — dlvsym with dlopen fallback for versioned libavcodec/libavutil symbols.
 - Passthrough-logging versions of `avcodec_find_decoder_by_name`, `avcodec_get_hw_config`, `av_hwdevice_ctx_create`.
 - Counters + periodic logs on `avcodec_send_packet` / `avcodec_receive_frame`.
 - Dummy-frame injection gated on `shim_pending_dummies > 0` and `ret == EAGAIN`.
 
-Behavior with the current shim (Step 47d): crashes at `./game+0xe3e250` after 4 injected frames. Reverting the dummy-frame-injection block to pure passthrough (no ref/unref) restores the Step-45 behavior (exit 4 clean shutdown, no video but stable). If you want "no crash, no video" for a baseline, delete the block that unrefs/refs the frame.
+Behavior with the current shim (Step 45d): crashes at `./game+0xe3e250` after 4 injected frames. Reverting the dummy-frame-injection block to pure passthrough (no ref/unref) restores the Step-45 behavior (exit 4 clean shutdown, no video but stable). If you want "no crash, no video" for a baseline, delete the block that unrefs/refs the frame.
 
 ### 47.8: Next-session starting point
 
@@ -3673,15 +3673,15 @@ If that's too ambitious, fallback: find a way to make the game fall through the 
 
 ### 47.9: Artifacts
 
-- `_emulation/spi_shim.c` — libavcodec/libavutil hooks + dummy frame infra (Step 47 section at end of file).
+- `_emulation/spi_shim.c` — libavcodec/libavutil hooks + dummy frame infra (Step 45 section at end of file).
 - `_emulation/spi_shim.so` — rebuilt, 151,368 bytes.
 - `_emulation/run_step47.stderr` — first-try (SIGABRT from hw_decoder assertion, SW-fallback hooks caused regression).
 - `_emulation/run_step47b.stderr` — passthrough hooks confirmed DRM-prime path, clean exit 4.
 - `_emulation/run_step47c.stderr` — dummy frame w/o pts → PTS assertion SIGABRT.
 - `_emulation/run_step47d.stderr` — dummy frame with pts → 4 frames injected, SIGSEGV at game's DRM-descriptor consumer.
-- `memory/project_emulation_progress.md` — updated with Step 47 summary.
+- `memory/project_emulation_progress.md` — updated with Step 45 summary.
 
-## Step 48: Netbridge protocol decoded from the netbridge.elf binary itself (2026-04-21)
+## Step 46: Netbridge protocol decoded from the netbridge.elf binary itself (2026-04-21)
 
 Major pivot. User observed that we've been reversing the bridge protocol from the CPU-side by watching what the game sends. The other side of the wire — the netbridge itself — is sitting as `games/pokemon_le/spike3/netbridge/netbridge.elf`: a 188 KB ARM EABI ELF, **statically linked, NOT stripped, WITH DEBUG_INFO**. The protocol truth is right there.
 
@@ -3726,7 +3726,7 @@ Raw pointer table at `0x1000155c` (34 entries × 4 bytes = 136 bytes):
 
 **Only cmds `0x20`, `0x23`, `0x24`, `0x25`, `0x26`, `0x27`, `0x29`, `0x2A` have real function pointers** (8 of 34 slots). `0x21`/`0x22`/`0x28` point at data/end-of-code — plausibly dead entries the dispatcher reaches for unsupported cmds. Everything from `0x2B` through `0x41` would jump to random code.
 
-**Verdict**: the real netbridge firmware also has **no handler for cmd 0x41** (and 0x25 is a stub-looking entry whose behaviour needs inspecting). Our Step-45 conclusion that "the 1 s timeout IS the game's progress signal" is the correct model of actual hardware behavior. Sending synthetic ACKs for unhandled cmds (Step 45 fix1) violated that model and stalled progress. Keep the current timeout-based shim; do NOT ACK arbitrary bridge cmds.
+**Verdict**: the real netbridge firmware also has **no handler for cmd 0x41** (and 0x25 is a stub-looking entry whose behaviour needs inspecting). Our Step-45 conclusion that "the 1 s timeout IS the game's progress signal" is the correct model of actual hardware behavior. Sending synthetic ACKs for unhandled cmds (Step 43 fix1) violated that model and stalled progress. Keep the current timeout-based shim; do NOT ACK arbitrary bridge cmds.
 
 ### 48.4: Reconciling with our existing PROTOCOL.md table
 
@@ -3778,13 +3778,13 @@ Stage taxonomy developed this session; applies to any Linux-binary-on-unknown-ha
 6. **Stage 5 — State-machine understanding.** Read the binary's mode/phase transitions; now you can *drive* the binary.
 7. **Stage 6 — Two-way interaction.** User input → emulated peripherals → binary → emulated output. "Emulation" becomes "playable."
 
-Pokemon LE current position: Stage 3 ~40% done + Stage 4 solid + Stage 5 ~20%. Step 48's netbridge analysis is the first real Stage 5 payoff — we now know what the protocol is supposed to do, not just what we can trick it into doing.
+Pokemon LE current position: Stage 3 ~40% done + Stage 4 solid + Stage 5 ~20%. Step 46's netbridge analysis is the first real Stage 5 payoff — we now know what the protocol is supposed to do, not just what we can trick it into doing.
 
 ### 48.10: Artifacts
 
 - `games/pokemon_le/spike3/netbridge/netbridge.elf` — 188 KB, ARM Cortex-M0+, RP2040 firmware, unstripped with debug_info. THE netbridge.
 - `games/pokemon_le/spike3/netbridge/netbridge.elf.bndb` — Binary Ninja analysis (already present).
-- JOURNAL Step 48 (this entry).
+- JOURNAL Step 46 (this entry).
 - PROTOCOL.md next edit: add "netbridge jump table at `0x1000155c` has 8 real handlers; cmds 0x2B-0x41 are intentionally unhandled; timeout-is-progress confirmed from firmware binary."
 - `memory/project_emulation_progress.md` next update: bump Stage 5 progress and note the netbridge.elf as analysis asset.
 
@@ -3817,7 +3817,7 @@ SceneLoaderLayeredDisplayElement::BDLModeCharmander2Total::VTable
 
 `BDL` ≡ "Battle Display Layer" (inferred). Per-mode, a stanza of layered display elements covers the full mode lifecycle: **Start → BG (looping) → Award (on score events) → SpinAward (shot-specific variant) → Completed (end-of-mode transition) → Total (final tally)**.
 
-**Multiplication check.** Six display elements × ~150 unique modes (accounting for stages: Bulbasaur 1/2, Charmander 1/2 + Spinner, Squirtle 1/2, Magikarp fishing/multiball/evolve, Pikachu vs {Charizard, Gyarados, Lucario, Mimikyu, Raichu, Magikarp}, Eevee {Espeon, Flareon, Glaceon, Jolteon, Leafeon, Sylveon, Umbreon, Vaporeon}, TeamRocket multiball 1/2/3 + Advance variants, plus attract / intermission / test-menu scenes) = ~900 layered display element classes. That closely matches the **885 scene slot** count from `select_and_load_scene`'s `0x375` upper bound (Step 34 / CLAUDE.md).
+**Multiplication check.** Six display elements × ~150 unique modes (accounting for stages: Bulbasaur 1/2, Charmander 1/2 + Spinner, Squirtle 1/2, Magikarp fishing/multiball/evolve, Pikachu vs {Charizard, Gyarados, Lucario, Mimikyu, Raichu, Magikarp}, Eevee {Espeon, Flareon, Glaceon, Jolteon, Leafeon, Sylveon, Umbreon, Vaporeon}, TeamRocket multiball 1/2/3 + Advance variants, plus attract / intermission / test-menu scenes) = ~900 layered display element classes. That closely matches the **885 scene slot** count from `select_and_load_scene`'s `0x375` upper bound (Step 32 / CLAUDE.md).
 
 **So the 885 "scenes" = instances of `SceneLoaderLayeredDisplayElement`-derived classes, each representing one display layer in a mode's lifecycle.**
 
@@ -3831,21 +3831,21 @@ Logged separately in the session-wrap response. In short:
 - **Game class hierarchy** (high-value): list every `SceneLoaderLayeredDisplayElement::*::VTable` type name from the game binary. Group by mode root (Charmander1, Charmander2, Bulbasaur1, …). Cross-reference with VIDEO_CLIPS.md and PROTOCOL.md's Radium scene classification. 15-30 min.
 - **Mode transition driver** (also high-value): find the class that INSTANTIATES the BDLMode* classes and hands them to the scene loader. It's probably named something like `ModeManager`, `PlayfieldController`, `GameModeBase`, `Mode`. Its `_process(dt)` or equivalent method is the mode-select state machine. 15 min.
 
-## Step 49: BN outputs decoded — netbridge jump table + BDLMode/crule class architecture (2026-04-21)
+## Step 47: BN outputs decoded — netbridge jump table + BDLMode/crule class architecture (2026-04-21)
 
-User ran all three BN prompts from Step 48.13. The results close multiple long-open gaps and reveal the game's complete mode architecture.
+User ran all three BN prompts from Step 46.13. The results close multiple long-open gaps and reveal the game's complete mode architecture.
 
-### 49.1: Netbridge jump table — correction to Step 48.3
+### 49.1: Netbridge jump table — correction to Step 46.3
 
 **My earlier interpretation was wrong.** BN confirms: at `0x1000127a` the `ldr r3, [pc, #736]` loads the CONSTANT at `0x1000155c`, which is the VALUE `0x10012048` — **the jump table base**. Then `ldr r3, [r3, r5]` at `0x1000127e` performs the actual table lookup at `0x10012048 + (cmd - 0x20) * 4`. So:
 
 - **The real jump table is at `0x10012048`**, NOT at `0x1000155c`.
 - BN types `data_1000155c` as `void*` pointing to `jump_table_10012048`.
 - BN recognizes `jump_table_10012048` as a bona fide computed-switch table of code pointers.
-- My Step 48.3 table dump (the one labelled "jump table entries") was actually reading HOST_Update's literal pool (several PC-relative constants the function uses: jump table base, `resetFlags` SRAM addr, `bridgeStatus` SRAM addr, etc.) as though they were sequential jump-table entries. I saw the pool as an array; it wasn't.
+- My Step 46.3 table dump (the one labelled "jump table entries") was actually reading HOST_Update's literal pool (several PC-relative constants the function uses: jump table base, `resetFlags` SRAM addr, `bridgeStatus` SRAM addr, etc.) as though they were sequential jump-table entries. I saw the pool as an array; it wasn't.
 - `0x10012048` IS in `.rodata`, but Cortex-M0+ executes from rodata fine (no MMU execute-bit). The compiler apparently emitted the table there because it's read-only data that happens to contain code pointers.
 
-**Operational impact:** none. Step 48's conclusion that "timeout-is-progress for unhandled cmds" still holds, but now for a different reason — the REAL table at `0x10012048` presumably has valid function pointers for the full cmd range (BN says "switch statement" which implies all cases handled), not a broken 11-entry table. Need a later BN dump of the table contents to get the actual per-cmd handler addresses.
+**Operational impact:** none. Step 46's conclusion that "timeout-is-progress for unhandled cmds" still holds, but now for a different reason — the REAL table at `0x10012048` presumably has valid function pointers for the full cmd range (BN says "switch statement" which implies all cases handled), not a broken 11-entry table. Need a later BN dump of the table contents to get the actual per-cmd handler addresses.
 
 PROTOCOL.md updated (this step) to reflect the correction.
 
@@ -3879,7 +3879,7 @@ BN dump shows the game defines **130+ classes** under `SceneLoaderLayeredDisplay
 - Parent class: `BDLModeStart` (single-inheritance)
 - 37 virtual methods starting at slot 0 = destructor `func_910a50`
 - Factory: `sub_90e3f4` (288 bytes) — guard-protected singleton in `.bss @ 0x4851998`
-- **References Radium scene `7949bb14a9a21abf5e2885a01eb5ed4f9c3a8eca`** (verified: exists in `assets/lcd/auto_loaded/`, classified as "AWARD TITLE" 1360×768 in Step 34)
+- **References Radium scene `7949bb14a9a21abf5e2885a01eb5ed4f9c3a8eca`** (verified: exists in `assets/lcd/auto_loaded/`, classified as "AWARD TITLE" 1360×768 in Step 32)
 
 ### 49.3: Three-layer architecture — the MVC of Stern pinball
 
@@ -3903,7 +3903,7 @@ sub_90d840(0x48586b8, 0x15, 0x28, 0x1a, 0x10, 0xf)
 
 Global C++ static initializer, 2432 bytes, called at program startup. Contains **50+ calls** to mode-constructors like `sub_90d840`, `sub_911d40`, `sub_91b810`, each registering one `cmode_*` instance. Together they constitute the **complete game mode table**: every mode ID, every scene ID, every flag, materialised statically in .bss at startup.
 
-This is the direct answer to Step 44's open question about `scene_config_table`. The BSS table at VA `0x47fcf10` (or wherever `scene_config_table` lives) is populated by `_INIT_74`'s calls, each of which registers {mode_id, scene_id, flags} for one mode. The 885 scene slots map to 50+ modes × some fanout factor.
+This is the direct answer to Step 42's open question about `scene_config_table`. The BSS table at VA `0x47fcf10` (or wherever `scene_config_table` lives) is populated by `_INIT_74`'s calls, each of which registers {mode_id, scene_id, flags} for one mode. The 885 scene slots map to 50+ modes × some fanout factor.
 
 **Key function to decode next session: `sub_90d840`** — this is the `crule::cmode_*` base-class constructor (or initializer). Its full signature tells us what each of the 6 parameters is. Once we know that, the entire `_INIT_74` becomes a trivial table of mode metadata.
 
@@ -3922,7 +3922,7 @@ Rodata strings like `"CHARMANDER 1 TIMER"`, `"CHARMANDER 1 CHAMPION"`, `"PIKACHU
 1. **Complete mode catalog** for free — we don't need to reverse the game loop to enumerate modes. _INIT_74 has them all.
 2. **Shim-level mode tracking** — we can hook `operator new` for cmode_*/BDLMode_* allocations OR their constructors, and log every mode activation at runtime. That's LIVE game-state visibility for the emulation.
 3. **VPX integration target** — each cmode has a well-defined lifecycle (entry conditions, scoring, exit). VPX triggers the entry conditions (e.g., player makes a shot combo) and the game responds with correct scoring. No emulation of game logic needed — we just drive the existing game's state machine.
-4. **Scene → mode mapping solved** — the 885 image.bin scenes map to 50+ modes via the scene_id field in `_INIT_74`. Parsing that function gives us the full mapping that Step 44 left open.
+4. **Scene → mode mapping solved** — the 885 image.bin scenes map to 50+ modes via the scene_id field in `_INIT_74`. Parsing that function gives us the full mapping that Step 42 left open.
 
 ### 49.8: Scene hash architecture insight
 
@@ -3947,12 +3947,12 @@ With that data we can build a complete mode table in under 10 minutes of synthes
 
 ### 49.10: Artifacts
 
-- JOURNAL Step 49 (this entry).
+- JOURNAL Step 47 (this entry).
 - PROTOCOL.md netbridge correction (table at `0x10012048`, not `0x1000155c`).
 - `memory/project_emulation_progress.md` — will update with 3-layer MVC architecture note.
 - Open: full `_INIT_74` + `sub_90d840` decomp pending from user's BN.
 
-## Step 50: The complete mode table — 42 crule objects extracted from _INIT_74 (2026-04-21)
+## Step 48: The complete mode table — 42 crule objects extracted from _INIT_74 (2026-04-21)
 
 User ran the BN queries and delivered the decompiled `_INIT_74` (all 47 constructor calls) and `sub_90d840` (one cmode constructor body, showing parameter → field mapping). Full synthesis landed in `_emulation/MODE_TABLE.md`. This is the biggest structural reveal of the project.
 
@@ -4036,7 +4036,7 @@ These pass **function pointers** (`sub_950d60`, `sub_94f140`) — they're event 
 
 ### 50.8: What's immediately actionable
 
-1. **Live runtime introspection via the shim.** All 42 cmode addresses are known. A `shim_dump_cmodes()` routine hooked into the SIGSEGV/SIGTERM handlers (like Step 43's `asset_registry` dump) would:
+1. **Live runtime introspection via the shim.** All 42 cmode addresses are known. A `shim_dump_cmodes()` routine hooked into the SIGSEGV/SIGTERM handlers (like Step 41's `asset_registry` dump) would:
    - Read `mode_id`/`type_flags`/`scene_data_ptr` from each BSS slot.
    - Verify they match `_INIT_74`'s parameters (sanity check static init ran).
    - Detect which modes have "activated" by checking `+0x308 init_flag` or field deltas over time.
@@ -4052,13 +4052,13 @@ These pass **function pointers** (`sub_950d60`, `sub_94f140`) — they're event 
 ### 50.10: Artifacts
 
 - `_emulation/MODE_TABLE.md` — authoritative mode registration table, synthesised from BN output (THIS SESSION's biggest deliverable).
-- JOURNAL Step 50 (this entry).
-- `memory/project_emulation_progress.md` — pending update to reflect Step 50's Stage-5 progress.
+- JOURNAL Step 48 (this entry).
+- `memory/project_emulation_progress.md` — pending update to reflect Step 48's Stage-5 progress.
 - Open: `sub_935e50`, `sub_950d60`, `sub_94f140` decomp for next session.
 
-## Step 50b: Runtime validation — 42/42 cmodes verified at expected .bss addresses (2026-04-21)
+## Step 49: Runtime validation — 42/42 cmodes verified at expected .bss addresses (2026-04-21)
 
-Built `shim_dump_cmodes()` patterned on Step 43's `shim_dump_sound_globals()`. Hooked into SIGSEGV + SIGTERM handlers. Ran the game, triggered the dump.
+Built `shim_dump_cmodes()` patterned on Step 41's `shim_dump_sound_globals()`. Hooked into SIGSEGV + SIGTERM handlers. Ran the game, triggered the dump.
 
 ### 50b.1: Result on first run
 
@@ -4120,7 +4120,7 @@ Not a bug in our dump — our interpretation of that offset was too optimistic. 
 **Runtime game-state observation now works.** From any SIGSEGV/SIGTERM handler, we can dump:
 - All 42 cmode slots' mode_id, type_flags, scene_data_ptr, some state field.
 - Three representative scene_data struct hexdumps.
-- Asset registry (Step 43) + sound-event hashmap (Step 41) from earlier runs.
+- Asset registry (Step 41) + sound-event hashmap (Step 39) from earlier runs.
 
 For Stage-6 interactive emulation, this is the **eyes inside the game**. When we simulate a switch close and want to see what the game does, we can dump cmodes before+after and observe which transitioned.
 
@@ -4132,7 +4132,7 @@ For Stage-6 interactive emulation, this is the **eyes inside the game**. When we
 - `_emulation/MODE_TABLE.md` — updated with verified struct offsets + scene_data layout.
 - This JOURNAL sub-step.
 
-## Step 51: The game loop decoded — scene data table, cmode registry, event dispatch (2026-04-21)
+## Step 50: The game loop decoded — scene data table, cmode registry, event dispatch (2026-04-21)
 
 User ran BN prompt #5 covering three decomp targets: `get_scene_data_by_id`, the two callback fns (`sub_950d60`, `sub_94f140`), and the two registrars (`sub_9c11d0`, `sub_adfcc0`). Plus vtable xrefs for `cmode_story_charmander_1`.
 
@@ -4149,7 +4149,7 @@ void *get_scene_data_by_id(uint32_t scene_id) {
 }
 ```
 
-Table: `data_480eab0`, **40 entries × 0x1a0 bytes (416) = 16,640 bytes** of .bss scene_data slots. Error sentinel at `data_480e900` is what base_00 (scene_id 0x29 out-of-range) returns, matching our live-dump observation (Step 50d).
+Table: `data_480eab0`, **40 entries × 0x1a0 bytes (416) = 16,640 bytes** of .bss scene_data slots. Error sentinel at `data_480e900` is what base_00 (scene_id 0x29 out-of-range) returns, matching our live-dump observation (Step 48d).
 
 `secondary_id` (at scene_data `+0x0c`) is populated by `sub_8ae4dc` at runtime — not from static data. So the scene_id ↔ Radium-scene-SHA-1 mapping is set up dynamically. **Open:** what does `sub_8ae4dc` read to populate secondary_id? That's the last remaining piece of the scene_id puzzle.
 
@@ -4201,7 +4201,7 @@ void sub_94f140(void) {
 | `+0xd8` | 27 | **per-frame tick / update** |
 | `+0xf0` | 30 | **event handler** (for event 0xc5 at least) |
 
-### 51.4: Runtime verification (Step 51 run)
+### 51.4: Runtime verification (Step 50 run)
 
 Shim dump confirms:
 - **Event dispatch populated**: **102 of 207 event slots** have handlers, **236 total handlers** registered.
@@ -4236,15 +4236,15 @@ With full knowledge of:
 2. Snapshot cmode state before and after to see what state transitioned.
 3. Dump any newly-allocated BDL display elements to see what got rendered.
 
-That's **Stage 6 (interactive emulation) in principle** — the remaining practical obstacles are: (a) event_id ↔ hardware switch mapping (still unknown), (b) the display path needs to actually render frames (Step 47's DRM_PRIME problem is the blocker), (c) a driving loop / external input source.
+That's **Stage 6 (interactive emulation) in principle** — the remaining practical obstacles are: (a) event_id ↔ hardware switch mapping (still unknown), (b) the display path needs to actually render frames (Step 45's DRM_PRIME problem is the blocker), (c) a driving loop / external input source.
 
 ### 51.7: What's closed and what remains
 
-| Gap as of Step 44 | Status after Step 51 |
+| Gap as of Step 42 | Status after Step 50 |
 |---|---|
 | 885 scene_config_table mapping | Superseded. Real architecture: 42 cmodes → 40-entry `data_480eab0` scene_data table via scene_id. The 885 count was misinterpretation. |
-| What does cmd 0x41 do | Empirically: "timeout is progress" (Step 48/49). Semantic: unknown but doesn't block us. |
-| How does the game loop work | **Fully decoded** (Step 51): event dispatch + update dispatch, both iterating `data_4767b30`. |
+| What does cmd 0x41 do | Empirically: "timeout is progress" (Step 46/47). Semantic: unknown but doesn't block us. |
+| How does the game loop work | **Fully decoded** (Step 50): event dispatch + update dispatch, both iterating `data_4767b30`. |
 | Mode → asset mapping | **Decoded** via cmode.scene_id → scene_data.secondary_id → (still TBD, but mechanism clear). |
 | Stage 5 understanding | **Fully done.** |
 | Stage 6 interactive emulation | Architecture understood, practical blockers remain. |
@@ -4259,17 +4259,17 @@ One small high-value one to fully close scene_id → Radium SHA-1:
 - `_emulation/spi_shim.c` — added `shim_dump_dispatch_tables()`.
 - `_emulation/spi_shim.so` — rebuilt (≈154 KB).
 - `_emulation/run_step51.stderr` — live validation output.
-- `_emulation/MODE_TABLE.md` — updated with Step 51 architecture decomp.
-- JOURNAL Step 51 (this entry).
+- `_emulation/MODE_TABLE.md` — updated with Step 50 architecture decomp.
+- JOURNAL Step 50 (this entry).
 
 
-## Step 52: fire_event trampoline, switch state array, switch-first API pivot (2026-04-21)
+## Step 51: fire_event trampoline, switch state array, switch-first API pivot (2026-04-21)
 
-User ran BN prompt 5 to close out the Stage-5 gaps identified in Step 51. Results refuted one prior interpretation, identified the event-firing primitive, and located the switch state array. Session then pivoted from a blind event-ID sweep to a switch-indexed scaffolding after finding the sweep low-signal.
+User ran BN prompt 5 to close out the Stage-5 gaps identified in Step 50. Results refuted one prior interpretation, identified the event-firing primitive, and located the switch state array. Session then pivoted from a blind event-ID sweep to a switch-indexed scaffolding after finding the sweep low-signal.
 
 ### 52.1: scene_id correction — the 0x480eab0 table is cawards state, not Radium picker
 
-Step 51 speculated that `sub_8ae4dc` populates a `secondary_id` at scene_data `+0x0c` that maps `scene_id` → Radium SHA-1. **Refuted.**
+Step 50 speculated that `sub_8ae4dc` populates a `secondary_id` at scene_data `+0x0c` that maps `scene_id` → Radium SHA-1. **Refuted.**
 
 `sub_8ae460` is the `__cxa_guard_acquire` singleton init for a `cawards_manager` (vtable literal: `_vtable_for_cawards_manager{for 'HookListener'}`). `sub_8ae4dc` writes per-player threshold constants into sub-arrays of the 0x1a0 records:
 
@@ -4284,9 +4284,9 @@ Step 51 speculated that `sub_8ae4dc` populates a `secondary_id` at scene_data `+
 
 All indexed by `((sub_9d0eb0() - 1) << 3)` = 5-player-max per-player stride. Plus a closing `do { sub_8ad3b0(tbl, 0..2); sub_b29ef0(0x5a); } while` 10-iter loop that looks like cawards category setup.
 
-Conclusion: `data_480eab0` is (or at least includes) per-mode cawards/achievement state, not a Radium scene picker. The real `scene_id` → Radium SHA-1 mapping almost certainly lives inside the `BDLMode*` factory functions — e.g. `sub_90e3f4` (Charmander1Start factory, 288 bytes) explicitly references `7949bb14a9a21abf5e2885a01eb5ed4f9c3a8eca` per Step 49.2.
+Conclusion: `data_480eab0` is (or at least includes) per-mode cawards/achievement state, not a Radium scene picker. The real `scene_id` → Radium SHA-1 mapping almost certainly lives inside the `BDLMode*` factory functions — e.g. `sub_90e3f4` (Charmander1Start factory, 288 bytes) explicitly references `7949bb14a9a21abf5e2885a01eb5ed4f9c3a8eca` per Step 47.2.
 
-**Files updated:** `_emulation/MODE_TABLE.md` (struck the `secondary_id` claim, flagged the cawards origin, left scene_id → Radium as open); `memory/project_emulation_progress.md` (bumped to Step 52 with correction called out).
+**Files updated:** `_emulation/MODE_TABLE.md` (struck the `secondary_id` claim, flagged the cawards origin, left scene_id → Radium as open); `memory/project_emulation_progress.md` (bumped to Step 51 with correction called out).
 
 ### 52.2: fire_event — the dispatcher we can trampoline into
 
@@ -4306,7 +4306,7 @@ uint64_t fire_event(int32_t event_id, int64_t event_data) {
 ```
 
 - Linked-list node at `data_485ea80 + event_id * 8`: `{callback_fn @ +0x00, priority @ +0x08, next @ +0x10}` (`i[2]` at 8-byte stride = byte offset +0x10).
-- Event_id bounds 0..0xce (206 slots, matches Step 51's `sub_9c11d0` registrar bound).
+- Event_id bounds 0..0xce (206 slots, matches Step 50's `sub_9c11d0` registrar bound).
 - Short-circuit: any callback returning an even value halts the chain; odd (conventionally 1) = continue.
 
 Five callers identified: `sub_b129f0`, `sub_bd39f0`, `sub_b16f64`, `sub_b82990`, `sub_b12760`. The switch→event translator is one of them (or an indirect). Plan-C BN query in flight.
@@ -4327,7 +4327,7 @@ From BN decomp of `sub_a50850` (switch state reader) and `sub_a50350` (switch va
 | `sw_stuck_active` | `data_4880230[id]` | NVRAM-backed |
 | `sw_alert_count` | `data_4880238[id*2]` | 16-bit, NVRAM-backed |
 
-Observed at runtime (Step 52g): state bytes for real switches were not all 0/1 — Left Flipper Button (id 9) read `0x20` (32), Right Flipper Button (id 10) read `0xab` (171). Two plausible explanations: (a) the field is a packed uint32 (sub_a50850 types it as `uint32_t x0_3 = *(x1 + 0x28)`) and only a specific bit is the "closed" flag, or (b) the runtime is using the adjacent bytes for something else. Not pinned down yet; scaffolding writes 0x01 to the byte at `+0x28` and restores the prior value on "release", which is faithful to what sub_a50850's return-value-and-compare pattern suggests.
+Observed at runtime (Step 51g): state bytes for real switches were not all 0/1 — Left Flipper Button (id 9) read `0x20` (32), Right Flipper Button (id 10) read `0xab` (171). Two plausible explanations: (a) the field is a packed uint32 (sub_a50850 types it as `uint32_t x0_3 = *(x1 + 0x28)`) and only a specific bit is the "closed" flag, or (b) the runtime is using the adjacent bytes for something else. Not pinned down yet; scaffolding writes 0x01 to the byte at `+0x28` and restores the prior value on "release", which is faithful to what sub_a50850's return-value-and-compare pattern suggests.
 
 ### 52.4: blind event-ID sweep — executed, preserved, deprioritised
 
@@ -4395,7 +4395,7 @@ Left Flipper before_state = `0x20`, Right Flipper before_state = `0xab`. The gam
 
 ### 52.8: Status and next moves
 
-**Closed in Step 52:**
+**Closed in Step 51:**
 - `fire_event` identified + trampoline built
 - Switch state array layout verified
 - Cawards correction landed
@@ -4418,7 +4418,7 @@ Left Flipper before_state = `0x20`, Right Flipper before_state = `0xab`. The gam
 - `_emulation/run_step52d.stderr` — sweep @ 25 s, hung at 0x5d (pre-alarm).
 - `_emulation/run_step52e.stderr` — full sweep @ 35 s, 207/207 covered.
 - `_emulation/run_step52g.stderr` — switch-API test, 4 switches fired cleanly.
-- `memory/MEMORY.md` + `memory/project_emulation_progress.md` — updated descriptions to reflect Step 52.
+- `memory/MEMORY.md` + `memory/project_emulation_progress.md` — updated descriptions to reflect Step 51.
 
 ### 52.10: BN prompt sent for Plan C
 
@@ -4441,7 +4441,7 @@ scene_data struct or is a separate arena).
 ```
 
 
-## Step 53: Two-stage switch architecture, event semantics, gstreamer proven dormant (2026-04-21)
+## Step 52: Two-stage switch architecture, event semantics, gstreamer proven dormant (2026-04-21)
 
 User ran BN Plan C. Three hard findings reshape our model.
 
@@ -4463,7 +4463,7 @@ The dispatch is **two-stage**:
 - Stage 1: `sub_b24f70` reads switch state → writes updated state into cmode fields / lamp subsystems.
 - Stage 2: separate monitoring functions watch those cmode fields and call `fire_event` with derived event_ids + payloads.
 
-Implication for our shim: **`shim_fire_switch` is already at the right layer.** It writes the same byte the UART cmd 0x27 decode path would — `sub_b24f70` picks it up on its next poll. No synthesis of event_ids needed; the game's own Stage-2 logic generates them. This validates the "switch-first API" pivot from Step 52.
+Implication for our shim: **`shim_fire_switch` is already at the right layer.** It writes the same byte the UART cmd 0x27 decode path would — `sub_b24f70` picks it up on its next poll. No synthesis of event_ids needed; the game's own Stage-2 logic generates them. This validates the "switch-first API" pivot from Step 51.
 
 ### 53.2: Cawards is parallel-array, not overlay (bonus query)
 
@@ -4487,7 +4487,7 @@ User pushed back on the "dead code" claim — fair, since BN showed defined symb
 | GObject imports (`g_object_*`, `g_signal_*`, `g_type_*`) | 0 — only `g_main_loop_{new,quit,run,unref}` + `g_thread_{new,join,exit}` |
 | Force-call `gstreamer_init` via shim trampoline | Succeeds; `gst_init_check` returns 1; main loop + VideoMessageBus thread start; NO subsequent gst activity in the game |
 
-Conclusion: the gstreamer subsystem is scaffolding linked from Stern's shared Spike 3 codebase, but Pokémon LE 0.81 contains no code that would ever add a GstBus watch, create a pipeline, or post a message. The VideoMessageBus thread, if started, would block in `g_main_loop_run` processing exactly zero events. The game's video path is **100% direct libavcodec** via Stern's `SpiVideoStreamDecoderBase` (HEVC DRM-prime, Step 47 wall) and Radium's `VideoStreamDecoder` classes.
+Conclusion: the gstreamer subsystem is scaffolding linked from Stern's shared Spike 3 codebase, but Pokémon LE 0.81 contains no code that would ever add a GstBus watch, create a pipeline, or post a message. The VideoMessageBus thread, if started, would block in `g_main_loop_run` processing exactly zero events. The game's video path is **100% direct libavcodec** via Stern's `SpiVideoStreamDecoderBase` (HEVC DRM-prime, Step 45 wall) and Radium's `VideoStreamDecoder` classes.
 
 PROTOCOL.md updated with corrected gstreamer section. Shim gst hooks stay in place — harmless, will fire if any unexpected code path ever reaches them.
 
@@ -4504,7 +4504,7 @@ Captured as `memory/reference_spike3_cpu_board.md`.
 - `memory/reference_spike3_cpu_board.md` — hardware map.
 - `_emulation/spi_shim.c` — gstreamer hooks (gst_element_factory_make, gst_parse_launch, gst_bin_add, gst_bin_add_many, gst_element_link, gst_element_link_many, gst_element_set_state, gst_init_check, gst_deinit) + `shim_force_gstreamer_thread` diagnostic. Via `SPIKE3_FORCE_GSTREAMER=<sec>` and `SPIKE3_INJECT_VIDEO=1` (gates Step-47 frame injection off by default for stable runs).
 
-## Step 54: Live state bridge — game drives Pokemon video rendering (2026-04-21)
+## Step 53: Live state bridge — game drives Pokemon video rendering (2026-04-21)
 
 With gstreamer ruled out, pivoted to Track-B synchronisation: stream cmode state from the running game to the reference-player so the player shows the clip that matches whichever cmode is currently live.
 
@@ -4534,7 +4534,7 @@ Non-blocking: `MSG_NOSIGNAL | MSG_DONTWAIT`, graceful on subscriber disconnect.
 - Retrying AF_UNIX client — reconnects at 1 Hz until the shim's listener is up.
 - Parses newline-delimited JSON, pretty-prints cmode deltas with `+ / - / Δ` markers (activation / deactivation / change).
 - `--play` mode: on any delta where `init != 0` AND the cmode has a clip-family mapping, launches `reference-player-v2.py --play-clip <FAMILY>_Start`. Previous player is terminated before new one starts.
-- `CMODE_TO_CLIP_FAMILY` covers Pokémon story modes, Pikachu-vs-X, Team Rocket multiball/wizard, Magikarp multiball. Battle environment modes (coast/forest/desert/mountain) are deliberately excluded — their backgrounds use HEVC DRM-prime (Step 47 wall), not Radium clips.
+- `CMODE_TO_CLIP_FAMILY` covers Pokémon story modes, Pikachu-vs-X, Team Rocket multiball/wizard, Magikarp multiball. Battle environment modes (coast/forest/desert/mountain) are deliberately excluded — their backgrounds use HEVC DRM-prime (Step 45 wall), not Radium clips.
 
 ### 54.4: End-to-end validation (run_step54e, 2026-04-21)
 
@@ -4561,7 +4561,7 @@ Subscriber log:
 
 ### 54.5: Incidental finding — `+0x308` baselines are non-zero for ~9 cmodes
 
-Step 50b observed that 9/42 cmodes have non-zero `+0x308` after static init. `story_charmander_1`'s baseline was `0xd00`. The field is subclass-interpreted, not a uniform "activation flag." Initial subscriber filter `"prev==0 AND init!=0"` missed all transitions for those 9 cmodes; widened to "`init != 0`" which catches any state that indicates the mode is live.
+Step 49 observed that 9/42 cmodes have non-zero `+0x308` after static init. `story_charmander_1`'s baseline was `0xd00`. The field is subclass-interpreted, not a uniform "activation flag." Initial subscriber filter `"prev==0 AND init!=0"` missed all transitions for those 9 cmodes; widened to "`init != 0`" which catches any state that indicates the mode is live.
 
 Longer-term, a cleaner signal would be hooking `sub_b24f70` directly to observe per-switch → per-cmode-field writes. That would give us a precise "mode X just transitioned to state Y" event without having to infer from `+0x308` deltas.
 
@@ -4593,7 +4593,7 @@ Also extracted a sample of the 5 captured 1920×1080 RGBA textures + 3 sprite at
 3. **Hook `sub_b24f70`** — intercept the switch-state reader to log which switch closures drive which cmode fields. Cleanest long-term observability.
 4. **Real EGL via Mesa/WSLg** — the big rendering job, multi-session. Shelved for now.
 
-## Step 55: Plan A dead, Plan B-lite lives — aarch64 Mesa software raster works under qemu-user (2026-04-22)
+## Step 54: Plan A dead, Plan B-lite lives — aarch64 Mesa software raster works under qemu-user (2026-04-22)
 
 Went in planning virtio-gpu host-GPU passthrough; came out with a complete software-rasterization path that works in qemu-user-mode and renders real pixels through llvmpipe. No VM, no kernel, no `/dev/dri`.
 
@@ -4620,7 +4620,7 @@ User solicited a second opinion. Three findings worth recording:
   1. No aarch64 Mesa build with the d3d12 driver ships anywhere — it's x86_64-first upstream, and Debian arm64 does not package it;
   2. WSL's D3D12 userspace libraries (`/usr/lib/wsl/lib/libd3d12.so`, `libd3d12core.so`, `libdxcore.so`) are x86_64 ELFs — an aarch64 process cannot load them; qemu-user cannot bridge ISAs inside a single process;
   3. DXGKrnl's ioctl set is custom (not in qemu-user's translation table) and carries pointer-bearing structs whose arg-layouts qemu-user won't rewrite.
-- **Useful reframe (adopted):** stay in qemu-user-mode, replace the sysroot's Mesa DRI drivers with a software-raster aarch64 build, remove the shim's EGL/GLES fake-success. No VM. This became Step 55 proper.
+- **Useful reframe (adopted):** stay in qemu-user-mode, replace the sysroot's Mesa DRI drivers with a software-raster aarch64 build, remove the shim's EGL/GLES fake-success. No VM. This became Step 54 proper.
 
 ### 55.3: Mesa overlay architecture
 
@@ -4753,7 +4753,7 @@ LIBGL_ALWAYS_SOFTWARE=1
 EGL_PLATFORM=surfaceless
 ```
 
-**Next (Step 56, planned):** Gate the shim's EGL + GLESv2 + GBM interceptors behind an env var (`SPIKE3_REAL_GL=1`). With the flag off, existing Step-54 behaviour. With the flag on, the shim short-circuits its GL fake-success paths and the game's calls fall through to real Mesa. Bridge/audio/UART/DRM-socketpair/memcpy/pthread_create/`system()`/ALSA stubs all stay always-on; only GL leaves.
+**Next (Step 55, planned):** Gate the shim's EGL + GLESv2 + GBM interceptors behind an env var (`SPIKE3_REAL_GL=1`). With the flag off, existing Step-54 behaviour. With the flag on, the shim short-circuits its GL fake-success paths and the game's calls fall through to real Mesa. Bridge/audio/UART/DRM-socketpair/memcpy/pthread_create/`system()`/ALSA stubs all stay always-on; only GL leaves.
 
 The first SPIKE3_REAL_GL=1 run is almost certainly going to surface new failures — surfaceless platform means the game's GBM/DRM page-flip path will hit surfaces we haven't matched to real EGL resources, shader-compile errors could light up, Godot may assert on a config we didn't handle. Each is its own sub-step. But we now have a **real** pipeline to walk down instead of a stack of stubs that always "succeed" by fiat.
 
@@ -4772,9 +4772,9 @@ The first SPIKE3_REAL_GL=1 run is almost certainly going to surface new failures
 - `_emulation/SETUP.md` — new dev-environment setup doc for onboarding contributors.
 - `_emulation/run_step55_sanity.log` — zero-risk run proving overlay is load-time innocent.
 
-## Step 56: Shim gate `SPIKE3_REAL_GL` lands; first real-Mesa runs trip on extension interception (2026-04-22)
+## Step 55: Shim gate `SPIKE3_REAL_GL` lands; first real-Mesa runs trip on extension interception (2026-04-22)
 
-Goal: remove the shim's EGL/GLES/GBM fake-success stubs so the game's calls fall through to the Mesa overlay we built in Step 55. Two-phase outcome — infrastructure works cleanly, first real-GL run surfaces an extension-handling gap that wasn't obvious from Step 55's isolated probes.
+Goal: remove the shim's EGL/GLES/GBM fake-success stubs so the game's calls fall through to the Mesa overlay we built in Step 54. Two-phase outcome — infrastructure works cleanly, first real-GL run surfaces an extension-handling gap that wasn't obvious from Step 54's isolated probes.
 
 ### 56.1: Infrastructure changes (shim gating)
 
@@ -4783,7 +4783,7 @@ Goal: remove the shim's EGL/GLES/GBM fake-success stubs so the game's calls fall
 Applied to:
 - **EGL** (~20 functions): `eglGetDisplay` / `eglGetPlatformDisplay[EXT]` / `eglInitialize` / `eglTerminate` / `eglQueryString` / `eglBindAPI` / `eglGet|ChooseConfig[s]` / `eglGetConfigAttrib` / `eglCreate|DestroyContext` / `eglCreate|DestroyWindowSurface` / `eglCreatePbufferSurface` / `eglMakeCurrent` / `eglSwapBuffers` / `eglSwapInterval` / `eglSurfaceAttrib` / `eglQuerySurface` / `eglGetError` / `eglGetProcAddress`.
 - **GLES** (~80 functions): all the Gen/Delete/Bind/Tex/Buffer/Shader/Program/Uniform/VertexAttrib/Framebuffer/State/Draw/Sync families.
-- **GBM** — **INITIALLY FORWARDED, THEN REVERTED to stub-always** (Step 56.2 below).
+- **GBM** — **INITIALLY FORWARDED, THEN REVERTED to stub-always** (Step 55.2 below).
 
 Removed instrumentation — per user direction, runtime capture of textures / shader sources / DMD frames was dropped as duplicative of the asset-extraction path (`_extraction/tools/spike_extract/`) and irrelevant on Spike 3 (no physical DMD). Deleted: `gl_capture_tex`, `gl_capture_ctex`, `gl_bytes_per_pixel`, `gl_tex_capture_count`, `gl_ctex_capture_count`, `gl_shader_capture_count`, `gl_shader_type[]`, `GL_SHADER_TYPE_MAX`, `is_dmd` / `mapped` fields in `gbm_bo_entry`, DMD-frame dump block in `gbm_bo_unmap`, `dmd_frame_counter`, and mkdirs for `_emulation/{dmd,shaders,textures}/`.
 
@@ -4795,7 +4795,7 @@ Sizes:
 
 ### 56.2: Regression verified — stub mode unchanged
 
-With `SPIKE3_REAL_GL` unset, the shim behaves identically to Step 54:
+With `SPIKE3_REAL_GL` unset, the shim behaves identically to Step 53:
 - 10,761 log lines over 20s (baseline 10-13k)
 - 30 Step-54 milestone markers
 - No segfault, no assertion, no `libEGL fatal`, no undefined symbol
@@ -4839,7 +4839,7 @@ When `SPIKE3_REAL_GL=1`, `eglGetProcAddress` forwards to Mesa's real implementat
 
 Mesa dereferences → SEGV. In stub mode, `eglGetProcAddress` returned our `stub_*` functions which accepted fake handles silently.
 
-**The fix is in Step 57** (new task): keep our `stub_*` functions as the authoritative return values for the KHR image/sync family and `glEGLImageTargetTexture2DOES`, regardless of SPIKE3_REAL_GL state. Forward only `eglGetPlatformDisplay*EXT` queries to Mesa. Also add SHIM_LOG coverage to every EGL function's forward path so the next crash is traceable.
+**The fix is in Step 56** (new task): keep our `stub_*` functions as the authoritative return values for the KHR image/sync family and `glEGLImageTargetTexture2DOES`, regardless of SPIKE3_REAL_GL state. Forward only `eglGetPlatformDisplay*EXT` queries to Mesa. Also add SHIM_LOG coverage to every EGL function's forward path so the next crash is traceable.
 
 ### 56.7: What's proven and what's open
 
@@ -4849,9 +4849,9 @@ Mesa dereferences → SEGV. In stub mode, `eglGetProcAddress` returned our `stub
 - Texture/shader/DMD capture removal is safe. Those paths were dead, removing them didn't regress steady-state.
 
 **Open:**
-- `SPIKE3_REAL_GL=1` SEGVs before Godot init. Cause is almost certainly the extension-interception gap; Step 57 handles it. Expected to need 1-2 more sub-steps after that to reach Godot init and a real render.
-- We don't know yet whether `eglCreateContext` succeeded (no log from it). Step 57's added SHIM_LOGs will answer.
-- Surfaceless vs. window-based swap semantics: real `eglSwapBuffers` on a pbuffer is a no-op in spec, but the game may assume buffer-flip timing (vsync, page-flip events through the DRM socketpair). This may surface after Step 57.
+- `SPIKE3_REAL_GL=1` SEGVs before Godot init. Cause is almost certainly the extension-interception gap; Step 56 handles it. Expected to need 1-2 more sub-steps after that to reach Godot init and a real render.
+- We don't know yet whether `eglCreateContext` succeeded (no log from it). Step 56's added SHIM_LOGs will answer.
+- Surfaceless vs. window-based swap semantics: real `eglSwapBuffers` on a pbuffer is a no-op in spec, but the game may assume buffer-flip timing (vsync, page-flip events through the DRM socketpair). This may surface after Step 56.
 
 ### 56.8: Artifacts
 
@@ -4862,9 +4862,9 @@ Mesa dereferences → SEGV. In stub mode, `eglGetProcAddress` returned our `stub
 - `_emulation/run_step56_realgl_v2.log` — with GBM un-forwarded + pbuffer redirect; SEGV at ~3.6k lines before Godot init.
 
 
-## Step 57: `eglGetProcAddress` pinned to our stub table; `FWD_RET_V` instrumentation pinpoints the real crash site (2026-04-22)
+## Step 56: `eglGetProcAddress` pinned to our stub table; `FWD_RET_V` instrumentation pinpoints the real crash site (2026-04-22)
 
-Goal (from Step 56.6): close the KHR extension-interception SEGV by guaranteeing our `stub_*` functions are the authoritative pointers the game retrieves, regardless of `SPIKE3_REAL_GL`. Add forward-path log coverage so the next crash is traceable.
+Goal (from Step 55.6): close the KHR extension-interception SEGV by guaranteeing our `stub_*` functions are the authoritative pointers the game retrieves, regardless of `SPIKE3_REAL_GL`. Add forward-path log coverage so the next crash is traceable.
 
 ### 57.1: Infrastructure changes
 
@@ -4884,10 +4884,10 @@ Clean build, zero warnings.
 
 With `SPIKE3_REAL_GL` unset:
 
-- 11,478 log lines in 22 s (Step 56 baseline: 10,761 in 20 s; both fall in the 10–13k-lines envelope).
+- 11,478 log lines in 22 s (Step 55 baseline: 10,761 in 20 s; both fall in the 10–13k-lines envelope).
 - Exit 124 (timeout, not crash).
-- Zero `Segmentation`, `Aborted`, `assertion`, `libEGL fatal`, `cannot open shared`, `undefined symbol` — matches Step 56.2 criteria.
-- Tail is the same event-registry / update-type dispatch dump as Step 56 regression3.
+- Zero `Segmentation`, `Aborted`, `assertion`, `libEGL fatal`, `cannot open shared`, `undefined symbol` — matches Step 55.2 criteria.
+- Tail is the same event-registry / update-type dispatch dump as Step 55 regression3.
 
 Run artifact: `_emulation/run_step57_regression.log`.
 
@@ -4901,7 +4901,7 @@ terminate called after throwing an instance of 'std::bad_array_new_length'
 qemu: uncaught target signal 6 (Aborted) - core dumped
 ```
 
-Exit 134 (SIGABRT). 3,056 log lines before the abort. Crucially: **this is a different failure from Step 56.5's SEGV**. The KHR-extension SEGV class is closed.
+Exit 134 (SIGABRT). 3,056 log lines before the abort. Crucially: **this is a different failure from Step 55.5's SEGV**. The KHR-extension SEGV class is closed.
 
 ### 57.4: Diagnosis — fake-display contamination between our stubs and real Mesa
 
@@ -4919,7 +4919,7 @@ terminate called after throwing an instance of 'std::bad_array_new_length'
 
 Read of the flow:
 
-1. Game calls `eglGetProcAddress("eglGetPlatformDisplayEXT")`. Our table returns **our wrapper** (Step 57 fix confirmed — Mesa is not consulted).
+1. Game calls `eglGetProcAddress("eglGetPlatformDisplayEXT")`. Our table returns **our wrapper** (Step 56 fix confirmed — Mesa is not consulted).
 2. Game calls the wrapper with `platform = 0x31d7` (`EGL_PLATFORM_GBM_KHR`) and the fake GBM device pointer we returned earlier from `gbm_create_device`.
 3. `FWD_RET_V` fires inside the wrapper. `dlsym(RTLD_NEXT, "eglGetPlatformDisplayEXT")` returns **NULL** — Mesa's `libEGL_mesa.so.0` exports `eglGetPlatformDisplay` (the EGL 1.5 core symbol) but not the `EXT` alias; the `EXT` variant is reachable only through the `eglGetProcAddress` chain, which we have (correctly) pinned to our own wrapper. `_real` stays NULL, the fall-through stub body runs, returns `FAKE_EGL_DISPLAY`.
 4. Game now holds `FAKE_EGL_DISPLAY` and feeds it to `eglInitialize`. `FWD_RET_V` finds Mesa's real `eglInitialize` (direct EGL 1.0 symbol), forwards with the fake display — Mesa doesn't recognize it, returns `EGL_FALSE`, doesn't populate `*major` / `*minor`.
@@ -4932,41 +4932,41 @@ Mechanism in one sentence: because Mesa doesn't export `eglGetPlatformDisplayEXT
 ### 57.5: What's proven and what's open
 
 **Proven:**
-- `eglGetProcAddress` stub table is authoritative. The Step 56.6 SEGV class (KHR image/sync/EGLImageTargetTexture2DOES driven by Mesa dereferencing fake handles) is closed by construction — our pointers are the only pointers the game ever retrieves through that API.
+- `eglGetProcAddress` stub table is authoritative. The Step 55.6 SEGV class (KHR image/sync/EGLImageTargetTexture2DOES driven by Mesa dereferencing fake handles) is closed by construction — our pointers are the only pointers the game ever retrieves through that API.
 - `FWD_RET_V` instrumentation is the right diagnostic granularity. 4 EGL calls produced 4 log lines, visible in-stream with the SPI / DRM / GBM shim chatter; GLES hot paths remain silent.
 - Stub-mode behaviour is preserved bit-for-bit (same line volume, same exit condition, same tail dump).
 
-**Open — Step 58 territory:**
+**Open — Step 57 territory:**
 - Resolve the EXT-symbol gap. Mesa in surfaceless mode exposes only `EGL_PLATFORM_SURFACELESS_MESA` (0x31DD) and exports `eglGetPlatformDisplay` (not the EXT alias) directly. Fix: make our `eglGetPlatformDisplay[EXT]` wrappers, when `SPIKE3_REAL_GL` is set, retry `dlsym(RTLD_NEXT, "eglGetPlatformDisplay")` (no EXT suffix) and call it with `EGL_PLATFORM_SURFACELESS_MESA` + `EGL_DEFAULT_DISPLAY` (NULL), ignoring the game's GBM platform/handle. Return Mesa's real display to the game. All subsequent EGL calls (`eglInitialize` / `eglGetConfigs` / `eglChooseConfig` / `eglCreateContext` / `eglMakeCurrent` / `eglSwapBuffers`) then receive a valid Mesa display and should succeed.
-- After that fix, the next crash is likely at `eglCreateWindowSurface` (Step 56.4's pbuffer redirect is still in place; confirm it still works with a real display) or `eglCreateContext` (config attributes may need translation). Each is its own sub-step.
+- After that fix, the next crash is likely at `eglCreateWindowSurface` (Step 55.4's pbuffer redirect is still in place; confirm it still works with a real display) or `eglCreateContext` (config attributes may need translation). Each is its own sub-step.
 
 ### 57.6: Artifacts
 
-- `_emulation/spi_shim.c` — +19 LOC net (two verbose macros + Step 57 comment on `eglGetProcAddress`; one deleted FWD line; 20 EGL sites renamed).
+- `_emulation/spi_shim.c` — +19 LOC net (two verbose macros + Step 56 comment on `eglGetProcAddress`; one deleted FWD line; 20 EGL sites renamed).
 - `_emulation/spi_shim.so` — rebuilt, 158,968 bytes.
 - `_emulation/run_step57_regression.log` — 11,478 lines, exit 124, clean.
 - `_emulation/run_step57_realgl.log` — 3,056 lines, exit 134, `std::bad_array_new_length` abort; FWD trace captures the exact failure sequence.
 
 
-## Step 58: Mesa display + config negotiation + frame bridge — game now reaches DMA-BUF FBO setup (2026-04-22)
+## Step 57: Mesa display + config negotiation + frame bridge — game now reaches DMA-BUF FBO setup (2026-04-22)
 
 User pivoted the plan: stop treating "pixels on screen" as a future milestone, build it now. This step bundles four concerns into one landing — EGL platform-display translation, `eglChooseConfig` attribute patching, a frame-bridge IPC channel with a Python viewer, and the diagnostic instrumentation that guided each sub-fix. Ending state: Mesa is doing real GL init for the game, the game walks through Stern-logo load, netbridge init, power-dist init, DRM mode negotiation, and crashes NULL-dereferencing inside the `create_egl_framebuffer` path (0xd00800 in BN) because our `stub_eglCreateImageKHR` returns a handle with no texture backing. That's the Step-59 target.
 
 ### Why bundle, why these four things together
 
-The goal was a first rendered frame reaching a Python viewer, so the display-acquisition fix and the IPC it delivers into had to land together. Splitting them would leave Mesa rendering into a pbuffer nobody can see. Diagnostic instrumentation (the attribute-array logger, the `FWD <fn>` verbose macros from Step 57) drove every decision — we needed to see what the game actually asked Mesa for, not guess.
+The goal was a first rendered frame reaching a Python viewer, so the display-acquisition fix and the IPC it delivers into had to land together. Splitting them would leave Mesa rendering into a pbuffer nobody can see. Diagnostic instrumentation (the attribute-array logger, the `FWD <fn>` verbose macros from Step 56) drove every decision — we needed to see what the game actually asked Mesa for, not guess.
 
 ### Display acquisition — `GBM_KHR` → `SURFACELESS_MESA`
 
-Step 57's FWD_RET_V trace pinpointed that Mesa doesn't export `eglGetPlatformDisplayEXT` as a direct dynamic symbol; the fall-back to our fake-display stub was poisoning every subsequent forwarded call. Fix: `eglGetDisplay` / `eglGetPlatformDisplay` / `eglGetPlatformDisplayEXT` all route through a new `shim_real_platform_display()` helper that tries `eglGetPlatformDisplay` (EGL 1.5 core, always exported) and falls through to legacy `eglGetDisplay`, calling with `EGL_PLATFORM_SURFACELESS_MESA` (0x31DD) + `EGL_DEFAULT_DISPLAY`. The game's `GBM_KHR` platform and GBM device pointer are dropped; semantically we're saying "we don't have a real display controller, just give me a surfaceless Mesa display we can render into an offscreen buffer with." Mesa accepts this and returns a real EGLDisplay handle. The game treats it as opaque.
+Step 56's FWD_RET_V trace pinpointed that Mesa doesn't export `eglGetPlatformDisplayEXT` as a direct dynamic symbol; the fall-back to our fake-display stub was poisoning every subsequent forwarded call. Fix: `eglGetDisplay` / `eglGetPlatformDisplay` / `eglGetPlatformDisplayEXT` all route through a new `shim_real_platform_display()` helper that tries `eglGetPlatformDisplay` (EGL 1.5 core, always exported) and falls through to legacy `eglGetDisplay`, calling with `EGL_PLATFORM_SURFACELESS_MESA` (0x31DD) + `EGL_DEFAULT_DISPLAY`. The game's `GBM_KHR` platform and GBM device pointer are dropped; semantically we're saying "we don't have a real display controller, just give me a surfaceless Mesa display we can render into an offscreen buffer with." Mesa accepts this and returns a real EGLDisplay handle. The game treats it as opaque.
 
-First run with this change confirmed `eglInitialize` / `eglBindAPI` / `eglGetConfigs` all succeed — the Step 57 `std::bad_array_new_length` abort is gone. New failure mode: `eglChooseConfig` returns `*num_config = 0`, game logs its own `failed to find appropriate egl configs for attributes`, continues through netbridge/power-dist init, hits a downstream SEGV eventually.
+First run with this change confirmed `eglInitialize` / `eglBindAPI` / `eglGetConfigs` all succeed — the Step 56 `std::bad_array_new_length` abort is gone. New failure mode: `eglChooseConfig` returns `*num_config = 0`, game logs its own `failed to find appropriate egl configs for attributes`, continues through netbridge/power-dist init, hits a downstream SEGV eventually.
 
 ### Attribute negotiation — `WINDOW_BIT` → `PBUFFER_BIT`
 
 Added a diagnostic dump to `eglChooseConfig` that walks the attribute list, names each EGL enum, and logs Mesa's returned config count. The game's ask: 8/8/8/0 RGBA, 24-bit depth, GLES2-renderable, `EGL_SURFACE_TYPE = EGL_WINDOW_BIT (0x4)`. Mesa's surfaceless+swrast platform only advertises `EGL_PBUFFER_BIT` configs — no match on the surface-type bit.
 
-Fix: copy the attribute list into a scratch buffer on the way in, replace `EGL_WINDOW_BIT` with `EGL_PBUFFER_BIT` on `EGL_SURFACE_TYPE`, pass the patched list to Mesa. This is end-to-end consistent with the Step 56.4 `eglCreateWindowSurface → eglCreatePbufferSurface` redirect — the game asks for a window surface at its API level, gets a pbuffer behind the scenes, doesn't know the difference. Mesa now returns 24 matching configs. Game walks through 24 × `eglGetConfigAttrib` calls (iterating every config looking for `EGL_NATIVE_VISUAL_ID = 0x34325258 = XR24`), then logs `failed to find egl config for gbm format` — no Mesa config declares that visual ID, because Mesa's surfaceless configs have no native-visual tie. Non-fatal; game continues and picks something.
+Fix: copy the attribute list into a scratch buffer on the way in, replace `EGL_WINDOW_BIT` with `EGL_PBUFFER_BIT` on `EGL_SURFACE_TYPE`, pass the patched list to Mesa. This is end-to-end consistent with the Step 55.4 `eglCreateWindowSurface → eglCreatePbufferSurface` redirect — the game asks for a window surface at its API level, gets a pbuffer behind the scenes, doesn't know the difference. Mesa now returns 24 matching configs. Game walks through 24 × `eglGetConfigAttrib` calls (iterating every config looking for `EGL_NATIVE_VISUAL_ID = 0x34325258 = XR24`), then logs `failed to find egl config for gbm format` — no Mesa config declares that visual ID, because Mesa's surfaceless configs have no native-visual tie. Non-fatal; game continues and picks something.
 
 ### Frame bridge — parallel socket for binary framebuffers
 
@@ -4980,18 +4980,18 @@ Hook lives inside `eglSwapBuffers` in real-GL mode: captures via `dlsym(RTLD_NEX
 
 Python viewer `_emulation/frame_viewer.py` connects, reads the header, reads the payload, Y-flips if flagged, displays in a tkinter window via `PIL.ImageTk`. Decoder runs in a background thread into a `queue.Queue(maxsize=1)` so Tk's event loop isn't blocked by recv. `--no-display` for headless, `--save-every N` dumps every Nth frame as PNG, `--scale` rescales the window.
 
-The bridge is currently **dormant** — no swaps happen because the game crashes before reaching the render loop. But connecting the viewer against a running game session works end-to-end with no errors; when Step 59 unblocks rendering, frames should start flowing with no further bridge work.
+The bridge is currently **dormant** — no swaps happen because the game crashes before reaching the render loop. But connecting the viewer against a running game session works end-to-end with no errors; when Step 61 unblocks rendering, frames should start flowing with no further bridge work.
 
 ### Instrumentation that made the difference
 
-`FWD_RET_V` from Step 57 was load-bearing here — without per-call forward logs we'd have had no idea that the config-negotiation wall was specifically at the surface-type bit. Added one more ad-hoc diagnostic in this step (the attribute-array decoder) rather than generalizing; config-attrib queries are a one-shot, generalizing the decoder isn't worth it yet.
+`FWD_RET_V` from Step 56 was load-bearing here — without per-call forward logs we'd have had no idea that the config-negotiation wall was specifically at the surface-type bit. Added one more ad-hoc diagnostic in this step (the attribute-array decoder) rather than generalizing; config-attrib queries are a one-shot, generalizing the decoder isn't worth it yet.
 
-### Progress vs. Step 57
+### Progress vs. Step 56
 
-- Step 57: exit 134 (SIGABRT `std::bad_array_new_length`) at 3,056 lines, crashed in `eglGetConfigs` config-array setup.
-- Step 58: exit 139 (SIGSEGV, NULL deref) at 3,963 lines, crashes inside `./game+0x901a7c` (file offset 0x501a7c).
+- Step 56: exit 134 (SIGABRT `std::bad_array_new_length`) at 3,056 lines, crashed in `eglGetConfigs` config-array setup.
+- Step 57: exit 139 (SIGSEGV, NULL deref) at 3,963 lines, crashes inside `./game+0x901a7c` (file offset 0x501a7c).
 
-Milestones crossed this run that Step 57 never touched:
+Milestones crossed this run that Step 56 never touched:
 - `/games/spike3/bin/SternLogo_800x480.png` — Stern logo PNG access (first asset load).
 - `netbridge image okay, CRC32=0x357f5327` — netbridge firmware verified.
 - `power dist: ... power dist. boot version: 1.0.0, runtime version: 0.0.0` — power-dist node mode-switch completed (boot → runtime).
@@ -5008,7 +5008,7 @@ Added a `dlopen`/`dlsym` intercept block that tracks handles returned by `dlopen
 
 Run-time confirmed: the ONLY `dlopen` calls the process makes are Mesa's own driver loading (`swrast_dri.so`). The game never dlopens libEGL.so.1 — it's DT_NEEDED, loaded at process start. So dlopen hooking was a dead end for this binary, but kept in place as a small, safe instrumentation.
 
-Meanwhile, `readelf -d` confirmed `libEGL.so.1` IS a DT_NEEDED of `game`, and the dynamic symbol table had `eglCreateContext` marked `UND GLOBAL` — a normal PLT import that LD_PRELOAD *should* intercept. But Step 58-c's FWD log still showed no `FWD eglCreateContext`. The discrepancy wasn't resolved; eglCreateContext was silently reaching Mesa through some path we haven't traced. Critically it wasn't blocking — Mesa got a real context either way, the game held onto it, `eglMakeCurrent` (which IS intercepted) bound it, and the game continued.
+Meanwhile, `readelf -d` confirmed `libEGL.so.1` IS a DT_NEEDED of `game`, and the dynamic symbol table had `eglCreateContext` marked `UND GLOBAL` — a normal PLT import that LD_PRELOAD *should* intercept. But Step 57-c's FWD log still showed no `FWD eglCreateContext`. The discrepancy wasn't resolved; eglCreateContext was silently reaching Mesa through some path we haven't traced. Critically it wasn't blocking — Mesa got a real context either way, the game held onto it, `eglMakeCurrent` (which IS intercepted) bound it, and the game continued.
 
 Final surgical fix — the third open from the earlier plan — `EGL_NATIVE_VISUAL_ID` override in `eglGetConfigAttrib`: forward to Mesa normally, then unconditionally overwrite `*value = 0x34325258` (XR24) for `attribute == EGL_NATIVE_VISUAL_ID (0x302E)`. Mesa's surfaceless configs don't declare any native visual ID; the game's config-filter loop (24 × `eglGetConfigAttrib`) was rejecting every Mesa config against the GBM fourcc our stubs advertise. Overwriting the returned VISUAL_ID to match GBM's XR24 passes the filter.
 
@@ -5017,7 +5017,7 @@ Final surgical fix — the third open from the earlier plan — `EGL_NATIVE_VISU
 With all four of {SURFACELESS display, WINDOW→PBUFFER surface-type patch, EGLImage → GL-texture backing, NATIVE_VISUAL_ID override} in place, the game **reaches steady state** under real Mesa:
 
 - **Exit 124** (timeout, not crash) at 11,245 log lines — matches the stub-mode regression baseline (11,411 lines). The game is ALIVE.
-- `FWD eglCreateContext` fires cleanly (the Step 58-c silent-bypass mystery apparently only manifested when the game was already failing; once config negotiation works, context creation goes through our normal PLT intercept).
+- `FWD eglCreateContext` fires cleanly (the Step 57-c silent-bypass mystery apparently only manifested when the game was already failing; once config negotiation works, context creation goes through our normal PLT intercept).
 - `eglGetProcAddress` is now queried for the full extension set — `eglCreateImageKHR`, `eglDestroyImageKHR`, `eglCreateSyncKHR`, `eglDestroySyncKHR`, `eglWaitSyncKHR`, `eglClientWaitSyncKHR`, `glEGLImageTargetTexture2DOES`. Our table returns our overrides for each.
 - `eglCreateImageKHR(target=0x3270 [EGL_LINUX_DMA_BUF_EXT], w=1024, h=256, fourcc=0x34324241 [AB24/ABGR8888])` fires — the game is constructing DMA-BUF-style EGLImages through our override.
 - `glEGLImageTargetTexture2DOES(target=0x8d65 [GL_TEXTURE_EXTERNAL_OES], image=...) → glTexImage2D 1024x256 RGBA8` fires — our override materializes the texture backing, Mesa allocates real storage.
@@ -5048,7 +5048,7 @@ Route 1 is the right answer for fidelity. Route 2 ships frames tomorrow. Call ei
 
 ### Artifacts
 
-- `_emulation/spi_shim.c` — +680 LOC net (Step 58 total): SURFACELESS translation helper; 3 display-acquisition function rewrites; attribute-list patching + attribute-name decoder in `eglChooseConfig`; frame bridge socket + accept thread + capture hook; `dlopen`/`dlsym` intercept infrastructure; 128-entry EGLImage sentinel → texture map with `glTexImage2D`-backed resolution; `EGL_NATIVE_VISUAL_ID` override in `eglGetConfigAttrib`; SHIM_LOG definition moved earlier in the file to predate the new `dlopen`/`dlsym` hooks. Size 5,215 → 5,895 LOC.
+- `_emulation/spi_shim.c` — +680 LOC net (Step 57 total): SURFACELESS translation helper; 3 display-acquisition function rewrites; attribute-list patching + attribute-name decoder in `eglChooseConfig`; frame bridge socket + accept thread + capture hook; `dlopen`/`dlsym` intercept infrastructure; 128-entry EGLImage sentinel → texture map with `glTexImage2D`-backed resolution; `EGL_NATIVE_VISUAL_ID` override in `eglGetConfigAttrib`; SHIM_LOG definition moved earlier in the file to predate the new `dlopen`/`dlsym` hooks. Size 5,215 → 5,895 LOC.
 - `_emulation/spi_shim.so` — rebuilt ~235 KB.
 - `_emulation/frame_viewer.py` — new, 186 LOC, tkinter + PIL + numpy subscriber; works against the bridge end-to-end but dormant until capture point moves to `MODE_PAGE_FLIP` or equivalent.
 - `_emulation/run_step58_regression.log` — stub-mode regression, 11,411 lines, exit 124, clean.
@@ -5065,7 +5065,7 @@ Route 1 is the right answer for fidelity. Route 2 ships frames tomorrow. Call ei
 2. Once frames flow, connect `frame_viewer.py` and watch the Stern boot splash + Godot attract mode render live.
 3. The switch-injection half of the VPX bridge architecture (message type 0x02 in the frame-bridge earlier protocol sketch) remains unimplemented — comes next, but doesn't need to precede first-frame-visible.
 
-### Step 58 addendum — capture relocated to MODE_PAGE_FLIP; pipeline end-to-end, but pixels are black
+### Step 57 addendum — capture relocated to MODE_PAGE_FLIP; pipeline end-to-end, but pixels are black
 
 The remainder of the session drove the frame capture into the DRM page-flip path. Summary of what was built and what that reveals about the game's render state.
 
@@ -5087,7 +5087,7 @@ Why Godot hasn't booted to the scene tree is the next investigation target — p
 
 **State left for next session.** The capture path is complete and proven to deliver pixels. `frame_viewer.py` works. The blocker is upstream: find what's keeping Godot from initializing, unblock it, then rendering flows through the capture we already built. No more GL-level bring-up required.
 
-### Step 58 final artifacts
+### Step 57 final artifacts
 
 Added to the earlier list:
 - `_emulation/spi_shim.c` — now 5,970 LOC. Added: `shim_frametex_record` + 32-entry registry (vestigial, kept for diagnostic); `shim_frame_capture_at_page_flip` (game-thread GL readback); refactored `shim_frame_send` / `shim_frame_send_all` to blocking `send`; `#include <poll.h>` (dormant now that send is blocking); `glBindFramebuffer` hook that tracks `shim_last_draw_fbo` for future use; diagnostic bind-count logger.
@@ -5102,14 +5102,14 @@ Added to the earlier list:
 ### Artifacts
 
 - `_emulation/spi_shim.c` — +330 LOC net (SURFACELESS translation helper, 3 display-acquisition function rewrites, attribute-list patching + name decoder in `eglChooseConfig`, frame bridge socket state + accept thread + capture-and-send, constructor hook). Size 5,215 → 5,545 LOC.
-- `_emulation/spi_shim.so` — rebuilt 225,232 bytes (was 158,968 at Step 57; +66 KB for new bridge infra + patching logic).
+- `_emulation/spi_shim.so` — rebuilt 225,232 bytes (was 158,968 at Step 56; +66 KB for new bridge infra + patching logic).
 - `_emulation/frame_viewer.py` — new, 186 LOC, tkinter + PIL + numpy subscriber with headless and PNG-save modes.
-- `_emulation/run_step58_regression.log` — stub-mode regression, 11,411 lines / 22 s / exit 124, clean. Matches Step 57 baseline (11,478 lines).
+- `_emulation/run_step58_regression.log` — stub-mode regression, 11,411 lines / 22 s / exit 124, clean. Matches Step 56 baseline (11,478 lines).
 - `_emulation/run_step58_realgl.log` — first real-GL run with SURFACELESS translation, 4,141 lines, exit 139. Revealed the `eglChooseConfig` empty-return.
 - `_emulation/run_step58b_realgl.log` — added attribute-array logger, 3,971 lines, exit 139. Confirmed `EGL_SURFACE_TYPE = EGL_WINDOW_BIT` was the mismatch.
 - `_emulation/run_step58c_realgl.log` — surface-type patch applied, Mesa returns 24 configs, game crosses 4 new milestones (SternLogo, netbridge, power-dist, DRM mode), crashes in `create_egl_framebuffer` DMA-BUF path. 3,963 lines.
 
-## Step 58.post: BN notebook read; boot-splash ⊥ Godot confirmed; blocker hypothesis pivots (2026-04-22)
+## Step 58: BN notebook read; boot-splash ⊥ Godot confirmed; blocker hypothesis pivots (2026-04-22)
 
 User exported the full BN analyst notebook to `_emulation/Binary Ninja Notebook Export (2026-04-22).json` (172 KB / 80 entries / 10 categories). Read in full. Key conclusions that reshape our next move:
 
@@ -5135,24 +5135,24 @@ The `create_egl_framebuffer` at `0xd00800` — the DMA-BUF pipeline we've been i
 - Entries [1], [9]: SIGINT / SIGBUS / SIGSEGV handlers registered at `_start @ 0x861270`. SIGBUS specifically for hardware access faults.
 - Entries [30], [73]: game logic is data-driven via scene files (`image-sc*.bin`, 885+ scenes); compiled binary is presentation engine + event dispatcher only. Fire_event at `0x9c12a0`; mode init table at `_INIT_74 @ 0x8733c0` (matches earlier Step-50 findings).
 - Entries [35], [37], [41]: `/dev/spidev4.0` is a serial bridge to an I/O controller MCU, not true SPI — we already shim this correctly.
-- Entry [46]: Godot audio uses Godot's native AudioStream pipeline (OggVorbis), NOT GStreamer. GStreamer is video-only. Confirms the Step 53 finding that gstreamer is dormant for audio.
+- Entry [46]: Godot audio uses Godot's native AudioStream pipeline (OggVorbis), NOT GStreamer. GStreamer is video-only. Confirms the Step 52 finding that gstreamer is dormant for audio.
 - Entry [32]/[33]: 4 embedded MP3s directly in data sections at 0x462e006 / 0x46742ee / 0x474b61e / 0x476599e (~100 KB each).
 
 **Caveat per user warning:** notebook entries were written over multiple BN analysis sessions and **may self-contradict** when a later observation refines an earlier one. Early entries call this a "slot machine" — BN analyst's initial (wrong) interpretation; this is Stern's Pokémon Pinball. When anything in the notebook seems suspicious, cross-reference with our own logs before trusting it.
 
 **Holding position until the follow-up BN query returns.** No shim changes this turn — no point wiring up a DMA-BUF/EGLImage fix for the boot-splash if the Godot gate is a condition variable elsewhere. Saved notebook pointer to memory (`reference_bn_notebook.md`) so future sessions can re-enter the context without re-reading 172 KB of JSON.
 
-## Step 58.post.2: BN follow-up (v4) overturns the two-pipeline story (2026-04-22)
+## Step 59: BN follow-up (v4) overturns the two-pipeline story (2026-04-22)
 
-Follow-up BN queries landed as notebook versions v2–v4 (entries 81–86, append-only). The architectural read from Step 58.post was **wrong** — a correction the analyst made in the follow-up pass.
+Follow-up BN queries landed as notebook versions v2–v4 (entries 81–86, append-only). The architectural read from Step 58 was **wrong** — a correction the analyst made in the follow-up pass.
 
 **[82] Single EGL context architecture — boot-splash is the ONLY rendering system.** There is exactly one EGL context creation callsite (`create_boot_splash_egl_context @ 0xd01d10`). Godot's rendering classes (`RasterizerSceneGLES3`, `GLES3::MeshStorage`, `ShaderGLES3`) are compiled into the binary but never instantiated at runtime. Boot-splash renders everything, including what would have been Godot scene content. *If boot-splash init fails, there is NO fallback path.* This directly contradicts entry [76]'s older claim of "two distinct pipelines" — [76] was the analyst's initial (wrong) interpretation.
 
-**[81] No standard Godot init.** `OS::initialize` / `DisplayServer::create` / `RenderingServer::init` / `SceneTree::init` / `Main::setup` / `Main::start` are all absent from the runtime flow. The game accesses Godot components through a custom `godot_spike_bridge` interface, not Godot's own bootstrap. So the "where does Godot init?" question from Step 58.post has no answer because it never happens — `procDispatch` at `sub_b2ae90` drives the entire show through condition variables and event firing.
+**[81] No standard Godot init.** `OS::initialize` / `DisplayServer::create` / `RenderingServer::init` / `SceneTree::init` / `Main::setup` / `Main::start` are all absent from the runtime flow. The game accesses Godot components through a custom `godot_spike_bridge` interface, not Godot's own bootstrap. So the "where does Godot init?" question from Step 58 has no answer because it never happens — `procDispatch` at `sub_b2ae90` drives the entire show through condition variables and event firing.
 
 **Consequences.**
 - The 4× `0x506 GL_INVALID_FRAMEBUFFER_OPERATION` errors are not boot-splash-only collateral that we could ignore. They're the entire render pipeline failing. Every black frame is what the boot-splash actually tried to draw.
-- The Step 58.post plan ("let boot-splash fail, Godot will take over") doesn't work because there is no Godot to take over. Fixing the boot-splash FBO is the blocker.
+- The Step 58 plan ("let boot-splash fail, Godot will take over") doesn't work because there is no Godot to take over. Fixing the boot-splash FBO is the blocker.
 - `create_egl_framebuffer (0xd00800)` — the DMA-BUF / `GL_TEXTURE_EXTERNAL_OES` pipeline — isn't "boot-splash only" in the sense of being a skippable subset; it's the only FBO setup the game has.
 
 **[84] 10-second timeout at 0xb2aba0 is fully traced.** Condition variable `g_main_loop_condition_var (0x48c9288)`. Single signaler is `process_dispatch_loop (0xb292ac)`, which signals at `0xb293c8` after draining the event queue and firing event `0x92`. Dispatch thread runs on its own CV `0x48c86f8` monitoring `event_queue_change_counter (0x48c8728)`. Main loop stalls if nothing enqueues events for `process_dispatch_loop` to consume. Not directly our current blocker (the game runs past this — no reboot in 22 s), but useful for switch-injection work later.
@@ -5167,7 +5167,7 @@ Follow-up BN queries landed as notebook versions v2–v4 (entries 81–86, appen
 
 The Step-58.post plan (`glFramebufferTexture2D` intercept to swap `EXTERNAL_OES` → `TEXTURE_2D`) was the right IDEA but the wrong execution — the intercept never fired because the game doesn't reach our `glFramebufferTexture2D` export through the PLT (GLAD-style cached function pointers bypass LD_PRELOAD). Two viable approaches:
 
-1. **Resolve the substitution via `eglGetProcAddress` instead.** We already intercept `eglGetProcAddress` and return our own stubs for KHR extensions. Extend the table to return shim wrappers for `glFramebufferTexture2D` / `glFramebufferTextureLayer` / `glFramebufferRenderbuffer` / `glCheckFramebufferStatus`. If the game resolves these via `eglGetProcAddress` (which our Step 58 log showed it does for KHR extensions), our wrappers get the call and can rewrite the target.
+1. **Resolve the substitution via `eglGetProcAddress` instead.** We already intercept `eglGetProcAddress` and return our own stubs for KHR extensions. Extend the table to return shim wrappers for `glFramebufferTexture2D` / `glFramebufferTextureLayer` / `glFramebufferRenderbuffer` / `glCheckFramebufferStatus`. If the game resolves these via `eglGetProcAddress` (which our Step 57 log showed it does for KHR extensions), our wrappers get the call and can rewrite the target.
 
 2. **Upstream swap in `glEGLImageTargetTexture2DOES`.** Rather than attach `EXTERNAL_OES` textures to an FBO at all, maintain a parallel `GL_TEXTURE_2D` texture per EGLImage: when the game binds a `EXTERNAL_OES` texture via our `glEGLImageTargetTexture2DOES`, silently create a `TEXTURE_2D` with same dimensions, record the {external_tex_id → 2d_tex_id} mapping. The game then calls `glFramebufferTexture2D(GL_TEXTURE_EXTERNAL_OES, external_tex)` which still fails — UNLESS we also intercept the FBO attach via (1). The two approaches work together.
 
@@ -5175,9 +5175,9 @@ The Step-58.post plan (`glFramebufferTexture2D` intercept to swap `EXTERNAL_OES`
 
 Verification is one run with the existing shim and an expanded `eglGetProcAddress` logger — effectively free. Worth doing before committing to either fix.
 
-## Step 62: LFS open() family hooks — main.pck was invisible to us (2026-04-22)
+## Step 60: LFS open() family hooks — main.pck was invisible to us (2026-04-22)
 
-After Step 62's SpiDecoder::Play vtable patch, the game still SIGABRT'd at shutdown with `pure virtual method called` / `terminate called without an active exception`. The patch fired (`[vp] fake_spi_play` logged twice, ***** banner gone), but the game reached the same destructor cascade and aborted.
+After Step 60's SpiDecoder::Play vtable patch, the game still SIGABRT'd at shutdown with `pure virtual method called` / `terminate called without an active exception`. The patch fired (`[vp] fake_spi_play` logged twice, ***** banner gone), but the game reached the same destructor cascade and aborted.
 
 Looking at what the game was actually doing, I noticed our shim logged **zero** opens for `.pck`, `.tscn`, or anything Godot-resource-looking. The game binary references `./assets/godot/main.pck` as an embedded relative path — so either the pck was embedded in the binary (no `GDPC` magic, ruled out) or we weren't seeing the open.
 
@@ -5201,9 +5201,9 @@ Added `open64`, `openat64`, `fopen64` hooks mirroring the existing `open`/`opena
 **Next:** investigate why `/root/Main` isn't loaded despite `main.tscn.remap` being present in the pck. Is there a missing `ResourceLoader::load("res://scenes/main.tscn")` + `add_child` in the C++ init path? Could the game be waiting on a specific event to kick off Main's load? The shipping init's custom path loads `pokemon_battle_scene`, `capture_battle_scene`, `Discover` directly but Main never shows up.
 
 
-## Step 59: fallback pbuffer unblocks the render — real pixels out, boot-splash is drawing (2026-04-22)
+## Step 61: fallback pbuffer unblocks the render — real pixels out, boot-splash is drawing (2026-04-22)
 
-User's strategic pivot (Step 58.post.3) of ignoring Godot paid off in one session. Traced the real blocker cleanly: the game calls `eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)` — a surfaceless context binding — but still draws to `fb=0` (the default framebuffer). On real hardware the game's GBM→DRM render chain apparently provides an implicit drawable that we don't reproduce; on our shim, Mesa's default framebuffer for a surfaceless context is `GL_FRAMEBUFFER_UNDEFINED (0x8219)`, so every `glDrawArrays` / `glUseProgram` returned `GL_INVALID_FRAMEBUFFER_OPERATION (0x506)` by spec. Those were the `SpriteRenderer.cpp:143` and `Shader.cpp:17` errors we'd been chasing all of Step 58 — never an FBO-completeness problem on a user framebuffer, always the *default* framebuffer failing because no surface was bound.
+User's strategic pivot (Step 62) of ignoring Godot paid off in one session. Traced the real blocker cleanly: the game calls `eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)` — a surfaceless context binding — but still draws to `fb=0` (the default framebuffer). On real hardware the game's GBM→DRM render chain apparently provides an implicit drawable that we don't reproduce; on our shim, Mesa's default framebuffer for a surfaceless context is `GL_FRAMEBUFFER_UNDEFINED (0x8219)`, so every `glDrawArrays` / `glUseProgram` returned `GL_INVALID_FRAMEBUFFER_OPERATION (0x506)` by spec. Those were the `SpriteRenderer.cpp:143` and `Shader.cpp:17` errors we'd been chasing all of Step 57 — never an FBO-completeness problem on a user framebuffer, always the *default* framebuffer failing because no surface was bound.
 
 ### Diagnostic path
 
@@ -5223,7 +5223,7 @@ The game never reads back from the default framebuffer — its actual present pa
 - `glCheckFramebufferStatus(DEFAULT) = 0x8CD5 (GL_FRAMEBUFFER_COMPLETE)` — the default framebuffer is now usable.
 - Game runs to timeout (exit 124, 11,186 lines), same steady state as before.
 - Frame bridge captured **22 × 1920×1080 PNGs** via `MODE_PAGE_FLIP` hook.
-- PNG analysis: **~34% non-zero pixels, full 0–255 range** (vs. 0.02% non-zero, max 81 in Step 58's all-black captures). That's real image content.
+- PNG analysis: **~34% non-zero pixels, full 0–255 range** (vs. 0.02% non-zero, max 81 in Step 57's all-black captures). That's real image content.
 - The content is stable frame-to-frame (34.0%, 34.2%, 34.2%, 34.2%...) which is consistent with a static image (e.g. the Stern boot splash — `SternLogo_800x480.png` that we saw get loaded earlier in the run).
 
 ### Why the Godot pivot mattered
@@ -5235,7 +5235,7 @@ If we'd kept chasing "why isn't Godot initializing," we'd never have looked at `
 - `_emulation/spi_shim.c` — +120 LOC net: fallback-pbuffer state (`shim_last_real_display`, `shim_last_real_config`, `shim_fallback_pbuf`), config capture in `eglChooseConfig`, display capture in `shim_real_platform_display`, pbuffer substitution + diagnostic block in `eglMakeCurrent`, forward decls for the three globals, extra `glFramebufferTextureLayer` export, three extra entries in `eglGetProcAddress` table.
 - `_emulation/spi_shim.so` — rebuilt.
 - `_emulation/run_step58q_procaddr.log` — proved `glFramebufferTexture2D` not queried via `eglGetProcAddress`.
-- `_emulation/run_step58r_mkcur.log` — revealed `draw=NULL` + `GL_FRAMEBUFFER_UNDEFINED (0x8219)`; also tripped the Step 56.3 assertion because our `eglQuerySurface(NULL,...)` clobbered EGL state.
+- `_emulation/run_step58r_mkcur.log` — revealed `draw=NULL` + `GL_FRAMEBUFFER_UNDEFINED (0x8219)`; also tripped the Step 55.3 assertion because our `eglQuerySurface(NULL,...)` clobbered EGL state.
 - `_emulation/run_step58s_fallpbuf.log` — first run with fallback pbuffer; zero 0x506 errors, FBO status COMPLETE.
 - `_emulation/run_step58t_viewer.log` + `_emulation/frames/frame_000001.png` through `frame_000022.png` — first real-pixel captures; 34% non-zero content.
 
@@ -5243,7 +5243,7 @@ If we'd kept chasing "why isn't Godot initializing," we'd never have looked at `
 
 Look at an actual saved PNG to see what the boot-splash is drawing. If it's the Stern logo, we know the render chain is end-to-end functional for static content. Then the next questions open up: why only 4 page flips (is the splash expected to be multi-frame animated)? Does the game ever transition past boot-splash into attract/gameplay without additional prodding? Those are game-logic questions now, not rendering questions.
 
-## Step 58.post.3: strategic pivot — ignore Godot entirely (2026-04-22)
+## Step 62: strategic pivot — ignore Godot entirely (2026-04-22)
 
 User called out that Reference implementation A for a different Spike 3 title doesn't involve Godot. FotE and Pokemon LE are both Spike 3 games; the platform-level render pipeline is the common denominator. If Godot were required at runtime for the render loop, Researcher A's emulator wouldn't be working without it.
 
@@ -5275,7 +5275,7 @@ Revised next action: extend the `eglGetProcAddress` intercept as a two-way instr
 
 ## Step 63: shim refactor — seven phases of carving, before we keep digging (2026-04-22 → 2026-04-23)
 
-Step 58.post.3 ended with a narrow plan: instrument `eglGetProcAddress` to see what core-GL names the game queries. Before writing it I re-read `spi_shim.c` and concluded the file itself had become the problem. At ~6400 LOC in a single translation unit, every new diagnostic meant scrolling past unrelated state, and I kept asking myself "does this subsystem hook the LFS variant?" or "is this fd predicate already defined somewhere above?" The Godot pivot (Step 58.post.3) reframed the investigation as a bounded Stern-only GL problem — but a bounded search space doesn't help when the tool you use to search it is illegible. The next several investigation steps are going to accrete a lot of diagnostic code; landing all of that on top of a 6400-line monolith would make it impossible to tell what subsystem each new hook belonged to, or whether an existing hook already covered the case.
+Step 62 ended with a narrow plan: instrument `eglGetProcAddress` to see what core-GL names the game queries. Before writing it I re-read `spi_shim.c` and concluded the file itself had become the problem. At ~6400 LOC in a single translation unit, every new diagnostic meant scrolling past unrelated state, and I kept asking myself "does this subsystem hook the LFS variant?" or "is this fd predicate already defined somewhere above?" The Godot pivot (Step 62) reframed the investigation as a bounded Stern-only GL problem — but a bounded search space doesn't help when the tool you use to search it is illegible. The next several investigation steps are going to accrete a lot of diagnostic code; landing all of that on top of a 6400-line monolith would make it impossible to tell what subsystem each new hook belonged to, or whether an existing hook already covered the case.
 
 So we took the detour: carve the shim into subsystem translation units along the boundaries of its actual behavior, preserve every line (including BN-derived RE code — cmode tables, switch manifests, dispatch-table dumpers), and give it the shared header it had been missing. Baseline-match each phase against the pre-refactor smoke run; anything that deviates is a regression and gets fixed before moving on. Pure maintainability investment — no new behavior, no new diagnostics (except defensively), no attempt to advance the game-logic frontier.
 
@@ -5287,8 +5287,8 @@ So we took the detour: carve the shim into subsystem translation units along the
 | 2     | `shim_bridges.c`      | state bridge poll thread, frame bridge (`glReadPixels` → RGBA socket), page-flip capture. No-op unless `SPIKE3_BRIDGE=1` / `SPIKE3_FRAME_BRIDGE=1`. |
 | 3     | `shim_diagnostics.c`  | cmode registry (42 BN-extracted entries), event sweep, SIGSEGV/SIGUSR2 dump handlers, dispatch-table dumpers, sound-globals dump. **The explicit home for RE output.** |
 | 4     | `shim_nodebus.c`      | UART netbridge framing + response synth. Keeps the game's dispatch wheel turning without real hardware. |
-| 5     | `shim_fs.c`           | `open`/`openat`/`open64`/`openat64`/`fopen`/`fopen64`, device intercept dispatcher, GPIO sysfs fake-fd pool, sysroot path remap. Step 62's LFS hooks carved here kept them together. |
-| 6     | `shim_gl.c`           | EGL surface/context plumbing, GLES stubs, fallback pbuffer, `eglGetProcAddress` table. Step 59's pbuffer fix lives here. |
+| 5     | `shim_fs.c`           | `open`/`openat`/`open64`/`openat64`/`fopen`/`fopen64`, device intercept dispatcher, GPIO sysfs fake-fd pool, sysroot path remap. Step 60's LFS hooks carved here kept them together. |
+| 6     | `shim_gl.c`           | EGL surface/context plumbing, GLES stubs, fallback pbuffer, `eglGetProcAddress` table. Step 61's pbuffer fix lives here. |
 | 7a    | `shim_io.c`           | `close`, `read`, `lseek`, `write` + LFS variants (`lseek64`, `pread`/`pread64`, `pwrite`/`pwrite64`). |
 | 7b    | `shim_ioctl.c`        | `ioctl` dispatch for UART/SPI/DRM/V4L2/I2C + DRM page-flip event synthesis. |
 
@@ -5306,11 +5306,11 @@ So we took the detour: carve the shim into subsystem translation units along the
 
 ### What the refactor does NOT change
 
-The game still stops where Step 59 + Step 62 left it: boot-splash with 40 page flips / 215 unique frames over 185 s, Godot banner prints, scripts load, `/root/Main` still missing, `VideoStreamPlayer::play()` still trips `is_inside_tree() == false` on orphaned nodes at destruct. This step didn't advance the state machine. That's fine and intentional — we paid tech-debt tax so Phases 8–9 and the subsequent investigation can move cheaply.
+The game still stops where Step 61 + Step 60 left it: boot-splash with 40 page flips / 215 unique frames over 185 s, Godot banner prints, scripts load, `/root/Main` still missing, `VideoStreamPlayer::play()` still trips `is_inside_tree() == false` on orphaned nodes at destruct. This step didn't advance the state machine. That's fine and intentional — we paid tech-debt tax so Phases 8–9 and the subsequent investigation can move cheaply.
 
 ### What's next
 
-- **Phase 8 (`shim_patches.c`)** — pull the runtime patches out of `spi_shim.c`: memcpy NULL-guard, Step 62 SpiDecoder::Play vtable patch, Step 64 `get_format` NOP, libavcodec HW-accel bypass, dummy-frame injection. These all share the "find-and-replace after dlopen" shape and belong together.
+- **Phase 8 (`shim_patches.c`)** — pull the runtime patches out of `spi_shim.c`: memcpy NULL-guard, Step 60 SpiDecoder::Play vtable patch, Step 64 `get_format` NOP, libavcodec HW-accel bypass, dummy-frame injection. These all share the "find-and-replace after dlopen" shape and belong together.
 - **Phase 9 (`shim_inject.c`)** — switch-manifest poker, event-sweep scheduler, `vp_patch` thread. All write into game memory at timed intervals; same operational shape.
 - **Follow-up: Phase 7 asymmetries.** Add `fopen`, `pread`, `pwrite` plain-variant hooks with the FIRST-CALL banner. Start with `fopen`.
 - **Follow-up: `fd=31` provenance.** Walk the full log for what was opened in the window before `pread64 #1` (or loosen `should_log_open` to dump every open regardless of path filter).
@@ -5325,11 +5325,11 @@ Phases 8 and 9 land the last two modules and complete the refactor.
 
 The "surgery" bucket: hooks and byte-level patches that intentionally alter the game's behavior at runtime. Pulled five blocks out of `spi_shim.c` totaling 501 lines:
 
-- `memcpy` NULL-guard (Step 45) — the long-standing Godot-DisplayRenderer-thread `memcpy(dst=NULL, src=NULL)` workaround.
-- Step 62 `SpiDecoder::Play` vtable patch + `shim_fake_spi_play` replacement.
+- `memcpy` NULL-guard (Step 43) — the long-standing Godot-DisplayRenderer-thread `memcpy(dst=NULL, src=NULL)` workaround.
+- Step 60 `SpiDecoder::Play` vtable patch + `shim_fake_spi_play` replacement.
 - Step 64 `get_format` callback NOP patch + `shim_sw_hevc_enabled` env-var gate.
 - libavcodec HW-accel bypass — `avcodec_find_decoder_by_name` name swap (`hevc_v4l2request` → `hevc` under `SPIKE3_SW_HEVC=1`) plus `avcodec_get_hw_config` / `av_hwdevice_ctx_create` / `avcodec_send_packet` / `avcodec_receive_frame` passthrough hooks with the `shim_resolve_libav(..., "LIBAVCODEC_59")` dlvsym helper.
-- Step 47b dummy-frame injection — `shim_init_dummy_frame` (`av_frame_alloc`/`av_frame_get_buffer` to allocate a 1920×1080 NV12 frame zero-filled to studio-black) + the `av_frame_ref`/`av_frame_unref` path in `avcodec_receive_frame` that substitutes it when the real decoder returns EAGAIN under `SPIKE3_INJECT_VIDEO=1`.
+- Step 45b dummy-frame injection — `shim_init_dummy_frame` (`av_frame_alloc`/`av_frame_get_buffer` to allocate a 1920×1080 NV12 frame zero-filled to studio-black) + the `av_frame_ref`/`av_frame_unref` path in `avcodec_receive_frame` that substitutes it when the real decoder returns EAGAIN under `SPIKE3_INJECT_VIDEO=1`.
 
 Intentionally kept in `spi_shim.c` through Phase 8: `shim_vp_patch_thread`, the 2-second-delayed thread that applies the two patches. It moved in Phase 9 as part of the "all worker threads in one place" design. Exposed `shim_patch_spi_video_vtable` / `shim_patch_get_format_callback` via the header so the thread could keep calling them cross-TU.
 
@@ -5342,7 +5342,7 @@ Side discovery during the Phase 8 smoke-report script: `REFACTOR_BASELINE.txt`'s
 The last carve, and the biggest single-file output of the refactor at 846 lines. Everything the shim pushes *into* the running game, as distinct from interception coming out:
 
 - Pokémon LE 105-switch manifest (transcribed from manual 500-55AJ-01) + `shim_find_switch` + `shim_fire_switch` that pokes the in-memory switch-state array at `data_4880220 + id*0x30 + 0x28` and diffs the cmode state around the closure.
-- Event-sweep machinery (Step 52): `shim_fire_event` trampoline to in-binary `fire_event @ 0x9c12a0`, `shim_event_sweep` that blind-fires every event ID 0..0xce with per-event SIGALRM timeout and SEGV recovery via `sigsetjmp`/`siglongjmp`.
+- Event-sweep machinery (Step 51): `shim_fire_event` trampoline to in-binary `fire_event @ 0x9c12a0`, `shim_event_sweep` that blind-fires every event ID 0..0xce with per-event SIGALRM timeout and SEGV recovery via `sigsetjmp`/`siglongjmp`.
 - The three sigjmp/sig-atomic globals whose externs live in the header (read by `shim_sigsegv_handler` in `shim_diagnostics.c` to longjmp out of a faulting iteration) — definitions moved here.
 - Six env-gated worker threads: sweep timer, switch firer, gstreamer force-init, cmode poke, state-flag poke, vp-patch.
 - SIGALRM handler used by the sweep.
@@ -5378,7 +5378,7 @@ Cumulative across all nine phases (including Step 63's findings):
 - **`fd=31` provenance.** Widen `should_log_open` to dump every open regardless of path filter for one run, correlate against the `[lfs] pread64 #N: fd=31 offset=... count=...` line that fires at startup.
 - **Two game-logic investigation threads resume now:**
   - `/root/Main` custom-init: how does Stern's boot path bring Main into the tree, given BN [81] says standard `SceneTree::init` is bypassed? The GDScripts reach for `$"/root/Main"` and find nothing.
-  - `VideoStreamPlayer::play()` trips `is_inside_tree() == false` on orphaned nodes at destruct. Either these nodes shouldn't exist, or they need parenting to a fake root before `play()`. The Step 62 vtable patch silences the downstream abort but doesn't fix the orphan-construction.
+  - `VideoStreamPlayer::play()` trips `is_inside_tree() == false` on orphaned nodes at destruct. Either these nodes shouldn't exist, or they need parenting to a fake root before `play()`. The Step 60 vtable patch silences the downstream abort but doesn't fix the orphan-construction.
 
 
 ## Step 65: NODEBUS_Hash polynomial — constants corrected, CPU-inline absent in this build (2026-04-27)
@@ -5471,7 +5471,7 @@ No BN renames performed (no function to rename — there is no inlined hash to l
 
 ## Step 66: encrypted nodebus channel discovered — cmd 0x41 is alive (2026-04-27)
 
-**Trigger.** User asked to look at `sub_8ec410`. That walk cracked open the part of Step 48 that was wrong: cmd 0x40 / 0x41 ARE sent at runtime, just not via static `mov w0, #0x40` immediates that our earlier scan was looking for.
+**Trigger.** User asked to look at `sub_8ec410`. That walk cracked open the part of Step 46 that was wrong: cmd 0x40 / 0x41 ARE sent at runtime, just not via static `mov w0, #0x40` immediates that our earlier scan was looking for.
 
 **Sender chain.**
 
@@ -5487,7 +5487,7 @@ mcp_nodebus_send_raw @ 0x9166c0          (computes cmd byte = (arg1[0] >> 7) + 0
 send_bridge_message_with_response @ 0x9164a0  (UART)
 ```
 
-The cmd byte being **runtime-computed** is why the static-immediate scan in Step 48 returned zero senders. Lesson for future RE: don't conclude "dead code" from absence of immediate-load patterns alone — Stern uses runtime-computed cmd bytes for the channels they want guarded.
+The cmd byte being **runtime-computed** is why the static-immediate scan in Step 46 returned zero senders. Lesson for future RE: don't conclude "dead code" from absence of immediate-load patterns alone — Stern uses runtime-computed cmd bytes for the channels they want guarded.
 
 **Cipher (per-slot XOR stream, outbound only).**
 
@@ -5533,7 +5533,7 @@ Layout fully resolved by `mcp_nodebus_reset_all_slots @ 0x8f61f0` (single functi
 
 **Artifacts.**
 - New standalone reference: `_emulation/docs/NODEBUS_CIPHER.md` (~340 lines: algorithm, wire frame, Python impl, hunting checklist for other Spike 3 builds, open questions).
-- `BRIDGE_PROTOCOL.md` updated in 8 places to retract the "cmd 0x40/0x41 dead code" claim with cross-references to `NODEBUS_CIPHER.md`. Step 48's "surprising negative result" entry marked superseded.
+- `BRIDGE_PROTOCOL.md` updated in 8 places to retract the "cmd 0x40/0x41 dead code" claim with cross-references to `NODEBUS_CIPHER.md`. Step 46's "surprising negative result" entry marked superseded.
 - Memory: new `polynomial_nodebus_hash.md` correction note + new `project_nodebus_cipher.md`; `reference_nodebus_protocol.md` cmd-0x41 entry updated.
 
 
@@ -5552,7 +5552,7 @@ Layout fully resolved by `mcp_nodebus_reset_all_slots @ 0x8f61f0` (single functi
 **Phase 2: cipher decoder in `shim_nodebus.c`.** Single-file change. Added:
 - `static uint8_t nodebus_cipher_keys[32][16] = {{0}};` mirroring the game's BSS state (zero at init = matches what the game has, since shim never returns key fetches).
 - `static void nodebus_cipher_decrypt(slot, inner_len, buf)` mirroring `mcp_nodebus_send_encrypted`'s loop byte-for-byte (cipher is involutive — same XOR undoes encryption).
-- `case 0x41:` in `synthesize_bridge_response()` — parses cipher frame from bridge payload, decrypts, logs `slot / inner_cmd / payload` via a single atomic `write(STDERR_FILENO, line, n)` call. Still no synthetic response (timeout-is-progress preserved per Step 45 lesson).
+- `case 0x41:` in `synthesize_bridge_response()` — parses cipher frame from bridge payload, decrypts, logs `slot / inner_cmd / payload` via a single atomic `write(STDERR_FILENO, line, n)` call. Still no synthetic response (timeout-is-progress preserved per Step 43 lesson).
 - `case 0x40:` ditto for cleartext bridge sub-cmds (now logs sub-cmd byte and payload length).
 
 Build clean: `spi_shim.so` 231,728 bytes (was ~231 KB).
@@ -5693,7 +5693,7 @@ With `NODEBUS_SYNTH_FE=1`:
 - ZERO bridge timeouts (vs 27+ in baseline)
 - BUT Godot doesn't initialize at all (no "Godot Engine" banner, no "Detected Capture/Discover scene" lines, no res:// references)
 
-The "timeout-is-progress" insight from Step 45 stands: bridge cmd timeouts are the path that lets the game advance past nodebus init and into Godot. By making fe_probe succeed, we trap the game in a deeper init phase waiting for key-fetch responses (cmd 0xF9 / 0xFC / 0xFD) that we don't synth — so Godot never starts.
+The "timeout-is-progress" insight from Step 43 stands: bridge cmd timeouts are the path that lets the game advance past nodebus init and into Godot. By making fe_probe succeed, we trap the game in a deeper init phase waiting for key-fetch responses (cmd 0xF9 / 0xFC / 0xFD) that we don't synth — so Godot never starts.
 
 ### Default behavior preserved
 
@@ -6173,7 +6173,7 @@ These have surfaced across recent sessions but haven't been actively chased. Lis
 
 **c. The other 6 deferred-scene-queue slots.** `data_44ca400` has 8 slots × 0x14 bytes. Only 2 are exercised by the discover-mode 10↔11 ping-pong. What's the other 6 for? Probably broader scene categories (capture, battle, pokedex). Knowing the slot↔scene-category mapping would help us understand which game modes each slot drives.
 
-**d. Step-62 `VideoPlayerSpi` vtable patches — verification missing.** Step 62 / 71 patched the vtable's `Play` slot (+0x28) to a shim function that forces state=PLAYING and `update_thread_running=1` immediately. We never confirmed the patch is actually taking effect post-Step-71 + Step-72 changes. If forward-decode is feeding frames but `_process()` never ticks, the vtable patch's effect is moot — but we should verify.
+**d. Step-62 `VideoPlayerSpi` vtable patches — verification missing.** Step 60 / 71 patched the vtable's `Play` slot (+0x28) to a shim function that forces state=PLAYING and `update_thread_running=1` immediately. We never confirmed the patch is actually taking effect post-Step-71 + Step-72 changes. If forward-decode is feeding frames but `_process()` never ticks, the vtable patch's effect is moot — but we should verify.
 
 **e. `ManualGodotScene` at game VA `0x04630230`.** Per memory `reference_radium_scene_format.md`, this class wraps Radium scenes into Godot Node trees. We've never decompiled it. If it's the bridge between Radium (Stern's scene format) and Godot (the rendering tree), it's a candidate for who's supposed to call `add_child()` for loaded scenes. Tied directly to thread #3 (`select_and_load_scene` mount path).
 
@@ -6196,7 +6196,7 @@ So the comparison is **better than another title's filesystem would be**: every 
 - New entry: `project_fs_hook_audit_2026_05_01.md` — terse note that the LD_PRELOAD path-coverage gap is closed for this game's import set; references the chdir arc as the canonical example of "what we miss when we miss one".
 - `feedback_check_fs_first.md` — could cite the chdir arc as a concrete cautionary tale: when a path-related error appears, hooks may be the leak point even when the dir exists.
 
-## Step 73f: spike_menu vs pokemon_le architectural diff — orchestrator confirmed shared, scene-bridge layer isolated (2026-05-01)
+## Step 74: spike_menu vs pokemon_le architectural diff — orchestrator confirmed shared, scene-bridge layer isolated (2026-05-01)
 
 Followup to 73e's `select_and_load_scene` analysis. User's hypothesis that "Godot may not be the orchestrator" prompted a temporary pivot to `games/pokemon_le/spike3/spike_menu/game` — the Spike 3 system-menu binary that ships on every Spike 3 machine. spike_menu uses the same Stern platform stack (EGL/GLES, GStreamer, libavcodec, DRM/GBM, gpiod) **with zero Godot integration** (`0` "godot" strings vs pokemon_le's `457`). That makes spike_menu a controlled-experiment baseline: every variable except Godot is held constant, so the binary-level diff IS the Godot-port glue.
 
@@ -6315,7 +6315,7 @@ GodotScene (../source/display/lcd/GodotScene.cpp — Pokemon-LE-specific bridge)
 - Pattern-search for callers of `godot_switch_scene` via raw disasm of the function-body neighborhood (RTTI-only xrefs aren't enough; need binary search for the BL target).
 - Confirm or rule out the "frame tick missing" hypothesis by tracing the threads spawned by pokemon_le's init functions — find the threads that call any of `eglSwapBuffers`, `glClear`, or Godot's `MessageQueue::flush`.
 
-## Step 73g: Radium-as-orchestrator reframe + knowledge-base cleanup (2026-05-01)
+## Step 75: Radium-as-orchestrator reframe + knowledge-base cleanup (2026-05-01)
 
 User-driven course correction during BN trace synthesis. The architectural model that was implicit in Steps 71–73f — "Godot drives the front-end, with Radium as a video/scene subsystem" — was inverted. **Radium is the primary UI runtime/renderer; Godot is an embedded element type within Radium scenes** via Stern's Pokemon-LE-specific `GodotScene` bridge layer (`../source/display/lcd/GodotScene.cpp`). All standard pinball UI (scores, pricing, AddCredits, GrandChamp, HighScore tiers, GameOver, attract rotation, tilt warnings) is rendered by Radium directly. Godot only drives Pokémon-specific embedded content (battle, capture, discover, pokédex). The 7-method binding API exposed by `ManualGodotScene` (`get_element` / `set_text` / `set_visible` / `set_clip` / `set_color` / `set_rect` / `set_transform`) is element-mutator semantics on a Radium element, not Node-tree semantics on Godot's SceneTree — confirming host(Radium) / embedded(Godot) directionality.
 
@@ -6326,13 +6326,13 @@ Implication for the persistent `is_inside_tree() == false` symptom: it's NOT abo
 To prevent future sessions from drifting back to wrong premises by reading stale docs, the knowledge structure was consolidated:
 
 - **New canonical entry point: `_emulation/MODEL.md`** — ≤2-page summary of the current architectural model, front-end-blocker hypothesis, suspect catalog, active env flags, next-probe priority, and where to find detail. Authoritative when anything elsewhere conflicts. Read first by every session.
-- **Removed (in git history): `docs/HANDOFF.md`** (superseded by MODEL.md), `docs/NEXT_SESSION.md` (superseded by MODEL.md), `docs/EVENT_SWEEP_STEP52.md` (already captured in JOURNAL Step 52).
+- **Removed (in git history): `docs/HANDOFF.md`** (superseded by MODEL.md), `docs/NEXT_SESSION.md` (superseded by MODEL.md), `docs/EVENT_SWEEP_STEP52.md` (already captured in JOURNAL Step 51).
 - **Memory updates:** `reference_radium_scene_format.md` had the Radium↔Godot relationship documented backwards in its "Integration with the game engine" section — corrected to reflect the embedded-element model. The MEMORY.md index now leads with a pointer to MODEL.md and flags the prior framing as inverted.
 - **Surviving docs/ files** (kept as living domain specs, not session-state): JOURNAL.md, PROTOCOL.md, BRIDGE_PROTOCOL.md, NODEBUS_CIPHER.md, NODEBUS_HASH.md, MODE_TABLE.md, ASSETS.md, VIDEO_CLIPS.md, RADIUM_INVESTIGATION.md, SETUP.md.
 
 Other memory entries (e.g. `reference_video_player_spi.md`, `project_emulation_progress.md`, `project_godot_engine.md`) likely need similar passes but weren't load-bearing enough to block forward motion this turn — left for incremental correction as future sessions touch them.
 
-### Step 73h — BN database rename + Star Wars LE comparison binary added (2026-05-01, same-day followup)
+### Step 75h — BN database rename + Star Wars LE comparison binary added (2026-05-01, same-day followup)
 
 Two related changes:
 
@@ -6344,7 +6344,7 @@ The investigative principle this enables: when in doubt about whether a function
 
 MODEL.md updated with a "Comparison binaries" section naming all current BNDB paths. MEMORY.md updated to surface the rename + SW LE availability at the top. `reference_netbridge_firmware.md` updated to use the new prefixed name. Other memory entries that mention `.bndb` paths (`feedback_bn_sequential_only.md`, `feedback_bn_function_comments.md`, `project_msgpack_SERVICE_S_only.md`, `reference_nodebus_protocol.md`) left as-is for now — they reference the unprefixed names in passing context where the rename doesn't break meaning, and incremental correction as future sessions touch them is fine.
 
-### Step 73i — IScene base + GodotRenderer hierarchy mapped (2026-05-01)
+### Step 75i — IScene base + GodotRenderer hierarchy mapped (2026-05-01)
 
 User-driven discovery from the BN Types panel: spike_menu, SW LE, and pokemon_le ALL have identical `IScene::DMDEmulationScene::vTable` (33 xrefs), `IScene::NuklearScene::vTable` (30 xrefs), and `IScene::RadiumScene::vTable` (66/66/68 xrefs respectively — only ~2 difference between SW LE and pokemon_le, which IS the SceneCache+IScene shared infrastructure). Pokemon LE adds **one new IScene subclass: `GodotRenderer`** (55 xrefs to its vtable). This nails down the architecture: IScene is Stern's shared abstract base, and Pokemon LE's port is one new IScene subclass that internally wraps a Godot Node tree.
 
@@ -6395,7 +6395,7 @@ All three are now mechanically investigable via xrefs on the vtable function add
 
 MODEL.md updated with new architecture paragraph, refined blocker section, full GodotRenderer suspect catalog, and reordered next-probe priorities (identifying `data_451adb0` is now #1).
 
-### Step 73j — IScene shared interface mapped + GodotRenderer bootstrap localized (2026-05-01)
+### Step 75j — IScene shared interface mapped + GodotRenderer bootstrap localized (2026-05-01)
 
 User course-correction: stop chasing Godot internals and find the Stern shared layer (IScene contract + its dispatchers in SceneCache/DisplayRenderer). This step delivers that map.
 
@@ -6426,9 +6426,9 @@ User course-correction: stop chasing Godot internals and find the Stern shared l
 
 **MODEL.md updated** with the IScene primary-virtual interface table and a reordered next-probe priority list explicitly anchored to "find Stern code that dispatches through IScene slots 8 (tick) and 9 (activate)".
 
-## Step 74: Stern boot sequence mapping + SW LE port + Godot-is-illegal scope lock (2026-05-02)
+## Step 76: Stern boot sequence mapping + SW LE port + Godot-is-illegal scope lock (2026-05-02)
 
-### Step 74a — Sub-Stern slot-8/9 dispatcher mapping in SW LE 0.85
+### Step 76a — Sub-Stern slot-8/9 dispatcher mapping in SW LE 0.85
 
 Worked primarily in SW LE 0.85 BNDB to isolate Pokemon-port glue from shared Stern code.
 
@@ -6445,7 +6445,7 @@ Worked primarily in SW LE 0.85 BNDB to isolate Pokemon-port glue from shared Ste
 - `mcp_g_display_renderer` (SW LE `data_804030`) — global DisplayRenderer singleton.
 - `mcp_request_scene_display_with_dedup_unsure` (`sub_3064e0`) — std::set dedup wrapper around `mcp_SceneCache_add_scene_to_display_unsure(g_scene_cache, scene, g_display_renderer)`.
 
-### Step 74b — Stern's main() boot sequence
+### Step 76b — Stern's main() boot sequence
 
 Decompiled SW LE `_start → __libc_start_main → main`:
 - `main`: readlink/dirname/chdir, init 2 semaphores, install 3 signal handlers, block SIGINT/SIGUSR1, call `sys_init() → sub_3f81d0() → sub_2b9b90() → exit(sub_2b95d0())`.
@@ -6455,7 +6455,7 @@ Decompiled SW LE `_start → __libc_start_main → main`:
 - `mcp_DisplayRenderer_ctor` (`sub_35ded0`): vptr install, condition_variable init, list head init, spawns thread named `"DisplayRenderer"`, waits on cv.
 - `mcp_SceneCache_ctor` (SW LE `sub_4c0250`): std::string + 4 hashmap inits + condition_variable + list head, spawns thread named `"PreLoadSceneCache"` running `mcp_PreLoadSceneCache_thread_body` (`sub_4c2e84`, just calls SceneCache_initialize).
 
-### Step 74c — Pokemon LE cross-validation
+### Step 76c — Pokemon LE cross-validation
 
 In PLE BNDB:
 - `DisplayRenderer_render_loop` at `0x7b7ac0` (already named in earlier session) — byte-shape-identical to SW LE's `mcp_DisplayRenderer_render_thread_body`. Same field offsets, same OpenGL calls, same source-file line numbers in fprintf assertions. Slot-8 dispatch at `0x7b7cc0`; slot-9 dispatch at `0x7b7bf8` + `0x7b8704`.
@@ -6464,7 +6464,7 @@ In PLE BNDB:
 - `mcp_g_display_renderer` (PLE `data_445fa40`), `mcp_g_scene_cache` (PLE `data_445fa48`) renamed.
 - `mcp_PreLoadSceneCache_thread_body` (PLE `sub_66db64`), `mcp_SceneCache_ctor` (PLE `sub_66af30`) renamed.
 
-### Step 74d — Runtime inspection of PLE (GDB attach)
+### Step 76d — Runtime inspection of PLE (GDB attach)
 
 Launched PLE with `qemu-aarch64 -g 1234 ./game` (TIMEOUT=300, VIEWER=0, AUDIO_PLAYER=0). Attached via `gdb_target_remote 127.0.0.1:1234`. Continued; interrupted at +45s; `info threads`.
 
@@ -6476,7 +6476,7 @@ Findings:
 - 1 thread in `select()`.
 - Game log shows ongoing `MODE_PAGE_FLIP`, `snd_pcm_writei`, `avcodec_send_packet`/`receive_frame`, `serial-number` polling — not crashed.
 
-### Step 74e — `feedback_godot_is_illegal.md` saved + MODEL.md scope reframe
+### Step 76e — `feedback_godot_is_illegal.md` saved + MODEL.md scope reframe
 
 After two course-corrections from user ("treat Godot like cooties" 2026-05-01; "I hate seeing the word Godot" / "godot is illegal" / "Godot doesn't come into play until middle of game" 2026-05-02), wrote `memory/feedback_godot_is_illegal.md`:
 - Off-limits: `VideoPlayerSpi`, `ManualGodotScene`, `PokemonGodotScene`, `godot_switch_scene`, `GodotRenderer` pre-warm internals, `/tmp/godot_logs`, `./assets/godot/main.pck`.
@@ -6492,7 +6492,7 @@ After two course-corrections from user ("treat Godot like cooties" 2026-05-01; "
 - Rewrote next-probe priority order with SW LE smoke-test as #1.
 - "Last meaningful update" timestamp bumped to 2026-05-02.
 
-### Step 74f — Star Wars LE 0.85 emulator port
+### Step 76f — Star Wars LE 0.85 emulator port
 
 Goal: prove the emulator goal (boot any Spike 3 game to attract) by running our shim against SW LE.
 
@@ -6531,7 +6531,7 @@ Replaced top-level broken entries in SW LE `games/`:
 - `games/game` (was 0-byte file) → copy of `games/star_wars_2025_le/game` (8.3M).
 - `games/spike3` (was 0-byte file) → directory copy of `games/star_wars_2025_le/spike3/` (bin/, netbridge/, powerdist/, spike_menu/).
 
-### Step 74g — SW LE smoke-test runs
+### Step 76g — SW LE smoke-test runs
 
 Run 1 (TIMEOUT=60, no env overrides beyond defaults disabled): `./run_game.sh --debug -g 1234`. Game exited status 127 ("command not found") via `./game: error while loading shared libraries: /mnt/c/Workspace/starwars-le-0.85.0/usr/lib/libbluetooth.so.3: file too short`. → led to fix_swle_libs.py.
 
@@ -6544,7 +6544,7 @@ Activity counts at 30s:
 
 Crash on shutdown via SIGTERM → `shim_term_dump_handler` → `shim_dump_sound_globals` → rodata probe at `game_base + 0x3607900` (`SE_PK_FX_ATTACK_TYPE_BUG`). That probe address is invalid in SW LE binary; segfaults inside the shim's diagnostic dump. Game itself didn't crash — only the shim's cleanup handler.
 
-### Step 74h — BN database renames committed
+### Step 76h — BN database renames committed
 
 PLE BNDB:
 - `sub_4d47ac` → `mcp_GodotRenderer_singleton_bootstrap`
@@ -6574,14 +6574,14 @@ SW LE BNDB:
 
 User confirmed File→Save on both DBs at intermediate checkpoints.
 
-### Step 74i — Pending follow-ups (not started)
+### Step 76i — Pending follow-ups (not started)
 
 - Game-detect gating for `shim_dump_sound_globals` / `shim_dump_cmodes` / `shim_dump_dispatch_tables` so SIGTERM cleanup doesn't segfault on non-Pokemon games.
 - 17 cross-directory broken symlinks in SW LE's `usr/lib/` (libblkid.so, libcurses.so, lib++dfb.so, etc.) — left unfixed because they didn't block boot.
 
 
 
-## Step 75: Boot-blocker threads — Connectivity Setup screen identified, eight investigation tracks (2026-05-02)
+## Step 77: Boot-blocker threads — Connectivity Setup screen identified, eight investigation tracks (2026-05-02)
 
 User documentation of expected first-run boot sequence:
 1. Coin door start → ~10s Stern Pinball logo + "Initializing..." with animated dots
@@ -6644,9 +6644,9 @@ When a new session opens, MEMORY.md will point here via `Latest JOURNAL step: 75
 
 
 
-## Step 76: T2 SPI experiments + run-archiving infrastructure (2026-05-03)
+## Step 78: T2 SPI experiments + run-archiving infrastructure (2026-05-03)
 
-### Step 76a — Two new shim env-var knobs
+### Step 78a — Two new shim env-var knobs
 
 Added in `shim_ioctl.c`:
 - **`SPIKE3_SPI_QUIET=1`** — default rx[2] flips from `0x04` to `0x00`. Per-cmd overrides via `SPIKE3_SPI_RX_<HEX>=` still take precedence.
@@ -6654,7 +6654,7 @@ Added in `shim_ioctl.c`:
 
 Both wired into `run_game.sh` as `SPI_QUIET` / `SPI_DELAY_US` shell tunables (defaults 0).
 
-### Step 76b — T2 experimental results (PLE)
+### Step 78b — T2 experimental results (PLE)
 
 Three PLE runs compared (all with `--debug` for full logs):
 
@@ -6680,7 +6680,7 @@ Three PLE runs compared (all with `--debug` for full logs):
 
 **Default settings reverted.** `SPI_QUIET=0` and `SPI_DELAY_US=0` are the defaults. Knobs left in place for future experiments.
 
-### Step 76c — Run-archiving infrastructure
+### Step 78c — Run-archiving infrastructure
 
 Every run now creates its own folder; `runs/latest` is a symlink to it. Backward-compatible with anything referencing `runs/latest/<file>`.
 
@@ -6707,7 +6707,7 @@ New CLI flag: `--note "..."` (or `-note "..."`) — sanitized to `[a-z0-9_]`, ma
 
 This addresses the recurring problem of "we can't compare to the previous run because runs/latest was overwritten."
 
-### Step 76d — NV persistence pushback (corrected)
+### Step 78d — NV persistence pushback (corrected)
 
 User pushed back on prior `project_persistence_gap.md` claim that "NV persistence is fully stubbed." Verified 2026-05-02:
 - **PIN_NVRAM persists correctly.** Sequential `00000065/00000066/00000067` files across runs, mtimes track run starts, NFI2-format content with NSEC timestamps + NDAT records.
@@ -6715,24 +6715,24 @@ User pushed back on prior `project_persistence_gap.md` claim that "NV persistenc
 
 `project_persistence_gap.md` memory updated to reflect this nuance — the gap is narrower than originally claimed.
 
-### Step 76e — Pending followups
+### Step 78e — Pending followups
 
-- T1, T3, T4, T5, T6, T7, T8 from Step 75 still open. Most actionable:
+- T1, T3, T4, T5, T6, T7, T8 from Step 77 still open. Most actionable:
   - **T5** (spike_menu boot test) — fastest "is the env right" check, ~15 min.
   - **T6** (full Researcher A list review for terminology) — pure orientation.
   - **T7** (find first-run NV gate flag) — concrete static-analysis target.
 - Task #13 (gate Pokemon-specific shim diagnostics so SIGTERM doesn't segfault on non-Pokemon games) — still pending, not blocking anything currently.
-- 17 cross-directory broken symlinks in SW LE's `usr/lib/` from Step 74f — still unfixed, didn't block boot.
+- 17 cross-directory broken symlinks in SW LE's `usr/lib/` from Step 76f — still unfixed, didn't block boot.
 
-## Step 77: Alternate startup-mode experiment and scene-loading observations (2026-05-04)
+## Step 79: Alternate startup-mode experiment and scene-loading observations (2026-05-04)
 
-### Step 77a — Startup-mode experiment
+### Step 79a — Startup-mode experiment
 
 > [Redacted: the activation patch, target address, write value and confirming
 > patch log. This experiment altered startup mode; the observations below
 > describe that altered run, not normal startup.]
 
-### Step 77b — Run diff (baseline `01.05.01` no-patch vs `23.53.48_diag_mode_v2` diag-on)
+### Step 79b — Run diff (baseline `01.05.01` no-patch vs `23.53.48_diag_mode_v2` diag-on)
 
 Both runs same shim infrastructure modulo the byte; baseline had `SPI_DELAY_US=100`, diag had `=0`, so SPI poll volume differs but semantic events are comparable. Pulled unique log-line patterns from each, filtered SPI noise, diffed.
 
@@ -6752,11 +6752,11 @@ Both runs same shim infrastructure modulo the byte; baseline had `SPI_DELAY_US=1
 
 Baseline has **zero** hits on `Discover`, `capture_battle_scene`, `pokemon_battle_scene`, `bridge cmd 0x41`, or any of the others.
 
-### Step 77c — User context: connects to extracted-previs keyboard-jump test scene
+### Step 79c — User context: connects to extracted-previs keyboard-jump test scene
 
 User confirmed: when extracting the Godot project (`assets/godot/main.pck`), there's a test mode that shows a scene with keyboard combinations (Ctrl+B/D/C/P per project `CLAUDE.md`) to hop directly into battle / discover / capture / pokédex. The diag flag plausibly gates the **same** test-cycler — the C++ side that auto-attempts these scenes without needing real keyboard input or completed Guided Setup. Code structure consistent: 7 of the 8 previs `.gd` scripts call `get_node("/root/Main")` (`bkgnd_video_player_manager`, `capture_bkgnd_video_player_manager`, `capture_char_sprite_manager`, `discover_bkgnd_video_player`, `discover_progress_bar`, `game_session`, etc.). User said `/root/Main` was commented out in the previs project to make it work; in the shipping binary `/root/Main` is also missing for the same root cause (see 77d).
 
-### Step 77d — `/root/Main` re-look: nothing new
+### Step 79d — `/root/Main` re-look: nothing new
 
 Per `feedback_grep_journal_before_change.md`, did a 30-second grep before deep-diving:
 
@@ -6766,30 +6766,30 @@ Per `feedback_grep_journal_before_change.md`, did a 30-second grep before deep-d
 
 So there's no new lead here. The `/root/Main` errors the diag flag triggers are downstream evidence of "test-cycler activated, but the embedded-subtree mount machinery still isn't there." Not a Godot fix path — Pokemon-port glue, out of scope per `feedback_godot_is_illegal.md`.
 
-### Step 77e — `runs/latest` fixed
+### Step 79e — `runs/latest` fixed
 
 Side bug surfaced during 77b log inspection: `runs/latest` had become a stale directory (with old log files + broken self-symlinks) instead of a symlink. `run_game.sh`'s `ln -sfn "$RUN_DIRNAME" "$SCRIPT_DIR/runs/latest"` silently no-ops when the link target already exists as a directory, so per-run logs were going to the timestamped dir but `runs/latest/` kept showing yesterday's contents.
 
 Fix: `rm -rf runs/latest`, then a fresh run (`runs/2026-05-03T23.59.10_diag_mode_v3_symlink_test`) re-created the symlink correctly. `runs/latest` now points at the most recent run dir as designed.
 
-### Step 77f — What this gives us / open threads
+### Step 79f — What this gives us / open threads
 
 **Useful side door:** the diag flag is a way to push the game into trying to render Pokemon-specific scenes (Discover/Capture/Battle) and exercise encrypted-nodebus + antenna paths **without** completing operator-side Guided Setup. Doesn't bypass the embedded-subtree mount problem — the scenes still error on `/root/Main` — but it activates a richer set of code paths than the attract-loop baseline.
 
-**Not a fix for the front-end blocker** (Step 75): the Connectivity Setup / Guided Setup path still doesn't complete; the test-cycler is a separate boot-mode selector. The two are independent.
+**Not a fix for the front-end blocker** (Step 77): the Connectivity Setup / Guided Setup path still doesn't complete; the test-cycler is a separate boot-mode selector. The two are independent.
 
 **Open:**
 - Whether the diag flag is C++ side or Godot side: `Main::Setup2` exists as a C++ symbol — possibly the second-stage init that respects this byte. Static-analysis target if useful.
 - Whether the encrypted bridge traffic (cmd 0x41) and `gkpd_*` rm calls are part of the test-cycler's setup or unrelated diag-mode side effects.
 - Cmd 0x12 has no synthetic response — minor gap in `shim_nodebus.c`. Add when bridge work resumes.
 
-## Step 78: BN notebook 2026-05-04 export — full boot-flow map + 7 high-value new leads (2026-05-04)
+## Step 80: BN notebook 2026-05-04 export — full boot-flow map + 7 high-value new leads (2026-05-04)
 
-### Step 78a — Source
+### Step 80a — Source
 
 Fresh BN notebook export at `_emulation/reference/game - Binary Ninja Notebook Export (2026-05-04).json` (160 entries across 11 categories: algorithm 36, system_interaction 29, architecture 29, data_flow 34, hidden_feature 19, capability 4, hardware_interfaces 3, environmental 2, data_format 2, persistence 1, security 1). Substantially more boot-flow detail than the older 2026-04-22 export the memory still pointed at; previous version had 80 entries.
 
-### Step 78b — Startup authorization and diagnostic state
+### Step 80b — Startup authorization and diagnostic state
 
 > [Redacted: authorization-bypass mechanisms, patch targets and values,
 > key-derivation and provisioning details, and protected storage locations.]
@@ -6799,19 +6799,19 @@ mode and a 12-state initialization machine. Subsequent work distinguished
 static structure from runtime evidence; the notebook alone did not prove the
 machine was responsible for the observed scene cycle.
 
-### Step 78c — `sub_873900` is a 12-state init/mode machine
+### Step 80c — `sub_873900` is a 12-state init/mode machine
 
 State machine "controls initialization sequence":
 - **State 0**: startup authorization check. [Redacted: internal identifier.]
 - **States 1-3**: initialization phases
 - **States 4-5**: diagnostic mode transitions
-- **States 6-8**: scene loading and processing  ← matches our Step 77 run-diff (Discover/Capture/Battle attempts)
+- **States 6-8**: scene loading and processing  ← matches our Step 79 run-diff (Discover/Capture/Battle attempts)
 - **States 9-10**: cleanup and reset
 - (state 11 unaccounted for in notebook)
 
 [Redacted: the proposed authorization-override transition.] That's the test-cycler we observed.
 
-### Step 78d — Six-tier boot sequence (newly mapped at last)
+### Step 80d — Six-tier boot sequence (newly mapped at last)
 
 ```
 _start (0x49cb80)
@@ -6841,7 +6841,7 @@ _start (0x49cb80)
 
 **Notebook quote on "no orchestrator":** "The control flow chain implements NO SINGLE ORCHESTRATOR. Instead, each tier signals completion via events: hardware tier fires readiness events (0x5c/0x5e/0x5f/0x5d), event dispatch tier signals main loop via condition variable, main loop synchronizes timing across tiers."
 
-### Step 78e — Seven high-value new leads
+### Step 80e — Seven high-value new leads
 
 Ranked by breakthrough potential. All addresses from BN notebook 2026-05-04; will re-verify each before relying on it (per `feedback_verify_every_address.md`).
 
@@ -6859,14 +6859,14 @@ Ranked by breakthrough potential. All addresses from BN notebook 2026-05-04; wil
 
 7. [Redacted: a proposed way to synthesize protected startup state. This was an unimplemented lead.]
 
-### Step 78f — Connections to prior steps
+### Step 80f — Connections to prior steps
 
-- **Step 75 thread T7**: the inquiry narrowed to persistent first-run state and its relationship to startup. [Redacted: proposed protected-state modifications.]
-- **Step 77 test-cycler observation**: confirmed by `sub_873900` states 6-8.
-- **Step 73g `is_inside_tree() == false` orphaned-subtree theory**: not contradicted; the diag flag activates the test-cycler but downstream `/root/Main` errors are downstream of the embedded-Godot-subtree mount problem, which the notebook also corroborates ("Godot Engine compiled into binary but NOT used for rendering — only asset management").
+- **Step 77 thread T7**: the inquiry narrowed to persistent first-run state and its relationship to startup. [Redacted: proposed protected-state modifications.]
+- **Step 79 test-cycler observation**: confirmed by `sub_873900` states 6-8.
+- **Step 75 `is_inside_tree() == false` orphaned-subtree theory**: not contradicted; the diag flag activates the test-cycler but downstream `/root/Main` errors are downstream of the embedded-Godot-subtree mount problem, which the notebook also corroborates ("Godot Engine compiled into binary but NOT used for rendering — only asset management").
 - **`feedback_godot_is_illegal.md`**: nothing here is Godot. The state machine, event 0x11 gating, sub_7a8de0 decision are pure shared Stern code — should reproduce in SW LE 0.85. T6 reorientation deferred to Researcher A-list review later; for now the fresh notebook covers most of it.
 
-### Step 78g — Probe queue (status)
+### Step 80g — Probe queue (status)
 
 | # | Lead | Status |
 |---|---|---|
@@ -6886,7 +6886,7 @@ Plus options that emerged mid-session:
 | (ii) | Look up handlers we already runtime-dumped for events 0x11 / 0x5d / 0x5f in BN | **in progress this session** |
 | (iii) | Bit-19 patch test (flip bit 19 of `data_44cb9f0`, run, see what `sub_579d30` adds) | not started |
 
-### Step 78h — In-session work completed (2026-05-04)
+### Step 80h — In-session work completed (2026-05-04)
 
 #### 78h.1 — Lead 1 verification + ruling out
 
@@ -6912,7 +6912,7 @@ Plus options that emerged mid-session:
   - `0x4d9db0` — `mov w0, #0x1; ret` (NOP-padded prologue at sym `sub_4d9da8`)
   - `0x70e790` — `bl sub_729d60` + read config 0x25/0x24 to fields `+0x108`/`+0x110`, `mov w0, #0x1; ret` (NOP-padded prologue at sym `sub_70e788`)
 - Therefore `fire_event(0x10)` returns 1 in our runs; `secondary_initialization` does NOT take the early-return path. Bit 19 / `sub_579d30` is a small optional pre-step.
-- **Reuse note**: Step 52 (2026-04-21) already covered `fire_event` semantics extensively and built `shim_fire_event` trampoline at `0x5c12a0`. This session re-derived the dispatch logic for the analysis above. Future event-handler work should reference Step 52's infrastructure (notably `shim_fire_event` is already callable from shim TUs).
+- **Reuse note**: Step 51 (2026-04-21) already covered `fire_event` semantics extensively and built `shim_fire_event` trampoline at `0x5c12a0`. This session re-derived the dispatch logic for the analysis above. Future event-handler work should reference Step 51's infrastructure (notably `shim_fire_event` is already callable from shim TUs).
 
 #### 78h.2 — Lead 5 (sub_873900) structural verification
 
@@ -6937,7 +6937,7 @@ Plus options that emerged mid-session:
   | 11 | 0x00 | 0x87397c | duplicate of state 4 |
 - **Static reachability is unresolved**: zero callers to `sub_873900` (only `sub_873c24` — a 1-line wrapper); zero callers to `sub_873c24`; zero 8-byte-LE pointer matches in binary; zero RELATIVE relocations (binary has 0 total).
 - Per user direction: assume dynamic dispatch via heap/stack-resident object, NOT dead code.
-- Runtime evidence (Step 77 diag-on test-cycler scene attempts) is *consistent with* sub_873900 driving the test cycler but does NOT prove it (could be one of the other 13 authorization-related paths the notebook describes). **Option (i) — BRK-trap entry — is the unfinished verification.**
+- Runtime evidence (Step 79 diag-on test-cycler scene attempts) is *consistent with* sub_873900 driving the test cycler but does NOT prove it (could be one of the other 13 authorization-related paths the notebook describes). **Option (i) — BRK-trap entry — is the unfinished verification.**
 
 #### 78h.3 — Tools added this session
 
@@ -6960,7 +6960,7 @@ Run: `runs/2026-05-04T11.19.01_event_handler_dump_v1/game.log`. All from `event_
 
 **Shared handler note**: `0x4d9db0` (just `return 1`) appears in events 0x10, 0x11, 0x5d. Skip in BN lookups.
 
-## Step 79: Architecture decision point — LD_PRELOAD path-remap → mount-namespace bind mounts (2026-05-04)
+## Step 81: Architecture decision point — LD_PRELOAD path-remap → mount-namespace bind mounts (2026-05-04)
 
 Decision point captured during investigation of why `.radium` files aren't visibly opened. Recording the assessment + proposal before attempting POC. Commit pinned for revert if needed.
 
@@ -7014,7 +7014,7 @@ Keep: every hardware hook (SPI/I2C/UART/V4L2/DRM/GPIO/ALSA), discovery infrastru
 - Some host paths we DO want to redirect (fontconfig probing /home/c/...) — handled by bind-mounting our config in or by setting env vars, not by remap.
 - A few "writes" we currently emulate via remap (audit-pass `unlink /connectivity/...`). Bind mount handles these for free, but verify clean run.
 
-## Step 80: POC validated — file loading was a phantom, real blocker is scene-cycling at 10↔11 (2026-05-04)
+## Step 82: POC validated — file loading was a phantom, real blocker is scene-cycling at 10↔11 (2026-05-04)
 
 ### Pivot summary
 
@@ -7048,7 +7048,7 @@ Scenes 10 and 11 are presumably a paired UI surface (e.g., status bar + content 
 
 ### Bind-mount approach validated
 
-Before the pivot we proposed in Step 79: replace LD_PRELOAD path-remap with mount-namespace + bind mounts. Tested today and confirmed:
+Before the pivot we proposed in Step 81: replace LD_PRELOAD path-remap with mount-namespace + bind mounts. Tested today and confirmed:
 
 - `sudo mkdir /games /connectivity /data && sudo mount --bind <sysroot>/{games,connectivity,data}` creates native-path equivalents
 - Game-relative paths (`./assets/...` from CWD) and absolute paths (`/games/...`, `/connectivity/...`) all resolve correctly via the kernel's mount table
@@ -7105,9 +7105,9 @@ The cycle pattern (~12Hz alternation) strongly suggests a paired UI redraw bound
 - A switch input held in an unintended state (cabinet button pressed → menu nav loop)
 - A timer-based scene transition with a condition check that's never satisfied
 
-## Step 81: Cycle source traced — `sub_7b3060` is the Connectivity TestMenu/Diag_1360 main loop (= Step 75 front-end blocker) (2026-05-04)
+## Step 83: Cycle source traced — `sub_7b3060` is the Connectivity TestMenu/Diag_1360 main loop (= Step 77 front-end blocker) (2026-05-04)
 
-The scene 10↔11 cycle has been traced from `select_and_load_scene` upward through several wrapper layers to the function that actually drives the front-end UI: `sub_7b3060`, the `Connectivity/TestMenu/Diag_1360` main loop. **This is the same blocker called out in Step 75.** Future investigation goes from here.
+The scene 10↔11 cycle has been traced from `select_and_load_scene` upward through several wrapper layers to the function that actually drives the front-end UI: `sub_7b3060`, the `Connectivity/TestMenu/Diag_1360` main loop. **This is the same blocker called out in Step 77.** Future investigation goes from here.
 
 ### Verified scene-load call chain
 
@@ -7176,7 +7176,7 @@ Scene 9 and 16 paths were NOT exercised in this run (their counters stayed at 0)
 
 ### Scenes loaded — what we know vs. what we don't
 
-**File-level (verified by host strace, Step 80):** 34 unique `.radium` files were actually opened during the run — 19 from `auto_loaded/` and 15 from `demand_loaded/`. The full path list is in Step 80's strace output. Loading works.
+**File-level (verified by host strace, Step 82):** 34 unique `.radium` files were actually opened during the run — 19 from `auto_loaded/` and 15 from `demand_loaded/`. The full path list is in Step 82's strace output. Loading works.
 
 **scene_id ↔ .radium path mapping:** **NOT yet definitively determined.** From `scene_config_table` we know:
 - scene_id 10 → asset_id 10 (image-id high16 = 0)
@@ -7211,24 +7211,24 @@ These are SCENE NAMES (or sub-element names) that the Radium scene tree uses; so
 | `0x730fb0` (`select_and_load_scene` entry) | `scene_id`, `asset_id` (read from `scene_config_table[scene_id]`), `caller_va` (= lr at entry) |
 | `0x731930` (`sub_731930` entry) | `scene_id`, `caller_va` (caller of the wrapper) |
 
-These traps work alongside the bind-mount setup from Step 80; nothing in Step 81 disturbs the FS pivot.
+These traps work alongside the bind-mount setup from Step 82; nothing in Step 83 disturbs the FS pivot.
 
 ### Next steps (in priority order)
 
 1. **Definitively identify which `.radium` file is scene_id 10 and which is scene_id 11.** Two paths: (a) extend the trap to log the scene's name string after the asset_bytecode resolution path; (b) inspect `Connectivity/TestMenu/Diag_1360.radium` in the Radium player (whichever of the 34 SHA-1 dirs holds it) and read its scene-tree references. (a) is more authoritative; (b) is faster.
 2. **Find what posts type-8 events** to `event_queue_head`. That's what keeps `sub_7b3060` looping. If we drain those events naturally, the menu may advance. If we patch/hook to drain them artificially, we bypass the menu.
 3. **Find what increments counters** `data_445d940` / `data_445d928`. These are the per-frame dispatch triggers. If a real-hardware-only condition (e.g., a switch state, a network event) is supposed to clear them but never fires in our env, we've found a concrete shim hook target.
-4. Out-of-band: the test-cycler diag flag from Step 77 unlocked downloadmgr's state machine but did NOT bypass `sub_7b3060`. The Diag_1360 menu loop runs **alongside** the downloadmgr thread, not via it. Two independent stuck systems; this one is the visible UI blocker.
+4. Out-of-band: the test-cycler diag flag from Step 79 unlocked downloadmgr's state machine but did NOT bypass `sub_7b3060`. The Diag_1360 menu loop runs **alongside** the downloadmgr thread, not via it. Two independent stuck systems; this one is the visible UI blocker.
 
 ### Why this matters
 
-We've been chasing "what's stuck" for months. With `sub_7b3060` identified as the Diag_1360 main loop, every future investigation can be framed in terms of: *what would make this loop progress on real hardware that doesn't happen in our env?* That's a much more targeted question than "what's wrong with file loading" or "what's wrong with the SceneCache." The Step 80 pivot (scenes load fine) and Step 81 finding (cycle is the menu loop) together close the "is the engine working?" question — the engine works, it's stuck in a UI screen waiting for input/events we don't supply.
+We've been chasing "what's stuck" for months. With `sub_7b3060` identified as the Diag_1360 main loop, every future investigation can be framed in terms of: *what would make this loop progress on real hardware that doesn't happen in our env?* That's a much more targeted question than "what's wrong with file loading" or "what's wrong with the SceneCache." The Step 82 pivot (scenes load fine) and Step 83 finding (cycle is the menu loop) together close the "is the engine working?" question — the engine works, it's stuck in a UI screen waiting for input/events we don't supply.
 
-## Step 82: Documentation consolidation — PROTOCOL.md as single source of truth (2026-05-04)
+## Step 84: Documentation consolidation — PROTOCOL.md as single source of truth (2026-05-04)
 
 ### Why
 
-Documentation has accumulated 14+ overlapping `.md` files across the repo. They overlap, drift, sometimes contradict. JOURNAL.md is narrative + speculation, not a stable reference, but everywhere cited. Concrete trigger today: while investigating the scene-10/11 cycle, this session re-derived image.bin section-5 layout from scratch — even though `PROTOCOL.md` Step 44 already documented it. The `MEMORY.md` "READ FIRST" entry pointed at MODEL.md and JOURNAL Steps 79-81 (narrative), not at PROTOCOL.md (truth). PROTOCOL had no TOC, so even after being told to look there, finding the relevant section wasn't obvious. About an hour was lost to the re-derivation.
+Documentation has accumulated 14+ overlapping `.md` files across the repo. They overlap, drift, sometimes contradict. JOURNAL.md is narrative + speculation, not a stable reference, but everywhere cited. Concrete trigger today: while investigating the scene-10/11 cycle, this session re-derived image.bin section-5 layout from scratch — even though `PROTOCOL.md` Step 42 already documented it. The `MEMORY.md` "READ FIRST" entry pointed at MODEL.md and JOURNAL Steps 81-83 (narrative), not at PROTOCOL.md (truth). PROTOCOL had no TOC, so even after being told to look there, finding the relevant section wasn't obvious. About an hour was lost to the re-derivation.
 
 ### Direction
 
@@ -7262,7 +7262,7 @@ Snapshotted here BEFORE any deletions, so future sessions can `git log -- <path>
 
 These are NOT verified facts; they're working hypotheses captured for the investigation thread. Future sessions: treat as starting points for inquiry, not as truth.
 
-- The Diag_1360 main loop (`sub_7b3060`) is the front-end blocker (per Step 81). What unblocks it on real hardware is unknown — candidates: a switch state we don't simulate, a network event from netbridge, a counter we haven't found the writer for.
+- The Diag_1360 main loop (`sub_7b3060`) is the front-end blocker (per Step 83). What unblocks it on real hardware is unknown — candidates: a switch state we don't simulate, a network event from netbridge, a counter we haven't found the writer for.
 - IScene shared abstract base layout (vtable slot semantics — slot 8 tick / slot 9 activate, slots 4-6 flag accessors) was derived by decompiling each slot. Mapping is consistent across PLE and SW LE 0.85 pokemon-port-glue functions but the "tick/activate" semantic labels are inferred from observed call patterns, not from a header file.
 - DisplayRenderer render-loop equivalence (PLE `0x7b7ac0` ↔ SW LE `mcp_DisplayRenderer_render_thread_body`) is byte-shape-identical at the OpenGL call level but the field offsets used to drain queues are inferred to match between binaries.
 - Cycle source (`sub_7b3060` → `sub_5a94f0` → `sub_58fc{10,20,30,40}` → `sub_731930` → `select_and_load_scene`) is verified at the call-chain level via decompile + runtime BRK trap, but the *meaning* of scenes 9/10/11/12 (mask bits 0/1/2/3) as "shared system scene types" vs. "specific UI element types" is inferred.
@@ -7283,7 +7283,7 @@ For each section in the new PROTOCOL.md target structure (Project overview, Quic
 After this point, JOURNAL Steps remain valuable for "what we tried and learned along the way," but should not be the source for facts about how the platform works. Cite PROTOCOL.md sections for facts; cite JOURNAL Steps only for "why this workaround exists" narrative context.
 
 
-## Step 83: System-mode HW-watchpoint debugging stood up; "Startup In Progress" overlay traced (2026-05-05)
+## Step 85: System-mode HW-watchpoint debugging stood up; "Startup In Progress" overlay traced (2026-05-05)
 
 ### Why
 
@@ -7355,7 +7355,7 @@ Pokémon logo (centered PNG) is a separate layer rendered by `create_boot_splash
 
 ### Open questions / next steps
 
-1. **Who sets `*(arg1 + 0x38)` bit 3?** This is the proximate driver for which boot overlay shows when. Once known, we can determine why our emulator gets stuck before the next overlay (e.g. step 4's "POKÉMON PRO" header / Guided Setup) — likely the Diag_1360 cycle from Step 81 is preventing the bit progression.
+1. **Who sets `*(arg1 + 0x38)` bit 3?** This is the proximate driver for which boot overlay shows when. Once known, we can determine why our emulator gets stuck before the next overlay (e.g. step 4's "POKÉMON PRO" header / Guided Setup) — likely the Diag_1360 cycle from Step 83 is preventing the bit progression.
 2. **What does `sub_7de9c0(3, &var_a8)` produce?** It's the `%s` argument that fills `"Startup In Progress%s"`.
 3. **What sets the language index `data_436c0c0`?** `mcp_pick_localized_string_from_row` reads it. Likely set during operator-config persist load.
 4. **Drawing chain for "Initializing....."** (boot step 1) — `boot_display` ELF + `dprint` helper, not yet decompiled.
@@ -7367,11 +7367,11 @@ Pokémon logo (centered PNG) is a separate layer rendered by `create_boot_splash
 Per PROTOCOL §14: from a clean state the full sequence produces the same PC/LR result. Verified 2026-05-05 with two consecutive `./RUN_QEMU.sh --headless --debug --ephemeral --gdb 1234` runs.
 
 
-## Step 84: System-mode visible parity — game frames blit into /dev/fb0 + launch-time speedups (2026-05-05)
+## Step 86: System-mode visible parity — game frames blit into /dev/fb0 + launch-time speedups (2026-05-05)
 
 ### Why
 
-Step 83 stood up system-mode for HW-watchpoint debugging but ran headless with the bridges off. To validate that system-mode reaches the same boot state as user-mode (apples-to-apples comparison) we need to *see* what the game is rendering — same way `frame_viewer.py` works in user-mode. The user explicitly directed: "never run it headless or with the bridges off… same experience so we can compare apples to apples." Saved as `feedback_system_mode_parity.md`.
+Step 85 stood up system-mode for HW-watchpoint debugging but ran headless with the bridges off. To validate that system-mode reaches the same boot state as user-mode (apples-to-apples comparison) we need to *see* what the game is rendering — same way `frame_viewer.py` works in user-mode. The user explicitly directed: "never run it headless or with the bridges off… same experience so we can compare apples to apples." Saved as `feedback_system_mode_parity.md`.
 
 ### Direction (and the dead ends)
 
@@ -7434,12 +7434,12 @@ While debugging the abandoned networking path, `shim_bridges.c` got a generic `s
 
 ### Open questions / next steps
 
-1. The Diag_1360 menu loop (JOURNAL Step 81) is still the front-end blocker. With visible parity in system-mode now available, both rigs can be observed side-by-side to look for divergences.
+1. The Diag_1360 menu loop (JOURNAL Step 83) is still the front-end blocker. With visible parity in system-mode now available, both rigs can be observed side-by-side to look for divergences.
 2. fb0 blit cadence is currently every 2nd page-flip (matched the bridge's existing rhythm). If TCG rendering lag becomes an issue, an env-tunable decimation (`SPIKE3_FB0_DECIMATE=N`) is a one-line change.
 3. The shipping production cabinet uses real `/dev/dri/card1` + KMS, not fb0. The fb0 path is purely an emulation-rig feedback channel; real game code is unaffected.
 
 
-## Step 85: Forward-decode bridge restored as default; SW HEVC fallback removed; decoder patches renamed and made unconditional (2026-05-06)
+## Step 87: Forward-decode bridge restored as default; SW HEVC fallback removed; decoder patches renamed and made unconditional (2026-05-06)
 
 ### Why
 
@@ -7482,7 +7482,7 @@ Step 73b's verified-working configuration **had the NOP active**. Without it:
 2. libavcodec invokes the game's `get_format` callback with a list of supported pix_fmts.
 3. Game's callback iterates looking for `AV_PIX_FMT_DRM_PRIME` (0xb3); none are offered (since we route to plain `hevc` SW decoder which produces NV12 / YUV420P).
 4. `cmp w0, #0xb3` → not equal → `b.ne 0x920ce0` loops back; eventually exhausts list and errors.
-5. `avcodec_open2` fails. Game's `SpiVideoStreamDecoderBase.cpp:1830` `assert(hw_decoder)` SIGABRTs (per Step 47).
+5. `avcodec_open2` fails. Game's `SpiVideoStreamDecoderBase.cpp:1830` `assert(hw_decoder)` SIGABRTs (per Step 45).
 
 So forward-decode would never get a chance to engage — the game crashes before sending the first packet. The restored bridge would have been a stillbirth.
 
@@ -7535,7 +7535,7 @@ Post-rename, the env var is no longer surfaced as a routine knob. Setting `SPIKE
 
 `avcodec_send_packet` / `avcodec_receive_frame` previously fell through to `real_avcodec_send_packet` / `real_avcodec_receive_frame` (i.e., the renamed-to-`hevc` SW decoder running on the in-VM CPU) when forward-decode reported unreachable. This was a silent fallback — game continues running, just with 5-fps SW HEVC instead of 49-fps NVDEC. Looks like a generic game-side performance issue from the outside.
 
-Removed the fallback. New behavior: when `shim_avforward_send_packet` / `shim_avforward_receive_frame` return `0` (forward couldn't engage), the wrappers return `-EIO` directly with a rate-limited `[forward unreachable; SW fallback removed]` log line. Game's own error handling kicks in (which per Step 47 means SIGABRT at `SpiVideoStreamDecoderBase.cpp:1830`).
+Removed the fallback. New behavior: when `shim_avforward_send_packet` / `shim_avforward_receive_frame` return `0` (forward couldn't engage), the wrappers return `-EIO` directly with a rate-limited `[forward unreachable; SW fallback removed]` log line. Game's own error handling kicks in (which per Step 45 means SIGABRT at `SpiVideoStreamDecoderBase.cpp:1830`).
 
 User-explicit trade-off: loud failure beats silent slow-fallback because (a) we want this to be a playable video game, not a CPU-decode toy; (b) bridge issues should surface immediately, not look like a generic game bug; (c) the daemon is launched by `run_game.sh` before qemu, so under normal flow it's ready before any send_packet — the only failure mode this hard-fail catches is daemon-died-mid-run, which is exactly the case where loud >> silent.
 
@@ -7549,7 +7549,7 @@ User's original intent for "HW decode" was to use `hevc_v4l2request` natively �
 3. DMA-BUF allocation for the capture-queue buffer (memfd + udmabuf).
 4. `EGL_EXT_image_dma_buf_import` + `glEGLImageTargetTexture2DOES` recognizing our fake DMA-BUFs.
 
-Step 47 already attempted layer 4 and walled at *"a real DMA-BUF fd that EGL can import via EGL_EXT_image_dma_buf_import"* — marked as bigger than the excitement-per-hour budget.
+Step 45 already attempted layer 4 and walled at *"a real DMA-BUF fd that EGL can import via EGL_EXT_image_dma_buf_import"* — marked as bigger than the excitement-per-hour budget.
 
 The structural wall: our Mesa overlay is `MESA_LOADER_DRIVER_OVERRIDE=swrast` + `LIBGL_ALWAYS_SOFTWARE=1`. **OpenGL runs on CPU.** Even with a perfect DMA-BUF, swrast can't sample GPU memory because there's no GPU passthrough into qemu user-mode. Any "real" DMA-BUF would have to be CPU-readable backing — same memory traffic as the current AF_UNIX bridge, just dressed up in V4L2 + DMA-BUF wrappers.
 
@@ -7560,7 +7560,7 @@ The structural wall: our Mesa overlay is `MESA_LOADER_DRIVER_OVERRIDE=swrast` + 
 After removing the CPU fallback, several `shim_patches.c` symbols became unused (compiler warnings):
 - `real_avcodec_send_packet_t` / `real_avcodec_receive_frame_t` typedefs
 - `real_avcodec_send_packet` / `real_avcodec_receive_frame` static function pointers
-- `shim_init_dummy_frame()` (Step 47b dummy NV12 1920×1080 black frame allocator) + its statics `shim_dummy_frame`, `shim_dummy_frame_inited`, `shim_pending_dummies`
+- `shim_init_dummy_frame()` (Step 45b dummy NV12 1920×1080 black frame allocator) + its statics `shim_dummy_frame`, `shim_dummy_frame_inited`, `shim_pending_dummies`
 - Local copies of macros now duplicated in `shim_avforward.c`: `DUMMY_FRAME_W/H`, `AV_PIX_FMT_NV12`, `AVFRAME_OFF_WIDTH/HEIGHT/FORMAT/PTS/PKTDTS`
 - `real_av_frame_alloc_t` / `real_av_frame_get_buffer_t` / `real_av_frame_ref_t` / `real_av_frame_unref_t` typedefs (only used by `shim_init_dummy_frame`)
 
@@ -7570,7 +7570,7 @@ The AVFrame/AVPacket field offsets that lived in `shim_patches.c` are now duplic
 
 ### Memory + skill updates
 
-- **Deleted** `memory/reference_video_player_spi.md` outright. It cited fabricated Step 72i / Step 72j as the source for "decoder is not the real blocker," and referencing nonexistent Steps undermines all its other (factually correct) claims about VideoPlayerSpi vtable / decoder chain / attract-mode. Information remains recoverable from JOURNAL Steps 47 / 62 / 71 / 72b–g / 73b / 73e and from the BN database.
+- **Deleted** `memory/reference_video_player_spi.md` outright. It cited fabricated Step 72i / Step 72j as the source for "decoder is not the real blocker," and referencing nonexistent Steps undermines all its other (factually correct) claims about VideoPlayerSpi vtable / decoder chain / attract-mode. Information remains recoverable from JOURNAL Steps 45 / 60 / 71 / 72b–g / 73b / 73e and from the BN database.
 - **Added** `memory/feedback_search_over_recall.md` as a PILLAR-level feedback. Codifies the rule that triggered this Step's discovery arc:
   1. For project-state facts (which Steps cover what, conclusions, addresses, decisions), use `/lore` active search instead of memory recall.
   2. When verifying a claim from JOURNAL Step N, ALWAYS also read Step N+1 — the chronologically next Step frequently revises, supersedes, or extends earlier conclusions.
@@ -7593,16 +7593,16 @@ The decoder-name-remap log (`[decoder_patch] remapping decoder name 'hevc_v4l2re
 ### What's NOT verified
 
 - **System-mode forward-decode is currently a no-op.** `wrap_game.sh` exports `SPIKE3_FORWARD_DECODE=1` for parity with user-mode, but the in-VM abstract AF_UNIX namespace can't see the host daemon — `connect()` to `@spike3_decode` fails fast, the no-CPU-fallback path returns `-EIO`. Game's video pipeline will hard-fail in system-mode until cross-VM transport is in place. This is a regression from "in-VM SW decode silently kept things alive" — by design per the no-fallback decision, but it means system-mode video doesn't work at all right now.
-- **End-to-end game playback through to attract-loop video display** — the bridge is delivering frames, but per Step 73e the front-end blocker is scene-tree attachment (`/root/Main` parent missing), not decode. Frames arrive but are not rendered until the orchestrator reframe (Step 81's Diag_1360 work) or scene-tree attachment is solved.
+- **End-to-end game playback through to attract-loop video display** — the bridge is delivering frames, but per Step 73e the front-end blocker is scene-tree attachment (`/root/Main` parent missing), not decode. Frames arrive but are not rendered until the orchestrator reframe (Step 83's Diag_1360 work) or scene-tree attachment is solved.
 
 ### Open questions / next steps
 
-1. **System-mode cross-VM transport** for forward-decode. Step 84 documented why every networking path on `-M raspi4b` is blocked: GENET hard-disabled by qemu's `compat_disable[]`, USB-net DWC2 doesn't enumerate, no PCIe / virtio-mmio / vsock by default. Reaching forward-decode parity in system-mode requires one of:
+1. **System-mode cross-VM transport** for forward-decode. Step 86 documented why every networking path on `-M raspi4b` is blocked: GENET hard-disabled by qemu's `compat_disable[]`, USB-net DWC2 doesn't enumerate, no PCIe / virtio-mmio / vsock by default. Reaching forward-decode parity in system-mode requires one of:
    - Re-add the TCP-listen support that was removed in `6c9e6d1` plus a patched qemu binary that re-enables GENET (one-time qemu rebuild).
    - DTB-overlay patching to inject a virtio-mmio bus + virtio-net.
    - virtio-vsock if qemu raspi4b can be coaxed to expose it.
    - Switch machine model from `-M raspi4b` to `-M virt` (loses production-hardware fidelity; raspi4b matches real CM4).
-2. **Front-end blocker** is the Diag_1360 menu loop (Step 81) → still the active investigation, unaffected by today's work.
+2. **Front-end blocker** is the Diag_1360 menu loop (Step 83) → still the active investigation, unaffected by today's work.
 3. **Dead code follow-up**: `shim_patches.c`'s remaining libavcodec hooks (`avcodec_get_hw_config`, `av_hwdevice_ctx_create`) are passthrough-with-logging — never exercised meaningfully in the forward-decode flow because `avcodec_open2` doesn't call hwaccel paths when get_format returns a SW-compatible pix_fmt. Could be deleted in a follow-on cleanup once we confirm they're truly never hit. Keep for now as a diagnostic safety net.
 
 ### Files changed
@@ -7619,11 +7619,11 @@ The decoder-name-remap log (`[decoder_patch] remapping decoder name 'hevc_v4l2re
 - `memory/feedback_search_over_recall.md` — NEW PILLAR feedback.
 - `memory/MEMORY.md` — VideoPlayerSpi index line replaced with the new PILLAR entry.
 
-## Step 86: PROTOCOL strict-philosophy audit + shim comment-hygiene pass (2026-05-07)
+## Step 88: PROTOCOL strict-philosophy audit + shim comment-hygiene pass (2026-05-07)
 
 ### Why
 
-Wrapping up a multi-session push to land the strict-philosophy rule (`feedback_protocol_strict_philosophy.md`, Step 82) consistently across the codebase: PROTOCOL.md = verified facts only, code comments = vital + stable only. This Step bookends two parallel cleanup arcs — a code-comment hygiene pass over the `_emulation/` shim source files using `/code-review`, and a per-section PROTOCOL audit using the new `/protocol audit` skill plus `lore-keeper` subagent dispatch.
+Wrapping up a multi-session push to land the strict-philosophy rule (`feedback_protocol_strict_philosophy.md`, Step 84) consistently across the codebase: PROTOCOL.md = verified facts only, code comments = vital + stable only. This Step bookends two parallel cleanup arcs — a code-comment hygiene pass over the `_emulation/` shim source files using `/code-review`, and a per-section PROTOCOL audit using the new `/protocol audit` skill plus `lore-keeper` subagent dispatch.
 
 ### State at session start
 
@@ -7639,14 +7639,14 @@ Ran the skill (heuristic + Qwen 2.5 7B grader) against each file. Applied STRIPs
 |---|--:|---|
 | `shim_gl.c` | -66 | 31 strips. KEEP-overrode ASCII-tag macros (`/* "eglD" */`), `/* 32-bpp assumed */`, `/* dlsym miss */` control-flow note |
 | `shim_diagnostics.c` | -46 | Step refs, 8 cmode-table category banners, `/* CORRECTED from +0x30 */` history |
-| `shim_bridges.c` | -22 | Step 54/58 banners, `/* every 2nd flip */`. **Fixed stale `/tmp/spike3_bridge.sock` and `SPIKE3_BRIDGE_SOCKET` env-var refs** — code uses abstract-namespace AF_UNIX |
+| `shim_bridges.c` | -22 | Step 53/57 banners, `/* every 2nd flip */`. **Fixed stale `/tmp/spike3_bridge.sock` and `SPIKE3_BRIDGE_SOCKET` env-var refs** — code uses abstract-namespace AF_UNIX |
 | `shim_nodebus.c` | -19 | Bridge-protocol-synthesis banner (kept wire spec), Sidekick attribution. KEEP-overrode wire STX/ETX/`-5` annotations |
 | `shim_patches.c` | -35 | memcpy NULL-guard rationale block, libavcodec-bypass Step refs, dead `real_gst_element_factory_make_t` typedef |
 | `shim_discovery.c` | -6 | Qwen mostly wrong here — `/* Emulate <aarch64-instr> */` comments document non-obvious instruction semantics that names can't convey. Only 4 actual strips |
 | `spi_shim.c` | -80 | Phase 5/8/9 "moved to" history blocks, every `---- Hooked: X ----` banner |
 | `spi_shim.h` | -9 | Section banners. KEEP-overrode `real_*` cross-file tags + env-var docs |
 | `decode_daemon.py` | small | 3 strips (PyAV history, dead annotation). Override-kept docstrings, NV12 byte-layout doc, `# noqa` directive |
-| `run_game.sh` | small | Conservative per user prediction ("expect mostly KEEPs"). Fixed 3 stale `/tmp/spike3_*.sock` paths to "abstract AF_UNIX socket"; dropped `Step 73b restored 2026-05-06` and `Step 75` history. Help text body untouched |
+| `run_game.sh` | small | Conservative per user prediction ("expect mostly KEEPs"). Fixed 3 stale `/tmp/spike3_*.sock` paths to "abstract AF_UNIX socket"; dropped `Step 73b restored 2026-05-06` and `Step 77` history. Help text body untouched |
 
 ### Phase 2 — PROTOCOL.md per-section audit
 
@@ -7663,13 +7663,13 @@ Workflow per section: `audit_section.py N` for anchors + tagged Steps; sections 
 | §9 | "Earlier docs claimed" banner, Generification subsection, Refactor candidate subsection, godot-illegal disclaimer. **Rebased `0xbb76e0 / 0xbb81e4 / 0xbb7c30 → 0x7b*`** |
 | §10 | Step-24/27 framing, history observations. **Rebased entire VA reference table** (7 dual-base pairs collapsed to single-column rebased VAs) |
 | §11 | "Corrected understanding" banner, "Old shim_fire_switch" history. **Rebased `0x9c12a0 → 0x5c12a0`** (verified against `shim_inject.c`'s `fn = (fire_event_t)(game_base + 0x5c12a0)`) |
-| §2 | Step ref, "legacy Step-54 mode" history. **Fixed stale `remap_path` claim** — Step 80's bind-mount approach supersedes |
+| §2 | Step ref, "legacy Step-54 mode" history. **Fixed stale `remap_path` claim** — Step 82's bind-mount approach supersedes |
 | §13 | TBD → `—`, godot-illegal disclaimer, "Why this matters" engineering advice |
 | §14 | Date stamps, `feedback_system_mode_parity.md` memory-file ref |
 
 **+0x400000 base drift findings.** §9, §10, §11 carried explicit dual-base annotations the original author had noted but not fully propagated (`0xbb76e0 → equivalent in PLE: 0x7b76e0`; `0xa8ca40 → 0x68ca40 runtime`). `shim_discovery.c`'s `#define DISCOVERY_ADDR_ASSET_LOAD 0x7321d0` ground-truthed the rebase pattern, contradicting PROTOCOL §9's `0xb321d0`. Per `feedback_verify_every_address.md` PILLAR (any function VA ≥ 0x800000 is suspect), rebased addresses wherever the dual-base evidence was explicit in-doc.
 
-**Stale-claim fixes.** §2 said the shim's `remap_path` translates absolute paths on every `open()` — Step 80's bind-mount approach has superseded that; corrected. `run_game.sh` documentation references to `/tmp/spike3_*.sock` corrected to "abstract AF_UNIX socket" matching `shim_bridges.c`'s `ABSTRACT_*_NAME` constants.
+**Stale-claim fixes.** §2 said the shim's `remap_path` translates absolute paths on every `open()` — Step 82's bind-mount approach has superseded that; corrected. `run_game.sh` documentation references to `/tmp/spike3_*.sock` corrected to "abstract AF_UNIX socket" matching `shim_bridges.c`'s `ABSTRACT_*_NAME` constants.
 
 ### State at session end
 
@@ -7682,11 +7682,11 @@ Workflow per section: `audit_section.py N` for anchors + tagged Steps; sections 
 - **§11 deferred address rebases.** ~10 addresses fit the +0x400000 drift pattern but lack explicit dual-base notation in-doc, so they were not auto-rebased: `sub_a50850 / sub_a50350` (switch-state readers), `sub_b24f70` (Stage-1 switch-state reader), `sub_b25438` (call site), `sub_b129f0 / sub_bd39f0 / sub_b16f64 / sub_b82990 / sub_b12760` (event-firing callers), `_INIT_74 @ 0x8733c0`. Each needs a single BN MCP `function_at` lookup to confirm; if pattern holds, all subtract `0x400000`.
 - **Magic-number → named-constant rename pass** deferred from this session's comment-strip work (would be substantive code change, not just comment removal). Targets: ~26 magic-number-interpretation comments in `shim_ioctl.c` (DRM_MODE_*/TIOCM_*), ~30 in `shim_gl.c` (EGL_*/GL_*), a few in `shim_bridges.c` (GL_RGBA/GL_UNSIGNED_BYTE). Each replaced by including the proper system header (`<drm/drm_mode.h>`, `<linux/input.h>`, `<EGL/egl.h>`, etc.) and using the actual named constant.
 
-## Step 87: Hardware-emulation marathon: I2C regfile + TAS5711 + GBM bo_fd + DRM-prime workaround + cipher key-fetch + send_encrypted wire-format discovery (2026-05-07)
+## Step 89: Hardware-emulation marathon: I2C regfile + TAS5711 + GBM bo_fd + DRM-prime workaround + cipher key-fetch + send_encrypted wire-format discovery (2026-05-07)
 
 Marathon session: five hardware-emulation fixes that compound into ~3 minutes of stable runtime past the previous SIGSEGV cliff, plus a wire-format discovery that corrects PROTOCOL §5.1 and a partial cipher-channel response synthesis (env-gated). All progress preserved without regressing the timeout-is-progress baseline.
 
-### Step 87a — I2C virtual regfile model
+### Step 89a — I2C virtual regfile model
 
 Audio driver was emitting **11 distinct `write failed to verify at NN: reads back as ffffffff` lines** because our `I2C_RDWR` ioctl handler returned `0` (the kernel ABI requires returning **nmsgs**) and never populated the read msg buffers. Verified the failure path at game `0x919f70` via `ldr w9, [x6, x2]` instruction trace — when `i2c_smbus_read_byte_data`-style helpers see ≤0, the verify code prints `(int)-1` formatted with `%02x` → `ffffffff`.
 
@@ -7694,7 +7694,7 @@ Fix: full `I2C_RDWR` and `I2C_SMBUS` handlers in `shim_ioctl.c` walking the `i2c
 
 Result: 11 → 0 verify errors. TAS57XX and MAX9850 amp init both reach "complete".
 
-### Step 87b — TAS5711 oscillator-trim post-write hook
+### Step 89b — TAS5711 oscillator-trim post-write hook
 
 After 87a the verify spam was gone but `TAS57XX: oscillator trim failed to lock` still fired once per run. Disassembly at game `0x91bfb0`:
 
@@ -7709,7 +7709,7 @@ Fix: added `shim_i2c_chip_post_write` hook in `shim_ioctl.c` that overrides `reg
 
 Architecture note: keeping the hook list narrow (one entry today), expanding only as new "polling never succeeds" symptoms appear. Safer than shipping a broad chip-emulation framework on day one.
 
-### Step 87c — GBM `bo_get_fd` returns `memfd` instead of -1
+### Step 89c — GBM `bo_get_fd` returns `memfd` instead of -1
 
 Function at game `0x900828` (`create_egl_framebuffer`-style):
 
@@ -7725,7 +7725,7 @@ Fix: `gbm_bo_get_fd` in `shim_gl.c` now does `syscall(SYS_memfd_create, "shim_dm
 
 Side effect: `gbm_bo_create` count = `eglCreateImageKHR` count = 16 in next run (was: `gbm_bo_create=16`, `eglCreateImageKHR=0`). Every BO now imports successfully.
 
-### Step 87d — DRM-prime consumer empty `AVDRMFrameDescriptor` redirect
+### Step 89d — DRM-prime consumer empty `AVDRMFrameDescriptor` redirect
 
 After 87c the run progressed past framebuffer setup and started decoding HEVC video via the avforward bridge. The third `[avforward] session OPEN` (codec_id=173, extradata=2453B) was followed within ~200 ms by SIGSEGV at game `0x e3e250`:
 
@@ -7742,15 +7742,15 @@ e3e250: ldr   w9, [x6, x2]     @ x6 = AVDRMFrameDescriptor.objects[0]; CRASH
 - `layers[i].nb_planes` @ +0x74
 - `layers[i].planes[j].object_index` @ +0x78 + j*24
 
-Crash chain consistent with **Step 47/85 wall**: get_format NOP makes `avcodec_open2` accept NV12, but downstream consumer still walks `frame->data[0]` as a DRM-prime descriptor. NV12 pixel bytes get dereferenced as struct → fault.
+Crash chain consistent with **Step 45/87 wall**: get_format NOP makes `avcodec_open2` accept NV12, but downstream consumer still walks `frame->data[0]` as a DRM-prime descriptor. NV12 pixel bytes get dereferenced as struct → fault.
 
-Real fix (real DMA-BUF + GPU import) is out-of-scope under `MESA_LOADER_DRIVER_OVERRIDE=swrast` per Step 47 §47.5. Compat patch instead: in `shim_avforward_receive_frame`, after `av_frame_get_buffer` succeeds, redirect `frame->data[0]` to a static zero-initialized 1024-byte buffer (`shim_avforward_empty_drm_descriptor`). The consumer reads `nb_layers = 0`, takes `b.le 0xe3e4cc`, returns peacefully. `frame->buf[0]` still owns the real allocation so `av_frame_unref` cleans up correctly.
+Real fix (real DMA-BUF + GPU import) is out-of-scope under `MESA_LOADER_DRIVER_OVERRIDE=swrast` per Step 45 §47.5. Compat patch instead: in `shim_avforward_receive_frame`, after `av_frame_get_buffer` succeeds, redirect `frame->data[0]` to a static zero-initialized 1024-byte buffer (`shim_avforward_empty_drm_descriptor`). The consumer reads `nb_layers = 0`, takes `b.le 0xe3e4cc`, returns peacefully. `frame->buf[0]` still owns the real allocation so `av_frame_unref` cleans up correctly.
 
 Result: 0 SIGSEGV across 180 s timeout. Game processes 113k+ `avcodec_receive_frame` calls (579 frames decoded ok), reaches scene loading (`base_00`/`story_charmander_1`/`battle_mountain` scene_data dumps).
 
-### Step 87e — Cipher channel: key-fetch synth + send_encrypted wire-format discovery
+### Step 89e — Cipher channel: key-fetch synth + send_encrypted wire-format discovery
 
-User asked to crack the nodebus cipher channel. Lore-keeper confirmed: timeouts are structural (Step 45 + Step 67 + Step 69 baseline), not a tunable knob. The path forward is real per-(slot, inner_cmd) response synthesis.
+User asked to crack the nodebus cipher channel. Lore-keeper confirmed: timeouts are structural (Step 43 + Step 67 + Step 69 baseline), not a tunable knob. The path forward is real per-(slot, inner_cmd) response synthesis.
 
 **87e.1 — Key-fetch synth (env-gated under `NODEBUS_SYNTH_FE`)**
 
@@ -7811,11 +7811,11 @@ Tried current code's `resp[3] |= 0x80` ("node present, default chip" — Step 69
 
 Tried inverted variant (no high-bit patch — "node not present" semantics, timeout-equivalent). Same regression: 0 timeouts but 0 frames decoded. Run gets to GL extensions enumeration but never opens an avforward HEVC session.
 
-Step 45's "timeout-is-progress" lesson is still load-bearing — the 1000 ms × ~150-frame timeout window is implicitly the time other threads need to bring up Godot/Radium/decode pipeline. Killing the timeouts races the main thread past that init window.
+Step 43's "timeout-is-progress" lesson is still load-bearing — the 1000 ms × ~150-frame timeout window is implicitly the time other threads need to bring up Godot/Radium/decode pipeline. Killing the timeouts races the main thread past that init window.
 
 For now: kept fe_probe synth logic in place but reverted the high-bit "node present" patch to "node not present" semantics (timeout-equivalent payload). Still env-gated; off by default. The key-fetch additions are safe to leave on with the env var since key-fetch traffic only fires after fe_probe declares a node present.
 
-### Step 87f — Chip vtable structure (corrected via screenshot reference/87f.png)
+### Step 89f — Chip vtable structure (corrected via screenshot reference/87f.png)
 
 `mcp_lpc_chip_vtable @ 0x42317c8`, 28 entries × 0x28 bytes. First `u32` of each entry is the chip ID matched against `response[4..7]` (var_34) of cmd `0xfe` response. Default entry at `0x42317a0` has zero chip_id and `data_42317a8` → `sub_35f3790` as the only non-null pointer (matches Step 69 "NULL fps" framing — var_34=0 hits this entry and most function-pointer slots are zero).
 
@@ -7892,11 +7892,11 @@ For shim purposes: any of these chip IDs in `response[4..7]` will make `mcp_node
 | `bridge message ... Connection timed out` | 158 | 158 (unchanged, default off) |
 | Forward progress | scene loading | scene loading + 113k frames decoded + 16 BO/EGL imports |
 
-## Step 88: Per-slot chip-IDs land all Tech Alerts rows on "Not Initialized"; switch-press injection unsolved (2026-05-07)
+## Step 90: Per-slot chip-IDs land all Tech Alerts rows on "Not Initialized"; switch-press injection unsolved (2026-05-07)
 
-Direct continuation of Step 87. Goal: turn the Tech Alerts UI breakthrough (visible test menu showing "Check Node Board N : Invalid/Not Initialized") into something we can advance past. Outcome: per-slot chip-ID synth flips every alert row from "Invalid" to "Not Initialized" (visual proof via frame capture). The 200ms cipher response delay is now a hardcoded shim default, and `run_game.sh`'s env-toggle plumbing is back to a clean state. Two Sidekick-driven attempts at switch-press injection failed empirical test — the Tech Alerts "Press Select" dispatcher is not driven by `g_switch_state_array` writes nor by `translate_switch_state_changes(5, …)`. Switch-press path remains unsolved; chip-ID + cipher-delay work landed clean.
+Direct continuation of Step 89. Goal: turn the Tech Alerts UI breakthrough (visible test menu showing "Check Node Board N : Invalid/Not Initialized") into something we can advance past. Outcome: per-slot chip-ID synth flips every alert row from "Invalid" to "Not Initialized" (visual proof via frame capture). The 200ms cipher response delay is now a hardcoded shim default, and `run_game.sh`'s env-toggle plumbing is back to a clean state. Two Sidekick-driven attempts at switch-press injection failed empirical test — the Tech Alerts "Press Select" dispatcher is not driven by `g_switch_state_array` writes nor by `translate_switch_state_changes(5, …)`. Switch-press path remains unsolved; chip-ID + cipher-delay work landed clean.
 
-### Step 88a — Per-slot chip-IDs flip "Invalid" → "Not Initialized"
+### Step 90a — Per-slot chip-IDs flip "Invalid" → "Not Initialized"
 
 User screenshot at `_emulation/reference/tech_alerts.png` (no synth, smoke run baseline) shows 5 rows: slot 1 = "Not Initialized", slots 4/8/9/10 = "Invalid". Hypothesis: `mcp_node_query_status_and_classify @ 0x8f38e0` matches `response[4..7]` (LE u32 = chip_id) against `mcp_lpc_chip_vtable @ 0x42317c8`; mismatch → "Invalid", match-but-no-post-init-traffic → "Not Initialized".
 
@@ -7925,16 +7925,16 @@ User-supplied topology (manual): `0 → 10 → 9 → 8 → 4` (playfield daisy c
 
 Implemented `nodebus_chip_id_for_slot()` in `shim_nodebus.c` returning the per-slot u32 chip_id for the FE-probe synth response. Run with viewer + frame capture (`/tmp/snap_frame.py` snapshotting the abstract-AF_UNIX frame bridge). Frame at +220s (Tech Alerts settled) shows **all five rows = "Not Initialized"**. Chip-ID hypothesis verified.
 
-### Step 88b — 200ms cipher synth delay is the new norm; env-var clutter removed
+### Step 90b — 200ms cipher synth delay is the new norm; env-var clutter removed
 
-Step 87e's NODEBUS_SYNTH_FE/NODEBUS_SYNTH_FE_DELAY_US env gates were running counter to the new "always-on" baseline. Two issues caught:
+Step 89e's NODEBUS_SYNTH_FE/NODEBUS_SYNTH_FE_DELAY_US env gates were running counter to the new "always-on" baseline. Two issues caught:
 
 1. `run_game.sh` only forwarded `NODEBUS_SYNTH_FE` to qemu — `NODEBUS_SYNTH_FE_DELAY_US` was silently dropped, so all "delay sweeps" earlier in the session were running at 0 ms.
 2. With `./run_game.sh` now expected to land on Tech Alerts directly, env gating adds zero value — the synth + 200ms delay is the new default.
 
 Fix: removed the `getenv` resolution in `shim_nodebus.c` for both vars. `usleep(NODEBUS_SYNTH_DELAY_US)` (a `#define` constant = 200000) inlines the pause before each `bridge_send_response` (FE, FA, key-fetch). Removed the corresponding `args+=(-E …)` lines and env-toggle table entries from `run_game.sh`. Plain `./run_game.sh` lands on "all-Not-Initialized" Tech Alerts.
 
-### Step 88c — `g_switch_state_array` layout verified, but writes don't drive UI
+### Step 90c — `g_switch_state_array` layout verified, but writes don't drive UI
 
 Sidekick (BN AI assistant, since BN MCP was unreachable this session) claimed `g_switch_state_array @ 0x4480220` is a pointer to a heap array of 0x30-byte switch entries with state byte at `+0x28` (1=pressed, 0=released). Wrote a probe in `shim_inject.c` (env-gated under `SHIM_SWITCH_PROBE`) that resolves the pointer and dumps entries.
 
@@ -7960,7 +7960,7 @@ Empirical test failed for both candidates and both polarities:
 
 **Conclusion**: `g_switch_state_array` is a derived cache, not the source of truth the Tech Alerts dispatcher reads. Writes to `+0x28` propagate nowhere observable.
 
-### Step 88d — Sidekick's channel-5 hypothesis empirically falsified
+### Step 90d — Sidekick's channel-5 hypothesis empirically falsified
 
 Sidekick's follow-up analysis pointed at `g_channel_state_buffers @ 0x44804b8` (0xb0 stride per channel) as the actual edge-detection source, with `translate_switch_state_changes @ 0x651610` as the entry point that consumes a per-channel 8-byte buffer and updates `g_switch_state_array` only when edges are detected. Claimed Service Select sits on **channel 5, switch_id 8 within channel** (bit 8 = byte 1 bit 0 in the 8-byte buffer), routed in real hardware via the UART netbridge cmd `0x27` polling that we don't synthesize.
 
@@ -7981,11 +7981,11 @@ Targeted (byte=1, bit=0) — no UI advance. Brute-forced **all 64 bit positions*
 
 **Conclusion**: either Sidekick's channel-5 mapping is wrong, or `translate_switch_state_changes` isn't the path the Tech Alerts scene's input handler reads from. Switch-press injection mechanism remains unsolved.
 
-### Step 88e — Code state at session end
+### Step 90e — Code state at session end
 
 `shim_nodebus.c`:
 
-- `nodebus_chip_id_for_slot(uint8_t slot)` — switch statement returning the u32 chip_id per Step 88a table.
+- `nodebus_chip_id_for_slot(uint8_t slot)` — switch statement returning the u32 chip_id per Step 90a table.
 - `NODEBUS_SYNTH_DELAY_US = 200000` `#define` constant; `usleep(NODEBUS_SYNTH_DELAY_US)` inlined before each FE/FA/key-fetch `bridge_send_response`.
 - All `getenv("NODEBUS_*")` calls removed.
 

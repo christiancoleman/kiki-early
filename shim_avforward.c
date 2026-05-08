@@ -69,7 +69,7 @@
 #define AVPKT_OFF_SIZE  32
 #define AVPKT_OFF_FLAGS 40
 
-/* AVFrame offsets — established by Step 47b dummy-frame code. */
+/* AVFrame offsets — established by Step 45b dummy-frame code. */
 #define AVFRAME_OFF_DATA0      0     /* uint8_t *data[8] */
 #define AVFRAME_OFF_LINESIZE0 64     /* int linesize[8] */
 #define AVFRAME_OFF_WIDTH    104
@@ -484,15 +484,15 @@ int shim_avforward_receive_frame(void *avctx, void *frame, int *out_ret) {
     *(int64_t *)((char *)frame + AVFRAME_OFF_PTS)    = fpts;
     *(int64_t *)((char *)frame + AVFRAME_OFF_PKTDTS) = fpts;
 
-    /* DRM-prime consumer compatibility shim. JOURNAL Step 47 / Step 85:
-     * Step 85's NOP at game VA 0x920cf0 made get_format accept non-DRM-PRIME
+    /* DRM-prime consumer compatibility shim. JOURNAL Step 45 / Step 87:
+     * Step 87's NOP at game VA 0x920cf0 made get_format accept non-DRM-PRIME
      * pix_fmts (so avcodec_open2 succeeds with the SW decoder), but a
      * downstream consumer at game+0xe3e15c still walks frame->data[0] as
      * AVDRMFrameDescriptor* — reading nb_layers at offset 104, then iterating
      * planes[i].object_index*24 into objects[].fd. With our NV12 pixel bytes
      * in data[0] the consumer faults on `ldr w9, [x6, x2]` at +0xe3e250.
      *
-     * Step 47 §47.5/§47.8 ruled out the proper fix (real DMA-BUF + GPU
+     * Step 45 §47.5/§47.8 ruled out the proper fix (real DMA-BUF + GPU
      * import) as out-of-scope under MESA_LOADER_DRIVER_OVERRIDE=swrast.
      *
      * Compat patch: redirect frame->data[0] to a zero-initialized buffer

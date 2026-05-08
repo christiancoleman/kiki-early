@@ -64,7 +64,7 @@ extern real_write_t real_write;
 static uint8_t nodebus_cipher_keys[32][16] = {{0}};
 
 /* Per-response delay before sending a synthetic cipher reply. Without it the
- * game races past Godot/Radium init (Step 45 "timeout is progress" — the path
+ * game races past Godot/Radium init (Step 43 "timeout is progress" — the path
  * that worked relied on the wall-clock pause from real-hardware timeouts, not
  * on the response shape). 200ms matches what's needed in practice. */
 #define NODEBUS_SYNTH_DELAY_US 200000
@@ -486,7 +486,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
                  cmd27_count, status, id);
         return;
     }
-    /* Step 45: cmd 0x25 / 0x41 silent-ACK reverted.
+    /* Step 43: cmd 0x25 / 0x41 silent-ACK reverted.
      *
      * ATTEMPTED: zero-payload ACK for both. Unblocked the send-side channel
      * wait, but progress REGRESSED — the crashing run reached Godot init +
@@ -517,7 +517,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
          *              0x0c = factory test trap (NEVER respond — bridge enters
          *              an infinite loop intentionally),
          *              0x0d = NODEBUS_Hash (not currently sent by this game).
-         * No synthetic response — game tolerates the timeout (Step 45 lesson).
+         * No synthetic response — game tolerates the timeout (Step 43 lesson).
          */
         if (req_len >= 5) {
             uint8_t sub = req[3];
@@ -531,7 +531,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
     case 0x41: {
         /* Encrypted node-bus channel. Decrypt inner_cmd + payload for log
          * visibility. We still don't synthesize a response — keys-stay-zero
-         * boot state (Step 45 lesson stands).
+         * boot state (Step 43 lesson stands).
          *
          * Bridge frame layout after escape decode:
          *   req[0]=STX  req[1]=cmd  req[2]=id

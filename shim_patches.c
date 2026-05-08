@@ -2,7 +2,7 @@
  * shim_patches.c — runtime patches and libavcodec entry-point hooks.
  *
  * Active content:
- *   - memcpy NULL-guard (Step 45): silently no-ops a memcpy() with src or
+ *   - memcpy NULL-guard (Step 43): silently no-ops a memcpy() with src or
  *     dst NULL. Fixes the Godot error-logger path on the Stern/Radium
  *     DisplayRenderer thread, where Godot's TLS singletons are unregistered
  *     and vformat()/memcpy(NULL,…) would otherwise SEGV. Always-on.
@@ -296,7 +296,7 @@ int av_hwdevice_ctx_create(void **device_ctx, int type, const char *device,
     return ret;
 }
 
-/* (The Step 47b dummy-frame injection block lived here until 2026-05-06.
+/* (The Step 45b dummy-frame injection block lived here until 2026-05-06.
  * It allocated an NV12 1920×1080 black AVFrame and injected it on
  * avcodec_receive_frame EAGAIN — useful when the only "decode" we had was a
  * DRM socketpair that produced no real frames. Now that shim_avforward.c

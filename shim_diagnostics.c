@@ -369,7 +369,7 @@ const size_t shim_cmode_table_count =
     sizeof(shim_cmode_table) / sizeof(shim_cmode_table[0]);
 
 /* Resolve the game binary's load base. Caches on first success — needed
- * because some shim code paths (e.g. the Step 52 sweep timer thread) run
+ * because some shim code paths (e.g. the Step 51 sweep timer thread) run
  * from threads that have no game frames on their stack, making backtrace
  * + dladdr return nothing. Any shim hook called from a game thread will
  * populate the cache via this function before the timer thread needs it. */

@@ -152,7 +152,7 @@ After setup, `/games`, `/connectivity`, `/data` are kernel-resolved into the sys
 - The shim's `remap_path` and most FS hooks have been removed (see §12 — only GPIO sysfs / libgpiod chardev FS-style hooks remain because those are hardware-related, not file-resolution).
 - The setup script creates `/games`, `/connectivity`, `/data` at root as zero-content mountpoint directories. They persist after `--umount`; remove with `sudo rmdir` if you want them gone.
 
-*Verified by:* `_emulation/scripts/setup_bind_mounts.sh` source; `findmnt /games /connectivity /data` against a live setup; JOURNAL Step 80 POC validation.
+*Verified by:* `_emulation/scripts/setup_bind_mounts.sh` source; `findmnt /games /connectivity /data` against a live setup; JOURNAL Step 82 POC validation.
 
 ### `/etc/init.d/shared` env propagation
 
@@ -629,7 +629,7 @@ out[2 + inner_len + 1]       = expected_response_len echo    ; hint+2 if hint!=0
 
 Total length on the wire = `inner_len + 4` bytes. The hint byte at `arg1[2 + inner_len]` is consumed before the wire is built; it travels to the bridge in the trailing echo slot, not the encrypted region.
 
-*Verified by:* JOURNAL Step 87e — disassembly of `send_encrypted` at `0x8ec52c` (`strb w0, [sp, #25]` writes `inner_len + 1`) and `0x8ec5e8` (length `inner_len + 4` passed to `send_raw`), plus four captured wire samples (cmd `0xfe`, `0xfa`, `0xf0`, `0xf1`) cross-checked with computed sum-checksums.
+*Verified by:* JOURNAL Step 89e — disassembly of `send_encrypted` at `0x8ec52c` (`strb w0, [sp, #25]` writes `inner_len + 1`) and `0x8ec5e8` (length `inner_len + 4` passed to `send_raw`), plus four captured wire samples (cmd `0xfe`, `0xfa`, `0xf0`, `0xf1`) cross-checked with computed sum-checksums.
 
 #### Cipher algorithm
 
@@ -910,7 +910,7 @@ Each downstream node on the RS-485 bus reports a 32-bit chip ID via the cmd `0xf
 
 Indices 13/19, 14/20, 21/22 share chip IDs across package variants — the chip-ID register can't distinguish FHN33 vs FBD48 packaging, so the lookup matches the first occurrence regardless. Entry 27's `0x411FD210` is the ARM Cortex-M33 CPUID register value (used because RP2350 doesn't expose an NXP-style part-ID register); this is what `netbridge.elf` would report as its own chip ID since it runs on RP2350 silicon (per `_emulation/.../netbridge/spike3-swd.cfg` + `rp2040.cfg`).
 
-*Verified by:* JOURNAL Step 87f — direct binary read at file offset `0x42307c8` (VA `0x42317c8`, `.data.rel.ro` segment, off-by-`0x1000` from VA-equals-file-offset assumption), all 28 chip-name strings re-read from binary's own `.rodata` (not from BN annotation), plus public-source spot-checks: `0x041E502B` matches NXP LPC1111FHN33/101 datasheet; `0x411FD210` matches ARM Cortex-M33 r1p0 CPUID per ARM Technical Reference Manual.
+*Verified by:* JOURNAL Step 89f — direct binary read at file offset `0x42307c8` (VA `0x42317c8`, `.data.rel.ro` segment, off-by-`0x1000` from VA-equals-file-offset assumption), all 28 chip-name strings re-read from binary's own `.rodata` (not from BN annotation), plus public-source spot-checks: `0x041E502B` matches NXP LPC1111FHN33/101 datasheet; `0x411FD210` matches ARM Cortex-M33 r1p0 CPUID per ARM Technical Reference Manual.
 
 #### Per-slot chip-ID synth (Pokémon LE)
 
@@ -932,7 +932,7 @@ The disagreement between LPC1313 firmware filenames and the LPC1342 vtable name 
 
 Synth requires a wall-clock pause before each `bridge_send_response` to preserve the timeout-driven timing real hardware imposes — empirically 200 ms (`shim_nodebus.c::NODEBUS_SYNTH_DELAY_US`). Immediate replies regress the run from frame-decode-active to "Godot init never fires".
 
-*Verified by:* JOURNAL Step 88 — frame capture via `_emulation/snap_frame.py` of the Tech Alerts screen at +220 s into a `./run_game.sh` run shows all five rows transitioning from "Invalid" (no synth) to "Not Initialized" (per-slot chip-ID synth + 200 ms delay). Slot-row state confirmed by direct visual comparison against the no-synth baseline screenshot at `_emulation/reference/tech_alerts.png`.
+*Verified by:* JOURNAL Step 90 — frame capture via `_emulation/snap_frame.py` of the Tech Alerts screen at +220 s into a `./run_game.sh` run shows all five rows transitioning from "Invalid" (no synth) to "Not Initialized" (per-slot chip-ID synth + 200 ms delay). Slot-row state confirmed by direct visual comparison against the no-synth baseline screenshot at `_emulation/reference/tech_alerts.png`.
 
 ---
 
@@ -999,7 +999,7 @@ absolute pointer inside mmap'd image.bin → PCM samples
 
 Token → asset_id is **not in compiled code**. It's populated at runtime when `load_scene_assets` walks each scene's bytecode and inserts type-0x0b records. Static extraction can recover (asset_id_low, flags, size, file_offset) from section 7 directly; the name → asset_id mapping requires runtime capture.
 
-*Verified by:* JOURNAL Step 41 (stages 1-2), Step 42 (stages 3-5), Step 43 (g_asset_registry / section-7 perfect intersection).
+*Verified by:* JOURNAL Step 39 (stages 1-2), Step 40 (stages 3-5), Step 41 (g_asset_registry / section-7 perfect intersection).
 
 #### Scene path (used by select_and_load_scene)
 
@@ -1060,7 +1060,7 @@ The 32-bit `flags` word of the section-7 composite key (`(flags << 32) | id_low`
 
 For partial extraction (asset_id_low only), the type-0x0b payload at byte +3 is sufficient.
 
-*Verified by:* JOURNAL Step 44; runtime BRK on `select_and_load_scene` confirms scene 10 bytecode at file offset 0x42eeebad starts with `05 04 01 f5 09 00 00 02 00 ...` matching the expected tag layout.
+*Verified by:* JOURNAL Step 42; runtime BRK on `select_and_load_scene` confirms scene 10 bytecode at file offset 0x42eeebad starts with `05 04 01 f5 09 00 00 02 00 ...` matching the expected tag layout.
 
 ### Section 7: asset directory (audio in PLE 0.81)
 
@@ -1108,7 +1108,7 @@ Later records (delta != 408) have different grid dimensions.
 
 **This is NOT a scene → asset mapping.** Zero of the section-2 uint32 values match any `asset_id_low` from section 7, and zero uint64 values match any section-5 offset. The records hold playfield lamp/target/insert state tables used by gameplay logic per mode or per animation frame.
 
-*Verified by:* JOURNAL Step 44.1.
+*Verified by:* JOURNAL Step 42.1.
 
 ### Multi-image sub-files (image-sc%02d.bin)
 
@@ -1313,7 +1313,7 @@ The Godot bridge exposes this method to GDScript via a `std::function<void(Array
 
 GDScript call pattern: `Spike.play_sound(SpikeSoundIds.SE_PK_FX_<NAME>)` passes the string. The C++ bridge looks it up in the hashmap to resolve to a token.
 
-*Verified by:* JOURNAL Step 41; BN decompile of `sub_8d3460` and the helper chain; Itanium demangling of the register_sound symbol.
+*Verified by:* JOURNAL Step 39; BN decompile of `sub_8d3460` and the helper chain; Itanium demangling of the register_sound symbol.
 
 #### NOT in the hashmap
 
@@ -1333,7 +1333,7 @@ GDScript call pattern: `Spike.play_sound(SpikeSoundIds.SE_PK_FX_<NAME>)` passes 
 
 No `uint32_t token_to_asset[]` array exists in the binary; token constants never appear in asset-ID construction paths. The same `SE_PK_*` can map to different `asset_id`s across scenes.
 
-*Verified by:* JOURNAL Step 42.
+*Verified by:* JOURNAL Step 40.
 
 ### Encryption status
 
@@ -1533,7 +1533,7 @@ uintptr_t sw_struct = arr + sw_id * 0x30;     // live heap struct
 
 `data_48cbaa0` holds the runtime-determined live switch count (PLE has ~105 manual-listed switch IDs but only installed+valid switches count).
 
-*Verified by:* JOURNAL Step 52, 72f.
+*Verified by:* JOURNAL Step 51, 72f.
 
 ### `fire_event` dispatcher
 
@@ -1585,7 +1585,7 @@ uint64_t r = fire_event(event_id, event_data);
 
 `event_data` is opaque to the dispatcher and handler-specific. Event `0xc5` ignores it (handler invokes cmode vtable with no args). Other events may require a valid pointer; calling with `event_data=0` for unknown events can SEGV in the handler.
 
-*Verified by:* JOURNAL Step 51, 52.
+*Verified by:* JOURNAL Step 50, 51.
 
 ### Switch → event dispatch is two-stage
 
@@ -1612,7 +1612,7 @@ None of them reads the switch state array directly.
 #### Implications for the shim
 
 - **Direct write to the deref'd switch state byte is the correct lowest-level input** — same byte the UART cmd 0x27 receive path writes. Stage 1 (`sub_b24f70`) picks it up on its next poll iteration.
-- **Calling `fire_event(id, 0)` blindly bypasses Stage 1 entirely** — sidesteps all the game logic that decides *which* event to fire based on state. That's why the Step 52 blind sweep had ~1% signal.
+- **Calling `fire_event(id, 0)` blindly bypasses Stage 1 entirely** — sidesteps all the game logic that decides *which* event to fire based on state. That's why the Step 51 blind sweep had ~1% signal.
 - **To test a specific game behaviour**, close the relevant switch via the (corrected-deref'd) state array and let the game's own Stage 2 decide what events to fire.
 
 #### Known event_id semantics
@@ -1623,12 +1623,12 @@ None of them reads the switch state array directly.
 | `0x10` | Secondary init start | fired by `secondary_initialization` (boot phase 5) |
 | `0x11` | Secondary init complete | fired by `secondary_initialization` |
 | `0x12` | Validated events (filtered through lookup tables before firing) | `sub_bd39f0` validates against tables at `0x4787fa8` + `0x4780724` |
-| `0x3e` | Battle-environment activation (empirical) | activated `cmode_battle_coast` during Step 52e sweep — `+0x308: 0 → 0x100000000` |
+| `0x3e` | Battle-environment activation (empirical) | activated `cmode_battle_coast` during Step 51e sweep — `+0x308: 0 → 0x100000000` |
 | `0x5c/0x5d/0x5e/0x5f` | Hardware-tier readiness events | fired by `primary_initialization_orchestrator` (boot phase 5) |
 | `0xc1` | Mode init complete | `sub_b12760` fires once at end of setup |
 | `0xc2` | Mode state transition | `sub_b129f0` fires unconditionally |
 | `0xc3` | Lamp timer event (payload 1..4 selects lamp subgroup) | `sub_b16f64` cycles values 1-4 |
-| `0xc5` | "Broadcast to all 42 cmodes" — calls vtable slot `+0xf0` on each | Step 51: `sub_950d60` is event-0xc5 handler |
+| `0xc5` | "Broadcast to all 42 cmodes" — calls vtable slot `+0xf0` on each | Step 50: `sub_950d60` is event-0xc5 handler |
 
 All other event_ids remain semantically unknown.
 
@@ -1640,7 +1640,7 @@ All other event_ids remain semantically unknown.
 sub_XXXXXX(bss_addr, mode_id, type_flags, scene_id, arg5 [, arg6])
 ```
 
-#### Cmode struct layout (verified at runtime Step 50)
+#### Cmode struct layout (verified at runtime Step 48)
 
 ```c
 struct crule_cmode_base {
@@ -1798,7 +1798,7 @@ The shim (`spi_shim.so`) intercepts every device the game expects and emulates i
 | `/dev/ttyAMA5` | real `socketpair(AF_UNIX, SOCK_STREAM)` | UART to netbridge (game gets sv[0], shim holds sv[1]) | Reads block naturally on the socketpair. Writes are intercepted by `shim_io.c::write` and routed to `synthesize_bridge_response` (see §4) |
 | `/dev/ttyAMA2` | real `socketpair(AF_UNIX, SOCK_STREAM)` | secondary UART (purpose unverified) | Pass-through |
 | `/dev/dri/card1` | real `socketpair(AF_UNIX, SOCK_STREAM)` | DRM KMS display | DRM ioctls intercepted before they'd reach the socketpair. See §10 for the full DRM/GBM/EGL/GLES coverage |
-| `/dev/shim-v4l2-*` | fake fds `FAKE_FD_V4L2_MEDIA=1021` / `FAKE_FD_V4L2_VIDEO=1020` | V4L2 video device probes (Step 46) | All ioctls return `ENOTTY` |
+| `/dev/shim-v4l2-*` | fake fds `FAKE_FD_V4L2_MEDIA=1021` / `FAKE_FD_V4L2_VIDEO=1020` | V4L2 video device probes (Step 44) | All ioctls return `ENOTTY` |
 | `/dev/boot_display` | fake fd `FAKE_FD_BOOT_DISPLAY=1019` | boot_display ioctl surface | ioctls return 0; writes swallowed |
 | `/dev/snd/*` | (full ALSA stub via libasound symbols) | audio output | See §8 — 18 symbols stubbed; `snd_pcm_writei` paces, captures, optionally tees to bridge |
 | GPIO sysfs (`/sys/class/gpio/*/value`, `direction`, etc.) | fake fd pool `1000..1015` | direct GPIO access (e.g. for libgpiod) | Synthetic reads: `"0\n"` value, `"out\n"` direction. One-shot latch reset by `lseek(0)` |
@@ -1832,7 +1832,7 @@ The game's HEVC video decode path is intercepted in-shim and routed to a host-si
 
 When the daemon is unreachable, `avcodec_send_packet` / `avcodec_receive_frame` return `-EIO` and the game raises `SIGABRT` from `SpiVideoStreamDecoderBase`.
 
-*Verified by:* JOURNAL Step 85 — daemon round-trip 49 fps NVDEC against `Lake_01_22_26_h265.mp4` (1940×1100, extradata=2490B); real game run `runs/2026-05-06T12.45.39_hw_refactor` shows 449/551 frame/EAGAIN ratio across 1000 `avcodec_receive_frame` calls.
+*Verified by:* JOURNAL Step 87 — daemon round-trip 49 fps NVDEC against `Lake_01_22_26_h265.mp4` (1940×1100, extradata=2490B); real game run `runs/2026-05-06T12.45.39_hw_refactor` shows 449/551 frame/EAGAIN ratio across 1000 `avcodec_receive_frame` calls.
 
 ### Runtime binary patches (`shim_patches.c`)
 

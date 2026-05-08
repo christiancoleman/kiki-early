@@ -263,13 +263,13 @@ real_write_t real_write = NULL;   /* used by shim_nodebus.c + shim_io.c write() 
 
 /* Audio capture (_emulation/captures/audio/stream.s16le) is the only
  * data-capture pipeline still in use — texture/shader/DMD capture was
- * removed in Step 56 (capture_hooks_note in README.md documents how to
+ * removed in Step 55 (capture_hooks_note in README.md documents how to
  * restore them if ever needed)
  * (duplicative of _extraction/ asset extraction, and DMD doesn't exist on
  * modern Spike 3 hardware).
  *
  * /tmp/cache exists because Godot logs an ERROR when it can't create it
- * (Step 45); the mkdir here pre-empts that. With shim_fs.c's remap_path
+ * (Step 43); the mkdir here pre-empts that. With shim_fs.c's remap_path
  * routing every /tmp/<X> to $SYSROOT/tmp/<X> (post-Step-71 cleanup), this
  * mkdir actually creates $SYSROOT/tmp/cache and the path stays inside the
  * project sysroot — no pollution of WSL's /tmp.
