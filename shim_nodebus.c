@@ -106,6 +106,62 @@ static uint32_t nodebus_chip_id_for_slot(uint8_t slot) {
     }
 }
 
+/* Read the version bytes (V1, V2, V3, V0) the game expects for slot's loaded
+ * firmware record. Mirrors FUN_008f88b0 so the FE-probe synth can return a
+ * matching response → status=2 (Ok). Returns 0 on success.
+ *
+ * Walks the runtime firmware-record list at DAT_044df838 — modular across
+ * games: PLE 0.81 (1_31_0), Star Wars 0.85, future titles all just work
+ * because each game ships its own .hex set and the shim parrots whatever
+ * version the loader ends up with. */
+static int nodebus_version_for_slot(uint8_t slot,
+                                    uint8_t *v1, uint8_t *v2,
+                                    uint8_t *v3, uint8_t *v0) {
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) return -1;
+
+    uint8_t *slot_struct = (uint8_t *)(game_base + 0x44cc290ULL +
+                                       (uint64_t)slot * 0xf0ULL);
+    uint32_t key1 = *(uint32_t *)(slot_struct + 0x60);
+    if (key1 == 0) return -1;
+
+    uint32_t chip_id = nodebus_chip_id_for_slot(slot);
+    uint8_t *vtable = (uint8_t *)(game_base + 0x42317c8ULL);
+    uint32_t key2 = 0;
+    int found = 0;
+    for (int i = 0; i < 28; i++) {
+        if (*(uint32_t *)(vtable + i * 0x28) == chip_id) {
+            key2 = *(uint32_t *)(vtable + i * 0x28 + 0x10);
+            found = 1;
+            break;
+        }
+    }
+    if (!found) return -1;
+
+    uint8_t *cur = *(uint8_t **)(game_base + 0x44df838ULL);
+    while (cur) {
+        if (*(uint32_t *)(cur + 0) == key1 && *(uint32_t *)(cur + 4) == key2)
+            break;
+        cur = *(uint8_t **)(cur + 0x50);
+    }
+    if (!cur) return -1;
+
+    uint64_t simple_gate = *(uint64_t *)(cur + 0x28);
+    if (simple_gate != 0) {
+        *v1 = cur[0x14]; *v2 = cur[0x16]; *v3 = cur[0x18]; *v0 = cur[0x1e];
+    } else {
+        uint64_t buf = *(uint64_t *)(cur + 0x20);
+        if (!buf) return -1;
+        uint32_t off = *(uint32_t *)(cur + 0x3c);
+        uint8_t *p = (uint8_t *)(uintptr_t)buf;
+        *v1 = p[off + 9];
+        *v2 = p[off + 10];
+        *v3 = p[off + 11];
+        *v0 = p[off + 8];
+    }
+    return 0;
+}
+
 /* Bridge response synthesis (parsed by netbridge.elf send_bridge_message_with_response
  * + sub_d15aa8):
  *
@@ -705,25 +761,25 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
                 resp[o++] = 0x00;
             if (hint >= 10) {
                 uint32_t chip_id = nodebus_chip_id_for_slot(slot);
-                /* byte[0] bit 7 is the boot-mode flag in FUN_008f38e0
-                 * (output[0] = resp[0] >> 7). FUN_00674680 routes
-                 * (local_88 & 1) != 0 → status 3 (Boot); we want clear so
-                 * the chip_id classification path runs → status 2/4/6/7.
-                 *
-                 * bytes [1..3] are the firmware version (major, minor, build).
-                 * FUN_00674680 compares them against record-reported version
-                 * via FUN_008f88b0; mismatch → status 7 (Version Mismatch).
-                 * All 6 shipped pinnode/node4/ws2812node .hex files in CWD
-                 * are version 1_31_0, so (1, 31, 0) matches every slot's
-                 * firmware-record. */
+                uint8_t v1 = 0x01, v2 = 0x1F, v3 = 0x00, v0 = 0x00;
+                (void)nodebus_version_for_slot(slot, &v1, &v2, &v3, &v0);
+                /* byte[0] bit 7 = boot-mode flag (FUN_00674680 routes set→3,
+                 * clear→chip_id classify path → status 2/4/6/7). */
                 resp[payload_start + 0] = 0x00;
-                resp[payload_start + 1] = 0x01;
-                resp[payload_start + 2] = 0x1F;
-                resp[payload_start + 3] = 0x00;
+                resp[payload_start + 1] = v1;
+                resp[payload_start + 2] = v2;
+                resp[payload_start + 3] = v3;
                 resp[payload_start + 4] = (uint8_t)(chip_id      );
                 resp[payload_start + 5] = (uint8_t)(chip_id >>  8);
                 resp[payload_start + 6] = (uint8_t)(chip_id >> 16);
                 resp[payload_start + 7] = (uint8_t)(chip_id >> 24);
+                /* Byte 10 is FE response byte 10 in FUN_008f38e0's output;
+                 * FUN_00674680 requires V0==0 || V0==byte10 for status=2.
+                 * Only safe to write when inner_size > 12 (else byte 10 is
+                 * the inner-cksum slot). */
+                if (inner_size > 12) {
+                    resp[payload_start + 10] = v0;
+                }
             }
             if (inner_size >= 2) {
                 uint32_t inner_sum = 0;

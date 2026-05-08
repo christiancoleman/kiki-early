@@ -413,6 +413,29 @@ static void *shim_node_records_probe_thread(void *arg) {
         char *fname = *(char **)(cur + 0x08);
         SHIM_LOG("[node_probe] fw_record[%d] @ %p key1=0x%08x key2=%u file=\"%s\"",
                  n_records, (void *)cur, key1, key2, fname ? fname : "(null)");
+        char line[400];
+        int n = snprintf(line, sizeof(line), "[node_probe]   bytes [+0x10..+0x4f]:");
+        for (int j = 0x10; j < 0x50 && n < (int)sizeof(line) - 4; j++)
+            n += snprintf(line + n, sizeof(line) - n, " %02x", cur[j]);
+        SHIM_LOG("%s", line);
+        uint64_t simple_gate = *(uint64_t *)(cur + 0x28);
+        uint8_t v[4];
+        const char *path;
+        if (simple_gate != 0) {
+            v[0] = cur[0x14]; v[1] = cur[0x16]; v[2] = cur[0x18]; v[3] = cur[0x1e];
+            path = "simple";
+        } else {
+            uint64_t buf = *(uint64_t *)(cur + 0x20);
+            uint32_t off = *(uint32_t *)(cur + 0x3c);
+            uint8_t *p = (uint8_t *)(uintptr_t)buf;
+            v[0] = p[off + 9];
+            v[1] = p[off + 10];
+            v[2] = p[off + 11];
+            v[3] = p[off + 8];
+            path = "complex";
+        }
+        SHIM_LOG("[node_probe]   version (V1,V2,V3,V0) = (0x%02x, 0x%02x, 0x%02x, 0x%02x) [%s path]",
+                 v[0], v[1], v[2], v[3], path);
         cur = *(uint8_t **)(cur + 0x50);
         n_records++;
     }
