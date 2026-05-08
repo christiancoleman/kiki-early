@@ -167,6 +167,8 @@ size_t shim_i2c_handle_read(uint8_t slave, uint8_t *buf, size_t len) {
 static uint32_t drm_next_dumb_handle = 1;
 static uint32_t drm_next_fb_id = 100;
 
+volatile uint8_t shim_spi_rx_extra[8] = {0};
+
 /* Synthesize a page-flip completion event on the shim side of the DRM
  * socketpair. Format matches `struct drm_event_vblank` from <drm/drm.h>
  * (32 bytes; libdrm reads the length field to know how much to consume,
@@ -359,6 +361,8 @@ int ioctl(int fd, unsigned long request, ...) {
                     }
                     rx[2] = quiet_cached ? 0x00 : 0x04;
                 }
+                for (uint32_t i = 0; i < len && i < 8; i++)
+                    rx[i] |= shim_spi_rx_extra[i];
             }
 
             /* Log cadence: first 20 transactions overall (boot visibility) +

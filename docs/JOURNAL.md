@@ -8199,3 +8199,73 @@ Remaining hypotheses (untested):
 
 ### Reproducible state
 Plain `./run_game.sh --debug` (no env) lands on Tech Alerts at +200 s with same alert rows as Step 90. Diagnostic dump: `SHIM_NODE_PROBE=1 SHIM_NODE_PROBE_DELAY_S=60 ./run_game.sh --debug --note "node_probe"` then grep `node_probe|fw_record|slot\[` in `runs/<TS>/game.log`.
+
+## Step 92: Nodebus init complete: service menu reached, Tech Alerts empty (2026-05-08)
+
+Investigation arc from "all 5 Tech Alerts rows on Not Initialized" (Step 90) to "all 11 populated nodebus slots at flag=0x03 status=2; Tech Alerts empty; game progresses to service menu showing Game V0.81.0 / Nodebus 1.31.0 / Bridge 39.83.127". Five distinct findings folded into a modular FE-probe + node-enumeration path in `shim_nodebus.c`.
+
+### Step 92a — FE-probe inner-payload was failing checksum, not size
+
+Decompiled the FE-probe call chain: `FUN_008ed870` (sender) → `FUN_008ed4a0` (worker) → `FUN_008ec410` (wire-frame validator). `FUN_008ec410` modifies `ilen` to `ilen+1` and appends `__n = hint + 2` at index `ilen+3` before transmit. Net effect: what the shim parses as "hint" at `payload[2 + inner_len]` is actually `__n` (= original game-side hint + 2). The shim's `inner_size = hint` was already the correct byte count.
+
+Real failure: validator sums inner bytes `[0..hint-2]` and requires `== 0 mod 256`. Shim's chip-id payload `0x80 0x01 0x80 0x00 + chip_id_LE` summed to `0xA9` — checksum mismatch sets `DAT_044fce30 = 3` and returns 0. No fprintf, silent failure that masked it as a size issue.
+
+Fix: write inner checksum at byte `[hint-2] = -sum(bytes[0..hint-3]) mod 256`. Status moved 8 → 3 (Boot).
+
+### Step 92b — `resp[0]` high bit is boot-mode, not "node present"
+
+Old shim comment was wrong. `FUN_008f38e0` does `*param_2 = local_38 >> 7`, then `FUN_00674680` routes `(local_88 & 1) != 0 → status=3 (Boot)`. Bit 7 = boot-mode active. Setting `resp[0] = 0x00` advances to chip_id classification. Status moved 3 → 7 (Version Mismatch).
+
+### Step 92c — Modular runtime version-byte lookup
+
+`FUN_008f88b0` exposes (V1, V2, V3, V0) via two paths gated on `record[+0x28]`:
+- Simple (`+0x28 != 0`): bytes at `record[+0x14], [+0x16], [+0x18], [+0x1e]`.
+- Complex (`+0x28 == 0`): bytes from `*(record+0x20) + record[+0x3c] + {9, 10, 11, 8}`.
+
+`FUN_00674680` requires FE bytes 1..3 == (V1, V2, V3) AND (V0 == 0 OR V0 == FE byte 10).
+
+Pinnode + ws2812node take complex path; node4 takes simple. Per-family V0: pinnode=0x01, node4=0x03, ws2812node=0x05. V1/V2/V3 = (0x01, 0x1F, 0x00) across all shipped 1_31_0 records.
+
+Implementation: `nodebus_version_for_slot()` in `shim_nodebus.c` walks `DAT_044df838`, finds record matching `(slot_struct[+0x60], vtable[chip_id_for_slot][+0x10])`, reads V1/V2/V3/V0 mirroring `FUN_008f88b0`. Game-portable: works for any game that ships .hex files via the same loader. Slots 1 (pinnode-LPC1112_101) and 4 (node4-LPC1124_303) reached status=2.
+
+### Step 92d — Bridge cmd 0x25 node-enumeration + cmd 0xF0 reset detection
+
+Tech Alerts dispatcher renders "Not Responding" override on status=2 unless flag bits 0+1 BOTH set. Bit 1 set by `mcp_nodebus_init_orchestrator` (`FUN_00675110`) at boot via three paths:
+- A/B: `FUN_007da920(list, 32, 2)`, list built by `FUN_00674600` calling `FUN_008ede50` repeatedly. `FUN_008ede50` issues bridge cmd 0x25 (no payload, 1-byte response = next slot ID).
+- C: direct `flag |= 2` in final pass, gated on `FUN_008f5cd0` (cmd 0x41 inner cmd 0xFF) success.
+
+`case 0x25` in `synthesize_bridge_response`: stateful counter through `enum_seq`, 0 terminates. `FUN_008f1100(0, 0)` (cmd 0x41 inner cmd 0xF0 with slot=0, payload byte 0x22) is the orchestrator's reset signal — detected in shim's cmd 0x41 path, resets cursor between retry cycles. Three full enumeration cycles observed per boot. Slots 1 and 4 reached flag=0x03 status=2.
+
+### Step 92e — Per-slot chip_id table verified via vtable dump
+
+Extending to pinnode slots 8/9/10/13 with assumed `chip_id=0x3D01402B` (LPC1313): status stayed 4. Vtable dump (`game_base + 0x42317c8`, 28 entries × 0x28) showed `0x3D01402B` is `vtable[21]/[22]` with `type_idx=0` — `FUN_008edd80` returns it, `+0x10 = 0`, `uVar9 = 0`, lookup miss, status=4.
+
+Real LPC1313 chip_ids in this binary: `0x2c40102b` (vtable[13]), `0x1830102b` (vtable[14]), `0x08018542` (vtable[16]) — all type_idx=5.
+
+Fix: pinnode slots 8/9/10/13 → LPC1112_101 (`0x042D502B`, vtable[2], type_idx=1) — bypasses the LPC1313 special branch via the simple chip_id path that already worked for slot 1. ws2812node slots 2/7/12/14 → real LPC1313 (`0x2c40102B`, vtable[13]). Updated `enum_seq` to `{1, 2, 4, 7, 8, 9, 10, 12, 13, 14, 0}`.
+
+### Step 92f — Result
+
+All 11 populated slots (0/1/2/4/7/8/9/10/12/13/14) probed at +80s: `flag=0x00000003 status=2`. Tech Alerts renders empty. Game advances to a service-menu screen with version line:
+
+```
+Game: V0.81.0      CPU: Spike 3
+System: 4.19.0     Nodebus: 1.31.0
+OS: 1.00.6         Bridge: 39.83.127
+Service S Agent: 1.00.16  PDB Boot: 1.00.0
+                   PDB Runtime: 0.00.0
+                   Video Processor: 0.00.12
+```
+
+`Nodebus: 1.31.0` and `Bridge: 39.83.127` are read from our shim's responses + loaded firmware records — visual confirmation the synthesis works end-to-end. Audio init runs (long-standing audio spam now correlates with this point). Footer prompt: "Press 'Select' to continue". Idle eventually advances to a Test Menu screen with no further visual feedback. Test cycle baseline shortened from 240s to 120s (`SHIM_NODE_PROBE_DELAY_S=80`).
+
+### Open / next session
+
+- Switch-press injection to advance the service menu — Step 90 #1 was empirically falsified on the Tech Alerts screen, but may behave differently on this screen.
+- LPC1313 special branch in `FUN_00674680` (`FUN_008f5390` = cmd 0xF2 × 8 per slot) — currently bypassed for pinnode slots by reporting LPC1112_101 chip_ids; ws2812node slots take the LPC1313 path successfully without cmd 0xF2 synth (FUN_008f5390 fails but `vtable+0x10=5` still drives correct lookup). cmd 0xF2 synth would close the gap properly.
+- Star Wars LE 0.85 cross-validation — modular version lookup should make the same shim work, validating game-portability.
+
+### Touched
+
+- `games/pokemon_le/_emulation/shim_nodebus.c` — FE-probe synth (checksum + boot-mode + version lookup), `nodebus_version_for_slot()`, `case 0x25` enum + cmd 0xF0 reset, `nodebus_chip_id_for_slot()` per-slot table.
+- `games/pokemon_le/_emulation/shim_inject.c` — probe extensions: record bytes, version bytes per record, vtable entries (env-gated).

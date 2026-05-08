@@ -58,6 +58,14 @@ int shim_avforward_enabled(void);
 int shim_avforward_send_packet(void *avctx, const void *avpkt, int *out_ret);
 int shim_avforward_receive_frame(void *avctx, void *frame, int *out_ret);
 
+/* Runtime SPI RX override (defined in shim_ioctl.c).
+ * Lets shim_inject.c inject CPU-local switch presses by OR-ing bits into
+ * the 8-byte SPI MESSAGE_1 RX buffer. Each byte is OR'd in after the env
+ * override (or default rx[2]=0x04) is applied. Zero entries are no-ops.
+ * The SPI thread polls at ~480 Hz; a bit stays asserted across many cycles
+ * until the inject thread clears it, so FUN_00674b90(0) sees a clean edge. */
+extern volatile uint8_t shim_spi_rx_extra[8];
+
 /* Decoder compatibility patch (defined in shim_patches.c).
  * Patches the b.ne at game VA 0x920cf0 in the game's get_format callback
  * so it accepts NV12 instead of insisting on DRM_PRIME. Required for any

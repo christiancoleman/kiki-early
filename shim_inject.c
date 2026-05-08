@@ -165,6 +165,29 @@ void shim_event_sweep(void) {
 
 
 
+/* Wait until channel-1's saved-state buffer at game_base + 0x44804d0 + 0xb0
+ * is non-zero (i.e., FUN_00650f00 has populated it), then write that buffer
+ * to DAT_0436b020 so FUN_00674b90's channel-0 path reads back idle bytes
+ * instead of zero. Polls every 100 ms with a 30 s timeout. */
+static void shim_install_channel1_idle(uintptr_t game_base) {
+    uint8_t *channel_1_saved = (uint8_t *)(uintptr_t)
+        (game_base + 0x44804d0ULL + 0xb0ULL);
+    volatile uint64_t *dat_0436b020 = (volatile uint64_t *)(uintptr_t)
+        (game_base + 0x436b020ULL);
+    for (int i = 0; i < 300; i++) {
+        uint64_t idle_u64;
+        memcpy(&idle_u64, channel_1_saved, 8);
+        if (idle_u64 != 0) {
+            *dat_0436b020 = idle_u64;
+            SHIM_LOG("[channel1_idle] wrote 0x%016lx to DAT_0436b020 after %dms (FUN_00674b90 spam fix)",
+                     (unsigned long)idle_u64, i * 100);
+            return;
+        }
+        usleep(100000);
+    }
+    SHIM_LOG("[channel1_idle] gave up after 30s — channel 1 saved state stayed zero");
+}
+
 static void *shim_discovery_init_thread(void *arg) {
     (void)arg;
     sleep(2);
@@ -176,6 +199,9 @@ static void *shim_discovery_init_thread(void *arg) {
      * — the 2 s sleep above already handles that timing. Default-on; gate
      * via SPIKE3_DECODER_PATCH=0. */
     shim_patch_get_format_callback();
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (game_base) shim_install_channel1_idle(game_base);
     return NULL;
 }
 
@@ -470,6 +496,337 @@ static void *shim_node_records_probe_thread(void *arg) {
     return NULL;
 }
 
+/* SHIM_SWITCH_TABLE_PROBE=1 — read g_switch_state_array @ 0x4480220 (heap;
+ * pointer-of-pointer-to-array calloc'd by FUN_00650f00). Per FUN_00650f00,
+ * each 0x30-byte entry has the resolved (channel, bit_idx) already filled
+ * in:
+ *
+ *   +0x20 : u16 switch_id     (== array index)
+ *   +0x22 : u16 bit_idx       (full bit position 0..63 in channel buffer)
+ *   +0x24 : byte channel_id   (0 = CPU SPI; >0 = remote node slot)
+ *
+ * (Step 90c labeled +0x22 "prev_id" and +0x24 "switch-type code" — both
+ * mislabeled. FUN_00650f00 line `*(short *)(lVar13 + 0x22) = uVar4` writes
+ * bit_idx, and `*(byte *)(lVar13 + 0x24) = bVar3` writes channel_id.)
+ *
+ * If SHIM_SELECT_PRESS=1, pulses Service Select (sw_id=8 by default;
+ * SHIM_SELECT_PRESS_SW_ID overrides) via
+ * translate_switch_state_changes(channel, buffer) with the resolved bit set
+ * then cleared, every SHIM_SELECT_PRESS_INTERVAL_S seconds (default 5), for
+ * SHIM_SELECT_PRESS_ATTEMPTS attempts (default 30). */
+static void *shim_switch_table_probe_thread(void *arg) {
+    (void)arg;
+    const char *v = getenv("SHIM_SWITCH_TABLE_PROBE");
+    if (!v || !v[0] || v[0] == '0') return NULL;
+
+    int delay_s = 80;
+    if ((v = getenv("SHIM_SWITCH_TABLE_PROBE_DELAY_S")) != NULL && v[0]) delay_s = atoi(v);
+    sleep((unsigned)delay_s);
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[switch_table] game_base unresolved; skipping");
+        return NULL;
+    }
+    SHIM_LOG("[switch_table] === START === game_base=0x%lx", (unsigned long)game_base);
+
+    uint8_t **arr_pp = (uint8_t **)(uintptr_t)(game_base + 0x4480220ULL);
+    uint8_t *arr = *arr_pp;
+    SHIM_LOG("[switch_table] g_switch_state_array @ %p", (void *)arr);
+    if (!arr) {
+        SHIM_LOG("[switch_table] array pointer is NULL; abort");
+        return NULL;
+    }
+
+    int max_sw = 256;
+    int valid = 0;
+    for (int sw_id = 1; sw_id < max_sw; sw_id++) {
+        uint8_t *e = arr + (size_t)sw_id * 0x30u;
+        uint16_t recorded_sw_id = *(uint16_t *)(e + 0x20);
+        if (recorded_sw_id != (uint16_t)sw_id) {
+            SHIM_LOG("[switch_table] sw_id=%d  recorded_sw_id=%u (mismatch — end of valid entries)",
+                     sw_id, recorded_sw_id);
+            break;
+        }
+        uint16_t bit_idx    = *(uint16_t *)(e + 0x22);
+        uint8_t  channel_id = *(uint8_t  *)(e + 0x24);
+        uint8_t  state_byte = *(uint8_t  *)(e + 0x28);
+
+        /* Per sub_6511c0 (drain): on transition, calls sub_729c10 with
+         *   arg1 = u16 at config_ptr[+0x34]  (event_id)
+         *   arg2 = u64 at config_ptr[+0x00]  (handler function pointer)
+         *   arg3 = u16 at config_ptr[+0x2c]  (priority/flags)
+         * config_ptr lives at switch_struct +0x10. Per sub_6511c0 the press/
+         * release fire-gate is config_ptr[+0x2e]: bit 11 = fire on press,
+         * bit 10 = fire on release, bit 12 = call sub_79fe00, bit 13 = call
+         * sub_79fd70, bit 14 = wraps edge_counter mod 2. */
+        uint64_t config_ptr_raw = *(uint64_t *)(e + 0x10);
+        uint64_t handler_fn     = 0;
+        uint64_t param_2        = 0;
+        uint16_t event_id       = 0;
+        uint16_t priority       = 0;
+        uint16_t flags_2e       = 0;
+        uint8_t  flags_30       = 0;
+        if (config_ptr_raw != 0) {
+            uint8_t *cfg = (uint8_t *)(uintptr_t)config_ptr_raw;
+            handler_fn = *(uint64_t *)(cfg + 0x00);
+            param_2    = *(uint64_t *)(cfg + 0x08);
+            priority   = *(uint16_t *)(cfg + 0x2c);
+            flags_2e   = *(uint16_t *)(cfg + 0x2e);
+            flags_30   = *(uint8_t  *)(cfg + 0x30);
+            event_id   = *(uint16_t *)(cfg + 0x34);
+        }
+        uint64_t handler_va = handler_fn ? (handler_fn - game_base) : 0;
+
+        SHIM_LOG("[switch_table] sw_id=%3d  ch=%u byte=%u bit=%u  state=%u  cfg=%p  handler=0x%lx  param=0x%lx  evt=0x%04x  prio=0x%04x  flag2e=0x%04x  flag30=0x%02x",
+                 sw_id, channel_id,
+                 (unsigned)(bit_idx >> 3), (unsigned)(bit_idx & 7), state_byte,
+                 (void *)(uintptr_t)config_ptr_raw,
+                 (unsigned long)handler_va,
+                 (unsigned long)param_2,
+                 event_id, priority, flags_2e, flags_30);
+        valid++;
+    }
+    SHIM_LOG("[switch_table] enumerated %d valid entries", valid);
+
+    /* Decode the 36-bit mode bitmap at DAT_044cb9f0 (5 bytes calloc'd). The
+     * service-button handler at sub_5902f0 gates on bits 3 and 4 being
+     * INACTIVE — if either is set, sub_5902f0 returns without firing
+     * sub_58ff40. Knowing which bits are set in the current state tells us
+     * whether the service-button event path is even reachable. */
+    {
+        uint8_t **mode_bitmap_pp = (uint8_t **)(uintptr_t)(game_base + 0x44cb9f0ULL);
+        uint8_t *mode_bitmap = *mode_bitmap_pp;
+        uint64_t mode_count_p = *(uint64_t *)(uintptr_t)(game_base + 0x43527d0ULL);
+        uint64_t mode_count = mode_count_p ? *(uint64_t *)(uintptr_t)mode_count_p : 0;
+        if (mode_bitmap) {
+            uint8_t b[5] = {0};
+            memcpy(b, mode_bitmap, 5);
+            char active[256] = "";
+            int n = 0;
+            for (int i = 0; i < 36; i++) {
+                int set = (b[i >> 3] >> (i & 7)) & 1;
+                if (set && n < (int)sizeof(active) - 8) {
+                    n += snprintf(active + n, sizeof(active) - n, " %d", i);
+                }
+            }
+            SHIM_LOG("[switch_table] mode_bitmap @ %p (count=%lu)  bytes=%02x %02x %02x %02x %02x  active modes:%s",
+                     (void *)mode_bitmap, (unsigned long)mode_count,
+                     b[0], b[1], b[2], b[3], b[4],
+                     n ? active : " (none)");
+        } else {
+            SHIM_LOG("[switch_table] mode_bitmap pointer NULL (sub_7a8b90 hasn't run yet?)");
+        }
+
+        /* Boot-state mask at DAT_0445f838 (per PROTOCOL §3). bit 0 of this
+         * gates sub_58ff40's Service Select path: if set, handler takes
+         * sub_731930(9) path instead of firing event 0xa5. */
+        uint32_t boot_mask = *(uint32_t *)(uintptr_t)(game_base + 0x445f838ULL);
+        SHIM_LOG("[switch_table] boot_state_mask @ 0x%lx = 0x%08x (bit 0 = %d  bit 3 = %d  -- bit 0 routes Service Select away from event 0xa5)",
+                 (unsigned long)(game_base + 0x445f838ULL),
+                 boot_mask, boot_mask & 1, (boot_mask >> 3) & 1);
+
+        /* Check FUN_0072a5c0(0x1a) result — if 1, sub_58ff40 takes another
+         * early-exit path (Service-Select-while-something path). */
+        typedef uint64_t (*chk_fn)(int);
+        chk_fn check_72a5c0 = (chk_fn)(uintptr_t)(game_base + 0x72a5c0ULL);
+        uint64_t r_72a5c0 = check_72a5c0(0x1a);
+        SHIM_LOG("[switch_table] sub_72a5c0(0x1a) = 0x%lx (bit 0 = %d  -- if 1, Service Select hits early-return path)",
+                 (unsigned long)r_72a5c0, (int)(r_72a5c0 & 1));
+    }
+
+    const char *p = getenv("SHIM_SELECT_PRESS");
+    if (!p || !p[0] || p[0] == '0') {
+        SHIM_LOG("[switch_table] === END === (no inject)");
+        return NULL;
+    }
+
+    /* Comma-separated list of sw_ids to press in sequence. Default: just 90
+     * (Service Select per PLE manual mapping 0-SW-8). Set
+     * SHIM_SELECT_PRESS_SW_ID="90,91,92,93" to sweep all four service
+     * buttons in turn. */
+    const char *id_list = getenv("SHIM_SELECT_PRESS_SW_ID");
+    if (!id_list || !id_list[0]) id_list = "90";
+
+    int inject_ids[16];
+    int n_inject = 0;
+    {
+        const char *p = id_list;
+        while (*p && n_inject < 16) {
+            int id = atoi(p);
+            if (id >= 1 && id <= valid) inject_ids[n_inject++] = id;
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+    }
+    if (n_inject == 0) {
+        SHIM_LOG("[select_press] no valid sw_ids in '%s'; abort", id_list);
+        return NULL;
+    }
+
+    int attempts = 4;
+    if ((v = getenv("SHIM_SELECT_PRESS_ATTEMPTS")) != NULL && v[0]) attempts = atoi(v);
+    int press_ms = 1500;
+    if ((v = getenv("SHIM_SELECT_PRESS_MS")) != NULL && v[0]) press_ms = atoi(v);
+    int interval_s = 3;
+    if ((v = getenv("SHIM_SELECT_PRESS_INTERVAL_S")) != NULL && v[0]) interval_s = atoi(v);
+
+    typedef int64_t (*translate_fn)(uint8_t channel_id, const uint8_t *buffer);
+    translate_fn translate = (translate_fn)(game_base + 0x651610);
+
+    for (int round = 0; round < attempts; round++) {
+        for (int k = 0; k < n_inject; k++) {
+            int sw_id = inject_ids[k];
+            uint8_t *e = arr + (size_t)sw_id * 0x30u;
+            uint16_t recorded = *(uint16_t *)(e + 0x20);
+            if (recorded != (uint16_t)sw_id) {
+                SHIM_LOG("[select_press] sw_id=%d not present (recorded=%u); skip",
+                         sw_id, recorded);
+                continue;
+            }
+            uint16_t bit_idx    = *(uint16_t *)(e + 0x22);
+            uint8_t  channel_id = *(uint8_t  *)(e + 0x24);
+            int byte_off = bit_idx >> 3;
+            uint8_t bit_mask = (uint8_t)(1u << (bit_idx & 7));
+
+            uint16_t edge_before = *(uint16_t *)(e + 0x26);
+            uint8_t  state_before = *(uint8_t *)(e + 0x28);
+            SHIM_LOG("[select_press] round %d/%d  sw_id=%d  channel=%u byte=%d bit=%u  (BEFORE: state=%u edge_cnt=%u)",
+                     round + 1, attempts, sw_id, channel_id, byte_off,
+                     (unsigned)(bit_idx & 7), state_before, edge_before);
+
+            if (channel_id == 0 && byte_off >= 1 && byte_off < 8) {
+                /* SPI thread builds DAT_0450d9b0 via
+                 *   CONCAT44(uStack_54, CONCAT13(bStack_55, CONCAT21(uStack_57, local_58)))
+                 * with local_58 zero-init at DAT byte 0:
+                 *   DAT byte 0 = 0 (always)
+                 *   DAT byte N = rx[N-1] for N=1..7   (rx[7] dropped)
+                 *
+                 * Setting rx_extra alone DOES NOT WORK — sub_8fa820 stores
+                 * to DAT_0450d9b0 but never calls translate. The translate
+                 * path (FUN_00674b90 → FUN_008fab80 → FUN_00651610) is only
+                 * invoked from sub_675a10 (one-shot, init-gated) and from
+                 * nodebus init/enum loops. Post-init, no periodic caller.
+                 *
+                 * So we BOTH set rx_extra (in case some path reads
+                 * DAT_0450d9b0) AND call FUN_00674b90(0) directly to force
+                 * a translate(0, ...) cycle that picks up the bit. */
+                int rx_off = byte_off - 1;
+                typedef void (*poll_ch0_fn)(int);
+                poll_ch0_fn poll_ch0 = (poll_ch0_fn)(uintptr_t)
+                    (game_base + 0x674b90ULL);
+
+                SHIM_LOG("[select_press]   PRESS via SPI+poll  (channel-byte=%d → rx[%d] |= 0x%02x; calling FUN_00674b90(0))",
+                         byte_off, rx_off, bit_mask);
+                shim_spi_rx_extra[rx_off] |= bit_mask;
+                usleep(5000);  /* let SPI thread cycle once with new rx */
+                poll_ch0(0);   /* force translate(0, ...) with current DAT_0450d9b0 */
+                usleep((useconds_t)press_ms * 1000);
+                uint16_t edge_during = *(uint16_t *)(e + 0x26);
+                uint8_t  state_during = *(uint8_t *)(e + 0x28);
+                SHIM_LOG("[select_press]   RELEASE  (DURING-press: state=%u edge_cnt=%u)",
+                         state_during, edge_during);
+                shim_spi_rx_extra[rx_off] &= (uint8_t)~bit_mask;
+                usleep(5000);
+                poll_ch0(0);   /* force translate(0, ...) with bit cleared (release edge) */
+            } else if (channel_id != 0) {
+                uint8_t buf[8];
+                SHIM_LOG("[select_press]   PRESS via translate(ch=%u, buf[%d]=0x%02x)",
+                         channel_id, byte_off, bit_mask);
+                memset(buf, 0, sizeof(buf));
+                buf[byte_off] = bit_mask;
+                translate(channel_id, buf);
+                usleep((useconds_t)press_ms * 1000);
+                uint16_t edge_during = *(uint16_t *)(e + 0x26);
+                uint8_t  state_during = *(uint8_t *)(e + 0x28);
+                SHIM_LOG("[select_press]   RELEASE  (DURING-press: state=%u edge_cnt=%u)",
+                         state_during, edge_during);
+                memset(buf, 0, sizeof(buf));
+                translate(channel_id, buf);
+            }
+
+            usleep(200000);  /* 200ms after release for drain to process */
+            uint16_t edge_after = *(uint16_t *)(e + 0x26);
+            uint8_t  state_after = *(uint8_t *)(e + 0x28);
+            SHIM_LOG("[select_press]   AFTER (post-release+200ms): state=%u edge_cnt=%u",
+                     state_after, edge_after);
+
+            sleep((unsigned)interval_s);
+        }
+    }
+    SHIM_LOG("[switch_table] === END === (inject complete)");
+    return NULL;
+}
+
+/* SHIM_EDGE_SNAPSHOT=1 — periodically snapshot every switch's edge counter
+ * (+0x26 of g_switch_state_array entry) and log only the entries that
+ * incremented since the previous snapshot. Identifies which switches are
+ * firing edges continuously (= the audio-spam source).
+ *
+ * SHIM_EDGE_SNAPSHOT_DELAY_S=N — wait N seconds before first snapshot
+ *   (default 30; long enough that channel-1-idle fix has taken effect)
+ * SHIM_EDGE_SNAPSHOT_INTERVAL_S=N — gap between snapshots (default 3)
+ * SHIM_EDGE_SNAPSHOT_CYCLES=N — total snapshots (default 30) */
+static void *shim_edge_snapshot_thread(void *arg) {
+    (void)arg;
+    const char *v = getenv("SHIM_EDGE_SNAPSHOT");
+    if (!v || !v[0] || v[0] == '0') return NULL;
+
+    int start_delay_s = 30;
+    if ((v = getenv("SHIM_EDGE_SNAPSHOT_DELAY_S")) != NULL && v[0]) start_delay_s = atoi(v);
+    int interval_s = 3;
+    if ((v = getenv("SHIM_EDGE_SNAPSHOT_INTERVAL_S")) != NULL && v[0]) interval_s = atoi(v);
+    int cycles = 30;
+    if ((v = getenv("SHIM_EDGE_SNAPSHOT_CYCLES")) != NULL && v[0]) cycles = atoi(v);
+
+    sleep((unsigned)start_delay_s);
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[edge_snap] game_base unresolved; skip");
+        return NULL;
+    }
+
+    uint8_t **arr_pp = (uint8_t **)(uintptr_t)(game_base + 0x4480220ULL);
+    uint8_t *arr = *arr_pp;
+    if (!arr) {
+        SHIM_LOG("[edge_snap] g_switch_state_array NULL; skip");
+        return NULL;
+    }
+
+    enum { MAX_SW = 100 };
+    uint16_t prev[MAX_SW] = {0};
+
+    SHIM_LOG("[edge_snap] starting %d cycles × %ds — logs switches with edge_counter changes",
+             cycles, interval_s);
+
+    for (int cycle = 0; cycle < cycles; cycle++) {
+        sleep((unsigned)interval_s);
+        char line[2048];
+        int n = snprintf(line, sizeof(line), "[edge_snap] cycle %d:", cycle);
+        int any = 0;
+        for (int sw_id = 1; sw_id < MAX_SW; sw_id++) {
+            uint8_t *e = arr + (size_t)sw_id * 0x30u;
+            uint16_t recorded = *(uint16_t *)(e + 0x20);
+            if (recorded != (uint16_t)sw_id) break;
+            uint16_t cur = *(uint16_t *)(e + 0x26);
+            if (cur != prev[sw_id]) {
+                if (n < (int)sizeof(line) - 32) {
+                    n += snprintf(line + n, sizeof(line) - n,
+                                  " sw%d:%u→%u", sw_id, prev[sw_id], cur);
+                }
+                prev[sw_id] = cur;
+                any++;
+            }
+        }
+        if (any > 0) {
+            SHIM_LOG("%s (%d changed)", line, any);
+        }
+    }
+    SHIM_LOG("[edge_snap] complete");
+    return NULL;
+}
+
 void shim_inject_start(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -494,4 +851,12 @@ void shim_inject_start(void) {
     pthread_t n;
     if (pthread_create(&n, NULL, shim_node_records_probe_thread, NULL) == 0)
         pthread_detach(n);
+
+    pthread_t st;
+    if (pthread_create(&st, NULL, shim_switch_table_probe_thread, NULL) == 0)
+        pthread_detach(st);
+
+    pthread_t es;
+    if (pthread_create(&es, NULL, shim_edge_snapshot_thread, NULL) == 0)
+        pthread_detach(es);
 }

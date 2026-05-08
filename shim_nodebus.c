@@ -908,6 +908,74 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
          *
          * Hint values hardcoded above are confirmed via static RE of each
          * wrapper's strh of arg1[2..3] / arg1[4]; they don't vary per-call. */
+        /* switch_poll synthesis (inner_cmd=0x11). FUN_008edec0 issues this to
+         * each slot N>0 to read 8 bytes of switch state into channel N's
+         * input buffer for translate_switch_state_changes. With NO synth, the
+         * stack-allocated local_50 buffer in FUN_00674b90 holds whatever
+         * garbage was on the stack — translate compares it against the per-
+         * channel saved state and fires "edge" events on every mismatched
+         * bit. That's the source of the audio spam we hear at runtime.
+         *
+         * Fix: return the channel's own POST-INIT idle state. FUN_00650f00
+         * wrote per-bit polarity-aware idle bytes into the channel struct's
+         * "saved state" buffer at &DAT_044804b8 + 0x18 + 0xb0*slot
+         * (= &DAT_044804d0 + 0xb0*slot). Reading those 8 bytes and sending
+         * them as the synth payload means the FIRST translate cycle on the
+         * channel sees current=idle / previous=initial-zero (one cycle of
+         * edges, then steady) and SUBSEQUENT cycles see current=idle /
+         * previous=idle (no edges, no spam).
+         *
+         * Per-slot status flag in mcp_nodebus_per_slot_status[slot]+3 is zero
+         * at boot (BSS init), so mcp_nodebus_send_encrypted takes the
+         * cleartext path: uVar4=0, rotated_mask=0, payload XOR is identity.
+         * Idle bytes go straight to the caller's switch buffer. */
+        if (inner_cmd == 0x11) {
+            int hint_idx = 2 + (int)inner_len;
+            if (hint_idx >= payload_len) {
+                SHIM_LOG("bridge: synth switch_poll SKIP slot=%u (hint_idx=%d ≥ payload_len=%d)",
+                         slot, hint_idx, payload_len);
+                return;
+            }
+            uint8_t hint = payload[hint_idx];
+            if (hint == 0 || hint > 32) {
+                SHIM_LOG("bridge: synth switch_poll SKIP slot=%u hint=%u (out of range)",
+                         slot, hint);
+                return;
+            }
+            uint8_t idle[8] = {0};
+            uintptr_t game_base = shim_resolve_game_base();
+            if (game_base) {
+                memcpy(idle,
+                       (void *)(uintptr_t)(game_base + 0x44804d0ULL +
+                                           0xb0ULL * (uint64_t)slot),
+                       8);
+            }
+            uint8_t resp[64];
+            int o = 0;
+            resp[o++] = 0x02;
+            resp[o++] = 0x41;
+            resp[o++] = id;
+            int payload_start = o;
+            int inner_size = (int)hint;
+            for (int i = 0; i < inner_size; i++)
+                resp[o++] = (i < 8) ? idle[i] : 0x00;
+            if (inner_size >= 2) {
+                uint32_t inner_sum = 0;
+                for (int i = 0; i < inner_size - 2; i++)
+                    inner_sum += resp[payload_start + i];
+                resp[payload_start + inner_size - 2] = (uint8_t)(-(int32_t)inner_sum);
+            }
+            uint8_t cks = bridge_checksum(resp + 1, (size_t)(o - 1));
+            resp[o++] = cks;
+            resp[o++] = 0x03;
+            SHIM_LOG("bridge: synth switch_poll RESP slot=%u hint=%u idle=%02x %02x %02x %02x %02x %02x %02x %02x",
+                     slot, hint, idle[0], idle[1], idle[2], idle[3],
+                     idle[4], idle[5], idle[6], idle[7]);
+            usleep(NODEBUS_SYNTH_DELAY_US);
+            bridge_send_response(resp, (size_t)o, 0x41, id);
+            return;
+        }
+
         if (inner_cmd == 0xFC || inner_cmd == 0xFD || inner_cmd == 0xF9) {
             int hint_idx = 2 + (int)inner_len;
             if (hint_idx >= payload_len) {

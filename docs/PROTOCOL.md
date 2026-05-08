@@ -370,7 +370,7 @@ Legend for **Shim status**: ✅ = handled with deliberate engineered shape; ⚠�
 | `0x22` | `resetFlags` (also sent unsolicited at boot) | `SendMessage(0x22, 0, 1 byte)` | ❌ never observed (bridge sends unsolicited at first connect — see "Async notifications" below) |
 | `0x23` | snapshot + clear `bridgeStatus` | `SendMessage(0x23, id, 4 bytes)` | ❌ never observed |
 | `0x24` | `ADC_GetVBBmV` (battery voltage) | `SendMessage(cmd, id, 4 bytes)` | ❌ never observed |
-| `0x25` | `NODEBUS_Poll` (flow-control probe; binary-search of free TX buffer space) | `SendMessage(cmd, id, 1 byte)` | ❓ shim lets it time out — see "Bridge-command timeouts as progress signal" below |
+| `0x25` | `NODEBUS_Poll` — node-enumeration query: yields next detected slot ID, 0 terminates | `SendMessage(0x25, id, 1 byte = next_slot_id_or_0)` | ✅ shim synthesizes via `enum_seq` cursor; resets on cmd `0x41` inner cmd `0xF0` slot=0 payload `0x22` (see "Cmd 0x25 node enumeration" below) |
 | `0x27` | LCD subcommands (sub-cmd at byte 0) | varies — see "Cmd 0x27 LCD subprotocol" below | ✅ shim alternates `0x06` / `0x02` per call to satisfy a paired bit-2-toggle poll loop in the game (see "Cmd 0x27 game-side polling" below) |
 | `0x28` | DMD ops (disambiguated by length) | varies | ❌ never observed |
 | `0x29` / `0x2A` / `0x2B` / `0x2F` | WS2812 LED chains | varies | ❌ never observed |
@@ -378,6 +378,16 @@ Legend for **Shim status**: ✅ = handled with deliberate engineered shape; ⚠�
 | `0x30` | `CRC32(0, &__VECTOR_TABLE, 0x12a40)` over bridge firmware | `SendMessage(0x30, id, 4 bytes)` | ✅ shim returns precomputed `NETBRIDGE_CRC32 = 0x357f5327` (zlib CRC32 chained over `netbridge.elf` `.text → .rodata → .binary_info`). Game prints `netbridge image okay, CRC32=0x357f5327` |
 | `0x40` | nodebus-passthrough subprotocol (cleartext path) | varies | ✅ sent at runtime, log only. See "Cmd 0x40 nodebus subprotocol" below |
 | `0x41` | node-bus query (encrypted transport) | varies | ✅ sent at runtime, encrypted. Shim logs decoded inner cmd + payload. See §5 for cipher; see "Cmd 0x41 wire format" below |
+
+### Cmd 0x25 node enumeration (with cmd 0x41 inner cmd `0xF0` reset)
+
+`mcp_nodebus_init_orchestrator @ 0x675110` enumerates detected nodes by calling `sub_8ede50` in a loop; each call sends bridge cmd `0x25` and reads the 1-byte response as the next detected slot ID. Iteration ends when the response is 0.
+
+Each enumeration cycle is bracketed by `sub_8f1100(0, 0)` reset calls — cmd `0x41` frame with slot=0, inner cmd `0xF0`, payload byte `0x22` (the `0x20` variant is per-slot ack-advance, sent once per detected slot during the loop). The bridge resets its enumeration cursor on the `0x22` variant; without the reset, retry cycles would return 0 immediately and `sub_7da920(list, 32, 2)` (called once per cycle) would clear flag bit 1 on previously-set slots.
+
+The list built from this enumeration drives `sub_7da920`'s flag-bit-1 path for Tech Alerts row hide (see §11 "Flag-bit-1 paths").
+
+*Verified by:* JOURNAL Step 92 — Ghidra decompile of `sub_675110`/`sub_674600`/`sub_8ede50`/`sub_8f1100` plus runtime confirmation that shim synthesis of cmd `0x25` (yielding `{1, 2, 4, 7, 8, 9, 10, 12, 13, 14, 0}`) plus cmd `0xF0` reset detection drives all 11 populated slots to flag bit 1 set across three consecutive enumeration cycles per boot.
 
 ### Cmd 0x27 LCD subprotocol (bridge handler)
 
@@ -646,7 +656,19 @@ Three sources of XOR per byte:
 2. **Header-derived mask** `(slot << 4) | ((inner_len + 1) & 0x0F)`. Constant for the whole message.
 3. **Parity flip** of that mask. Even-indexed bytes XOR with `mask`, odd-indexed bytes XOR with `~mask`.
 
-The cipher is **involutive** (XOR is its own inverse). It is also **outbound only** — `mcp_nodebus_send_encrypted` does not decrypt the response; it `memcpy`s the response payload from the bridge into the caller's `arg2` buffer as-is. The status byte is the response's last byte (after the checksum the bridge strips).
+The cipher is **involutive** (XOR is its own inverse). It is also **outbound only** — `mcp_nodebus_send_encrypted` does not decrypt the response. The receive path validates and strips two trailing bytes before forwarding to the caller (see "Response wire validation" below).
+
+#### Response wire validation
+
+The bridge replies with `__n = hint + 2` inner bytes (`__n` is computed at `0x8ec4c4` from the hint byte at `arg1[2 + inner_len]`; bridge STX/CMD/ID/CSUM/ETX framing already stripped). `mcp_nodebus_send_encrypted` checks three gates before forwarding:
+
+- **Size**: actual received bytes must equal `__n`. Mismatch → `mcp_nodebus_last_error = 4`, function returns 0.
+- **Status byte** at `recv[__n - 1]`: bits 2 and 3 must be clear. Bit 2 set → `last_error = 1`; bit 3 set → `last_error = 2`. Either fails the call.
+- **Inner sum-checksum**: `sum(recv[0..__n-2]) == 0 (mod 256)`, where the byte at `recv[__n - 2]` is the cksum chosen to satisfy this (sum includes the cksum byte itself). Mismatch → `last_error = 3`.
+
+On all three pass: `memcpy(arg2, recv, __n - 2)` — the cksum and status bytes are consumed, not forwarded. Caller sees exactly `hint` payload bytes. None of the three failure paths emit `fprintf`; only the size mismatch logs (`"short response (got %d, expected %d)"`).
+
+*Verified by:* JOURNAL Step 92 — Ghidra decompile of `mcp_nodebus_send_encrypted` `LAB_008ec484` validation block; runtime confirmation that a shim FE-probe synth omitting the cksum at `recv[hint - 2]` silently failed (no fprintf, just `last_error = 3`) and masqueraded as a size issue. Fixing the cksum advanced slot 1 status from 8 (Not Initialized) through chip_id classification, and a wire dump (`02 41 01 80 01 80 00 2b 50 2d 04 00 00 00 00 00 53 00 be 03`) confirmed the inner cksum byte (`0x53`) makes `sum(bytes[0..11]) == 0 mod 256`.
 
 #### Sum checksum
 
@@ -914,25 +936,32 @@ Indices 13/19, 14/20, 21/22 share chip IDs across package variants — the chip-
 
 #### Per-slot chip-ID synth (Pokémon LE)
 
-`shim_nodebus.c::nodebus_chip_id_for_slot` returns the chip_id the shim writes into `response[4..7]` of every synthesized FE-probe reply. Mapping derived from the cabinet manual + the `.hex` firmware filenames in `games/pokemon_le/`:
+`shim_nodebus.c::nodebus_chip_id_for_slot` returns the chip_id the shim writes into `response[4..7]` of every synthesized FE-probe reply. Each chip_id matches a vtable entry whose `+0x10` (type_idx — the same value `sub_840d30` uses as `key2`) corresponds to a shipped `.hex` firmware family.
 
-| Slot | Role (manual) | chip_id sent | vtable name | Source for choice |
-|---:|---|---|---|---|
-| 0  | CPU bridge LPC | `0x00140040` | LPC1124JBD48/303 (entry 15) | host-side bridge LPC on CPU board |
-| 1  | Cabinet Node | `0x041E502B` | LPC1111FHN33/101 (entry 0, default) | unverified — accepted by game |
-| 4  | QR Reader (Bottom Arch) | `0x00140040` | LPC1124JBD48/303 (entry 15) | `node4-LPC1124_303-1_31_0.hex` |
-| 8  | Core Driver Lower Playfield | `0x3D01402B` | LPC1342FHN33 (entry 21) | accepted by game; LPC1313 firmware filename suggests silicon mismatch — see note |
-| 9  | Core Driver Upper Playfield | `0x3D01402B` | LPC1342FHN33 (entry 21) | same as slot 8 (DIP-distinguished, identical hardware) |
-| 10 | SPI Servo Node Board | `0x3D01402B` | LPC1342FHN33 (entry 21) | accepted by game; `tmc5041node-LPC1313` / `tmc2590node-LPC1313` firmware filenames |
-| any other | — | `0x041E502B` | LPC1111FHN33/101 (entry 0) | default fallback |
+| Slot | Role (manual) | chip_id | vtable entry | type_idx | Firmware match |
+|---:|---|---|---|---:|---|
+| 0  | CPU bridge | `0x00140040` | LPC1124_303 (15) | 4 | host-side bridge LPC on CPU board |
+| 1  | Cabinet | `0x042D502B` | LPC1112_101 (2) | 1 | `pinnode-LPC1112_101-1_31_0.hex` |
+| 2  | Cabinet-Express | `0x2C40102B` | LPC1313 (13) | 5 | `ws2812node-LPC1313-1_31_0.hex` |
+| 4  | QR Reader (Bottom Arch) | `0x00140040` | LPC1124_303 (15) | 4 | `node4-LPC1124_303-1_31_0.hex` |
+| 7  | Speaker-Expression | `0x2C40102B` | LPC1313 (13) | 5 | `ws2812node-LPC1313-1_31_0.hex` |
+| 8  | Core Driver Lower Playfield | `0x042D502B` | LPC1112_101 (2) | 1 | `pinnode-LPC1112_101-1_31_0.hex` |
+| 9  | Core Driver Upper Playfield | `0x042D502B` | LPC1112_101 (2) | 1 | (same record as slot 8) |
+| 10 | SPI Servo Node Board | `0x042D502B` | LPC1112_101 (2) | 1 | (same record as slot 8) |
+| 12 | Topper-Lamps | `0x2C40102B` | LPC1313 (13) | 5 | `ws2812node-LPC1313-1_31_0.hex` |
+| 13 | Topper-Servo | `0x042D502B` | LPC1112_101 (2) | 1 | `pinnode-LPC1112_101-1_31_0.hex` |
+| 14 | Universal Topper | `0x2C40102B` | LPC1313 (13) | 5 | `ws2812node-LPC1313-1_31_0.hex` |
+| any other | — | `0x041E502B` | LPC1111_101 (0) | 0 | fallback (no shipped firmware match) |
 
-Result: with this mapping all five Tech Alerts rows on the operator-mode test screen (slots 1, 4, 8, 9, 10) read **"Not Initialized"** — chip_id matched against vtable entry, post-init handshake not yet completed. Without this mapping (or with a non-vtable chip_id), the same rows read **"Invalid"**.
+Result: all 11 populated slots reach `status=2 + flag=0x03` — every row hidden in Tech Alerts; game advances past Tech Alerts to the service-menu screen. See §11 for the status writer success path and the flag-bit-1 paths driven by bridge cmd `0x25` enumeration.
 
-The disagreement between LPC1313 firmware filenames and the LPC1342 vtable name for `0x3D01402B` is unresolved. The LPC1313 chip_ids in the vtable are `0x2C40102B` (entries 13/19) and `0x1830102B` (entries 14/20); switching slots 8/9/10 to one of those is untested but a candidate for closer hardware fidelity. Topology per cabinet manual: `0 → 10 → 9 → 8 → 4` (playfield daisy chain via CPU CN22), `0 → 1` (separate cabinet branch via CPU CN11).
+LPC1342 entries (vtable 21/22, chip_id `0x3D01402B`) have `type_idx=0` — using that chip_id causes `sub_840d30` lookup miss (no shipped firmware record has `key2=0`) → status 4. Pinnode slots therefore take the simple chip_id path via LPC1112_101 (type_idx=1), which bypasses the LPC1313 special branch (`sub_8f5390` cmd `0xF2 × 8`) in `sub_674680`. ws2812node slots take the real LPC1313 chip_id (`0x2C40102B`, vtable entry 13) since the only ws2812node firmware shipped is LPC1313.
+
+Topology per cabinet manual: `0 → 10 → 9 → 8 → 4` (playfield daisy chain via CPU CN22), `0 → 1` (separate cabinet branch via CPU CN11).
 
 Synth requires a wall-clock pause before each `bridge_send_response` to preserve the timeout-driven timing real hardware imposes — empirically 200 ms (`shim_nodebus.c::NODEBUS_SYNTH_DELAY_US`). Immediate replies regress the run from frame-decode-active to "Godot init never fires".
 
-*Verified by:* JOURNAL Step 90 — frame capture via `_emulation/snap_frame.py` of the Tech Alerts screen at +220 s into a `./run_game.sh` run shows all five rows transitioning from "Invalid" (no synth) to "Not Initialized" (per-slot chip-ID synth + 200 ms delay). Slot-row state confirmed by direct visual comparison against the no-synth baseline screenshot at `_emulation/reference/tech_alerts.png`.
+*Verified by:* JOURNAL Step 92 — runtime vtable dump (`game_base + 0x42317c8`, 28 entries × 0x28) confirms `type_idx` per entry; runtime probe of all 11 populated slots reaching `flag=0x03 status=2` after shim synthesis with the chip_id table above plus bridge cmd `0x25` enumeration. Visual confirmation: Tech Alerts panel rendering empty + game advancing to service-menu screen. Earlier Step 90 captures of the "Not Initialized" intermediate state are archived in `_emulation/reference/` (file naming `tech_alerts_v*.png`; ask the user which capture is most current for any given regression check).
 
 ---
 
@@ -1879,15 +1908,46 @@ Pokémon LE ships 17 `.hex` files in `games/pokemon_le/`: `coil4_lednode-LPC1313
 | slot | family (from key1) | role (from cabinet manual) |
 |---:|---|---|
 | 1 | pinnode | Cabinet Node |
-| 2 | ws2812node | (LED node) |
+| 2 | ws2812node | Cabinet-Express |
 | 4 | node4 | QR Reader (Bottom Arch) |
-| 7 | ws2812node | (LED node) |
+| 7 | ws2812node | Speaker-Expression |
 | 8 | pinnode | Core Driver Lower Playfield |
 | 9 | pinnode | Core Driver Upper Playfield |
 | 10 | pinnode | SPI Servo Node |
-| 12, 13, 14 | (mixed) | (configured but FUN_00674680 not yet run during early boot) |
+| 12 | ws2812node | Topper-Lamps |
+| 13 | pinnode | Topper-Servo |
+| 14 | ws2812node | Universal Topper |
 
 *Verified by:* JOURNAL Step 91 — objdump-cross-checked string table at `0x37c9ef0`; Ghidra decompile of `sub_7da460`/`sub_7dae30`/`sub_674680`/`sub_840a40`/`sub_840d30`/`sub_8f88b0`; runtime probe of `shim_node_records_probe_thread` capturing fw_key per slot at +60s into a plain `./run_game.sh --debug` baseline.
+
+#### Status writer success path (`sub_674680`)
+
+After the 5×5 FE-probe consistency loop succeeds (`iVar13 == 0`, no drift), `sub_674680` classifies the outer FE response into one of {2, 3, 4, 6, 7}:
+
+- `(local_88 & 1) != 0` → status **3 (Boot)**. `local_88 byte 0` is `FE_response[0] >> 7`; bit 7 of FE response byte 0 is the **boot-mode** flag. Real nodes clear it once firmware is up; setting it forces this branch.
+- `(local_88 & 1) == 0` → chip_id classification path:
+  - `sub_840d30(slot[+0x60], chip_type_index)` looks up the firmware record. `lVar8 == 0` OR `record[+0x20] == 0` OR `record[+0x40] == 0` → status **4 (Runtime Info)**.
+  - `sub_8f88b0(record + 0x10, &v1, &v2, &v3, &v0)` returns success bit + four version bytes. Failure → status **6 (Hex Image Version not Found)**.
+  - Version mismatch (FE bytes 1..3 != `(v1, v2, v3)`) → status **7 (Version Mismatch)**.
+  - Otherwise: if `v0 == 0` OR `v0 == FE byte 10` → status **2 (Ok)**, else status **6** (re-used).
+
+`sub_8f88b0` reads version bytes via two paths gated on `record[+0x28]`:
+
+- **Simple** (`+0x28 != 0`): bytes at `record[+0x14]`, `[+0x16]`, `[+0x18]`, `[+0x1e]`.
+- **Complex** (`+0x28 == 0`, plus `record[+0x38] == 1` and `record[+0x40] >= 12`): bytes from `*(uint8_t **)(record + 0x20) + record[+0x3c] + {9, 10, 11, 8}`.
+
+In Pokémon LE 0.81, pinnode and ws2812node records take the complex path; node4 records take the simple path. V1/V2/V3 are `(0x01, 0x1F, 0x00)` for all shipped `1_31_0` records; V0 varies per family: pinnode=`0x01`, node4=`0x03`, ws2812node=`0x05`.
+
+LPC1313-classified slots take a special branch: `(cVar3 != 0) && (bVar4 >= 0x16) && (vtable[lVar8 + 0x10] == 5)` calls `sub_8f5390` (cmd `0xF2` × 8 per slot, offsets 0/8/.../56) before lookup. Both success and failure of `sub_8f5390` route through `LAB_006748c0`/`LAB_00674830` to `uVar9 = vtable[+0x10] = 5`; `uVar9 = 0` only when `lVar8 == 0` (i.e., when the FE-response chip_id was not in the vtable and `sub_8edd80` returned the default entry `0x42317a0`).
+
+#### Flag-bit-1 paths (registration)
+
+Status alone doesn't hide a row — `sub_7da460`'s "Not Responding/Not Registered" override on status 2 fires unless flag bits 0 **and** 1 are both set. Bit 1 is set during `mcp_nodebus_init_orchestrator @ 0x675110` boot, via three paths:
+
+- **A/B** — `sub_7da920(list, 32, 2)` walks 32 slots; for each slot index `N`, if `list[N] == N` and `slot[+0x00] == N`, OR-s bit 1; else clears bit 1. List is built by `sub_674600` calling `sub_8ede50` in a loop. `sub_8ede50` issues bridge cmd `0x25` (no payload, 1-byte response = next slot ID; 0 terminates). The orchestrator brackets each enumeration cycle in `sub_8f1100(0, 0)` reset calls (cmd `0x41` inner cmd `0xF0`, slot=0, payload byte `0x22`); the bridge resets its iterator on each. Called from the first while-loop and again in each retry-with-power-cycle iteration (up to 6 retries).
+- **C** — direct `flag |= 2` write in the orchestrator's LAB_00675424 pass, gated on `slot[+0x20] == 2` AND `slot[+0x10] != NULL` AND `sub_8f5cd0(slot)` success. `sub_8f5cd0` issues cmd `0x41` inner cmd `0xFF` (hint=8 → 10-byte inner response).
+
+*Verified by:* JOURNAL Step 92 — Ghidra decompile of `sub_8f5390`/`sub_8f5cd0`/`sub_675110`/`sub_674600`/`sub_7da920`/`sub_8ede50`/`sub_8f1100`/`sub_8f88b0`; runtime vtable dump (`game_base + 0x42317c8`, 28 entries × 0x28); runtime probe of all 11 populated slots reaching `flag=0x03 status=2` after shim synthesis of bridge cmd `0x25` enumeration (with cmd `0xF0` reset detection) and per-slot chip_id-driven FE-probe responses; visual confirmation via Tech Alerts panel rendering empty and game advancing to a service-menu screen displaying `Nodebus: 1.31.0` and `Bridge: 39.83.127`.
 
 ---
 
@@ -2092,6 +2152,12 @@ PLE has 4 IScene subclasses (typeinfo data refs). SW LE has 4 (typeinfo data ref
 The DisplayRenderer / SceneCache / RadiumScene / proc-system / node-bus / SPI / audio code is shared between PLE and SW LE. Anything Godot-specific (PCK loading, ClassDB registration, `_process(delta)` ticks, scene-tree management, libgodot internals) is PLE-only.
 
 *Verified by:* JOURNAL Step 73.
+
+### Per-game firmware versions
+
+Each Spike 3 game ships its own set of node firmware `.hex` files (the per-family files described in §11). Firmware versions vary across game releases — Pokémon LE 0.81 ships `1_31_0` for every node family; other Spike 3 titles will likely ship different versions. The shim's FE-probe synth reads version bytes from the loaded firmware records at runtime (`shim_nodebus.c::nodebus_version_for_slot()` walks `data_44df838`, mirrors `sub_8f88b0`'s simple/complex path logic), so the same shim source works across games without per-version updates as long as the loader's record format stays stable.
+
+*Verified by:* JOURNAL Step 92 — runtime version-byte probe of all 6 loaded records in PLE 0.81 producing `(V1, V2, V3, V0)` matching the shipped `1_31_0` filenames; shim implementation in `shim_nodebus.c::nodebus_version_for_slot()`.
 
 ---
 
