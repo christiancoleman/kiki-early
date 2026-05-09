@@ -48,6 +48,31 @@
 #define GL_OP_GL_UNIFORM_MATRIX4FV   0x010E
 
 #define GL_OP_GL_DRAW_ARRAYS         0x040B
+#define GL_OP_GL_DRAW_ELEMENTS       0x040C
+
+#define GL_OP_GL_ENABLE              0x010F
+#define GL_OP_GL_DISABLE             0x0110
+#define GL_OP_GL_BLEND_FUNC          0x0111
+#define GL_OP_GL_DEPTH_FUNC          0x0112
+#define GL_OP_GL_DEPTH_MASK          0x0113
+#define GL_OP_GL_CULL_FACE           0x0114
+#define GL_OP_GL_SCISSOR             0x0115
+#define GL_OP_GL_COLOR_MASK          0x0116
+
+#define GL_OP_GL_GEN_TEXTURES        0x020D
+#define GL_OP_GL_DELETE_TEXTURES     0x020E
+#define GL_OP_GL_ACTIVE_TEXTURE      0x0117
+#define GL_OP_GL_BIND_TEXTURE        0x0118
+#define GL_OP_GL_TEX_IMAGE_2D        0x0303
+#define GL_OP_GL_TEX_SUB_IMAGE_2D    0x0304
+#define GL_OP_GL_TEX_PARAMETER_I     0x0119
+#define GL_OP_GL_PIXEL_STORE_I       0x011A
+
+#define GL_OP_GL_GEN_FRAMEBUFFERS    0x020F
+#define GL_OP_GL_DELETE_FRAMEBUFFERS 0x0210
+#define GL_OP_GL_BIND_FRAMEBUFFER    0x011B
+#define GL_OP_GL_FRAMEBUFFER_TEX_2D  0x011C
+#define GL_OP_GL_CHECK_FRAMEBUFFER   0x040D
 
 #define GL_OP_REP_OK          0x0F01
 #define GL_OP_REP_VALUE       0x0F02
@@ -170,6 +195,86 @@ struct gl_payload_draw_arrays {
     uint32_t mode;
     int32_t  first;
     int32_t  count;
+};
+
+struct gl_payload_draw_elements {
+    uint32_t mode;
+    int32_t  count;
+    uint32_t type;
+    uint64_t offset;
+};
+
+struct gl_payload_enable {
+    uint32_t cap;
+};
+
+struct gl_payload_blend_func {
+    uint32_t sfactor;
+    uint32_t dfactor;
+};
+
+struct gl_payload_depth_func {
+    uint32_t func;
+};
+
+struct gl_payload_byte_param {
+    uint8_t  value;
+    uint8_t  pad[3];
+};
+
+struct gl_payload_color_mask {
+    uint8_t  r, g, b, a;
+};
+
+struct gl_payload_rect {
+    int32_t  x, y, w, h;
+};
+
+struct gl_payload_active_texture {
+    uint32_t texture_unit;
+};
+
+struct gl_payload_tex_image_2d {
+    uint32_t target;
+    int32_t  level;
+    int32_t  internal_format;
+    int32_t  width;
+    int32_t  height;
+    int32_t  border;
+    uint32_t format;
+    uint32_t type;
+    uint32_t data_size;
+};
+
+struct gl_payload_tex_sub_image_2d {
+    uint32_t target;
+    int32_t  level;
+    int32_t  xoffset;
+    int32_t  yoffset;
+    int32_t  width;
+    int32_t  height;
+    uint32_t format;
+    uint32_t type;
+    uint32_t data_size;
+};
+
+struct gl_payload_tex_parameter_i {
+    uint32_t target;
+    uint32_t pname;
+    int32_t  param;
+};
+
+struct gl_payload_pixel_store_i {
+    uint32_t pname;
+    int32_t  param;
+};
+
+struct gl_payload_framebuffer_tex_2d {
+    uint32_t target;
+    uint32_t attachment;
+    uint32_t textarget;
+    uint32_t texture;
+    int32_t  level;
 };
 
 struct gl_payload_rep_ids {

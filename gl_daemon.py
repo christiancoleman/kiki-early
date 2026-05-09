@@ -156,10 +156,17 @@ class Renderer:
         self._GL.glDeleteShader(shader_id)
 
     def shader_source(self, shader_id: int, source: bytes) -> None:
-        self._GL.glShaderSource(shader_id, [source.decode("utf-8", "replace")])
+        src = source.decode("utf-8", "replace")
+        self.log.info("shader_source(id=%d, %d bytes): %r", shader_id, len(source), src[:200])
+        self._GL.glShaderSource(shader_id, [src])
 
     def compile_shader(self, shader_id: int) -> None:
         self._GL.glCompileShader(shader_id)
+        status = self._GL.glGetShaderiv(shader_id, 0x8B81)
+        if not status:
+            log = self._GL.glGetShaderInfoLog(shader_id)
+            self.log.warning("shader %d compile FAILED: %s", shader_id,
+                             log.decode() if isinstance(log, bytes) else log)
 
     def get_shader_iv(self, shader_id: int, pname: int) -> int:
         return int(self._GL.glGetShaderiv(shader_id, pname))
@@ -210,6 +217,44 @@ class Renderer:
     def draw_arrays(self, mode: int, first: int, count: int) -> None:
         self._GL.glDrawArrays(mode, first, count)
 
+    def draw_elements(self, mode: int, count: int, typ: int, offset: int) -> None:
+        self._GL.glDrawElements(mode, count, typ, ctypes.c_void_p(offset))
+
+    def enable(self, cap: int) -> None:    self._GL.glEnable(cap)
+    def disable(self, cap: int) -> None:   self._GL.glDisable(cap)
+    def blend_func(self, s: int, d: int) -> None: self._GL.glBlendFunc(s, d)
+    def depth_func(self, f: int) -> None:  self._GL.glDepthFunc(f)
+    def depth_mask(self, m: int) -> None:  self._GL.glDepthMask(bool(m))
+    def cull_face(self, m: int) -> None:   self._GL.glCullFace(m)
+    def scissor(self, x: int, y: int, w: int, h: int) -> None: self._GL.glScissor(x, y, w, h)
+    def color_mask(self, r: int, g: int, b: int, a: int) -> None:
+        self._GL.glColorMask(bool(r), bool(g), bool(b), bool(a))
+
+    def gen_textures(self, n: int) -> list:
+        return [int(i) for i in self._GL.glGenTextures(n)] if n != 1 else [int(self._GL.glGenTextures(1))]
+    def delete_textures(self, ids: list) -> None: self._GL.glDeleteTextures(ids)
+    def active_texture(self, unit: int) -> None:  self._GL.glActiveTexture(unit)
+    def bind_texture(self, target: int, tex: int) -> None: self._GL.glBindTexture(target, tex)
+    def tex_image_2d(self, target, level, internal_format, w, h, border, fmt, typ, data: bytes) -> None:
+        self._GL.glTexImage2D(target, level, internal_format, w, h, border, fmt, typ,
+                              data if data else None)
+    def tex_sub_image_2d(self, target, level, x, y, w, h, fmt, typ, data: bytes) -> None:
+        self._GL.glTexSubImage2D(target, level, x, y, w, h, fmt, typ,
+                                 data if data else None)
+    def tex_parameter_i(self, target: int, pname: int, param: int) -> None:
+        self._GL.glTexParameteri(target, pname, param)
+    def pixel_store_i(self, pname: int, param: int) -> None:
+        self._GL.glPixelStorei(pname, param)
+
+    def gen_framebuffers(self, n: int) -> list:
+        return [int(i) for i in self._GL.glGenFramebuffers(n)] if n != 1 else [int(self._GL.glGenFramebuffers(1))]
+    def delete_framebuffers(self, ids: list) -> None: self._GL.glDeleteFramebuffers(len(ids), ids)
+    def bind_framebuffer(self, target: int, fb: int) -> None: self._GL.glBindFramebuffer(target, fb)
+    def framebuffer_texture_2d(self, target, attachment, textarget, tex, level) -> None:
+        self._GL.glFramebufferTexture2D(target, attachment, textarget, tex, level)
+    def check_framebuffer_status(self, target: int) -> int:
+        return int(self._GL.glCheckFramebufferStatus(target))
+
 
 def read_all(sock: socket.socket, n: int) -> bytes:
     buf = bytearray()
@@ -255,7 +300,13 @@ class Session:
                 if len(payload) < plen:
                     self.log.warning("short payload (got %d of %d)", len(payload), plen)
                     return
-                self.handle(op, flags, payload)
+                try:
+                    self.handle(op, flags, payload)
+                except Exception as e:
+                    self.log.error("handle(op=0x%04x) raised %s: %s", op, type(e).__name__, e)
+                    if flags & P.GL_FLAG_SYNC:
+                        send_reply(self.sock, P.GL_OP_REP_ERR,
+                                   struct.pack(P.REP_ERR_FMT, -1, 0))
         except OSError as e:
             self.log.info("disconnected: %s", e)
         finally:
@@ -413,6 +464,97 @@ class Session:
             mode, first, count = struct.unpack(P.DRAW_ARRAYS_FMT, payload)
             self.renderer.draw_arrays(mode, first, count)
             if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_DRAW_ELEMENTS:
+            mode, count, typ_, offset = struct.unpack(P.DRAW_ELEMENTS_FMT, payload)
+            self.renderer.draw_elements(mode, count, typ_, offset)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+
+        elif op == P.GL_OP_GL_ENABLE:
+            (cap,) = struct.unpack(P.ENABLE_FMT, payload); self.renderer.enable(cap)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_DISABLE:
+            (cap,) = struct.unpack(P.ENABLE_FMT, payload); self.renderer.disable(cap)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BLEND_FUNC:
+            s, d = struct.unpack(P.BLEND_FUNC_FMT, payload); self.renderer.blend_func(s, d)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_DEPTH_FUNC:
+            (f,) = struct.unpack(P.DEPTH_FUNC_FMT, payload); self.renderer.depth_func(f)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_DEPTH_MASK:
+            (m,) = struct.unpack(P.BYTE_PARAM_FMT, payload); self.renderer.depth_mask(m)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_CULL_FACE:
+            (m,) = struct.unpack(P.ENABLE_FMT, payload); self.renderer.cull_face(m)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_SCISSOR:
+            x, y, w, h = struct.unpack(P.RECT_FMT, payload); self.renderer.scissor(x, y, w, h)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_COLOR_MASK:
+            r, g, b, a = struct.unpack(P.COLOR_MASK_FMT, payload)
+            self.renderer.color_mask(r, g, b, a)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+
+        elif op == P.GL_OP_GL_GEN_TEXTURES:
+            (n,) = struct.unpack(P.COUNT_FMT, payload)
+            ids = self.renderer.gen_textures(n)
+            send_reply(self.sock, P.GL_OP_REP_IDS,
+                       struct.pack(P.REP_IDS_FMT, len(ids)) +
+                       b''.join(struct.pack("<I", i) for i in ids))
+        elif op == P.GL_OP_GL_DELETE_TEXTURES:
+            (n,) = struct.unpack(P.COUNT_FMT, payload[:4])
+            ids = list(struct.unpack(f"<{n}I", payload[4:4+4*n]))
+            self.renderer.delete_textures(ids)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_ACTIVE_TEXTURE:
+            (u,) = struct.unpack(P.ACTIVE_TEX_FMT, payload); self.renderer.active_texture(u)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BIND_TEXTURE:
+            t, tex = struct.unpack(P.BIND_FMT, payload); self.renderer.bind_texture(t, tex)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_TEX_IMAGE_2D:
+            hsz = struct.calcsize(P.TEX_IMAGE_2D_FMT)
+            t, lvl, ifmt, w, h, border, fmt, typ, dsz = struct.unpack(P.TEX_IMAGE_2D_FMT, payload[:hsz])
+            self.renderer.tex_image_2d(t, lvl, ifmt, w, h, border, fmt, typ,
+                                       payload[hsz:hsz+dsz] if dsz else b'')
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_TEX_SUB_IMAGE_2D:
+            hsz = struct.calcsize(P.TEX_SUB_IMAGE_2D_FMT)
+            t, lvl, x, y, w, h, fmt, typ, dsz = struct.unpack(P.TEX_SUB_IMAGE_2D_FMT, payload[:hsz])
+            self.renderer.tex_sub_image_2d(t, lvl, x, y, w, h, fmt, typ,
+                                           payload[hsz:hsz+dsz] if dsz else b'')
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_TEX_PARAMETER_I:
+            t, pn, val = struct.unpack(P.TEX_PARAMETER_I_FMT, payload)
+            self.renderer.tex_parameter_i(t, pn, val)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_PIXEL_STORE_I:
+            pn, val = struct.unpack(P.PIXEL_STORE_I_FMT, payload)
+            self.renderer.pixel_store_i(pn, val)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+
+        elif op == P.GL_OP_GL_GEN_FRAMEBUFFERS:
+            (n,) = struct.unpack(P.COUNT_FMT, payload)
+            ids = self.renderer.gen_framebuffers(n)
+            send_reply(self.sock, P.GL_OP_REP_IDS,
+                       struct.pack(P.REP_IDS_FMT, len(ids)) +
+                       b''.join(struct.pack("<I", i) for i in ids))
+        elif op == P.GL_OP_GL_DELETE_FRAMEBUFFERS:
+            (n,) = struct.unpack(P.COUNT_FMT, payload[:4])
+            ids = list(struct.unpack(f"<{n}I", payload[4:4+4*n]))
+            self.renderer.delete_framebuffers(ids)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BIND_FRAMEBUFFER:
+            t, fb = struct.unpack(P.BIND_FMT, payload); self.renderer.bind_framebuffer(t, fb)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_FRAMEBUFFER_TEX_2D:
+            t, att, tt, tex, lvl = struct.unpack(P.FRAMEBUFFER_TEX_2D_FMT, payload)
+            self.renderer.framebuffer_texture_2d(t, att, tt, tex, lvl)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_CHECK_FRAMEBUFFER:
+            (t,) = struct.unpack(P.ENABLE_FMT, payload)
+            v = self.renderer.check_framebuffer_status(t)
+            send_reply(self.sock, P.GL_OP_REP_VALUE, struct.pack(P.REP_VALUE_FMT, v))
 
         else:
             self.log.warning("unknown op 0x%04x flags=0x%04x payload=%db",
