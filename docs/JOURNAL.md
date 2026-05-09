@@ -8663,3 +8663,74 @@ Orphan-code cleanup (same Phase 0): `shim_fb0_blit` in `shim_bridges.c` was the 
 - `~/.claude/projects/.../memory/MEMORY.md` — system-mode entry removed; topic count updated; new memories added (`feedback_no_orphans.md`, `feedback_baseline_runs_ask_first.md`).
 - `~/.claude/projects/.../memory/feedback_no_orphans.md` — NEW.
 - `~/.claude/projects/.../memory/feedback_baseline_runs_ask_first.md` — NEW.
+
+### Step 96.1 — Phases 1–3c: host-native GL marshalling stack landed (2026-05-09)
+
+End-to-end shim → daemon → native llvmpipe pipeline working. **Game integration not yet attempted** (Phase 3d). Default `GL_DAEMON=0` preserves the existing Mesa-aarch64 overlay path; setting `GL_DAEMON=1` (or `SPIKE3_GL_DAEMON=1` directly) routes a substantial subset of GL/EGL through the new host-native daemon.
+
+**Architecture (implemented).** Shim's GL/EGL hooks marshal over abstract AF_UNIX socket `@spike3_gl` to `gl_daemon.py`, which runs natively on host x86_64. Daemon binds an EGL display via `EGL_PLATFORM_SURFACELESS_MESA` (constant 0x31DD, resolved through `eglGetPlatformDisplay`), creates a 1920×1080 GLES2 pbuffer + context, and replays incoming opcodes via PyOpenGL. Shim returns synthesized FAKE_EGL_* sentinels for the EGL setup calls (display/config/context/surface) so the qemu-side game/probe never knows the real EGL state lives on host. EGL_VERSION on host: `Mesa Project 1.5`; GL_RENDERER: `llvmpipe (LLVM 19.1.7, 256 bits)`; GL_VERSION: `OpenGL ES 3.2 Mesa 25.0.7-2`.
+
+**Wire protocol** (`gl_proto.h` + `gl_proto.py` — matched constants by hand-sync). 8-byte header `{u16 op, u16 flags, u32 payload_len}` LE + payload. Flags: bit 0 SYNC, bit 1 HAS_DATA. Sync ops carry their own typed reply (REP_OK / REP_VALUE / REP_LOC / REP_IDS / REP_PIXELS / REP_ERR). Async ops are fire-and-forget; daemon logs unknowns. ~50 opcodes wired across EGL (synthesized in shim), GL state, object lifecycle, upload, draw + sync, uniforms, replies.
+
+**Verification — 4 probes pass through full pipeline:**
+- `gles_probe3` (Phase 2b): EGL init + clear-to-red + readback → 2048/2048 red.
+- `gles_probe4` (Phase 3a): full triangle pipeline (shaders + buffers + glDrawArrays) → 2048/2048 green.
+- `gles_probe5` (Phase 3c): textured quad (genTextures + texImage2D + texParameteri + sampler2D + texture2D in fragment shader) → 2048/2048 yellow.
+- `gles_probe6` (Phase 3c): render-to-FBO + sample FBO's color texture from default framebuffer → 2048/2048 green; FBO status COMPLETE (0x8CD5).
+
+Each probe is a self-contained aarch64 binary linking directly against `libEGL.so.1` / `libGLESv2.so.2` (so LD_PRELOAD interposition works — `gles_probe2`'s pre-existing `dlsym(handle, "glXXX")` pattern bypasses the shim, which is why the new probes inline minimal EGL/GLES decls and link directly).
+
+**Two non-obvious bugs surfaced and fixed:**
+- **Phase 1**: `glGetError` MUST be async-marshalled (not sync). Sync round-trip widens a cross-thread synchronization race that triggers the audio-singleton vtable[5] = `_ZSt10unexpectedv` corruption around attract-mode start. Fix in `shim_gl.c::glGetError`: send_async only, FWD_RET still returns Mesa's authoritative error from local path. Note for Phase 3d game run: glGetError sync is **off-limits** until the audio race is independently understood.
+- **Phase 3b**: `shim_gl.c::glShaderSource` had a `dlsym(RTLD_NEXT, "glShaderSource")` early-return path (`if (!real_fn || count <= 0 || !string)`) that fired before the marshal block. With daemon-only mode (no Mesa overlay needed) `real_fn` is permitted to be NULL, so the function returned without sending. Restructured the function: daemon-mode is checked first, FWD path only runs when `!active`.
+
+**Run pattern (manual probe testing this session):**
+```bash
+python3 -u gl_daemon.py > /tmp/gl_daemon.log 2>&1 &
+qemu-aarch64 -L "$SYSROOT" \
+    -E LD_LIBRARY_PATH="$OVERLAY:$SYSROOT/usr/lib64:$SYSROOT/usr/lib:$SYSROOT/lib64:$SYSROOT/lib" \
+    -E LD_PRELOAD="$SHIM" \
+    -E SPIKE3_GL_DAEMON=1 \
+    ./gles_probeN
+```
+For game runs: `GL_DAEMON=1 ./run_game.sh ...` spawns daemon automatically.
+
+**Daemon state hygiene gotcha** (cost ~30 min mid-session): stale `gl_daemon.py` processes from prior probe runs hold the abstract socket and yield ID-space confusion (shim sees `prog=1`, daemon executes `glUseProgram(3)`). Always `pkill -9 gl_daemon.py` before fresh runs. Single-connection assumption: `Session.serve()` is called inline from accept loop, so two clients can't connect simultaneously, but state across sequential connections persists in PyOpenGL's GL state. Phase 3d should add `Renderer.reset()` on accept (delete all programs/shaders/buffers) OR exit-after-disconnect for cleanliness.
+
+**Coverage maturity post-Phase-3c:**
+- ✅ EGL setup (synth in shim; daemon has its own pre-init context)
+- ✅ Shader compile/link (samplerExternalOES rewrite preserved; rewritten source marshalled)
+- ✅ Buffers + VAOs + glDrawArrays
+- ✅ Textures (genTextures, activeTexture, bindTexture, texImage2D, texSubImage2D, texParameteri, pixelStorei, deleteTextures)
+- ✅ Framebuffers (gen/bind/attach/checkStatus/delete)
+- ✅ glDrawElements (wired, untested)
+- ✅ State setters: glEnable/Disable, BlendFunc, DepthFunc, DepthMask, CullFace, Scissor, ColorMask
+- ✅ Uniforms: 1i, 4f, Matrix4fv (sync GetUniformLocation)
+- ⏳ Untested in-shim hooks: glDrawElements, glColorMask, several state-setters
+- ⏳ Not-yet-marshalled: BlendFuncSeparate, BlendEquation/Separate, BlendColor, StencilFunc/Op/Mask, FrontFace, LineWidth, PolygonOffset, ClearDepthf, ClearStencil, DepthRangef, Uniform2f/3f/Matrix3fv, Uniform[1234]i variants, Uniform1iv/Xfv, IsEnabled, BindRenderbuffer, RenderbufferStorage, FramebufferRenderbuffer, FramebufferTextureLayer, GenerateMipmap, BlitFramebuffer, DrawArraysInstanced, DrawElementsInstanced, VertexAttribDivisor, BindAttribLocation, ValidateProgram, DetachShader, glGetString, glGetIntegerv, glGetFloatv, glGetBooleanv, glIsEnabled, glCompressedTex{,Sub}Image2D, glTexParameterf, glMapBufferRange/Unmap, glUniform4i/3i/2i etc, EGL_IMAGE / DMA-BUF path
+
+**Phase 3d open work** (next session pick-up):
+1. **shim_avforward video-frame integration**: existing `g_video_pixel_table[]` provides RGBA. The shim-owned `glEGLImageTargetTexture2DOES` hook should marshal `OP_GL_TEX_IMAGE_2D` (or `OP_GL_TEX_SUB_IMAGE_2D` for re-binds) directly to daemon with the RGBA payload, instead of forwarding to local Mesa. Estimated: 1 hour. Replaces the current EGLImage path entirely when daemon mode is active.
+2. **Frame-capture relay**: `shim_frame_capture_at_page_flip` in `shim_bridges.c` does local `glReadPixels`. When daemon active, send `OP_GL_READ_PIXELS` sync, get bytes back, call `shim_frame_send` exactly as today. ~20 lines. Restores the viewer.
+3. **Bulk-add remaining hook marshals** (~30 functions listed above, mostly mechanical async-marshal pattern). Add corresponding daemon handlers for the ones that affect rendering correctness; no-op the rest (daemon's "unknown op" handler already returns gracefully).
+4. **Daemon state reset**: add `Renderer.reset()` invoked from `Session.bind()` so each connection starts with a fresh GL state.
+5. **Game run** with `GL_DAEMON=1`. Per `feedback_baseline_runs_ask_first.md` user drives this. Expected to surface several missing-opcode crashes that we iterate on.
+
+**Phase 4 (post-game-running)**: per the plan file at `~/.claude/plans/let-s-create-a-plan-atomic-horizon.md` — measure attract framerate vs the 1.37 fps baseline; bake verified facts into PROTOCOL §10/§12; flip `GL_DAEMON=1` default once stable; consider ring-buffer batching only if Phase 4 numbers demand it.
+
+### Touched (Step 96.1)
+
+- `_emulation/gl_proto.h` — NEW. Wire protocol opcodes + payload structs (C side, ~50 opcodes covering EGL/state/object/upload/draw/uniform/reply ranges).
+- `_emulation/gl_proto.py` — NEW. Matching opcodes + struct.pack format strings (Python side).
+- `_emulation/gl_daemon.py` — NEW. Host-native daemon. Renderer class with `EGL_PLATFORM_SURFACELESS_MESA` context init via raw libEGL ctypes (PyOpenGL's Python layer doesn't expose that platform constant); PyOpenGL for everything after. Session class with full opcode dispatcher + per-handler exception logging that returns REP_ERR on SYNC failures.
+- `_emulation/shim_gl_marshal.c` — NEW. Marshal lib: `shim_gl_marshal_active()` (lazy connect with 3× retry + dlsym fallback), `_send_async()`, `_send_sync()` with mutex.
+- `_emulation/spi_shim.h` — extern decls for the marshal API.
+- `_emulation/shim_gl.c` — ~30 hooks updated with daemon-mode early-return: eglGetDisplay/Initialize/BindAPI/ChooseConfig/CreateContext/CreatePbufferSurface/MakeCurrent (synth sentinels), glViewport/ClearColor/Clear/Finish/GetError/ReadPixels (marshal), glGenBuffers/DeleteBuffers/BindBuffer/BufferData/GenVertexArrays/DeleteVertexArrays/BindVertexArray, glCreateShader/DeleteShader/ShaderSource/CompileShader/GetShaderiv, glCreateProgram/DeleteProgram/AttachShader/LinkProgram/GetProgramiv/UseProgram, glGetAttribLocation/GetUniformLocation/VertexAttribPointer/EnableVertexAttribArray/Uniform1i/Uniform4f/UniformMatrix4fv, glDrawArrays/DrawElements, glEnable/Disable/BlendFunc/DepthFunc/DepthMask/CullFace/Scissor/ColorMask, glGenTextures/DeleteTextures/ActiveTexture/BindTexture/TexImage2D/TexSubImage2D/TexParameteri/PixelStorei, glGenFramebuffers/DeleteFramebuffers/BindFramebuffer/FramebufferTexture2D/CheckFramebufferStatus. Plus `gl_marshal_gen_ids`/`gl_marshal_delete_ids`/`gl_marshal_get_location` static helpers; `gl_pixel_size` helper for tex upload size estimation. Forward decls for the static helpers added at top.
+- `_emulation/build.sh` — `shim_gl_marshal.c` added to `SOURCES=()`. Build: `spi_shim.so 367168 bytes` (clean, only pre-existing warnings).
+- `_emulation/run_game.sh` — `GL_DAEMON` env knob (default 0); spawns `gl_daemon.py` alongside `decode_daemon.py`; forwards `SPIKE3_GL_DAEMON=1` to qemu env; logs go to `runs/<TS>/gl_daemon.log`.
+- `_emulation/gles_probe3.c` — NEW. Minimal EGL+GLES probe linking directly against libEGL/libGLESv2 (no dlopen, so LD_PRELOAD interposes).
+- `_emulation/gles_probe4.c` — NEW. Triangle pipeline.
+- `_emulation/gles_probe5.c` — NEW. Textured quad.
+- `_emulation/gles_probe6.c` — NEW. FBO render-to-texture + sample.
+- `_emulation/docs/JOURNAL.md` — this Step 96.1 entry appended.
+
