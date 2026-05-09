@@ -35,9 +35,13 @@
 #include <signal.h>
 #include <setjmp.h>
 #include <pthread.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
 
 #include "spi_shim.h"
 #include "shim_discovery.h"
+#include "games/pokemon_le_machine.h"
 
 /* Sweep globals — read by shim_sigsegv_handler (in shim_diagnostics.c) to
  * longjmp back out of a faulting sweep iteration. Externed in spi_shim.h. */
@@ -827,6 +831,439 @@ static void *shim_edge_snapshot_thread(void *arg) {
     return NULL;
 }
 
+/* SHIM_MACHINE_DUMP=1 — join the runtime switch table against the per-game
+ * mechanical inventory in games/pokemon_le_machine.{c,h}. Logs each manual
+ * entry's runtime sw_id (or "missing" if the manual lists a switch not in
+ * the runtime array), plus the full driver and lamp tables.
+ *
+ * SHIM_MACHINE_DUMP_DELAY_S=N — wait N seconds before dumping (default 70;
+ * pairs naturally with SHIM_SWITCH_TABLE_PROBE_DELAY_S=65). */
+static void *shim_machine_dump_thread(void *arg) {
+    (void)arg;
+    const char *v = getenv("SHIM_MACHINE_DUMP");
+    if (!v || !v[0] || v[0] == '0') return NULL;
+
+    int delay_s = 70;
+    if ((v = getenv("SHIM_MACHINE_DUMP_DELAY_S")) != NULL && v[0])
+        delay_s = atoi(v);
+    if (delay_s > 0) sleep((unsigned)delay_s);
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[machine_dump] game_base unresolved; abort");
+        return NULL;
+    }
+
+    SHIM_LOG("[machine_dump] === START === switches=%zu drivers=%zu lamps=%zu",
+             ple_switches_count, ple_drivers_count, ple_lamps_count);
+
+    uint8_t **arr_pp = (uint8_t **)(uintptr_t)(game_base + 0x4480220ULL);
+    uint8_t *arr = *arr_pp;
+    int matched = 0, missing = 0;
+
+    for (size_t i = 0; i < ple_switches_count; i++) {
+        const ple_switch_t *m = &ple_switches[i];
+        int found_sw_id = -1;
+        if (arr) {
+            for (int sw_id = 1; sw_id < 256; sw_id++) {
+                uint8_t *e = arr + (size_t)sw_id * 0x30u;
+                uint16_t recorded = *(uint16_t *)(e + 0x20);
+                if (recorded != (uint16_t)sw_id) break;
+                uint16_t bit_idx = *(uint16_t *)(e + 0x22);
+                uint8_t channel = *(uint8_t *)(e + 0x24);
+                if (channel == m->channel && bit_idx == m->bit_idx) {
+                    found_sw_id = sw_id;
+                    break;
+                }
+            }
+        }
+        if (found_sw_id >= 0) {
+            SHIM_LOG("[machine_dump] SW %-7s ch=%u bit=%2u sw_id=%3d  %s",
+                     m->manual_id, m->channel, m->bit_idx, found_sw_id, m->name);
+            matched++;
+        } else {
+            SHIM_LOG("[machine_dump] SW %-7s ch=%u bit=%2u sw_id=---  %s  (MISSING from runtime)",
+                     m->manual_id, m->channel, m->bit_idx, m->name);
+            missing++;
+        }
+    }
+    SHIM_LOG("[machine_dump] switches: %d matched / %d missing of %zu manual entries",
+             matched, missing, ple_switches_count);
+
+    for (size_t i = 0; i < ple_drivers_count; i++) {
+        const ple_driver_t *d = &ple_drivers[i];
+        const char *kind_name = "?";
+        switch (d->kind) {
+        case PLE_KIND_COIL: kind_name = "COIL";    break;
+        case PLE_KIND_MOTOR: kind_name = "MOTOR";  break;
+        case PLE_KIND_SERVO: kind_name = "SERVO";  break;
+        case PLE_KIND_MAGNET: kind_name = "MAGNET"; break;
+        case PLE_KIND_DIGITAL: kind_name = "DIGITAL"; break;
+        }
+        SHIM_LOG("[machine_dump] DR %-7s slot=%2u idx=%2u kind=%s  %s",
+                 d->manual_id, d->slot, d->dr_idx, kind_name, d->name);
+    }
+
+    for (size_t i = 0; i < ple_lamps_count; i++) {
+        const ple_lamp_t *l = &ple_lamps[i];
+        const char *kind_name = "?";
+        switch (l->kind) {
+        case PLE_LAMP_GI: kind_name = "GI";          break;
+        case PLE_LAMP_FEATURE: kind_name = "FEATURE"; break;
+        case PLE_LAMP_RGB_R: kind_name = "RGB_R";    break;
+        case PLE_LAMP_RGB_G: kind_name = "RGB_G";    break;
+        case PLE_LAMP_RGB_B: kind_name = "RGB_B";    break;
+        case PLE_LAMP_FLASHER: kind_name = "FLASHER"; break;
+        case PLE_LAMP_DIGITAL: kind_name = "DIGITAL"; break;
+        }
+        SHIM_LOG("[machine_dump] LP %-7s slot=%2u idx=%3u kind=%-7s %s",
+                 l->manual_id, l->slot, l->lp_idx, kind_name, l->name);
+    }
+
+    SHIM_LOG("[machine_dump] === END ===");
+    return NULL;
+}
+
+/* SHIM_OUTPUT_PROBE=1 — periodically poll g_hardware_output_state at game
+ * VA 0x450da30 (8 bytes, written by set_hardware_output_bit @ 0x8fac70 and
+ * write_hardware_output_byte @ 0x8fad0c, transmitted by SPI bridge thread
+ * to the MCU on every cycle). Diff against last sample, log byte-level
+ * changes with timestamps.
+ *
+ * Verified Phase-0 (2026-05-08, Ghidra MCP):
+ *   - 0x450da30: 8-byte g_hardware_output_state; mutex 0x450d9f8
+ *   - 0x450da28: init flag (set 1 by SPI bridge thread once running)
+ *
+ * Env knobs:
+ *   SHIM_OUTPUT_PROBE=1            — enable
+ *   SHIM_OUTPUT_PROBE_DELAY_S=N    — wait N seconds before first poll (default 50)
+ *   SHIM_OUTPUT_PROBE_INTERVAL_MS=N — gap between polls in ms (default 100)
+ *   SHIM_OUTPUT_PROBE_DURATION_S=N — total polling duration (default 60) */
+static void *shim_output_probe_thread(void *arg) {
+    (void)arg;
+    const char *v = getenv("SHIM_OUTPUT_PROBE");
+    if (!v || !v[0] || v[0] == '0') return NULL;
+
+    int delay_s = 50;
+    int interval_ms = 100;
+    int duration_s = 60;
+    if ((v = getenv("SHIM_OUTPUT_PROBE_DELAY_S")) != NULL && v[0]) delay_s = atoi(v);
+    if ((v = getenv("SHIM_OUTPUT_PROBE_INTERVAL_MS")) != NULL && v[0]) interval_ms = atoi(v);
+    if ((v = getenv("SHIM_OUTPUT_PROBE_DURATION_S")) != NULL && v[0]) duration_s = atoi(v);
+
+    if (delay_s > 0) sleep((unsigned)delay_s);
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[output_probe] game_base unresolved; abort");
+        return NULL;
+    }
+
+    volatile uint8_t *out_state = (volatile uint8_t *)(uintptr_t)(game_base + 0x450da30ULL);
+    volatile uint8_t *init_flag = (volatile uint8_t *)(uintptr_t)(game_base + 0x450da28ULL);
+    SHIM_LOG("[output_probe] === START === out_state @ %p init_flag=%u  duration=%ds interval=%dms",
+             (void *)out_state, *init_flag, duration_s, interval_ms);
+
+    uint8_t prev[8];
+    memcpy(prev, (const void *)out_state, 8);
+    SHIM_LOG("[output_probe] initial: %02x %02x %02x %02x %02x %02x %02x %02x",
+             prev[0], prev[1], prev[2], prev[3], prev[4], prev[5], prev[6], prev[7]);
+
+    int total_ticks = (duration_s * 1000) / (interval_ms > 0 ? interval_ms : 100);
+    int changes = 0;
+    for (int tick = 0; tick < total_ticks; tick++) {
+        usleep((useconds_t)interval_ms * 1000);
+        uint8_t cur[8];
+        memcpy(cur, (const void *)out_state, 8);
+        if (memcmp(cur, prev, 8) != 0) {
+            char line[256];
+            int n = snprintf(line, sizeof(line),
+                             "[output_probe] tick=%d  %02x %02x %02x %02x %02x %02x %02x %02x  diff:",
+                             tick, cur[0], cur[1], cur[2], cur[3],
+                             cur[4], cur[5], cur[6], cur[7]);
+            for (int b = 0; b < 8; b++) {
+                if (cur[b] != prev[b] && n < (int)sizeof(line) - 32) {
+                    uint8_t diff = cur[b] ^ prev[b];
+                    n += snprintf(line + n, sizeof(line) - n,
+                                  " byte%d:%02x->%02x(^%02x)",
+                                  b, prev[b], cur[b], diff);
+                }
+            }
+            SHIM_LOG("%s", line);
+            memcpy(prev, cur, 8);
+            changes++;
+        }
+    }
+    SHIM_LOG("[output_probe] === END === %d changes over %ds", changes, duration_s);
+    return NULL;
+}
+
+/* SHIM_DISPATCH_WATCHDOG=1 — periodically check whether the procDispatch
+ * thread is still ticking by reading g_timestamp_threshold_1 @ 0x44cb2e0
+ * (PROTOCOL §3 Phase 5). If the timestamp doesn't advance for N seconds,
+ * send SIGUSR1 to the procDispatch thread (located by /proc/self/task name
+ * match) — the existing signal handler dumps a backtrace ON THE STALLED
+ * THREAD, telling us which subsystem call inside FUN_00720cf0 is blocked
+ * when status-5 dispatch timeout would fire.
+ *
+ * Knobs:
+ *   SHIM_DISPATCH_WATCHDOG_DELAY_S=N      — wait N s before starting (default 30)
+ *   SHIM_DISPATCH_WATCHDOG_THRESHOLD_S=N  — fire SIGUSR1 after N s of no
+ *                                          timestamp change (default 7;
+ *                                          must be < 10 s game-side timeout) */
+static pid_t shim_find_thread_by_name(const char *name) {
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return -1;
+    pid_t result = -1;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char path[256];
+        snprintf(path, sizeof(path), "/proc/self/task/%s/comm", de->d_name);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        char buf[32] = {0};
+        ssize_t r = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (r <= 0) continue;
+        char *nl = strchr(buf, '\n');
+        if (nl) *nl = 0;
+        if (strcmp(buf, name) == 0) {
+            result = (pid_t)atoi(de->d_name);
+            break;
+        }
+    }
+    closedir(d);
+    return result;
+}
+
+static void *shim_dispatch_watchdog_thread(void *arg) {
+    (void)arg;
+    const char *v = getenv("SHIM_DISPATCH_WATCHDOG");
+    if (!v || !v[0] || v[0] == '0') return NULL;
+
+    int delay_s = 30;
+    int threshold_s = 7;
+    if ((v = getenv("SHIM_DISPATCH_WATCHDOG_DELAY_S")) != NULL && v[0]) delay_s = atoi(v);
+    if ((v = getenv("SHIM_DISPATCH_WATCHDOG_THRESHOLD_S")) != NULL && v[0]) threshold_s = atoi(v);
+    if (threshold_s < 2) threshold_s = 2;
+    if (threshold_s > 9) threshold_s = 9;
+
+    if (delay_s > 0) sleep((unsigned)delay_s);
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[watchdog] game_base unresolved; abort");
+        return NULL;
+    }
+    volatile uint64_t *ts_ptr = (volatile uint64_t *)(uintptr_t)
+        (game_base + 0x44cb2e0ULL);
+    pid_t my_pid = getpid();
+
+    /* qemu-user prefixes guest thread names with its own process name and
+     * truncates the combined string to 15 chars (TASK_COMM_LEN-1). So the
+     * "procDispatch" pthread_setname_np in the game becomes the comm value
+     * "qemu-aarch64:pr" in the host kernel. Try the qemu-mangled form first,
+     * fall back to the unprefixed name (in case qemu version differs). */
+    pid_t target_tid = -1;
+    int spin = 0;
+    while (target_tid < 0) {
+        target_tid = shim_find_thread_by_name("qemu-aarch64:pr");
+        if (target_tid < 0)
+            target_tid = shim_find_thread_by_name("procDispatch");
+        if (target_tid < 0) {
+            if (spin == 30 || spin == 90 || spin == 180 || spin == 300)
+                SHIM_LOG("[watchdog] still searching for procDispatch (waited %ds)", spin);
+            spin++;
+            sleep(1);
+        }
+    }
+    if (target_tid < 0) {
+        SHIM_LOG("[watchdog] could not find 'procDispatch' thread after 30s; "
+                 "dumping all thread names found for diagnosis:");
+        DIR *d = opendir("/proc/self/task");
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.') continue;
+                char path[256], buf[32] = {0};
+                snprintf(path, sizeof(path), "/proc/self/task/%s/comm", de->d_name);
+                int fd = open(path, O_RDONLY);
+                if (fd < 0) continue;
+                ssize_t r = read(fd, buf, sizeof(buf) - 1);
+                close(fd);
+                if (r <= 0) continue;
+                char *nl = strchr(buf, '\n');
+                if (nl) *nl = 0;
+                SHIM_LOG("[watchdog]   tid=%s comm=\"%s\"", de->d_name, buf);
+            }
+            closedir(d);
+        }
+        return NULL;
+    }
+
+    SHIM_LOG("[watchdog] === START === pid=%d procDispatch_tid=%d ts_ptr=%p threshold=%ds",
+             (int)my_pid, (int)target_tid, (void *)ts_ptr, threshold_s);
+
+    /* Wait until the dispatcher has ticked at least once (timestamp != 0).
+     * Without this, the first 7s after watchdog start always look like a
+     * stall because procDispatch hasn't yet entered FUN_00720cf0. */
+    uint64_t prev_ts = *ts_ptr;
+    int warmup_logged = 0;
+    while (prev_ts == 0) {
+        sleep(1);
+        prev_ts = *ts_ptr;
+        if (!warmup_logged) {
+            SHIM_LOG("[watchdog] dispatcher ts still 0 — waiting for first tick");
+            warmup_logged = 1;
+        }
+    }
+    SHIM_LOG("[watchdog] first dispatcher tick observed (ts=0x%lx); now monitoring",
+             (unsigned long)prev_ts);
+
+    int stuck_secs = 0;
+    int last_signaled = 0;
+    while (1) {
+        sleep(1);
+        uint64_t cur_ts = *ts_ptr;
+        if (cur_ts != prev_ts) {
+            if (last_signaled) {
+                SHIM_LOG("[watchdog] resumed after stall: ts %lu -> %lu",
+                         (unsigned long)prev_ts, (unsigned long)cur_ts);
+                last_signaled = 0;
+            }
+            prev_ts = cur_ts;
+            stuck_secs = 0;
+            continue;
+        }
+        stuck_secs++;
+        if (stuck_secs == threshold_s) {
+            /* Use SIGURG (16): procDispatch's SigBlk (0x2a02) blocks SIGUSR1
+             * (bit 9), so an SIGUSR1 sent here gets queued in SigPnd but
+             * never delivered. SIGURG is unblocked and its default
+             * disposition is ignore (won't crash if no handler installed),
+             * so the shim's SIGURG handler can dump procDispatch's stack. */
+            SHIM_LOG("[watchdog] STALL detected: ts unchanged for %ds at value 0x%lx; sending SIGURG to tid %d",
+                     stuck_secs, (unsigned long)cur_ts, (int)target_tid);
+            if (syscall(SYS_tgkill, my_pid, target_tid, SIGURG) != 0) {
+                SHIM_LOG("[watchdog] tgkill failed: errno=%d (%s)",
+                         errno, strerror(errno));
+            }
+            last_signaled = 1;
+        }
+    }
+}
+
+/* SHIM_MANUAL_PRESS=1 — poll runs/latest/press_request.txt every 200 ms;
+ * when the file appears, parse its first int as a runtime sw_id, delete the
+ * file, and drive ONE press/release through the same code path that
+ * shim_select_press_thread uses (SPI rx-extra + force-poll for channel 0;
+ * direct translate() call for remote nodes). Enables marker_button.py to
+ * trigger presses interactively, synced to what the user sees on screen.
+ *
+ * Env knobs:
+ *   SHIM_MANUAL_PRESS=1               — enable
+ *   SHIM_MANUAL_PRESS_DELAY_S=N       — wait N s before first poll (default 30)
+ *   SHIM_MANUAL_PRESS_MS=N            — press hold ms (default 500) */
+static void shim_press_one_sw_id(uintptr_t game_base, uint8_t *arr, int sw_id, int press_ms) {
+    typedef int64_t (*translate_fn)(uint8_t channel_id, const uint8_t *buffer);
+    translate_fn translate = (translate_fn)(game_base + 0x651610);
+    typedef void (*poll_ch0_fn)(int);
+    poll_ch0_fn poll_ch0 = (poll_ch0_fn)(uintptr_t)(game_base + 0x674b90ULL);
+
+    uint8_t *e = arr + (size_t)sw_id * 0x30u;
+    uint16_t recorded = *(uint16_t *)(e + 0x20);
+    if (recorded != (uint16_t)sw_id) {
+        SHIM_LOG("[manual_press] sw_id=%d not present (recorded=%u); skip",
+                 sw_id, recorded);
+        return;
+    }
+    uint16_t bit_idx    = *(uint16_t *)(e + 0x22);
+    uint8_t  channel_id = *(uint8_t  *)(e + 0x24);
+    int byte_off = bit_idx >> 3;
+    uint8_t bit_mask = (uint8_t)(1u << (bit_idx & 7));
+    uint16_t edge_before = *(uint16_t *)(e + 0x26);
+    uint8_t  state_before = *(uint8_t *)(e + 0x28);
+    SHIM_LOG("[manual_press] sw_id=%d ch=%u byte=%d bit=%u  (BEFORE: state=%u edge=%u)",
+             sw_id, channel_id, byte_off, (unsigned)(bit_idx & 7),
+             state_before, edge_before);
+
+    if (channel_id == 0 && byte_off >= 1 && byte_off < 8) {
+        int rx_off = byte_off - 1;
+        shim_spi_rx_extra[rx_off] |= bit_mask;
+        usleep(5000);
+        poll_ch0(0);
+        usleep((useconds_t)press_ms * 1000);
+        shim_spi_rx_extra[rx_off] &= (uint8_t)~bit_mask;
+        usleep(5000);
+        poll_ch0(0);
+    } else if (channel_id != 0) {
+        uint8_t buf[8] = {0};
+        buf[byte_off] = bit_mask;
+        translate(channel_id, buf);
+        usleep((useconds_t)press_ms * 1000);
+        memset(buf, 0, sizeof(buf));
+        translate(channel_id, buf);
+    }
+    usleep(200000);
+    uint16_t edge_after = *(uint16_t *)(e + 0x26);
+    uint8_t  state_after = *(uint8_t *)(e + 0x28);
+    SHIM_LOG("[manual_press] sw_id=%d AFTER: state=%u edge=%u (delta=%d)",
+             sw_id, state_after, edge_after, edge_after - edge_before);
+}
+
+static void *shim_manual_press_thread(void *arg) {
+    (void)arg;
+    const char *v = getenv("SHIM_MANUAL_PRESS");
+    if (!v || !v[0] || v[0] == '0') return NULL;
+
+    int delay_s = 30;
+    int press_ms = 500;
+    if ((v = getenv("SHIM_MANUAL_PRESS_DELAY_S")) != NULL && v[0]) delay_s = atoi(v);
+    if ((v = getenv("SHIM_MANUAL_PRESS_MS")) != NULL && v[0]) press_ms = atoi(v);
+
+    if (delay_s > 0) sleep((unsigned)delay_s);
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[manual_press] game_base unresolved; abort");
+        return NULL;
+    }
+
+    /* Resolve the press_request.txt path relative to the run dir. The shim
+     * runs with cwd = $GAME_DIR (per run_game.sh's `cd "$GAME_DIR"` before
+     * exec qemu), so we use the absolute path through _emulation/runs/latest. */
+    const char *req_path = "/mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le/"
+                           "_emulation/runs/latest/press_request.txt";
+
+    SHIM_LOG("[manual_press] === START === press_ms=%d req_path=%s",
+             press_ms, req_path);
+
+    while (1) {
+        usleep(200000);  /* 200 ms poll */
+        int fd = open(req_path, O_RDONLY);
+        if (fd < 0) continue;
+        char buf[64] = {0};
+        ssize_t r = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        unlink(req_path);
+        if (r <= 0) continue;
+        int sw_id = atoi(buf);
+        if (sw_id < 1 || sw_id > 255) {
+            SHIM_LOG("[manual_press] bogus sw_id=%d in request '%.32s'; skip", sw_id, buf);
+            continue;
+        }
+
+        uint8_t **arr_pp = (uint8_t **)(uintptr_t)(game_base + 0x4480220ULL);
+        uint8_t *arr = *arr_pp;
+        if (!arr) {
+            SHIM_LOG("[manual_press] g_switch_state_array NULL; skip");
+            continue;
+        }
+        shim_press_one_sw_id(game_base, arr, sw_id, press_ms);
+    }
+}
+
 void shim_inject_start(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -859,4 +1296,20 @@ void shim_inject_start(void) {
     pthread_t es;
     if (pthread_create(&es, NULL, shim_edge_snapshot_thread, NULL) == 0)
         pthread_detach(es);
+
+    pthread_t md;
+    if (pthread_create(&md, NULL, shim_machine_dump_thread, NULL) == 0)
+        pthread_detach(md);
+
+    pthread_t op;
+    if (pthread_create(&op, NULL, shim_output_probe_thread, NULL) == 0)
+        pthread_detach(op);
+
+    pthread_t wd;
+    if (pthread_create(&wd, NULL, shim_dispatch_watchdog_thread, NULL) == 0)
+        pthread_detach(wd);
+
+    pthread_t mp;
+    if (pthread_create(&mp, NULL, shim_manual_press_thread, NULL) == 0)
+        pthread_detach(mp);
 }

@@ -8373,3 +8373,189 @@ Memory file `project_version_info_screen_blocker.md` was renamed to `project_ser
 - `_emulation/docs/PROTOCOL.md` — §3 "Canonical post-boot screen names" added; §11 "Runtime switch table" subsection added; §6 "scene_config_table misnaming" subsection deleted; screen-name fixes across §1, §5.4, §9, §11, §12.
 - `_emulation/docs/JOURNAL.md` — Step 90 + Step 92 prose fixes; this step appended.
 - `_emulation/reference/switch_table.md` — DELETED (content migrated to PROTOCOL §11).
+
+## Step 94: Service Select press advances Service Menu; output-state register verified; per-game machine inventory introduced (2026-05-08)
+
+Direct continuation of Step 93. Tonight's session: (a) verified BN entry 322's output-state register claims via Ghidra MCP, (b) confirmed the Step-93 press infrastructure successfully advances the Service Menu when given enough press attempts at the right cadence, (c) introduced a per-game mechanical inventory header as the first concrete step toward separating game-specific data from platform-generic shim code.
+
+### Step 94a — BN output-state addresses verified
+
+Ghidra MCP decompile of BN export entry 322's claims:
+
+| BN claim | Verified | Notes |
+|---|---|---|
+| `set_hardware_output_bit @ 0x8fac70` | ✅ | `(byte bit_mask, uint set_flag)` — mutex-locked on `0x450d9f8`; gates on `(0x450da28 & 1) || FUN_008faa50()&1`; **only writes byte 7** (`DAT_0450da30._7_1_`). `set_flag & 1 == 1` ORs the mask in; `== 0` ANDs `(mask^0xff)` in |
+| `write_hardware_output_byte @ 0x8fad0c` | ✅ | `(ulong byte_idx, uint8 value)` — same mutex + gate; bounds-check `byte_idx < 8`; writes any byte 0..7 of `0x450da30` |
+| `g_hardware_output_state @ 0x450da30` (8 bytes) | ✅ | SPI bridge thread `FUN_008fa820` snapshots all 8 bytes into a stack-local under the mutex, then ships them as the SPI MESSAGE_1 TX buffer every cycle |
+| `g_hardware_input_state @ 0x450da9b0` | ❌ typo in BN | Real address is `0x450d9b0` (matches PROTOCOL §11's `DAT_0450d9b0`). One extra `a` in the BN export string |
+| `g_rotation_counter @ 0x450d9f0` | ✅ | Has its own mutex `0x450d9c0` (different from output mutex). `FUN_008fae00` reads as `counter / 3` and stores `counter % 3` (quadrature decoder consumer) |
+
+**Bonus discoveries from the same decompile:**
+- `0x450d9f8` — mutex governing all hardware-output-state writes
+- `0x450da28` — init flag, set to 1 by SPI bridge thread once the device is open + the first ioctl succeeded
+- The shim's existing diagnostic at `[shim] SPI #N cmd=0x6c TX: 00 00 00 00 00 00 00 6c` shows TX byte 7 = `0x6c` because that's the only byte `set_hardware_output_bit` ever writes; bytes 0-6 stay zero unless `write_hardware_output_byte` is called.
+
+### Step 94b — Press cadence reproducibly advances the Service Menu
+
+Step 93 traced the mechanical press path but never observed visual screen advance. Tonight's Phase 2 run with `SHIM_SELECT_PRESS=1 SHIM_SELECT_PRESS_SW_ID=90 SHIM_SELECT_PRESS_INTERVAL_S=4 SHIM_SELECT_PRESS_ATTEMPTS=4 SHIM_SELECT_PRESS_MS=500` reached the Service Menu at 21:00:47 and produced the first observed visual transition out of SM at 21:01:01-06 (user marker `VISUAL CHANGE`). User confirmed via screenshot the transition was to a genuine attract screen (Pokemon logo with Credits in corner).
+
+Critical observation about edge timing:
+
+| Round | edge_cnt before | edge_cnt during press | edge_cnt after release | translate fired? |
+|---:|---:|---:|---:|---|
+| 1 | 0 | 0 | 0 | no — channel state still warming |
+| 2 | 0 | 0 | 0 | no |
+| 3 | 0 | 1 | 2 | **yes** — first edge fired |
+| 4 | 2 | 3 | 4 | yes |
+
+Rounds 1–2 set `state` byte to 1 during the press but `edge_counter` did not increment. Round 3 was the first round where `translate_switch_state_changes (sub_651610)` actually flipped the recorded state and counted the edge. Hypothesis: the channel's saved-state buffer at `&DAT_044804b8 + 0x18 + 0xb0*0` (channel 0) was initialized to `0x01` by `FUN_00650f00` (idle = high), so the first 1→1 "press" was a no-op until something normalized state. Step 93 has the partial answer — `shim_install_channel1_idle` writes idle bytes to `DAT_0436b020` for **channel 1**; channel 0 may need an analogous fixup, but operationally 4 press attempts with `INTERVAL_S=4` reliably crosses the edge by round 3.
+
+Manual cross-reference (user-supplied from Star Wars FOTE manual; switches identical to PLE per user verification):
+
+| Coin-door label | manual_id | Conn | sw_id (runtime) | Maps to handler / event |
+|---|---|---|---:|---|
+| Service Select (SS) | `0-SW-8` | C9-C25 | 90 | `sub_5902f0(param=8)` → `sub_58ff40` → SM → "Stern Pinball Main Menu" (Quick Adjustments / Diagnostics / Device Tests) |
+| Service Plus (SP) | `0-SW-9` | C10-C25 | 91 | `sub_5902f0(param=4)` → audio path (crashes per Step 93d) |
+| Service Minus (SM) | `0-SW-10` | C11-C25 | 92 | `sub_5902f0(param=2)` → audio path (crashes per Step 93d) |
+| Service Back (SB) | `0-SW-11` | C12-C25 | 93 | `sub_5902f0(param=1)` → "back to game" (attract) |
+
+Pin numbering in the manual diagram is off-by-one (pin 9 on connector for switch 8 etc.) — quirk of the printed reference; runtime sw_ids are authoritative.
+
+### Step 94c — Output-side probe (`SHIM_OUTPUT_PROBE=1`)
+
+New thread in `shim_inject.c` polls `g_hardware_output_state @ 0x450da30` every `SHIM_OUTPUT_PROBE_INTERVAL_MS` (default 100), diffs against last sample, logs bit-level changes. Phase 3 run saw **zero changes** over 85s spanning SM idle + Service Select press cycle. Initial state `00 00 00 00 00 00 00 6c`; byte 7 stayed `0x6c` throughout. The CPU's local 8-byte output is essentially static during SM/idle — interesting outputs (lamp animations, coil pulses) flow through cmd-0x41 outbound traffic to remote nodes, which `shim_nodebus.c` already logs as `bridge: cmd 0x41 slot=N inner_cmd=0xXX ...`. The `SHIM_OUTPUT_PROBE` is the right primitive for CPU-side outputs (Action Button LED, Start LED, coin meter, ticket dispenser) — those are the Node 0 / Node 1 paths.
+
+Probe lives behind `SHIM_OUTPUT_PROBE=1`, default off. Knobs `SHIM_OUTPUT_PROBE_DELAY_S` (default 50), `SHIM_OUTPUT_PROBE_INTERVAL_MS` (100), `SHIM_OUTPUT_PROBE_DURATION_S` (60).
+
+### Step 94d — Per-game mechanical inventory header
+
+New directory `_emulation/games/` introduced as the home for per-game data tables. First content:
+
+- `games/pokemon_le_machine.h` — typed records for switches/drivers/lamps with kind enums (coil/motor/servo/magnet/digital; GI/feature/RGB/flasher/digital).
+- `games/pokemon_le_machine.c` — populated from §3-§7 of `_emulation/reference/Pokemon-Premium-LE-Lite-Manual.md`: 85 switches across nodes 0/1/8/9, 22 drivers (incl. Node 10 servos for Poké Ball + Pikachu), 158 lamps (incl. all RGB triplets and flashers).
+- `build.sh` — added the new TU to the source list.
+
+New consumer: `SHIM_MACHINE_DUMP=1` (default off) reads the runtime switch table at `g_switch_state_array @ 0x4480220` and joins it against `ple_switches[]`, logging `(manual_id, channel, bit_idx, runtime sw_id)` per row plus a summary. Phase 3+4 run produced **82 of 85 manual switches matched**; 3 missing are `0-SW-20`/`21`/`22` (CPU LVDS jumper bits + reserved jumper) — expected, as these have no game-side handlers in PLE.
+
+This header is **data-only** in this step. The follow-up architectural cut — replacing PLE-specific VAs in `shim_inject.c`/`shim_nodebus.c` with table lookups — is deferred. Star Wars LE 0.85 will get its own `games/starwars_le_machine.{c,h}` skeleton when we pivot to that game.
+
+### Step 94e — `run_game.sh` defaults shifted toward "press Service Select on every run"
+
+Per user direction, the press-cycle parameters that produced visible SM advance are now defaults in `run_game.sh`:
+- `SHIM_SELECT_PRESS=1`
+- `SHIM_SELECT_PRESS_SW_ID=90` (Service Select / 0-SW-8)
+- `SHIM_SELECT_PRESS_INTERVAL_S=4`
+- `SHIM_SELECT_PRESS_ATTEMPTS=4`
+- `SHIM_SELECT_PRESS_MS=500`
+- `SHIM_SWITCH_TABLE_PROBE=1` + `_DELAY_S=65`
+
+All five are `${VAR:-default}` patterns so explicit overrides still win. Plus the script grew an `env | grep ^SHIM_ → -E ...` loop to auto-forward every exported `SHIM_*` env var to qemu's environment (the shim's `getenv()` runs inside the qemu-aarch64 process and only sees vars passed via `-E`). Without this, the host-shell exports were silently ignored.
+
+### Step 94f — `avcodec_flush_buffers` bridge resolves DoSeek timeouts (2026-05-08 late)
+
+Standard FFmpeg post-seek protocol is `avformat_seek_file → avcodec_flush_buffers → avcodec_send_packet`. Game's `SpiVideoStreamDecoderBase::DoSeek (FUN_00922aa0)` follows that order; without the flush bridge, `decode_daemon.py`'s PyAV codec context kept stale state across seeks and rejected post-seek packets, fed the 2 s `DoSeek while loop timeout` (printed 20+ times) and ultimately the proc-dispatch deadlock that surfaced as `[run_game] status 5 — DISPATCH TIMEOUT`.
+
+Wire protocol grew `REQ_FLUSH (0x05)` between shim and daemon. Shim hook in `shim_patches.c`: `void avcodec_flush_buffers(void *avctx) { shim_avforward_flush(avctx); }`. Daemon's `handle_flush()` calls `self.codec_ctx.flush_buffers()` (PyAV native, fast — keeps the CUDA context warm for `hevc_cuvid`); falls back to recreate with saved `codec_id + extradata` if PyAV raises. Verified working: post-fix runs show `(flush_buffers())` in `decode_daemon.log` instead of the recreate path, and `DoSeek while loop timeout` count went from 20+ to **0**.
+
+This was a necessary-but-not-sufficient fix — even with seek bridge, status 5 still fired non-deterministically (~1/5 success). The status-5 root cause was elsewhere; see Step 94k.
+
+### Step 94g — `marker_button.py` v2: elapsed timer, observation presets, press buttons
+
+GUI rewrite to support manual switch-press control synced to user observations:
+- Live `T+M:SS.x` elapsed timer at top, updates every 100 ms via `root.after`. Every marker line gets the elapsed prefix (e.g. `[marker] T+1:23.4 click #5 (...)`), eliminating after-the-fact log timestamp math.
+- New observation presets per user request: `Pokemon Logo (Startup In Progress...)`, `Service Menu (Main)`, `Service Menu (#?)`, `Attract Mode (#1)`, `Attract Mode (#2)`, `Sound Starts`, `Sound Ends`. Old presets retired.
+- New PRESS button row: `Service Select (sw_id 90)`, `Service Plus (91)`, `Service Minus (92)`, `Service Back (93)`, `Start Button (78)`, `Action Button (77)`. Each click writes the runtime sw_id to `runs/latest/press_request.txt` (no signal — file-based IPC, simple to debug).
+- `KILL GAME` button retained.
+
+The PRESS buttons write to `press_request.txt`; the shim watches that file via a new thread (Step 94h) and drives the actual press through the existing translate / SPI-rx-extra path.
+
+### Step 94h — `shim_manual_press_thread` + auto-press disabled
+
+New shim thread `shim_manual_press_thread` polls `press_request.txt` every 200 ms. When the file appears, parses the first integer as a runtime sw_id, deletes the file, and drives a single press-and-release through `shim_press_one_sw_id` — a helper extracted from the auto-press logic that handles both the channel-0 SPI path (`shim_spi_rx_extra | force-poll`) and the remote-node path (direct `translate(channel, buf)` call at game VA `0x651610`). Logs `[manual_press] sw_id=N ... AFTER: state=S edge=E` so press effects show in the same line as the marker click.
+
+Env knobs: `SHIM_MANUAL_PRESS=1` (default on), `SHIM_MANUAL_PRESS_DELAY_S=N` (default 30), `SHIM_MANUAL_PRESS_MS=N` (default 500). `run_game.sh` flipped `SHIM_SELECT_PRESS` default 1 → 0; the auto-press machinery still works for headless / scripted runs but tonight's interactive runs use the manual GUI exclusively.
+
+### Step 94i — Viewport / scissor logger reveals boot-splash scissor leak
+
+Added throttled loggers in `shim_gl.c` for `glViewport(x,y,w,h)`, `glScissor(x,y,w,h)`, plus `glEnable(GL_SCISSOR_TEST)` / `glDisable(GL_SCISSOR_TEST)` toggles — each emits a line only on transition (initial value tracking avoids drowning game.log in per-draw spam).
+
+User reported the Service Menu rendered into roughly the top-left ~⅕ of the 1920×1080 frame_viewer window while Pokémon-logo and attract scenes filled the window. The logger captured exactly one scissor change for the whole run: `glScissor(0, 0, 800, 480)` set during the boot-splash phase (the 800×480 Radium scene `3fdc91b3` per PROTOCOL §9), and **never reset**. Math: `800/1920 × 480/1080 ≈ 18%` of framebuffer area — matches the observed clip exactly. Whenever `GL_SCISSOR_TEST` is enabled later (NuklearScene operator UI does this), output gets clipped to that stale rectangle.
+
+The leak is benign for our breakthrough investigation — it's a visual-only artifact and doesn't affect game logic — but worth noting as an Open item: a `shim_gl.c` override that pins `glScissor` to `(0, 0, 1920, 1080)` post-boot would restore full-frame SM rendering.
+
+### Step 94j — Dispatch watchdog (SIGURG via tgkill) — partial / wrong target
+
+To capture stack traces of stalled dispatch threads at the moment status 5 would fire, added `shim_dispatch_watchdog_thread`:
+- Locates the `procDispatch` thread via `/proc/self/task/*/comm` matching. **Important nuance:** qemu-user prefixes guest pthread names with its own process name then truncates to TASK_COMM_LEN-1 (15 chars) — `procDispatch` (12 chars) becomes `qemu-aarch64:pr` (`qemu-aarch64:` prefix + 2 chars from guest name). Watchdog tries the qemu-mangled form first, falls back to bare `procDispatch`.
+- Polls `g_timestamp_threshold_1 @ 0x44cb2e0` (the BN-named "dispatcher tick timestamp"), tgkills SIGURG to the procDispatch thread on stall. SIGURG chosen because procDispatch's `SigBlk = 0x2a02` blocks SIGINT/SIGUSR1/SIGUSR2/SIGALRM — sending the obvious choice (SIGUSR1) just queued in `SigPnd` and was never delivered. SIGURG is unblocked + has default disposition "ignore", so safe.
+- SIGURG handler in `shim_term_dump_handler` extended to dump `backtrace()` of the receiving thread.
+
+**Wrong-address bug discovered:** `0x44cb2e0` is read by the main loop's progress check but is NOT the address procDispatch updates on each tick. Decompile of `FUN_007292b0` (procDispatch body) shows it signals progress via `pthread_cond_signal(&DAT_044c9288)` at the END of each loop iteration — no shared timestamp write. So the watchdog's stall predicate never fires (timestamp stays 0). The infrastructure (signal delivery, thread-targeted backtrace, qemu-user thread-name discovery) all works; the polled address needs to change. Next iteration: hook `pthread_cond_signal` and use a shim-side timestamp updated when the relevant CV is signaled.
+
+### Step 94k — cwd-to-`/games/` + `/games/game` symlink: the breakthrough
+
+Single biggest win of the session, almost stumbled into. The user observed that on real hardware, `/etc/init.d/shared` defines `GAME=/games/game` and `S95game` execs from that canonical path; whatever cwd the cabinet uses is from there too. Our `run_game.sh` instead `cd "$GAME_DIR"` (= `/games/pokemon_le/`) and execs `./game` — argv[0] becomes `/games/pokemon_le/game`. Mismatch.
+
+Two changes:
+
+1. `/games/game` was a 71 MB regular file duplicating `/games/pokemon_le/game` (md5 verified identical). Replaced with a relative symlink: `/games/game → pokemon_le/game`. Single source of truth, saves the disk dup, and works through the bind-mounted `/games` view (relative symlinks resolve via the directory containing the symlink, which is `/games/` in both the host path and the bind-mounted view).
+
+2. `run_game.sh` updated:
+   - `cd /games` (was: `cd "$GAME_DIR"` = `/games/pokemon_le/`)
+   - exec `/games/game` (was: `./game`)
+
+The binary's argv[0], `/proc/self/exe`, dirname-of-self lookups, and any path-aware game logic now see `/games/game` exactly as the cabinet does. The cwd of `/games/` matters for any code path that opens files relative to cwd; the binary's strings include `./assets/godot/main.pck` etc. (verified via `strings | grep ^\./`), so cwd does feed into asset resolution. We did NOT add `/games/assets` symlinks — surprisingly the game still finds its assets, suggesting either (a) absolute paths win in the actual hot path, (b) the binary calls `chdir()` itself early in init to a dir with the right layout, or (c) bind-mount magic we haven't traced. **TBD which.**
+
+**Result, immediately observable:**
+
+| Metric | Before (cwd=`/games/pokemon_le/`) | After (cwd=`/games/`) |
+|---|---:|---:|
+| Run survival | seconds before status 5 / SIGABRT (1/5 success rate) | **2+ minutes, no crash, killed by user via SIGTERM** |
+| `decode_daemon` conn-3 frames | ~700 max | **1,500+** (still climbing at kill) |
+| `decode_daemon` conn-4 frames | ~400 max | **1,200+** (still climbing at kill) |
+| Visual state at +2 min | crash or stale frame | **clean attract loop, multiple scene cycles, sound spam GONE** |
+| `DoSeek` / `Play` / `FlushDecoder` timeouts | one or more per run | **0** |
+
+The user's words: "I saw a completely unbothered and perfectly run game that cycled through the attract mode... Literally the only problem was that the videos in the background weren't playing." Frames flow shim ↔ daemon at scale; the in-attract video black-frames issue is a downstream display problem (AVFrame data/linesize/format mismatch in some game-side shader path), explicitly out of scope for tonight.
+
+This change supersedes a lot of earlier "non-determinism" framing across the run: the inconsistent attract-vs-SM-vs-crash outcomes from earlier in the session were essentially all the same root cause manifesting at different points in the boot/post-press timeline. With cwd correct, the game is fundamentally healthy.
+
+### Step 94l — Press-path semantics clarified (operator-menu auto-timeout, NOT press-driven attract)
+
+Field observation across ~11 runs the user did mid-session under the auto-press defaults (Service Select × 4): outcomes split roughly 50/50 between "ended in attract" vs "ended in operator menu", with both crash modes (status 5 dispatch + status 134 SIGABRT) showing up in either screen state.
+
+Per the user's manual cross-reference:
+- Service Select (sw_id 90, `0-SW-8`) → SM → **Stern Pinball Main Menu** (Quick Adjustments / Diagnostics / Device Tests). Successive presses navigate INTO the menu tree.
+- Service Back (sw_id 93, `0-SW-11`) → "back to game" (= attract).
+
+Tonight's auto-press was 4 × Service Select with no Back. So the runs that "ended in attract" were NOT press-driven — they hit Stern's operator-menu inactivity timeout and returned to attract on their own (~30-60 s of post-press silence). That explains the non-deterministic split: depending on how deep into the menu tree the 4 presses landed, the timeout fired at different times relative to whichever crash was independently brewing. Same code, different lottery.
+
+Practical consequence: tonight's manual-press flow + observation timer (Step 94g/h) lets the user explicitly drive Service Back to test the press-driven attract path, separate from the auto-timeout path.
+
+### Open / next session
+
+- **In-attract video display:** decoder is producing 1500+ frames at full rate but the visible attract is black/static behind the overlay text. Investigate AVFrame `data[]` / `linesize[]` / `format` plane layout in `shim_avforward.c::shim_avforward_receive_frame` against what the game's render path expects. PROTOCOL §10 + §12 "Forward-decode bridge" hold the field offsets we already trust; this is about whether the bytes are being consumed correctly downstream.
+- **Asset-resolution cwd mystery:** with cwd=`/games/` and no `/games/assets/` directory, the game still finds its assets. Either the binary chdir's itself or there's a path-rewrite happening we haven't documented. `strace` of file opens in the first ~5 s of a run would settle it.
+- **Boot-splash scissor leak (cosmetic):** `glScissor(0, 0, 800, 480)` set during boot is never reset; SM appears clipped to top-left ~18% of frame whenever `GL_SCISSOR_TEST` is enabled later. Trivial fix — pin scissor to full FB in `shim_gl.c` post-boot.
+- **Watchdog needs the right tick address:** Step 94j infrastructure works but `0x44cb2e0` isn't procDispatch's tick. Replace with a shim-side timestamp updated on `pthread_cond_signal(&DAT_044c9288)` calls (hook the syscall in `spi_shim.c`, look for that specific cv arg, bump a counter / mtime).
+- **Audio singleton vtable** (Step 93d carryover): the abort-on-vtable[5] path still exists when sw_ids 91/92 (Service Plus/Minus) fire. Step 94k's stability win means the issue is rare in a no-press passive run, but still latent.
+- **Per-game machine-inventory consumers:** refactor `shim_nodebus.c::nodebus_chip_id_for_slot` to read slot→chip_id pairs from `pokemon_le_machine.c` rather than hardcoded switch. Then pull cmode-table + `g_switch_state_array` VAs into the same per-game header. Once those land, `starwars_le_machine.{c,h}` skeleton is the next concrete step.
+- **Service Back press-driven attract test:** with the manual-press GUI, fire sw_id=93 from SM and observe whether attract appears immediately (proving press-driven) vs. taking ~30-60 s (proving timeout-driven).
+
+### Touched
+
+- `games/pokemon_le/_emulation/games/pokemon_le_machine.h` — NEW. Typed records for switches / drivers / lamps; lookup helpers.
+- `games/pokemon_le/_emulation/games/pokemon_le_machine.c` — NEW. 85 switches, 22 drivers, 158 lamps populated from manual §3-§7.
+- `games/pokemon_le/_emulation/build.sh` — added `games/pokemon_le_machine.c` to source list.
+- `games/pokemon_le/_emulation/shim_inject.c` — `shim_machine_dump_thread` (`SHIM_MACHINE_DUMP=1`); `shim_output_probe_thread` (`SHIM_OUTPUT_PROBE=1`); `shim_dispatch_watchdog_thread` (`SHIM_DISPATCH_WATCHDOG=1`, partial); `shim_manual_press_thread` (`SHIM_MANUAL_PRESS=1`, default on) + `shim_press_one_sw_id` helper; all wired into `shim_inject_start`.
+- `games/pokemon_le/_emulation/shim_avforward.c` — `REQ_FLUSH (0x05)` opcode; `shim_avforward_flush(void *avctx)` round-trip.
+- `games/pokemon_le/_emulation/shim_patches.c` — `avcodec_flush_buffers(void *avctx)` hook → `shim_avforward_flush`.
+- `games/pokemon_le/_emulation/shim_gl.c` — throttled `glViewport` / `glScissor` / `GL_SCISSOR_TEST` toggle loggers.
+- `games/pokemon_le/_emulation/shim_diagnostics.c` — SIGUSR1+SIGURG handler now dumps backtrace via `backtrace()` + `dladdr`; `<sys/syscall.h>` added for `SYS_gettid`.
+- `games/pokemon_le/_emulation/spi_shim.c` — `sigaction(SIGURG, ...)` registered alongside SIGTERM/SIGINT/SIGUSR1/SIGUSR2.
+- `games/pokemon_le/_emulation/spi_shim.h` — extern declaration for `shim_avforward_flush`.
+- `games/pokemon_le/_emulation/decode_daemon.py` — `REQ_FLUSH = 0x05`; `handle_flush()` (PyAV `flush_buffers()` fast path with recreate-with-extradata fallback); save `codec_id + extradata` at OPEN for fallback path.
+- `games/pokemon_le/_emulation/marker_button.py` — full rewrite: elapsed timer top of GUI, new observation presets, PRESS buttons writing `runs/latest/press_request.txt`, retained KILL.
+- `games/pokemon_le/_emulation/run_game.sh` — `cd /games` (was `cd "$GAME_DIR"` = `/games/pokemon_le/`); exec `/games/game` (was `./game`); `SHIM_MANUAL_PRESS` defaults; `SHIM_SELECT_PRESS` default flipped to 0; `GDB_PORT` env-gate appends `-g $GDB_PORT` to qemu cmdline; auto-forward of every exported `SHIM_*` env var to qemu via `-E`.
+- `/mnt/c/Workspace/pokemon-le-0.81.0/games/game` — was a 71 MB regular file duplicating `pokemon_le/game`. First attempt: relative symlink — rejected because git-on-Windows doesn't track POSIX symlinks reliably. Final: **NTFS hard link** (`ln pokemon_le/game game`). Both paths share inode `1125899907059074`, link count 2, single 71 MB on disk; git on either Windows or WSL sees two regular files with identical content and dedups blobs naturally via content-addressed storage.
+- `_emulation/docs/JOURNAL.md` — this step appended.

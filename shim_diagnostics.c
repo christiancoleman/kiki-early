@@ -31,6 +31,7 @@
 #include <execinfo.h>
 #include <dlfcn.h>
 #include <sys/types.h>
+#include <sys/syscall.h>
 
 #include "spi_shim.h"
 
@@ -786,9 +787,54 @@ void shim_term_dump_handler(int sig) {
 
     char hdr[128];
     int hn = snprintf(hdr, sizeof(hdr),
-        "\n=== SHIM SIGTERM/USR1 DUMP (sig=%d) ===\n", sig);
+        "\n=== SHIM SIGTERM/USR1 DUMP (sig=%d, tid=%d) ===\n",
+        sig, (int)syscall(SYS_gettid));
     ssize_t u = write(STDERR_FILENO, hdr, (size_t)hn);
     (void)u;
+
+    /* Backtrace of the receiving thread — when the dispatch-watchdog signals
+     * procDispatch at stall (SIGURG; SIGUSR1 is blocked by the dispatcher
+     * and never delivered), this prints the stalled thread's stack frame
+     * and identifies which subsystem call inside FUN_00720cf0 is blocked. */
+    if (sig == SIGUSR1 || sig == SIGURG) {
+        uintptr_t game_base = shim_resolve_game_base();
+        char base_line[128];
+        int bln = snprintf(base_line, sizeof(base_line),
+            "(game_base=0x%lx)\n", (unsigned long)game_base);
+        u = write(STDERR_FILENO, base_line, (size_t)bln);
+        void *frames[64];
+        int n = backtrace(frames, 64);
+        for (int i = 0; i < n; i++) {
+            Dl_info di;
+            char line[640];
+            int ln;
+            if (dladdr(frames[i], &di) && di.dli_fname) {
+                unsigned long off_module =
+                    (unsigned long)((uintptr_t)frames[i] - (uintptr_t)di.dli_fbase);
+                int is_game = strstr(di.dli_fname, "/game") &&
+                              !strstr(di.dli_fname, ".so");
+                unsigned long elf_va = is_game && game_base
+                    ? (unsigned long)((uintptr_t)frames[i] - game_base) : 0;
+                if (elf_va) {
+                    ln = snprintf(line, sizeof(line),
+                        "[%02d] %p  %s+0x%lx  %s  ELF_VA=0x%lx\n",
+                        i, frames[i], di.dli_fname, off_module,
+                        di.dli_sname ? di.dli_sname : "(no symbol)",
+                        elf_va);
+                } else {
+                    ln = snprintf(line, sizeof(line),
+                        "[%02d] %p  %s+0x%lx  %s\n",
+                        i, frames[i], di.dli_fname, off_module,
+                        di.dli_sname ? di.dli_sname : "(no symbol)");
+                }
+            } else {
+                ln = snprintf(line, sizeof(line),
+                    "[%02d] %p  (no dladdr)\n", i, frames[i]);
+            }
+            u = write(STDERR_FILENO, line, (size_t)ln);
+        }
+    }
+
     shim_dump_sound_globals();
     shim_dump_cmodes();
     shim_dump_dispatch_tables();

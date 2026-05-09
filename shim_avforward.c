@@ -49,6 +49,7 @@
 #define REQ_PACKET    0x02u
 #define REQ_RECEIVE   0x03u
 #define REQ_CLOSE     0x04u
+#define REQ_FLUSH     0x05u
 #define REP_OPEN_OK   0x81u
 #define REP_PACKET_OK 0x82u
 #define REP_FRAME     0x83u
@@ -513,5 +514,34 @@ fail:
     drain_bytes(s->sockfd, remaining);
     pthread_mutex_unlock(&s->mu);
     *out_ret = -EIO;
+    return 1;
+}
+
+int shim_avforward_flush(void *avctx) {
+    if (!shim_avforward_enabled()) return 0;
+    pthread_mutex_lock(&g_sessions_mu);
+    forward_sess_t *s = find_session_locked(avctx);
+    pthread_mutex_unlock(&g_sessions_mu);
+    if (!s || !s->opened) return 0;
+
+    pthread_mutex_lock(&s->mu);
+    if (send_msg(s->sockfd, REQ_FLUSH, NULL, 0) != 0) {
+        SHIM_LOG("[avforward] FLUSH write failed");
+        pthread_mutex_unlock(&s->mu);
+        return 0;
+    }
+    uint32_t rhdr[2];
+    if (read_all(s->sockfd, rhdr, 8) != 0) {
+        SHIM_LOG("[avforward] FLUSH reply read failed");
+        pthread_mutex_unlock(&s->mu);
+        return 0;
+    }
+    if (rhdr[1]) drain_bytes(s->sockfd, rhdr[1]);
+    if (rhdr[0] != REP_OK) {
+        SHIM_LOG("[avforward] FLUSH rejected type=0x%x", rhdr[0]);
+        pthread_mutex_unlock(&s->mu);
+        return 0;
+    }
+    pthread_mutex_unlock(&s->mu);
     return 1;
 }

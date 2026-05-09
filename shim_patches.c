@@ -353,3 +353,13 @@ int avcodec_receive_frame(void *avctx, void *frame) {
     return -5;  /* -EIO */
 }
 
+void avcodec_flush_buffers(void *avctx) {
+    /* Standard FFmpeg post-seek protocol: avformat_seek_file → flush_buffers
+     * → send_packet (new keyframe). The game calls this after seeking the
+     * attract video; without forwarding, the daemon's PyAV codec context
+     * keeps stale state and rejects post-seek packets, triggering the 2s
+     * SpiVideoStreamDecoderBase::DoSeek timeout → status-5 dispatch deadlock. */
+    SHIM_LOG("avcodec_flush_buffers (ctx=%p) [forward]", avctx);
+    shim_avforward_flush(avctx);
+}
+

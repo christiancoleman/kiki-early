@@ -57,6 +57,7 @@ void *shim_resolve_libav(const char *sym, const char *version);
 int shim_avforward_enabled(void);
 int shim_avforward_send_packet(void *avctx, const void *avpkt, int *out_ret);
 int shim_avforward_receive_frame(void *avctx, void *frame, int *out_ret);
+int shim_avforward_flush(void *avctx);
 
 /* Runtime SPI RX override (defined in shim_ioctl.c).
  * Lets shim_inject.c inject CPU-local switch presses by OR-ing bits into

@@ -60,6 +60,7 @@ REQ_OPEN = 0x01
 REQ_PACKET = 0x02
 REQ_RECEIVE = 0x03
 REQ_CLOSE = 0x04
+REQ_FLUSH = 0x05
 
 REP_OPEN_OK = 0x81
 REP_PACKET_OK = 0x82
@@ -123,6 +124,8 @@ class Session:
         self.log = log
         self.codec_ctx: av.codec.context.CodecContext | None = None
         self.codec_name: str = ""
+        self.codec_id: int = 0
+        self.extradata: bytes = b""
         self.frames_decoded = 0
         self.packets_in = 0
 
@@ -171,6 +174,8 @@ class Session:
 
         self.codec_ctx = ctx
         self.codec_name = codec_name
+        self.codec_id = codec_id
+        self.extradata = bytes(extradata)
         self.log.info(
             "[%s] OPEN codec=%s extradata=%dB", self.peer, codec_name, extra_len
         )
@@ -266,6 +271,43 @@ class Session:
                 pts,
             )
 
+    def handle_flush(self) -> None:
+        """Reset codec state for post-seek packet stream.
+
+        Use PyAV's flush_buffers() — fast path, keeps the CUDA context warm
+        for hevc_cuvid (avoids ~hundreds-of-ms cold-init). Falls back to
+        recreate-with-extradata if the codec doesn't expose it. Drains the
+        in-flight frame queue + clears EOF flag.
+        """
+        if self.codec_ctx is None:
+            send_err(self.sock, -22, "FLUSH before OPEN")
+            return
+        used_recreate = False
+        flush_err = None
+        try:
+            self.codec_ctx.flush_buffers()
+        except Exception as exc:
+            flush_err = f"{type(exc).__name__}: {exc}"
+            try:
+                ctx = av.codec.CodecContext.create(self.codec_name, "r")
+                if self.extradata:
+                    ctx.extradata = self.extradata
+                ctx.open()
+                self.codec_ctx = ctx
+                used_recreate = True
+            except Exception as exc2:
+                send_err(self.sock, -22, f"flush failed: {flush_err} / recreate: {exc2}")
+                return
+        self._frame_queue = []
+        self._eof_pending = False
+        self.log.info(
+            "[%s] FLUSH codec=%s pkts_in=%d frames_out=%d (%s)",
+            self.peer, self.codec_name, self.packets_in, self.frames_decoded,
+            f"ctx reopened — flush_buffers err: {flush_err}" if used_recreate
+            else "flush_buffers()",
+        )
+        send_msg(self.sock, REP_OK)
+
     def handle_close(self) -> None:
         send_msg(self.sock, REP_OK)
         self.log.info(
@@ -295,6 +337,8 @@ class Session:
                 elif msg_type == REQ_CLOSE:
                     self.handle_close()
                     return
+                elif msg_type == REQ_FLUSH:
+                    self.handle_flush()
                 else:
                     send_err(self.sock, -22, f"unknown msg_type 0x{msg_type:x}")
                     return

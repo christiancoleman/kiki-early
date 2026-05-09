@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-marker_button.py — single-button GUI to drop timestamped markers into the
-running game.log so user observations interleave with shim/Godot output
-under the same timeline.
+marker_button.py — observation-tagging GUI plus manual switch-press triggers.
+
+Two button groups:
+  - OBSERVATION: drops a timestamped marker into game.log so user observations
+    interleave with shim/Godot output under the same timeline.
+  - PRESS: writes runs/latest/press_request.txt; the shim's
+    shim_manual_press_thread polls this file every 200 ms, parses it as a
+    runtime sw_id, and drives a single press/release through the same
+    translate() / SPI-rx-extra path the auto-press thread uses.
 
 Usage:
     python3 marker_button.py
     (or via run_game.sh's TIMER=ON path — needs DISPLAY/WAYLAND_DISPLAY)
 
-Output:
-    Each click writes ONE line in the EXACT same format as SHIM_LOG, directly
-    to runs/latest/game.log via raw O_APPEND for atomic line append (safe
-    even with the qemu/shim writing concurrently):
-        2026/04/28 - 14:05:48.178 - [marker] click #N (label)
-
-    On write failure (file missing, permission, etc.), the failure is recorded
-    in $SYSROOT/tmp/marker_button_errors.log so we can debug after the fact.
-
-Edit the label field before clicking to tag what you're marking. Spacebar
-also fires a click.
+A live "T+M:SS.x" elapsed timer updates every 100 ms at the top of the window
+so observations land with at-a-glance "this happened ~30 s in" framing
+without having to subtract timestamps from the log later.
 """
 
 import datetime
@@ -26,6 +24,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import time
 import tkinter as tk
 
 # Derive paths from the script's location so the marker button works no matter
@@ -34,7 +33,7 @@ _HERE = pathlib.Path(__file__).resolve().parent  # _emulation/
 _SYSROOT = _HERE.parent.parent.parent  # 3 up from _emulation = project sysroot
 
 GAME_LOG_PATH = str(_HERE / "runs" / "latest" / "game.log")
-# Stay inside the project sysroot — never write into WSL's /tmp
+PRESS_REQUEST_PATH = str(_HERE / "runs" / "latest" / "press_request.txt")
 ERROR_LOG_PATH = str(_SYSROOT / "tmp" / "marker_button_errors.log")
 
 
@@ -44,8 +43,7 @@ def now_timestamp():
 
 
 def append_to_game_log(line: str) -> tuple[bool, str]:
-    """Raw O_APPEND write — atomic per line on Linux for sub-PIPE_BUF writes.
-    Returns (success, detail)."""
+    """Raw O_APPEND write — atomic per line on Linux for sub-PIPE_BUF writes."""
     try:
         fd = os.open(GAME_LOG_PATH, os.O_WRONLY | os.O_APPEND)
     except OSError as e:
@@ -64,44 +62,46 @@ def log_error(detail: str):
         with open(ERROR_LOG_PATH, "a") as f:
             f.write(f"{now_timestamp()} - {detail}\n")
     except OSError:
-        pass  # last-resort silent
+        pass
 
 
-def write_marker(label_var, status_var, count_ref):
-    """Broad try/except + always-log diagnostic so ANY click activity is
-    visible in the error log. Earlier narrow OSError-only catch + stderr-
-    to-/dev/null was silently eating click failures."""
+def write_marker(label: str, elapsed_var, status_var, count_ref):
     try:
         count_ref[0] += 1
-        label = label_var.get().strip() or "event"
-        line = f"{now_timestamp()} - [marker] click #{count_ref[0]} ({label})\n"
+        elapsed = elapsed_var.get()
+        line = f"{now_timestamp()} - [marker] {elapsed} click #{count_ref[0]} ({label})\n"
     except Exception as e:
-        log_error(f"CLICK #{count_ref[0]} SETUP RAISED: {type(e).__name__}: {e}")
-        try: status_var.set(f"SETUP EXCEPTION: {type(e).__name__}: {e}")
-        except Exception: pass
+        log_error(f"CLICK SETUP RAISED: {type(e).__name__}: {e}")
         return
-
-    # Always log every click attempt so we know the handler fired.
     log_error(f"CLICK #{count_ref[0]} fired (label={label!r})")
-
     ok, detail = append_to_game_log(line)
     if ok:
-        log_error(f"CLICK #{count_ref[0]} wrote OK to game.log")
-        try:
-            status_var.set(f"#{count_ref[0]} @ {line.split(' - ')[1]} → game.log")
-        except Exception:
-            pass  # status display failure should never lose the marker write
+        try: status_var.set(f"#{count_ref[0]} {elapsed} → {label}")
+        except Exception: pass
         return
-
-    # Write failed — log every detail.
     log_error(f"CLICK #{count_ref[0]} APPEND FAILED: {detail} — line: {line.rstrip()}")
-    log_error(f"  GAME_LOG_PATH={GAME_LOG_PATH}")
-    log_error(f"  exists={os.path.exists(GAME_LOG_PATH)} writable={os.access(GAME_LOG_PATH, os.W_OK)}")
     print(f"[marker] click #{count_ref[0]} FAILED: {detail}", file=sys.stderr, flush=True)
+    try: status_var.set(f"#{count_ref[0]} FAILED ({detail}). See {ERROR_LOG_PATH}.")
+    except Exception: pass
+
+
+def write_press_request(sw_id: int, name: str, elapsed_var, status_var, count_ref):
+    """Write the requested sw_id to press_request.txt; the shim's
+    shim_manual_press_thread reads + deletes the file + triggers a press."""
     try:
-        status_var.set(f"#{count_ref[0]} FAILED ({detail}). See {ERROR_LOG_PATH}.")
-    except Exception:
-        pass
+        with open(PRESS_REQUEST_PATH, "w") as f:
+            f.write(f"{sw_id}\n")
+        count_ref[0] += 1
+        elapsed = elapsed_var.get()
+        line = f"{now_timestamp()} - [marker] {elapsed} click #{count_ref[0]} (PRESS {name} sw_id={sw_id})\n"
+        append_to_game_log(line)
+        log_error(f"PRESS request written: sw_id={sw_id} ({name})")
+        try: status_var.set(f"#{count_ref[0]} {elapsed} → PRESS {name} (sw_id={sw_id})")
+        except Exception: pass
+    except OSError as e:
+        log_error(f"PRESS request write failed: {e}")
+        try: status_var.set(f"PRESS {name} FAILED: {e}")
+        except Exception: pass
 
 
 _HELPER_PATTERNS = (
@@ -113,18 +113,12 @@ _HELPER_PATTERNS = (
 
 
 def kill_game(root, status_var):
-    """Layered kill: SIGTERM run_game.sh first so bash's `cleanup_all` trap
-    runs the well-tested graceful teardown (qemu → helpers → exit). After
-    a 2-second grace we SIGKILL the parent + every helper pattern by name,
-    in case the parent's `wait` got stuck (e.g. WSL2 SIGCHLD-mask deadlock).
-    Marker GUI kills itself last so the status line is visible."""
     try:
         subprocess.run(
             ["pkill", "-TERM", "-f", r"run_game\.sh"],
             capture_output=True, text=True, timeout=2,
         )
-        status_var.set("SIGTERM → run_game.sh (its trap kills qemu + helpers). "
-                       "SIGKILL fallback in 2 s.")
+        status_var.set("SIGTERM → run_game.sh. SIGKILL fallback in 2 s.")
         append_to_game_log(f"{now_timestamp()} - [marker] KILL: SIGTERM run_game.sh\n")
         root.after(2000, lambda: _kill_followup(root, status_var))
     except Exception as e:
@@ -132,110 +126,116 @@ def kill_game(root, status_var):
 
 
 def _kill_followup(root, status_var):
-    """SIGKILL anything still alive — parent script first, then every
-    helper. Marker self-kill scheduled separately so the user sees the
-    final status line before the window disappears."""
     try:
-        # Force-kill the parent script first (in case its `wait` was stuck
-        # — see WSL2 SIGCHLD-mask issue documented 2026-05-05).
         subprocess.run(["pkill", "-KILL", "-f", r"run_game\.sh"],
                        capture_output=True, timeout=1)
-        # Then every helper that might be a stale WSLg window or detached
-        # process. Each pattern's pkill is independent — a missing match
-        # (rc=1) is fine.
         for pat in _HELPER_PATTERNS:
             subprocess.run(["pkill", "-KILL", "-f", pat],
                            capture_output=True, timeout=1)
-
         status_var.set("SIGKILL'd parent + helpers. Marker closing in 1 s.")
         append_to_game_log(f"{now_timestamp()} - [marker] KILL: SIGKILL fallback fired\n")
-        # Self-kill last, after the user has had a chance to see the
-        # status line. os._exit (vs sys.exit) avoids running atexit
-        # handlers that might block on Tk.
         root.after(1000, lambda: os._exit(0))
     except Exception as e:
         status_var.set(f"KILL KILL failed: {e}")
 
 
-def fire_preset(label: str, status_var, count_ref):
-    """Drop a marker with a fixed label — for one-click observation tagging
-    so the user doesn't have to type while watching the game."""
-    saved = tk.StringVar(value=label)
-    write_marker(saved, status_var, count_ref)
-
-
+# Observation presets — labels describe what the user is SEEING on the screen
+# at the moment of click, so log lines align with visual state.
 _PRESETS = [
-    ("VISUAL CHANGE",                    "#1565c0"),  # blue
-    ("AURAL CHANGE",                     "#6a1b9a"),  # purple
-    ("TECH ALERT SHOWN",                 "#ef6c00"),  # orange
-    ("VERSION INFO SCREEN SHOWN",        "#2e7d32"),  # green
-    ("SOMETHING NEW - MASSIVE BREAKTHROUGH", "#c62828"),  # red
+    ("Pokemon Logo (Startup In Progress...)", "#1565c0"),
+    ("Service Menu (Main)",                   "#2e7d32"),
+    ("Service Menu (#?)",                     "#558b2f"),
+    ("Attract Mode (#1)",                     "#6a1b9a"),
+    ("Attract Mode (#2)",                     "#8e24aa"),
+    ("Sound Starts",                          "#ef6c00"),
+    ("Sound Ends",                            "#bf360c"),
+]
+
+# Press buttons — runtime sw_id per PROTOCOL §11 + Step 93f. Each click writes
+# the sw_id to PRESS_REQUEST_PATH; the shim's shim_manual_press_thread does
+# the actual press through the same path the auto-press thread used.
+_PRESSES = [
+    ("PRESS Service Select (sw_id 90)", 90, "#0277bd"),
+    ("PRESS Service Plus  (sw_id 91)",  91, "#0288d1"),
+    ("PRESS Service Minus (sw_id 92)",  92, "#039be5"),
+    ("PRESS Service Back  (sw_id 93)",  93, "#0097a7"),
+    ("PRESS Start Button  (sw_id 78)",  78, "#00838f"),
+    ("PRESS Action Button (sw_id 77)",  77, "#006064"),
 ]
 
 
+def _fmt_elapsed(secs: float) -> str:
+    m = int(secs) // 60
+    s = secs - m * 60
+    return f"T+{m:d}:{s:04.1f}"
+
+
+def _tick_timer(root, start_time, elapsed_var):
+    elapsed = time.monotonic() - start_time
+    elapsed_var.set(_fmt_elapsed(elapsed))
+    root.after(100, lambda: _tick_timer(root, start_time, elapsed_var))
+
+
 def main():
-    # Startup diagnostic — proves the script ran. If user reports "no markers"
-    # and this line is absent, marker_button.py never spawned (env / TIMER=ON
-    # / DISPLAY issue). If it's present and click logs are absent, the GUI
-    # isn't receiving click events (focus / Tk issue).
     log_error(f"STARTED pid={os.getpid()} GAME_LOG_PATH={GAME_LOG_PATH} "
+              f"PRESS_REQUEST_PATH={PRESS_REQUEST_PATH} "
               f"exists={os.path.exists(GAME_LOG_PATH)} "
               f"writable={os.access(GAME_LOG_PATH, os.W_OK)}")
 
     root = tk.Tk()
-    root.title("Spike 3 Marker")
-    root.geometry("440x520")
+    root.title("Spike 3 Marker + Press")
+    root.geometry("520x780")
 
-    label_var = tk.StringVar(value="event")
-    status_var = tk.StringVar(value="Click a preset OR edit label + MARK.")
+    elapsed_var = tk.StringVar(value="T+0:00.0")
+    status_var = tk.StringVar(value="Click an observation OR press button.")
     count_ref = [0]
 
-    # Preset observation buttons — one-click tagging for common observations.
-    tk.Label(root, text="Quick observation:", font=("monospace", 10)).pack(pady=(8, 0))
+    # Top: live elapsed timer (updates every 100ms via root.after).
+    tk.Label(
+        root,
+        textvariable=elapsed_var,
+        font=("monospace", 24, "bold"),
+        fg="#000",
+        bg="#e3f2fd",
+        height=2,
+    ).pack(padx=8, pady=(8, 4), fill=tk.X)
+    start_time = time.monotonic()
+    _tick_timer(root, start_time, elapsed_var)
+
+    tk.Label(root, text="Observation (mark what you see):", font=("monospace", 9)).pack(pady=(4, 0))
     for label, color in _PRESETS:
         tk.Button(
-            root,
-            text=label,
-            command=lambda l=label: fire_preset(l, status_var, count_ref),
-            bg=color,
-            fg="white",
-            font=("monospace", 10, "bold"),
-            height=2,
-        ).pack(padx=20, pady=2, fill=tk.X)
+            root, text=label,
+            command=lambda l=label: write_marker(l, elapsed_var, status_var, count_ref),
+            bg=color, fg="white",
+            font=("monospace", 9, "bold"),
+            height=1,
+        ).pack(padx=12, pady=1, fill=tk.X)
 
-    # Free-form label entry + MARK button (kept for arbitrary notes).
-    tk.Label(root, text="Custom label:", font=("monospace", 10)).pack(pady=(10, 0))
-    tk.Entry(root, textvariable=label_var, font=("monospace", 12)).pack(
-        padx=20, pady=(2, 4), fill=tk.X
-    )
-    tk.Button(
-        root,
-        text="MARK (custom)",
-        command=lambda: write_marker(label_var, status_var, count_ref),
-        bg="#ff8c00",
-        fg="white",
-        font=("monospace", 12, "bold"),
-        height=1,
-    ).pack(padx=20, pady=2, fill=tk.X)
+    tk.Label(root, text="Press (drive a switch):", font=("monospace", 9)).pack(pady=(8, 0))
+    for label, sw_id, color in _PRESSES:
+        tk.Button(
+            root, text=label,
+            command=lambda l=label, s=sw_id: write_press_request(
+                s, l.split(" (")[0].replace("PRESS ", ""), elapsed_var, status_var, count_ref),
+            bg=color, fg="white",
+            font=("monospace", 9, "bold"),
+            height=1,
+        ).pack(padx=12, pady=1, fill=tk.X)
 
     tk.Button(
-        root,
-        text="KILL GAME (SIGTERM → SIGKILL)",
+        root, text="KILL GAME (SIGTERM → SIGKILL)",
         command=lambda: kill_game(root, status_var),
-        bg="#b00020",
-        fg="white",
+        bg="#b00020", fg="white",
         font=("monospace", 10, "bold"),
         height=1,
-    ).pack(padx=20, pady=(8, 2), fill=tk.X)
-    tk.Label(root, textvariable=status_var, wraplength=400, fg="#444",
-             font=("monospace", 9)).pack(pady=4, padx=10)
+    ).pack(padx=12, pady=(8, 2), fill=tk.X)
 
-    # NOTE: no global keyboard shortcut. Earlier <space> binding fired even
-    # when the user was typing labels containing spaces ("FROZEN SCREEN" etc.)
-    # which generated phantom markers. Use the buttons.
+    tk.Label(root, textvariable=status_var, wraplength=480, fg="#444",
+             font=("monospace", 9)).pack(pady=4, padx=10)
 
     root.mainloop()
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    main()

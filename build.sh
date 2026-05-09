@@ -40,6 +40,7 @@ SOURCES=(
     shim_avforward.c
     shim_inject.c
     shim_net.c
+    games/pokemon_le_machine.c
 )
 
 VERSION_SCRIPT="$SCRIPT_DIR/spi_shim.ver"

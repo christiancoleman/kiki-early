@@ -1487,13 +1487,30 @@ unsigned glCheckFramebufferStatus(unsigned target) {
     (void)target; return GL_FRAMEBUFFER_COMPLETE;
 }
 
+/* SCISSOR_TEST tracker: log every transition so we can correlate viewport
+ * clipping with what's on screen (PROTOCOL §10 — Service Menu appears
+ * clipped to 800x480 because the boot-splash Radium scene set scissor
+ * there and never reset it). */
+#ifndef GL_SCISSOR_TEST
+#define GL_SCISSOR_TEST 0x0C11
+#endif
+static int shim_scissor_test_state = -1;  /* -1 = unknown, 0 = off, 1 = on */
+
 void glEnable(unsigned cap) {
     FWD_VOID(glEnable, (unsigned), (cap));
     GLLOG(state, "glEnable(0x%x)", cap);
+    if (cap == GL_SCISSOR_TEST && shim_scissor_test_state != 1) {
+        SHIM_LOG("[scissor_test] ENABLED (0x%x)", cap);
+        shim_scissor_test_state = 1;
+    }
 }
 void glDisable(unsigned cap) {
     FWD_VOID(glDisable, (unsigned), (cap));
     GLLOG(state, "glDisable(0x%x)", cap);
+    if (cap == GL_SCISSOR_TEST && shim_scissor_test_state != 0) {
+        SHIM_LOG("[scissor_test] DISABLED (0x%x)", cap);
+        shim_scissor_test_state = 0;
+    }
 }
 unsigned char glIsEnabled(unsigned cap) {
     FWD_RET(unsigned char, glIsEnabled, (unsigned), (cap));
@@ -1521,12 +1538,26 @@ void glBlendColor(float r, float g, float b, float a) {
     (void)r; (void)g; (void)b; (void)a;
 }
 void glViewport(int x, int y, int w, int h) {
+    /* Throttled logger: only log on CHANGE — the game sets viewport every
+     * draw call, so unfiltered logging would drown game.log. Tracks last
+     * (x,y,w,h) tuple and emits a [viewport] line only when it differs.
+     * Visual: small viewport pinned at top-left = NuklearScene (Service
+     * Menu / operator UI) drawing into a sub-region of the 1920x1080 EGL
+     * pbuffer; full 1920x1080 = Radium scene (boot splash, attract, HUD). */
+    static int last_x = -1, last_y = -1, last_w = -1, last_h = -1;
+    if (x != last_x || y != last_y || w != last_w || h != last_h) {
+        SHIM_LOG("[viewport] glViewport(%d, %d, %d, %d)", x, y, w, h);
+        last_x = x; last_y = y; last_w = w; last_h = h;
+    }
     FWD_VOID(glViewport, (int, int, int, int), (x, y, w, h));
-    (void)x; (void)y; (void)w; (void)h;
 }
 void glScissor(int x, int y, int w, int h) {
+    static int last_x = -1, last_y = -1, last_w = -1, last_h = -1;
+    if (x != last_x || y != last_y || w != last_w || h != last_h) {
+        SHIM_LOG("[scissor] glScissor(%d, %d, %d, %d)", x, y, w, h);
+        last_x = x; last_y = y; last_w = w; last_h = h;
+    }
     FWD_VOID(glScissor, (int, int, int, int), (x, y, w, h));
-    (void)x; (void)y; (void)w; (void)h;
 }
 void glDepthFunc(unsigned func) {
     FWD_VOID(glDepthFunc, (unsigned), (func));

@@ -345,6 +345,7 @@ static void shim_install_crash_handler(void) {
     sigaction(SIGINT,  &sa2, NULL);
     sigaction(SIGUSR1, &sa2, NULL);
     sigaction(SIGUSR2, &sa2, NULL);  /* event sweep (signal path, usually swallowed by qemu) */
+    sigaction(SIGURG,  &sa2, NULL);  /* dispatch watchdog backtrace target — unblocked by procDispatch */
 
     /* SIGTRAP handler — log PC + advance past the 4-byte brk + continue.
      * The game evidently has at least one brk site that doesn't kill on

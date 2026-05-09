@@ -137,6 +137,26 @@ STALE_KILL="${STALE_KILL:-1}"
 LOGFILE="${LOGFILE:-}"
 QEMU="${QEMU:-qemu-aarch64}"
 
+# Default mode is MANUAL press control via marker_button.py: TIMER=ON spawns
+# the marker GUI, which has explicit "PRESS Service Select / Plus / Minus /
+# Back / Start / Action" buttons that write runs/latest/press_request.txt;
+# the shim's shim_manual_press_thread polls for the file and drives the
+# requested switch. Default delay 30s for the manual watcher (well before
+# SM at ~+65s).
+#
+# To restore the older auto-press behaviour, set SHIM_SELECT_PRESS=1 (off
+# by default now) along with SHIM_SELECT_PRESS_SW_ID/INTERVAL_S/ATTEMPTS/MS.
+export SHIM_MANUAL_PRESS="${SHIM_MANUAL_PRESS:-1}"
+export SHIM_MANUAL_PRESS_DELAY_S="${SHIM_MANUAL_PRESS_DELAY_S:-30}"
+export SHIM_MANUAL_PRESS_MS="${SHIM_MANUAL_PRESS_MS:-500}"
+export SHIM_SELECT_PRESS="${SHIM_SELECT_PRESS:-0}"
+export SHIM_SELECT_PRESS_SW_ID="${SHIM_SELECT_PRESS_SW_ID:-90}"
+export SHIM_SELECT_PRESS_INTERVAL_S="${SHIM_SELECT_PRESS_INTERVAL_S:-4}"
+export SHIM_SELECT_PRESS_ATTEMPTS="${SHIM_SELECT_PRESS_ATTEMPTS:-4}"
+export SHIM_SELECT_PRESS_MS="${SHIM_SELECT_PRESS_MS:-500}"
+export SHIM_SWITCH_TABLE_PROBE="${SHIM_SWITCH_TABLE_PROBE:-1}"
+export SHIM_SWITCH_TABLE_PROBE_DELAY_S="${SHIM_SWITCH_TABLE_PROBE_DELAY_S:-65}"
+
 # ---- Derived ----
 SHIM="$SCRIPT_DIR/spi_shim.so"
 OVERLAY="$SCRIPT_DIR/mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu"
@@ -422,9 +442,29 @@ fi
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")
 [[ "$OFFLINE_MODE"    == "1" ]] && args+=(-E "SPIKE3_OFFLINE=1")
 
+# Forward every exported SHIM_* env var to qemu (the shim's getenv() runs
+# inside the qemu-aarch64 process and only sees vars passed via -E).
+while IFS='=' read -r _name _val; do
+    [[ -n "$_name" ]] && args+=(-E "$_name=$_val")
+done < <(env | grep -E '^SHIM_' || true)
 
-# Append any caller-supplied flags (post --debug-strip) and the game binary last.
-args+=("${POSITIONAL[@]+"${POSITIONAL[@]}"}" ./game)
+
+# If GDB_PORT is set, gate qemu on a gdbstub listener — game blocks until gdb
+# attaches at localhost:$GDB_PORT. Use to drop breakpoints into the dispatcher
+# and capture a stack trace at proc-system stall (status 5).
+if [[ -n "${GDB_PORT:-}" ]]; then
+    args+=(-g "$GDB_PORT")
+    printf '[run_game] qemu gdbstub waiting on tcp:%s — connect with: gdb-multiarch -ex "target remote :%s"\n' \
+        "$GDB_PORT" "$GDB_PORT" >&2
+fi
+
+# Run the game via its canonical /games/game path (a relative symlink to
+# pokemon_le/game). Matches /etc/init.d/shared's GAME=/games/game env that
+# real cabinets see — the binary's argv[0], /proc/self/exe, and any
+# path-aware game-side checks all see the canonical path. cwd stays at
+# $GAME_DIR (= /games/pokemon_le/) so the binary's relative ./assets/
+# lookups still resolve through the per-game subdir.
+args+=("${POSITIONAL[@]+"${POSITIONAL[@]}"}" /games/game)
 
 # Wrap in `timeout` unless TIMEOUT=0
 if [[ "$TIMEOUT" != "0" ]]; then
@@ -470,7 +510,11 @@ fi
     printf '%s\n' "${args[*]}"
 } > "$RUN_DIR/run_info.txt"
 
-cd "$GAME_DIR"
+# cwd = /games/ (same dir as the /games/game symlink) so the binary's
+# relative path lookups resolve from the canonical real-cabinet location.
+# If asset opens fail (binary uses relative ./assets/) we'll see
+# ENOENT in the log and revert to GAME_DIR cwd.
+cd /games
 # Background qemu + wait so the trap can kill it directly on Ctrl+C (bash
 # doesn't forward signals to foreground children reliably, and the shim's
 # SIGINT handler doesn't always terminate — see cleanup_all's SIGKILL path).
