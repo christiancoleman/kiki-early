@@ -23,7 +23,6 @@ When a claim here turns out to be wrong, **delete it**. Do not leave a banner. G
 11. [Game runtime model (switches, events, modes)](#11-game-runtime-model-switches-events-modes)
 12. [Hardware shim coverage reference](#12-hardware-shim-coverage-reference)
 13. [Comparison binaries (SW LE 0.85)](#13-comparison-binaries-sw-le-085)
-14. [System-mode debugging (HW watchpoints)](#14-system-mode-debugging-hw-watchpoints)
 
 ---
 
@@ -282,9 +281,9 @@ fire_event(0x5f, 0);
 
 `mcp_scene_cache_preload_done` is set to 1 at `0x66d490` inside `SceneCache_PreLoadRadiumAssets` — i.e. when the Radium scene preload phase finishes (after enumerating `/lcd/demand_loaded/*.{radium,json}`, `/nuk/images/*.{jpg,bmp,png,dds}`, `/lcd/auto_loaded/*.{radium,json}` and constructing the auto-loaded `RadiumScene` objects). That preload runs on a **background thread** (`RadiumAssetLoader_ThreadEntry`) launched by `mcp_SceneCache_ctor` at `0x66b06c` via `CC_mainDispatchThread(RadiumAssetLoader_ThreadEntry+0xc, 8, "PreLoadSceneCache", arg1)`.
 
-Implication: the wait loop is **time-bounded regardless** — even if the asset preload thread hangs, the orchestrator continues after ~8 wall seconds (in user-mode; longer in system-mode TCG emulation). The overlay is therefore not the proximate cause of any indefinite stall.
+Implication: the wait loop is **time-bounded regardless** — even if the asset preload thread hangs, the orchestrator continues after ~8 wall seconds. The overlay is therefore not the proximate cause of any indefinite stall.
 
-*Verified by:* runtime hardware-read-watchpoint observation 2026-05-05 (PC `0x7a64ec`, LR `0x5cdf90`); BN decompile of the listed functions; `get_xrefs_to(0x445f838)` to enumerate writers, `get_xrefs_to(0x5d0930)` to confirm only the two orchestrator call-sites; `get_xrefs_to(0x4482108)` to find the `SceneCache_PreLoadRadiumAssets` writer; chain confirmed by user (system-mode and user-mode both reach the post-overlay state).
+*Verified by:* BN decompile of the listed functions; `get_xrefs_to(0x445f838)` to enumerate writers, `get_xrefs_to(0x5d0930)` to confirm only the two orchestrator call-sites; `get_xrefs_to(0x4482108)` to find the `SceneCache_PreLoadRadiumAssets` writer; user-mode runs reach the post-overlay state.
 
 ## 4. CPU ↔ netbridge UART bridge protocol
 
@@ -1364,7 +1363,7 @@ No `uint32_t token_to_asset[]` array exists in the binary; token constants never
 
 ## 10. Display pipeline (DRM / GBM / EGL / GLES)
 
-**Data flow at a glance.** The game does its own real GLES rendering — no synthesized frames are fed to it. We intercept the hardware-specific framebuffer presentation parts (DRM/KMS ioctls + GBM allocation calls) and replace them with stand-ins, but every `glClear` / `glDraw*` / shader / texture upload the game issues is forwarded through to **real Mesa with the llvmpipe CPU rasterizer**, which writes real pixels into a real off-screen EGL pbuffer (returned by Mesa's `eglCreatePbufferSurface(1920×1080)` after we redirect the game's `eglCreateWindowSurface` call). At each fake page-flip the shim does `glReadPixels` on that pbuffer and routes the bytes to one or more sinks (frame bridge over abstract AF_UNIX, `/dev/fb0` blit for the qemu GTK window, periodic on-disk capture). GBM in this flow is a handle stand-in — its BOs are `calloc(256)` scratch pointers used as opaque tokens passed between layers; the only GBM BOs that actually carry pixel data are the special 1024×256 DMD path (`gbm_bo_map` returns `calloc(stride*height)` storage and `gbm_bo_unmap` captures it).
+**Data flow at a glance.** The game does its own real GLES rendering — no synthesized frames are fed to it. We intercept the hardware-specific framebuffer presentation parts (DRM/KMS ioctls + GBM allocation calls) and replace them with stand-ins, but every `glClear` / `glDraw*` / shader / texture upload the game issues is forwarded through to **real Mesa with the llvmpipe CPU rasterizer**, which writes real pixels into a real off-screen EGL pbuffer (returned by Mesa's `eglCreatePbufferSurface(1920×1080)` after we redirect the game's `eglCreateWindowSurface` call). At each fake page-flip the shim does `glReadPixels` on that pbuffer and routes the bytes to one or more sinks (frame bridge over abstract AF_UNIX, periodic on-disk capture). GBM in this flow is a handle stand-in — its BOs are `calloc(256)` scratch pointers used as opaque tokens passed between layers; the only GBM BOs that actually carry pixel data are the special 1024×256 DMD path (`gbm_bo_map` returns `calloc(stride*height)` storage and `gbm_bo_unmap` captures it).
 
 The game presents frames via Linux's KMS/DRM stack with EGL on top of GBM. Three layers in the shim:
 
@@ -2194,77 +2193,4 @@ The DisplayRenderer / SceneCache / RadiumScene / proc-system / node-bus / SPI / 
 Each Spike 3 game ships its own set of node firmware `.hex` files (the per-family files described in §11). Firmware versions vary across game releases — Pokémon LE 0.81 ships `1_31_0` for every node family; other Spike 3 titles will likely ship different versions. The shim's FE-probe synth reads version bytes from the loaded firmware records at runtime (`shim_nodebus.c::nodebus_version_for_slot()` walks `data_44df838`, mirrors `sub_8f88b0`'s simple/complex path logic), so the same shim source works across games without per-version updates as long as the loader's record format stays stable.
 
 *Verified by:* JOURNAL Step 92 — runtime version-byte probe of all 6 loaded records in PLE 0.81 producing `(V1, V2, V3, V0)` matching the shipped `1_31_0` filenames; shim implementation in `shim_nodebus.c::nodebus_version_for_slot()`.
-
----
-
-## 14. System-mode debugging (HW watchpoints)
-
-### Visible display via /dev/fb0
-
-qemu raspi4b's GTK window mirrors the kernel's `/dev/fb0` framebuffer (`bcm2708_fb` driver). The shim's frame-capture path hooks into the `MODE_PAGE_FLIP` ioctl handler — every second flip, it does `glReadPixels` on the current draw FBO and (when `SPIKE3_FB0_OUTPUT=1`) blits the RGBA bytes directly into mmap'd `/dev/fb0`. Result: the qemu GTK window shows whatever the game just rendered, with no host-side subscriber, no cross-VM transport, no networking-stack workarounds. Same architecture as the user-mode `frame_viewer.py` flow but with `/dev/fb0` instead of an AF_UNIX abstract socket.
-
-Implementation lives in `shim_bridges.c::shim_fb0_blit` (lazy `open(/dev/fb0)` + `FBIOGET_VSCREENINFO` on first frame, mmap, then per-frame format-convert + nearest-neighbor scale into the mapped framebuffer). It runs alongside the existing AF_UNIX/TCP frame-bridge path — both are no-ops if their respective consumers aren't enabled.
-
-**Force fb0 to game resolution.** qemu raspi4b's default `bcm2708_fb` size is 800×480, smaller than the game's 1920×1080. The kernel's `bcm2708_fb` driver honors the `bcm2708_fb.fbwidth=` / `bcm2708_fb.fbheight=` cmdline params, so `RUN_QEMU.sh`'s `-append` carries `bcm2708_fb.fbwidth=1920 bcm2708_fb.fbheight=1080`. With those, fb0 registers at native game resolution and no scaling is needed in the blit fast path.
-
-**Avoid the WSLg fullscreen crash.** GTK on WSLg's Wayland backend crashes qemu with `Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display.` on certain operations (notably fullscreen toggles). `RUN_QEMU.sh` exports `GDK_BACKEND=x11` before launching qemu — WSLg also exposes an X11 socket, GTK is happy on X11, fullscreen works.
-
-### Networking is not available in this environment
-
-For completeness: TCP-based bridges are not available in the system-mode rig. qemu raspi4b's machine code disables `brcm,bcm2711-pcie`, `brcm,bcm2711-genet-v5`, and `brcm,bcm2711-thermal` in the DTB before the kernel parses it (verified via the `bcm2711 dtc: %s has been disabled!` warnings + the `compat_disable[]` array in the qemu binary). `-device usb-net` attaches to qemu's emulated DWC2 controller correctly (verified via `info qtree` from the monitor) but no kernel driver enumerates the resulting USB device — the rootfs's built-in `dwc_otg` driver expects BCM2835 register layout, mainline `dwc2.ko` won't auto-bind to the DTB's `brcm,bcm2708-usb` compat string, and patching the DTB to `brcm,bcm2835-usb` (which dwc2 would match) still doesn't get past probe in this combo. The `SPIKE3_FB0_OUTPUT` path sidesteps the entire problem — system-mode renders the game's frames straight to qemu's GTK window.
-
-# 1. Boot. --ephemeral discards SD writes; --debug backgrounds qemu; --gdb [PORT] enables gdbstub.
-# Do not pass --headless: the GTK window is the only visible-display path.
-./RUN_QEMU.sh --debug --ephemeral --gdb 1234
-
-# 2. Watch the boot until the game launches. The wrap_game.sh prints
-#    "GAME_PIE_MAP: <base>-<end> r-xp ... /games/game" lines once exec /games/game completes.
-tail -f last_run.log
-# (Ctrl+C tail when you see GAME_PIE_MAP for /games/game)
-
-# 3. Compute runtime addresses. Default PIE base with ASLR off in this kernel
-#    is 0x5555550000. For any BN VA, runtime = 0x5555550000 + BN_VA.
-python3 -c 'B=0x5555550000; print(hex(B + 0x43989c8))'   # example: a table-entry address
-
-# 4. Attach gdb and set the read watchpoint.
-gdb-multiarch -ex 'set arch aarch64' \
-              -ex 'target remote :1234' \
-              -ex 'rwatch *(unsigned long long*)0x55598e89c8' \
-              -ex 'commands
-                 silent
-                 printf "\n=== HIT pc=%p (BN 0x%llx)  lr=%p (BN 0x%llx) ===\n", \
-                   $pc, (unsigned long long)$pc - 0x5555550000, \
-                   $lr, (unsigned long long)$lr - 0x5555550000
-                 printf "  x0=%p x1=%p x19=%p x20=%p\n", $x0, $x1, $x19, $x20
-                 bt 30
-                 c
-                 end' \
-              -ex 'continue'
-
-# 5. Each hit prints PC and LR translated to BN VAs. Look up those addresses in BN
-#    to identify the function reading the location.
-```
-
-### PIE base discovery — first time on a new build
-
-The PIE base for the game.elf changes only when the kernel's mmap-base policy or ASLR setting changes. With `randomize_va_space=0` (set by initramfs/init), in this Stern kernel build, the base has been **0x5555550000** consistently. To re-verify on a fresh build:
-
-```bash
-# After boot, tail last_run.log for the GAME_PIE_MAP line printed by wrap_game.sh:
-grep -E 'GAME_PIE_MAP.*r-xp 00000000.*/games/game' last_run.log | head -1
-# Expected format:
-# GAME_PIE_MAP: 5555550000-55559af000 r-xp 00000000 fe:02 1835258  /games/pokemon_le/game
-# The first hex value (start of the r-xp 00000000 line for the game binary) IS the PIE base.
-```
-
-**Subshell-PID gotcha:** `wrap_game.sh` uses a backgrounded subshell to `cat /proc/$$/maps`. `$$` in POSIX `(…)` subshells refers to the parent shell's PID, which after `exec /games/game` becomes the game's PID. The subshell sleeps 100 ms first to let `exec` complete. If the sleep is too short, the subshell sees the pre-`exec` busybox/wrapper maps instead of the game's. If you ever see `GAME_PIE_MAP` showing `/bin/busybox` or `/bin/sh`, increase the sleep.
-
-### BN VA ↔ runtime translation
-
-The game's BN database is rebased to base 0x0, so `BN VA == ELF VA == file offset`. With ASLR off, `runtime_addr = 0x5555550000 + BN_VA` and `BN_VA = runtime_addr - 0x5555550000`. Always run the math through python (per `feedback_compute_via_python.md`):
-
-```bash
-python3 -c 'B=0x5555550000; va=0x43989c8; print(f"BN 0x{va:x} -> runtime 0x{B+va:x}")'
-python3 -c 'B=0x5555550000; rt=0x55598e89c8; print(f"runtime 0x{rt:x} -> BN 0x{rt-B:x}")'
-```
 

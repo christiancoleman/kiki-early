@@ -8626,3 +8626,40 @@ Also no measurable framerate change. So the bottleneck isn't texture allocation 
 - `games/pokemon_le/_emulation/spi_shim.h` — `shim_avforward_pixel_lookup` signature changed from `(fd, y, uv, w, h, sy, su)` to `(fd, rgba, w, h, stride)`.
 - `games/pokemon_le/_emulation/decode_daemon.py` — `handle_receive` calls `frame.reformat(format='rgba')` + `to_ndarray(format='rgba')`, ships `n_planes=1` `AV_PIX_FMT_RGBA=26` single-plane payload (`stride = w*4`). Log message tag updated `nv12 → rgba`.
 - `_emulation/docs/JOURNAL.md` — this step appended.
+
+## Step 96: Atomic Horizon — host-native GL marshalling architecture (Phase 0: archival) (2026-05-09)
+
+Architectural pivot. Step 95g measurements established a hard ~5.5 fps ceiling in attract video even with frame-bridge readback fully disabled — confirming the wall is qemu-aarch64's TCG (Big TCG Lock serializes all guest threads through one translator, so Mesa llvmpipe's parallel fragment shading runs serially). Tuning the existing pipeline cannot reach the user's 30+ fps "playable" bar. Plan committed: move GL/EGL execution out of TCG to a host-native daemon (`gl_daemon.py` over abstract AF_UNIX `@spike3_gl`), mirroring the proven `decode_daemon.py` NVDEC pattern. Researcher A's working Spike 3 emulator uses this approach.
+
+Plan file: `~/.claude/plans/let-s-create-a-plan-atomic-horizon.md`. Six phases: 0 archival, 1 protocol skeleton, 2 gles_probe2 POC, 3 game-mode coverage, 4 validation, 5 perf opt (deferred). The full journal entry with verified fps numbers will be appended at end of Phase 4.
+
+### Step 96.0 — System-mode archived (this commit)
+
+Per user direction during plan review: "Don't leave any orphaned code please. Let's leave the code better than we found it." User-mode is the singular emulation path going forward. System-mode (`_emulation/historical-system-rig/`) was a parallel rig kept around for HW-watchpoint debugging, but its abstract AF_UNIX socket doesn't cross the VM kernel namespace boundary — bringing the GL daemon into system-mode would require vsock or an AF_UNIX-forwarder transport, ~1-2 sessions of work whose only benefit is preserving an occasional debug capability (last used Step 91/92 for the Tech Alerts row dispatcher). HW watchpoints are recoverable via `git revert` if a future bug demands them.
+
+What got removed:
+
+- `_emulation/historical-system-rig/` directory (60 GB, including 58 GB `sdcard.raw` LUKS image, 1.4 GB persist branch, RUN_QEMU.sh, MOUNT_OVERLAY.sh, initramfs/, scripts). User confirmed deletion of irreplaceable assets — backups exist elsewhere or re-imageable from cabinet.
+- PROTOCOL §14 "System-mode debugging (HW watchpoints)" — full section deleted (was 207 lines).
+- PROTOCOL §2 "Alternate path: full-system QEMU spike" subsection — deleted (22 lines).
+- PROTOCOL §1 architecture diagram block "System-mode only (gated): /dev/fb0 direct blit" — deleted.
+- PROTOCOL §3 boot-splash tick chain footnote: removed system-mode mention from time-bounded discussion.
+- PROTOCOL §3 Verified-by footnote (boot-splash chain): removed system-mode hardware-read-watchpoint provenance.
+- PROTOCOL §10 Display pipeline data-flow paragraph: removed `/dev/fb0` blit sink.
+- PROTOCOL §12 `shim_bridges.c` row: removed system-mode-spike rig description.
+- TOC: §14 entry removed (TOC now 13 entries).
+- Memory: `feedback_system_mode_parity.md` deleted from auto-memory.
+- MEMORY.md: pillar entry for system-mode parity removed; "14 numbered topics" → "13 numbered topics".
+
+Orphan-code cleanup (same Phase 0): `shim_fb0_blit` in `shim_bridges.c` was the only consumer of the system-mode GTK-window-via-/dev/fb0 path. With system-mode archived, the function and its supporting code (the `SPIKE3_FB0_OUTPUT` env knob, `shim_fb0_init_once`, the static fb0 fd/mmap state, and the `<sys/mman.h>`/`<sys/ioctl.h>`/`<linux/fb.h>` includes that fed only the fb0 implementation) were all removed from `shim_bridges.c`. Frame-capture call site simplified: `shim_fb0_blit(...)` removed; `if (shim_frame_client_fd < 0 && !fb0_env_cached) return;` collapsed to `if (shim_frame_client_fd < 0) return;`. `shim_bridges.c` now 518 lines (was ~656). Shim rebuilt clean: `spi_shim.so 300776 bytes`.
+
+### Touched (Step 96.0)
+
+- `_emulation/historical-system-rig/` — deleted entire directory (60 GB).
+- `_emulation/shim_bridges.c` — removed `shim_fb0_blit` + `shim_fb0_init_once` + fb0 static state + SPIKE3_FB0_OUTPUT env handling + fb-related includes. Frame-capture preamble simplified.
+- `_emulation/docs/PROTOCOL.md` — §14 deleted; §2 Alternate-path subsection deleted; §1 / §3 / §10 / §12 mentions scrubbed; TOC updated. File: 3023 → 2792 lines.
+- `_emulation/docs/JOURNAL.md` — this Step 96.0 entry appended.
+- `~/.claude/projects/.../memory/feedback_system_mode_parity.md` — deleted.
+- `~/.claude/projects/.../memory/MEMORY.md` — system-mode entry removed; topic count updated; new memories added (`feedback_no_orphans.md`, `feedback_baseline_runs_ask_first.md`).
+- `~/.claude/projects/.../memory/feedback_no_orphans.md` — NEW.
+- `~/.claude/projects/.../memory/feedback_baseline_runs_ask_first.md` — NEW.

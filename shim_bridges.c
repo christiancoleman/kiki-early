@@ -28,9 +28,6 @@
 #include <sys/un.h>
 #include <poll.h>
 #include <sys/time.h>
-#include <sys/mman.h>
-#include <sys/ioctl.h>
-#include <linux/fb.h>
 
 #include "spi_shim.h"
 
@@ -61,8 +58,6 @@ static int shim_bridge_create_listener(const char *abstract_name,
  * capture function reads it atomically. Keep as extern to avoid dragging
  * the GL state into this TU. */
 extern volatile unsigned shim_last_draw_fbo;
-
-static void shim_fb0_blit(int src_w, int src_h, const uint8_t *src_rgba);
 
 /* shim_unix_abstract_addr is defined as static inline in spi_shim.h —
  * the canonical AF_UNIX addressing strategy: abstract namespace, no fs
@@ -382,16 +377,7 @@ static void shim_frame_send(int w, int h, const uint8_t *rgba) {
 static uint32_t shim_capture_flip_counter = 0;
 
 void shim_frame_capture_at_page_flip(void) {
-    /* Skip readback when nothing's consuming. Two possible sinks:
-     *   - shim_frame_client_fd >= 0 → TCP/AF_UNIX subscriber connected
-     *   - SPIKE3_FB0_OUTPUT=1       → blitting to /dev/fb0 (qemu GTK window)
-     * Cache fb0 env once (cheap; getenv each frame would be silly). */
-    static int fb0_env_cached = -1;
-    if (fb0_env_cached == -1) {
-        const char *e = getenv("SPIKE3_FB0_OUTPUT");
-        fb0_env_cached = (e && e[0] == '1') ? 1 : 0;
-    }
-    if (shim_frame_client_fd < 0 && !fb0_env_cached) return;
+    if (shim_frame_client_fd < 0) return;
     if ((++shim_capture_flip_counter) & 1) return;
 
     static void (*real_glReadPixels)(int, int, int, int, unsigned, unsigned, void*) = NULL;
@@ -431,7 +417,6 @@ void shim_frame_capture_at_page_flip(void) {
     real_glReadPixels(0, 0, w, h, 0x1908 /* GL_RGBA */, 0x1401 /* GL_UNSIGNED_BYTE */,
                       shim_frame_buf);
     shim_frame_send(w, h, shim_frame_buf);
-    shim_fb0_blit(w, h, shim_frame_buf);
     if (verbose)
         SHIM_LOG("[frame_cap] sent %dx%d (flip #%u, from_fbo=%u prev_read=%d)",
                  w, h, shim_capture_flip_counter, game_fbo, prev_read);
@@ -530,125 +515,4 @@ void shim_audio_start(void) {
     pthread_t t;
     if (pthread_create(&t, NULL, shim_audio_accept_thread, NULL) == 0) pthread_detach(t);
     SHIM_LOG("[audio] wire format: S16_LE 2ch 44.1 kHz raw");
-}
-
-/* /dev/fb0 output (system-mode-spike — render game into qemu's GTK window,
- * no host-side subscriber needed).
- *
- * Gated by SPIKE3_FB0_OUTPUT=1. Lazy-init on first frame: open(/dev/fb0),
- * FBIOGET_VSCREENINFO to learn dims+format, mmap. Each frame: convert
- * RGBA8 -> fb0's native pixel format (RGBA8 / BGRA8 / RGB565), nearest-
- * neighbor scale if src and dst dims differ, write to mmap'd memory.
- *
- * In real hardware the kernel framebuffer is owned by the boot logo briefly
- * then idle while EGL/DRM does its thing. In qemu raspi4b, fb0 is what the
- * GTK display surface mirrors, so writing into it makes frames visible
- * without any cross-VM transport. */
-
-static int      shim_fb0_fd            = -1;
-static uint8_t *shim_fb0_mem           = NULL;
-static size_t   shim_fb0_size          = 0;
-static int      shim_fb0_w             = 0;
-static int      shim_fb0_h             = 0;
-static int      shim_fb0_bpp           = 0;     /* bytes per pixel */
-static int      shim_fb0_swap_rb       = 0;
-static int      shim_fb0_init_done     = 0;
-static int      shim_fb0_init_failed   = 0;
-
-static void shim_fb0_init_once(void) {
-    if (shim_fb0_init_done || shim_fb0_init_failed) return;
-
-    const char *enabled = getenv("SPIKE3_FB0_OUTPUT");
-    if (!enabled || enabled[0] != '1') { shim_fb0_init_failed = 1; return; }
-
-    shim_fb0_fd = open("/dev/fb0", O_RDWR);
-    if (shim_fb0_fd < 0) {
-        SHIM_LOG("[fb0] open(/dev/fb0) failed: %s", strerror(errno));
-        shim_fb0_init_failed = 1;
-        return;
-    }
-
-    struct fb_var_screeninfo vinfo;
-    if (ioctl(shim_fb0_fd, FBIOGET_VSCREENINFO, &vinfo) < 0) {
-        SHIM_LOG("[fb0] FBIOGET_VSCREENINFO failed: %s", strerror(errno));
-        close(shim_fb0_fd); shim_fb0_fd = -1;
-        shim_fb0_init_failed = 1;
-        return;
-    }
-
-    shim_fb0_w        = (int)vinfo.xres;
-    shim_fb0_h        = (int)vinfo.yres;
-    shim_fb0_bpp      = (int)(vinfo.bits_per_pixel / 8);
-    shim_fb0_swap_rb  = (vinfo.red.offset > vinfo.blue.offset);  /* BGRA-ish */
-
-    if (shim_fb0_bpp != 2 && shim_fb0_bpp != 4) {
-        SHIM_LOG("[fb0] unsupported bpp %d (only 2 / 4 handled)", shim_fb0_bpp * 8);
-        close(shim_fb0_fd); shim_fb0_fd = -1;
-        shim_fb0_init_failed = 1;
-        return;
-    }
-
-    shim_fb0_size = (size_t)shim_fb0_w * (size_t)shim_fb0_h * (size_t)shim_fb0_bpp;
-    shim_fb0_mem  = mmap(NULL, shim_fb0_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                         shim_fb0_fd, 0);
-    if (shim_fb0_mem == MAP_FAILED) {
-        SHIM_LOG("[fb0] mmap(%zu) failed: %s", shim_fb0_size, strerror(errno));
-        shim_fb0_mem = NULL;
-        close(shim_fb0_fd); shim_fb0_fd = -1;
-        shim_fb0_init_failed = 1;
-        return;
-    }
-
-    SHIM_LOG("[fb0] ready: %dx%d %dbpp swap_rb=%d (%zu bytes mapped)",
-             shim_fb0_w, shim_fb0_h, shim_fb0_bpp * 8, shim_fb0_swap_rb,
-             shim_fb0_size);
-    shim_fb0_init_done = 1;
-}
-
-static void shim_fb0_blit(int src_w, int src_h, const uint8_t *src_rgba) {
-    shim_fb0_init_once();
-    if (!shim_fb0_init_done || !shim_fb0_mem || !src_rgba) return;
-
-    const int dst_w = shim_fb0_w;
-    const int dst_h = shim_fb0_h;
-    const int bpp   = shim_fb0_bpp;
-    const int swap  = shim_fb0_swap_rb;
-
-    if (src_w == dst_w && src_h == dst_h && bpp == 4) {
-        for (int y = 0; y < dst_h; y++) {
-            const uint8_t *s = src_rgba + (size_t)y * (size_t)src_w * 4;
-            uint8_t       *d = shim_fb0_mem + (size_t)y * (size_t)dst_w * 4;
-            if (swap) {
-                for (int x = 0; x < dst_w; x++) {
-                    d[x*4 + 0] = s[x*4 + 2];   /* B */
-                    d[x*4 + 1] = s[x*4 + 1];   /* G */
-                    d[x*4 + 2] = s[x*4 + 0];   /* R */
-                    d[x*4 + 3] = 0xff;
-                }
-            } else {
-                memcpy(d, s, (size_t)dst_w * 4);
-            }
-        }
-        return;
-    }
-
-    for (int y = 0; y < dst_h; y++) {
-        int sy = (y * src_h) / dst_h;
-        const uint8_t *srow = src_rgba + (size_t)sy * (size_t)src_w * 4;
-        uint8_t       *drow = shim_fb0_mem + (size_t)y * (size_t)dst_w * (size_t)bpp;
-        for (int x = 0; x < dst_w; x++) {
-            int sx = (x * src_w) / dst_w;
-            const uint8_t *p = srow + sx * 4;
-            uint8_t r = p[0], g = p[1], b = p[2];
-            if (bpp == 4) {
-                drow[x*4 + 0] = swap ? b : r;
-                drow[x*4 + 1] = g;
-                drow[x*4 + 2] = swap ? r : b;
-                drow[x*4 + 3] = 0xff;
-            } else {
-                uint16_t pix = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
-                memcpy(drow + x*2, &pix, 2);
-            }
-        }
-    }
 }
