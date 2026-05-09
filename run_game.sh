@@ -116,6 +116,10 @@ AUDIO_BRIDGE="${AUDIO_BRIDGE:-1}"
 # shim falls back gracefully to local libavcodec passthrough — no errors
 # propagated to the game.
 FORWARD_DECODE="${FORWARD_DECODE:-1}"
+# GL_DAEMON=1: launch gl_daemon.py and route shim GL/EGL calls to host-native
+# Mesa via abstract AF_UNIX @spike3_gl. Atomic Horizon Phase 1 = log-only;
+# real GL still runs through Mesa overlay via dlsym. Default off until Phase 4.
+GL_DAEMON="${GL_DAEMON:-0}"
 # SPI_QUIET=1: stop replying byte-2=0x04 ("ack/data-available") to every SPI
 # transfer; instead reply all-zeros. Per-cmd overrides via SPIKE3_SPI_RX_<HEX>=
 # still take precedence.
@@ -394,6 +398,21 @@ if [[ "$FORWARD_DECODE" == "1" ]]; then
     fi
 fi
 
+if [[ "$GL_DAEMON" == "1" ]]; then
+    if command -v python3 >/dev/null; then
+        gl_daemon_log_target="$LATEST_DIR/gl_daemon.log"
+        # Daemon binds abstract AF_UNIX @spike3_gl. Same lifecycle as decode_daemon.
+        python3 -u "$SCRIPT_DIR/gl_daemon.py" \
+            >"$gl_daemon_log_target" 2>&1 &
+        HELPER_PIDS+=("$!"); HELPER_LABELS+=("gl daemon")
+        printf '[run_game] spawned gl daemon (pid %d) — log %s\n' \
+            "$!" "$gl_daemon_log_target" >&2
+        sleep 0.3
+    else
+        printf '[run_game] GL_DAEMON=1 but python3 not found; skipping\n' >&2
+    fi
+fi
+
 if [[ "$TIMER" == "ON" ]]; then
     if command -v python3 >/dev/null; then
         # Marker writes go directly to runs/latest/game.log (raw O_APPEND in
@@ -437,6 +456,7 @@ fi
 [[ "$FRAME_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_FRAME_BRIDGE=1")
 [[ "$AUDIO_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_AUDIO_BRIDGE=1")
 [[ "$FORWARD_DECODE"   == "1" ]] && args+=(-E "SPIKE3_FORWARD_DECODE=1")
+[[ "$GL_DAEMON"        == "1" ]] && args+=(-E "SPIKE3_GL_DAEMON=1")
 [[ "$SPI_QUIET"        == "1" ]] && args+=(-E "SPIKE3_SPI_QUIET=1")
 [[ "$SPI_DELAY_US"     != "0" ]] && args+=(-E "SPIKE3_SPI_DELAY_US=$SPI_DELAY_US")
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")
@@ -500,7 +520,7 @@ fi
     printf '\n# invocation (raw shell)\n'
     printf '$ %s %s\n' "$0" "$*"
     printf '\n# env-toggle settings (final values)\n'
-    for v in TIMEOUT REAL_GL FRAME_BRIDGE AUDIO_BRIDGE FORWARD_DECODE \
+    for v in TIMEOUT REAL_GL FRAME_BRIDGE AUDIO_BRIDGE FORWARD_DECODE GL_DAEMON \
              SPI_QUIET SPI_DELAY_US STATE_BRIDGE OFFLINE_MODE \
              VIEWER VIEWER_FULLSCREEN AUDIO_PLAYER TIMER  BOOT_DISPLAY \
              BOOT_DISPLAY_DURATION STALE_KILL DEBUG LOGFILE; do

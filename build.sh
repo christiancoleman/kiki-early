@@ -38,6 +38,7 @@ SOURCES=(
     shim_ioctl.c
     shim_patches.c
     shim_avforward.c
+    shim_gl_marshal.c
     shim_inject.c
     shim_net.c
     games/pokemon_le_machine.c

@@ -69,6 +69,19 @@ int shim_avforward_pixel_lookup(int sentinel_fd,
                                 const uint8_t **rgba_ptr,
                                 int *width, int *height, int *stride);
 
+/* GL marshalling (defined in shim_gl_marshal.c).
+ * Atomic Horizon Phase 1: ferries shim GL/EGL calls to the host-native
+ * gl_daemon.py over abstract AF_UNIX @spike3_gl. Active iff
+ * SPIKE3_GL_DAEMON=1 AND the daemon is reachable. send_sync returns the
+ * reply opcode (>= 0) or -1 on failure; out_reply_len is the number of
+ * payload bytes copied into reply_payload (truncated to reply_max). */
+int shim_gl_marshal_active(void);
+int shim_gl_marshal_send_async(uint16_t op, const void *args, uint32_t args_len);
+int shim_gl_marshal_send_sync(uint16_t op,
+                              const void *args, uint32_t args_len,
+                              void *reply_payload, uint32_t reply_max,
+                              uint32_t *out_reply_len);
+
 /* Runtime SPI RX override (defined in shim_ioctl.c).
  * Lets shim_inject.c inject CPU-local switch presses by OR-ing bits into
  * the 8-byte SPI MESSAGE_1 RX buffer. Each byte is OR'd in after the env

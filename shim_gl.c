@@ -47,6 +47,7 @@
 #include <sys/syscall.h>
 
 #include "spi_shim.h"
+#include "gl_proto.h"
 
 /* Exported so shim_bridges.c's frame capture can read the game's most recent
  * draw-FBO binding. Definition still lives with glBindFramebuffer inside
@@ -1115,6 +1116,9 @@ static int gl_log_budget_state         = 40;
 } while (0)
 
 unsigned glGetError(void) {
+    if (shim_gl_marshal_active()) {
+        shim_gl_marshal_send_async(GL_OP_GL_GET_ERROR, NULL, 0);
+    }
     FWD_RET(unsigned, glGetError, (void), ());
     return GL_NO_ERROR;
 }
@@ -1809,6 +1813,10 @@ void glClearStencil(int s) {
     (void)s;
 }
 void glClear(unsigned mask) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_clear pl = { .mask = mask };
+        shim_gl_marshal_send_async(GL_OP_GL_CLEAR, &pl, sizeof(pl));
+    }
     FWD_VOID(glClear, (unsigned), (mask));
     (void)mask;
 }
