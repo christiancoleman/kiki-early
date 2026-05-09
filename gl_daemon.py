@@ -42,6 +42,10 @@ class Renderer:
         self.log = logging.getLogger("renderer")
         self.width = width
         self.height = height
+        self._first_bind = True
+        self._tracked = {k: set() for k in
+                         ("programs", "shaders", "buffers", "vaos",
+                          "textures", "framebuffers")}
         self._libEGL = _load_libegl()
         from OpenGL import EGL as E
         self._E = E
@@ -60,6 +64,7 @@ class Renderer:
         if not E.eglBindAPI(E.EGL_OPENGL_ES_API):
             raise RuntimeError(f"eglBindAPI(GLES) failed (err=0x{E.eglGetError():x})")
 
+        EGL_OPENGL_ES3_BIT = 0x00000040
         attribs = (ctypes.c_int * 17)(
             E.EGL_SURFACE_TYPE,    E.EGL_PBUFFER_BIT,
             E.EGL_RED_SIZE,        8,
@@ -68,7 +73,7 @@ class Renderer:
             E.EGL_ALPHA_SIZE,      8,
             E.EGL_DEPTH_SIZE,      24,
             E.EGL_STENCIL_SIZE,    8,
-            E.EGL_RENDERABLE_TYPE, E.EGL_OPENGL_ES2_BIT,
+            E.EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
             E.EGL_NONE,
         )
         cfg = (E.EGLConfig * 1)()
@@ -78,7 +83,7 @@ class Renderer:
         self.config = cfg[0]
 
         ctx_attribs = (ctypes.c_int * 3)(
-            E.EGL_CONTEXT_CLIENT_VERSION, 2,
+            E.EGL_CONTEXT_CLIENT_VERSION, 3,
             E.EGL_NONE,
         )
         self.context = E.eglCreateContext(self.display, self.config,
@@ -98,16 +103,48 @@ class Renderer:
         self.log.info("renderer ready: %dx%d pbuffer, GLES2 context", self.width, self.height)
 
     def bind(self) -> None:
-        """Make the context current on the calling thread."""
+        """Make the context current on the calling thread. On every bind
+        after the first, scrub all GL objects created by the prior session so
+        the new client starts from a clean slate (the EGL context is shared
+        across Sessions; PyOpenGL's GL state is process-global)."""
         E = self._E
         if not E.eglMakeCurrent(self.display, self.surface, self.surface, self.context):
             raise RuntimeError(f"eglMakeCurrent failed (err=0x{E.eglGetError():x})")
         from OpenGL import GL
         self._GL = GL
-        v = GL.glGetString(GL.GL_VERSION)
-        r = GL.glGetString(GL.GL_RENDERER)
-        self.log.info("context current: GL_VERSION=%s GL_RENDERER=%s",
-                      v.decode() if v else "?", r.decode() if r else "?")
+        if self._first_bind:
+            v = GL.glGetString(GL.GL_VERSION)
+            r = GL.glGetString(GL.GL_RENDERER)
+            self.log.info("context current: GL_VERSION=%s GL_RENDERER=%s",
+                          v.decode() if v else "?", r.decode() if r else "?")
+            self._first_bind = False
+        else:
+            self.reset()
+
+    def reset(self) -> None:
+        GL = self._GL
+        GL.glUseProgram(0)
+        GL.glBindBuffer(0x8892, 0)
+        GL.glBindBuffer(0x8893, 0)
+        GL.glBindFramebuffer(0x8D40, 0)
+        GL.glBindTexture(0x0DE1, 0)
+        for prog in list(self._tracked["programs"]):     GL.glDeleteProgram(prog)
+        for shd  in list(self._tracked["shaders"]):      GL.glDeleteShader(shd)
+        if self._tracked["buffers"]:
+            ids = list(self._tracked["buffers"])
+            GL.glDeleteBuffers(len(ids), ids)
+        if self._tracked["vaos"]:
+            ids = list(self._tracked["vaos"])
+            GL.glDeleteVertexArrays(len(ids), ids)
+        if self._tracked["textures"]:
+            ids = list(self._tracked["textures"])
+            GL.glDeleteTextures(ids)
+        if self._tracked["framebuffers"]:
+            ids = list(self._tracked["framebuffers"])
+            GL.glDeleteFramebuffers(len(ids), ids)
+        counts = {k: len(v) for k, v in self._tracked.items()}
+        self._tracked = {k: set() for k in self._tracked}
+        self.log.info("renderer reset: scrubbed %s", counts)
 
     def execute_clear(self, mask: int) -> None:
         self._GL.glClear(mask)
@@ -129,10 +166,13 @@ class Renderer:
         return bytes(self._GL.glReadPixels(x, y, w, h, fmt, typ))
 
     def gen_buffers(self, n: int) -> list:
-        return [int(i) for i in self._GL.glGenBuffers(n)] if n != 1 else [int(self._GL.glGenBuffers(1))]
+        ids = [int(i) for i in self._GL.glGenBuffers(n)] if n != 1 else [int(self._GL.glGenBuffers(1))]
+        self._tracked["buffers"].update(ids)
+        return ids
 
     def delete_buffers(self, ids: list) -> None:
         self._GL.glDeleteBuffers(len(ids), ids)
+        for i in ids: self._tracked["buffers"].discard(int(i))
 
     def bind_buffer(self, target: int, buf_id: int) -> None:
         self._GL.glBindBuffer(target, buf_id)
@@ -141,19 +181,25 @@ class Renderer:
         self._GL.glBufferData(target, size, data if data else None, usage)
 
     def gen_vertex_arrays(self, n: int) -> list:
-        return [int(i) for i in self._GL.glGenVertexArrays(n)] if n != 1 else [int(self._GL.glGenVertexArrays(1))]
+        ids = [int(i) for i in self._GL.glGenVertexArrays(n)] if n != 1 else [int(self._GL.glGenVertexArrays(1))]
+        self._tracked["vaos"].update(ids)
+        return ids
 
     def delete_vertex_arrays(self, ids: list) -> None:
         self._GL.glDeleteVertexArrays(len(ids), ids)
+        for i in ids: self._tracked["vaos"].discard(int(i))
 
     def bind_vertex_array(self, vao_id: int) -> None:
         self._GL.glBindVertexArray(vao_id)
 
     def create_shader(self, shader_type: int) -> int:
-        return int(self._GL.glCreateShader(shader_type))
+        sid = int(self._GL.glCreateShader(shader_type))
+        self._tracked["shaders"].add(sid)
+        return sid
 
     def delete_shader(self, shader_id: int) -> None:
         self._GL.glDeleteShader(shader_id)
+        self._tracked["shaders"].discard(int(shader_id))
 
     def shader_source(self, shader_id: int, source: bytes) -> None:
         src = source.decode("utf-8", "replace")
@@ -172,10 +218,13 @@ class Renderer:
         return int(self._GL.glGetShaderiv(shader_id, pname))
 
     def create_program(self) -> int:
-        return int(self._GL.glCreateProgram())
+        pid = int(self._GL.glCreateProgram())
+        self._tracked["programs"].add(pid)
+        return pid
 
     def delete_program(self, prog: int) -> None:
         self._GL.glDeleteProgram(prog)
+        self._tracked["programs"].discard(int(prog))
 
     def attach_shader(self, prog: int, shader: int) -> None:
         self._GL.glAttachShader(prog, shader)
@@ -231,8 +280,12 @@ class Renderer:
         self._GL.glColorMask(bool(r), bool(g), bool(b), bool(a))
 
     def gen_textures(self, n: int) -> list:
-        return [int(i) for i in self._GL.glGenTextures(n)] if n != 1 else [int(self._GL.glGenTextures(1))]
-    def delete_textures(self, ids: list) -> None: self._GL.glDeleteTextures(ids)
+        ids = [int(i) for i in self._GL.glGenTextures(n)] if n != 1 else [int(self._GL.glGenTextures(1))]
+        self._tracked["textures"].update(ids)
+        return ids
+    def delete_textures(self, ids: list) -> None:
+        self._GL.glDeleteTextures(ids)
+        for i in ids: self._tracked["textures"].discard(int(i))
     def active_texture(self, unit: int) -> None:  self._GL.glActiveTexture(unit)
     def bind_texture(self, target: int, tex: int) -> None: self._GL.glBindTexture(target, tex)
     def tex_image_2d(self, target, level, internal_format, w, h, border, fmt, typ, data: bytes) -> None:
@@ -247,13 +300,111 @@ class Renderer:
         self._GL.glPixelStorei(pname, param)
 
     def gen_framebuffers(self, n: int) -> list:
-        return [int(i) for i in self._GL.glGenFramebuffers(n)] if n != 1 else [int(self._GL.glGenFramebuffers(1))]
-    def delete_framebuffers(self, ids: list) -> None: self._GL.glDeleteFramebuffers(len(ids), ids)
+        ids = [int(i) for i in self._GL.glGenFramebuffers(n)] if n != 1 else [int(self._GL.glGenFramebuffers(1))]
+        self._tracked["framebuffers"].update(ids)
+        return ids
+    def delete_framebuffers(self, ids: list) -> None:
+        self._GL.glDeleteFramebuffers(len(ids), ids)
+        for i in ids: self._tracked["framebuffers"].discard(int(i))
     def bind_framebuffer(self, target: int, fb: int) -> None: self._GL.glBindFramebuffer(target, fb)
     def framebuffer_texture_2d(self, target, attachment, textarget, tex, level) -> None:
         self._GL.glFramebufferTexture2D(target, attachment, textarget, tex, level)
     def check_framebuffer_status(self, target: int) -> int:
         return int(self._GL.glCheckFramebufferStatus(target))
+
+    # --- Phase 3d additions ---
+    def disable_vertex_attrib_array(self, idx: int) -> None: self._GL.glDisableVertexAttribArray(idx)
+    def blend_func_separate(self, srcRGB, dstRGB, srcA, dstA) -> None: self._GL.glBlendFuncSeparate(srcRGB, dstRGB, srcA, dstA)
+    def blend_equation(self, mode: int) -> None: self._GL.glBlendEquation(mode)
+    def blend_equation_separate(self, modeRGB, modeA) -> None: self._GL.glBlendEquationSeparate(modeRGB, modeA)
+    def blend_color(self, r, g, b, a) -> None: self._GL.glBlendColor(r, g, b, a)
+    def stencil_func(self, fn, ref, mask) -> None: self._GL.glStencilFunc(fn, ref, mask)
+    def stencil_op(self, sf, df, dp) -> None: self._GL.glStencilOp(sf, df, dp)
+    def stencil_mask(self, m: int) -> None: self._GL.glStencilMask(m)
+    def depth_rangef(self, n, f) -> None: self._GL.glDepthRangef(n, f)
+    def front_face(self, mode: int) -> None: self._GL.glFrontFace(mode)
+    def line_width(self, w: float) -> None: self._GL.glLineWidth(w)
+    def polygon_offset(self, factor, units) -> None: self._GL.glPolygonOffset(factor, units)
+    def clear_depthf(self, d: float) -> None: self._GL.glClearDepthf(d)
+    def clear_stencil(self, s: int) -> None: self._GL.glClearStencil(s)
+    def tex_parameter_f(self, target, pname, param) -> None: self._GL.glTexParameterf(target, pname, param)
+    def vertex_attrib_divisor(self, idx, div) -> None: self._GL.glVertexAttribDivisor(idx, div)
+    def bind_buffer_base(self, target, idx, buf) -> None: self._GL.glBindBufferBase(target, idx, buf)
+    def bind_buffer_range(self, target, idx, buf, offset, size) -> None: self._GL.glBindBufferRange(target, idx, buf, offset, size)
+    def uniform_block_binding(self, prog, idx, binding) -> None: self._GL.glUniformBlockBinding(prog, idx, binding)
+    def get_uniform_block_index(self, prog: int, name: bytes) -> int:
+        return int(self._GL.glGetUniformBlockIndex(prog, name.decode("utf-8", "replace")))
+    def gen_renderbuffers(self, n: int) -> list:
+        ids = [int(i) for i in self._GL.glGenRenderbuffers(n)] if n != 1 else [int(self._GL.glGenRenderbuffers(1))]
+        self._tracked["framebuffers"].update(ids)  # share tracking bucket
+        return ids
+    def delete_renderbuffers(self, ids: list) -> None:
+        self._GL.glDeleteRenderbuffers(len(ids), ids)
+        for i in ids: self._tracked["framebuffers"].discard(int(i))
+    def bind_renderbuffer(self, target, rb) -> None: self._GL.glBindRenderbuffer(target, rb)
+    def framebuffer_renderbuffer(self, target, attachment, rb_target, rb) -> None:
+        self._GL.glFramebufferRenderbuffer(target, attachment, rb_target, rb)
+    def renderbuffer_storage(self, target, internalformat, w, h) -> None:
+        self._GL.glRenderbufferStorage(target, internalformat, w, h)
+    def generate_mipmap(self, target: int) -> None: self._GL.glGenerateMipmap(target)
+    def draw_buffers(self, bufs: list) -> None: self._GL.glDrawBuffers(len(bufs), bufs)
+    def read_buffer(self, src: int) -> None: self._GL.glReadBuffer(src)
+    def invalidate_framebuffer(self, target: int, attachments: list) -> None:
+        self._GL.glInvalidateFramebuffer(target, len(attachments), attachments)
+    def vertex_attrib_i_pointer(self, idx, size, typ, stride, offset) -> None:
+        self._GL.glVertexAttribIPointer(idx, size, typ, stride, ctypes.c_void_p(offset))
+    def clear_buffer_fv(self, buffer: int, drawbuffer: int, vals: list) -> None:
+        self._GL.glClearBufferfv(buffer, drawbuffer, vals)
+    def detach_shader(self, prog, shader) -> None: self._GL.glDetachShader(prog, shader)
+    def bind_attrib_location(self, prog, idx, name: bytes) -> None:
+        self._GL.glBindAttribLocation(prog, idx, name.decode("utf-8", "replace"))
+    def validate_program(self, prog: int) -> None: self._GL.glValidateProgram(prog)
+    def gl_flush(self) -> None: self._GL.glFlush()
+
+    def buffer_sub_data(self, target, offset, data: bytes) -> None:
+        self._GL.glBufferSubData(target, offset, len(data), data)
+    def tex_image_3d(self, target, level, internal, w, h, d, border, fmt, typ, data: bytes) -> None:
+        self._GL.glTexImage3D(target, level, internal, w, h, d, border, fmt, typ, data if data else None)
+    def tex_sub_image_3d(self, target, level, x, y, z, w, h, d, fmt, typ, data: bytes) -> None:
+        self._GL.glTexSubImage3D(target, level, x, y, z, w, h, d, fmt, typ, data if data else None)
+    def tex_storage_2d(self, target, levels, internal, w, h) -> None:
+        self._GL.glTexStorage2D(target, levels, internal, w, h)
+    def tex_storage_3d(self, target, levels, internal, w, h, d) -> None:
+        self._GL.glTexStorage3D(target, levels, internal, w, h, d)
+    def compressed_tex_image_2d(self, target, level, internal, w, h, border, data: bytes) -> None:
+        self._GL.glCompressedTexImage2D(target, level, internal, w, h, border, len(data), data if data else None)
+    def compressed_tex_sub_image_2d(self, target, level, x, y, w, h, fmt, data: bytes) -> None:
+        self._GL.glCompressedTexSubImage2D(target, level, x, y, w, h, fmt, len(data), data if data else None)
+
+    def blit_framebuffer(self, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filt) -> None:
+        self._GL.glBlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filt)
+    def draw_range_elements(self, mode, start, end, count, typ, offset) -> None:
+        self._GL.glDrawRangeElements(mode, start, end, count, typ, ctypes.c_void_p(offset))
+    def draw_arrays_instanced(self, mode, first, count, inst) -> None:
+        self._GL.glDrawArraysInstanced(mode, first, count, inst)
+    def draw_elements_instanced(self, mode, count, typ, offset, inst) -> None:
+        self._GL.glDrawElementsInstanced(mode, count, typ, ctypes.c_void_p(offset), inst)
+    def copy_buffer_sub_data(self, rt, wt, ro, wo, sz) -> None:
+        self._GL.glCopyBufferSubData(rt, wt, ro, wo, sz)
+
+    def uniform_1f(self, loc, v0) -> None: self._GL.glUniform1f(loc, v0)
+    def uniform_2f(self, loc, v0, v1) -> None: self._GL.glUniform2f(loc, v0, v1)
+    def uniform_3f(self, loc, v0, v1, v2) -> None: self._GL.glUniform3f(loc, v0, v1, v2)
+    def uniform_2i(self, loc, v0, v1) -> None: self._GL.glUniform2i(loc, v0, v1)
+    def uniform_3i(self, loc, v0, v1, v2) -> None: self._GL.glUniform3i(loc, v0, v1, v2)
+    def uniform_4i(self, loc, v0, v1, v2, v3) -> None: self._GL.glUniform4i(loc, v0, v1, v2, v3)
+    def uniform_1iv(self, loc, count, data: bytes) -> None:
+        import numpy as np
+        ints = np.frombuffer(data, dtype=np.int32, count=count)
+        self._GL.glUniform1iv(loc, count, ints)
+    def uniform_xfv(self, n_per_elem: int, fn, loc, count, data: bytes) -> None:
+        import numpy as np
+        floats = np.frombuffer(data, dtype=np.float32, count=count * n_per_elem)
+        fn(loc, count, floats)
+    def uniform_matrix_3fv(self, loc, count, transpose, data: bytes) -> None:
+        import numpy as np
+        floats = np.frombuffer(data, dtype=np.float32, count=count * 9).reshape(count, 3, 3)
+        self._GL.glUniformMatrix3fv(loc, count, bool(transpose), floats)
 
 
 def read_all(sock: socket.socket, n: int) -> bytes:
@@ -555,6 +706,232 @@ class Session:
             (t,) = struct.unpack(P.ENABLE_FMT, payload)
             v = self.renderer.check_framebuffer_status(t)
             send_reply(self.sock, P.GL_OP_REP_VALUE, struct.pack(P.REP_VALUE_FMT, v))
+
+        # --- Phase 3d batch ---
+        elif op == P.GL_OP_GL_DISABLE_VERTEX_ATTRIB:
+            (idx,) = struct.unpack(P.P1U_FMT, payload); self.renderer.disable_vertex_attrib_array(idx)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BLEND_FUNC_SEPARATE:
+            sR, dR, sA, dA = struct.unpack(P.BLEND_FUNC_SEPARATE_FMT, payload)
+            self.renderer.blend_func_separate(sR, dR, sA, dA)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BLEND_EQUATION:
+            (m,) = struct.unpack(P.P1U_FMT, payload); self.renderer.blend_equation(m)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BLEND_EQUATION_SEPARATE:
+            mR, mA = struct.unpack(P.BLEND_EQ_SEPARATE_FMT, payload)
+            self.renderer.blend_equation_separate(mR, mA)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BLEND_COLOR:
+            r, g, b, a = struct.unpack(P.P4F_FMT, payload); self.renderer.blend_color(r, g, b, a)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_STENCIL_FUNC:
+            f, r, m = struct.unpack(P.P3U_FMT, payload); self.renderer.stencil_func(f, r, m)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_STENCIL_OP:
+            sf, df, dp = struct.unpack(P.P3U_FMT, payload); self.renderer.stencil_op(sf, df, dp)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_STENCIL_MASK:
+            (m,) = struct.unpack(P.P1U_FMT, payload); self.renderer.stencil_mask(m)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_DEPTH_RANGEF:
+            n, f = struct.unpack(P.P2F_FMT, payload); self.renderer.depth_rangef(n, f)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_FRONT_FACE:
+            (m,) = struct.unpack(P.P1U_FMT, payload); self.renderer.front_face(m)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_LINE_WIDTH:
+            (w,) = struct.unpack(P.P1F_FMT, payload); self.renderer.line_width(w)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_POLYGON_OFFSET:
+            f, u = struct.unpack(P.P2F_FMT, payload); self.renderer.polygon_offset(f, u)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_CLEAR_DEPTHF:
+            (d,) = struct.unpack(P.P1F_FMT, payload); self.renderer.clear_depthf(d)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_CLEAR_STENCIL:
+            (s,) = struct.unpack(P.P1I_FMT, payload); self.renderer.clear_stencil(s)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_TEX_PARAMETER_F:
+            t, pn, v = struct.unpack(P.TEX_PARAM_F_FMT, payload); self.renderer.tex_parameter_f(t, pn, v)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_VERTEX_ATTRIB_DIVISOR:
+            i, d = struct.unpack(P.P2U_FMT, payload); self.renderer.vertex_attrib_divisor(i, d)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BIND_BUFFER_BASE:
+            t, idx, b = struct.unpack(P.BIND_BUF_BASE_FMT, payload); self.renderer.bind_buffer_base(t, idx, b)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BIND_BUFFER_RANGE:
+            t, idx, b, off, sz = struct.unpack(P.BIND_BUF_RANGE_FMT, payload)
+            self.renderer.bind_buffer_range(t, idx, b, off, sz)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_BLOCK_BINDING:
+            p, i, b = struct.unpack(P.UBLOCK_BINDING_FMT, payload)
+            self.renderer.uniform_block_binding(p, i, b)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BIND_RENDERBUFFER:
+            t, rb = struct.unpack(P.BIND_FMT, payload); self.renderer.bind_renderbuffer(t, rb)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_FRAMEBUFFER_RB:
+            t, a, rt, rb = struct.unpack(P.FB_RB_FMT, payload)
+            self.renderer.framebuffer_renderbuffer(t, a, rt, rb)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_RENDERBUFFER_STORAGE:
+            t, ifmt, w, h = struct.unpack(P.RB_STORAGE_FMT, payload)
+            self.renderer.renderbuffer_storage(t, ifmt, w, h)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_GENERATE_MIPMAP:
+            (t,) = struct.unpack(P.P1U_FMT, payload); self.renderer.generate_mipmap(t)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_DRAW_BUFFERS:
+            (n,) = struct.unpack(P.DRAW_BUFFERS_FMT, payload[:4])
+            bufs = list(struct.unpack(f"<{n}I", payload[4:4+4*n]))
+            self.renderer.draw_buffers(bufs)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_READ_BUFFER:
+            (s,) = struct.unpack(P.P1U_FMT, payload); self.renderer.read_buffer(s)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_INVALIDATE_FB:
+            t, n = struct.unpack(P.INVALIDATE_FB_FMT, payload[:8])
+            atts = list(struct.unpack(f"<{n}I", payload[8:8+4*n]))
+            self.renderer.invalidate_framebuffer(t, atts)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_VERTEX_ATTRIB_I_PTR:
+            i, sz, ty, st, off = struct.unpack(P.VAP_I_FMT, payload)
+            self.renderer.vertex_attrib_i_pointer(i, sz, ty, st, off)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_CLEAR_BUFFER_FV:
+            buf, db = struct.unpack(P.CLEAR_BUFFER_FV_FMT, payload[:8])
+            vals = list(struct.unpack("<4f", payload[8:24]))
+            self.renderer.clear_buffer_fv(buf, db, vals)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_DETACH_SHADER:
+            p, s = struct.unpack(P.TWO_ID_FMT, payload); self.renderer.detach_shader(p, s)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BIND_ATTRIB_LOC:
+            p, idx, nlen = struct.unpack(P.BIND_ATTRIB_LOC_FMT, payload[:12])
+            name = payload[12:12+nlen]
+            self.renderer.bind_attrib_location(p, idx, name)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_VALIDATE_PROGRAM:
+            (p,) = struct.unpack(P.P1U_FMT, payload); self.renderer.validate_program(p)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_FLUSH:
+            self.renderer.gl_flush()
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+
+        elif op == P.GL_OP_GL_BUFFER_SUB_DATA:
+            t, off, sz = struct.unpack(P.BUFFER_SUB_DATA_FMT, payload[:16])
+            self.renderer.buffer_sub_data(t, off, payload[16:16+sz])
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_TEX_IMAGE_3D:
+            hsz = struct.calcsize(P.TEX_IMAGE_3D_FMT)
+            t, lvl, ifmt, w, h, d, border, fmt, typ, dsz = struct.unpack(P.TEX_IMAGE_3D_FMT, payload[:hsz])
+            self.renderer.tex_image_3d(t, lvl, ifmt, w, h, d, border, fmt, typ, payload[hsz:hsz+dsz] if dsz else b'')
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_TEX_SUB_IMAGE_3D:
+            hsz = struct.calcsize(P.TEX_SUB_IMAGE_3D_FMT)
+            t, lvl, x, y, z, w, h, d, fmt, typ, dsz = struct.unpack(P.TEX_SUB_IMAGE_3D_FMT, payload[:hsz])
+            self.renderer.tex_sub_image_3d(t, lvl, x, y, z, w, h, d, fmt, typ, payload[hsz:hsz+dsz] if dsz else b'')
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_TEX_STORAGE_2D:
+            t, lv, ifmt, w, h = struct.unpack(P.TEX_STORAGE_2D_FMT, payload)
+            self.renderer.tex_storage_2d(t, lv, ifmt, w, h)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_TEX_STORAGE_3D:
+            t, lv, ifmt, w, h, d = struct.unpack(P.TEX_STORAGE_3D_FMT, payload)
+            self.renderer.tex_storage_3d(t, lv, ifmt, w, h, d)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_COMPRESSED_TEX_IMAGE_2D:
+            hsz = struct.calcsize(P.COMPRESSED_TEX_IMAGE_2D_FMT)
+            t, lv, ifmt, w, h, b, isz = struct.unpack(P.COMPRESSED_TEX_IMAGE_2D_FMT, payload[:hsz])
+            self.renderer.compressed_tex_image_2d(t, lv, ifmt, w, h, b, payload[hsz:hsz+isz] if isz else b'')
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_COMPRESSED_TEX_SUB_IMAGE_2D:
+            hsz = struct.calcsize(P.COMPRESSED_TEX_SUB_IMAGE_2D_FMT)
+            t, lv, x, y, w, h, fmt, isz = struct.unpack(P.COMPRESSED_TEX_SUB_IMAGE_2D_FMT, payload[:hsz])
+            self.renderer.compressed_tex_sub_image_2d(t, lv, x, y, w, h, fmt, payload[hsz:hsz+isz] if isz else b'')
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+
+        elif op == P.GL_OP_GL_GEN_RENDERBUFFERS:
+            (n,) = struct.unpack(P.COUNT_FMT, payload)
+            ids = self.renderer.gen_renderbuffers(n)
+            send_reply(self.sock, P.GL_OP_REP_IDS,
+                       struct.pack(P.REP_IDS_FMT, len(ids)) +
+                       b''.join(struct.pack("<I", i) for i in ids))
+        elif op == P.GL_OP_GL_DELETE_RENDERBUFFERS:
+            (n,) = struct.unpack(P.COUNT_FMT, payload[:4])
+            ids = list(struct.unpack(f"<{n}I", payload[4:4+4*n]))
+            self.renderer.delete_renderbuffers(ids)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+
+        elif op == P.GL_OP_GL_BLIT_FRAMEBUFFER:
+            sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, fil = struct.unpack(P.BLIT_FB_FMT, payload)
+            self.renderer.blit_framebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, fil)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_DRAW_RANGE_ELEMENTS:
+            mode, st, en, ct, ty, off = struct.unpack(P.DRAW_RANGE_ELEMENTS_FMT, payload)
+            self.renderer.draw_range_elements(mode, st, en, ct, ty, off)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_DRAW_ARRAYS_INSTANCED:
+            mode, first, count, inst = struct.unpack(P.DRAW_ARRAYS_INST_FMT, payload)
+            self.renderer.draw_arrays_instanced(mode, first, count, inst)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_DRAW_ELEMENTS_INSTANCED:
+            mode, count, ty, off, inst = struct.unpack(P.DRAW_ELEMENTS_INST_FMT, payload)
+            self.renderer.draw_elements_instanced(mode, count, ty, off, inst)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_GET_UBLOCK_INDEX:
+            p, nlen = struct.unpack(P.GET_UBLOCK_INDEX_FMT, payload[:8])
+            idx = self.renderer.get_uniform_block_index(p, payload[8:8+nlen])
+            send_reply(self.sock, P.GL_OP_REP_VALUE, struct.pack(P.REP_VALUE_FMT, idx & 0xFFFFFFFF))
+        elif op == P.GL_OP_GL_COPY_BUFFER_SUB_DATA:
+            rt, wt, ro, wo, sz = struct.unpack(P.COPY_BUFFER_SUB_DATA_FMT, payload)
+            self.renderer.copy_buffer_sub_data(rt, wt, ro, wo, sz)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+
+        elif op == P.GL_OP_GL_UNIFORM_1F:
+            l, v0 = struct.unpack(P.UNIFORM_1F_FMT, payload); self.renderer.uniform_1f(l, v0)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_2F:
+            l, v0, v1 = struct.unpack(P.UNIFORM_2F_FMT, payload); self.renderer.uniform_2f(l, v0, v1)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_3F:
+            l, v0, v1, v2 = struct.unpack(P.UNIFORM_3F_FMT, payload); self.renderer.uniform_3f(l, v0, v1, v2)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_2I:
+            l, v0, v1 = struct.unpack(P.UNIFORM_2I_FMT, payload); self.renderer.uniform_2i(l, v0, v1)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_3I:
+            l, v0, v1, v2 = struct.unpack(P.UNIFORM_3I_FMT, payload); self.renderer.uniform_3i(l, v0, v1, v2)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_4I:
+            l, v0, v1, v2, v3 = struct.unpack(P.UNIFORM_4I_FMT, payload); self.renderer.uniform_4i(l, v0, v1, v2, v3)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_1IV:
+            l, ct = struct.unpack(P.UNIFORM_XIV_FMT, payload[:8])
+            self.renderer.uniform_1iv(l, ct, payload[8:])
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_1FV:
+            l, ct = struct.unpack(P.UNIFORM_XFV_FMT, payload[:8])
+            self.renderer.uniform_xfv(1, self.renderer._GL.glUniform1fv, l, ct, payload[8:])
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_2FV:
+            l, ct = struct.unpack(P.UNIFORM_XFV_FMT, payload[:8])
+            self.renderer.uniform_xfv(2, self.renderer._GL.glUniform2fv, l, ct, payload[8:])
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_3FV:
+            l, ct = struct.unpack(P.UNIFORM_XFV_FMT, payload[:8])
+            self.renderer.uniform_xfv(3, self.renderer._GL.glUniform3fv, l, ct, payload[8:])
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_4FV:
+            l, ct = struct.unpack(P.UNIFORM_XFV_FMT, payload[:8])
+            self.renderer.uniform_xfv(4, self.renderer._GL.glUniform4fv, l, ct, payload[8:])
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_MATRIX_3FV:
+            l, ct, tr = struct.unpack(P.UNIFORM_MAT3_FMT, payload[:12])
+            self.renderer.uniform_matrix_3fv(l, ct, tr, payload[12:])
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
 
         else:
             self.log.warning("unknown op 0x%04x flags=0x%04x payload=%db",

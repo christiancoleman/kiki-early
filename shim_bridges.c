@@ -30,6 +30,7 @@
 #include <sys/time.h>
 
 #include "spi_shim.h"
+#include "gl_proto.h"
 
 /* Common listener creator for the three bridges. Creates an abstract
  * AF_UNIX listener at `abstract_name`. `tag` is used only in log messages.
@@ -379,6 +380,59 @@ static uint32_t shim_capture_flip_counter = 0;
 void shim_frame_capture_at_page_flip(void) {
     if (shim_frame_client_fd < 0) return;
     if ((++shim_capture_flip_counter) & 1) return;
+
+    int verbose_d = (shim_capture_flip_counter < 8) ||
+                    ((shim_capture_flip_counter & 63) == 0);
+
+    if (shim_gl_marshal_active()) {
+        int w = FAKE_MODE_HDISPLAY, h = FAKE_MODE_VDISPLAY;
+        size_t need = (size_t)w * h * 4;
+        if (!shim_frame_buf || shim_frame_buf_size < need) {
+            free(shim_frame_buf);
+            shim_frame_buf = malloc(need);
+            shim_frame_buf_size = shim_frame_buf ? need : 0;
+        }
+        if (!shim_frame_buf) return;
+
+        unsigned game_fbo = __atomic_load_n(&shim_last_draw_fbo, __ATOMIC_RELAXED);
+        if (game_fbo != 0) {
+            struct gl_payload_bind bind_to = { 0x8CA8 /* GL_READ_FRAMEBUFFER */, game_fbo };
+            shim_gl_marshal_send_async(GL_OP_GL_BIND_FRAMEBUFFER, &bind_to, sizeof(bind_to));
+        }
+
+        struct gl_payload_read_pixels req = {
+            0, 0, w, h, 0x1908 /* GL_RGBA */, 0x1401 /* GL_UNSIGNED_BYTE */ };
+        size_t reply_size = sizeof(struct gl_payload_rep_pixels) + need;
+        unsigned char *reply = (unsigned char*)malloc(reply_size);
+        int sent = 0;
+        if (reply) {
+            uint32_t reply_len = 0;
+            int rep_op = shim_gl_marshal_send_sync(GL_OP_GL_READ_PIXELS,
+                                                   &req, sizeof(req),
+                                                   reply, (uint32_t)reply_size,
+                                                   &reply_len);
+            if (rep_op == GL_OP_REP_PIXELS &&
+                reply_len >= sizeof(struct gl_payload_rep_pixels)) {
+                size_t got = reply_len - sizeof(struct gl_payload_rep_pixels);
+                if (got > need) got = need;
+                memcpy(shim_frame_buf, reply + sizeof(struct gl_payload_rep_pixels), got);
+                if (got < need) memset(shim_frame_buf + got, 0, need - got);
+                shim_frame_send(w, h, shim_frame_buf);
+                sent = 1;
+            }
+            free(reply);
+        }
+
+        if (game_fbo != 0) {
+            struct gl_payload_bind bind_back = { 0x8CA8, 0 };
+            shim_gl_marshal_send_async(GL_OP_GL_BIND_FRAMEBUFFER, &bind_back, sizeof(bind_back));
+        }
+
+        if (verbose_d)
+            SHIM_LOG("[frame_cap] %s %dx%d (flip #%u, daemon, from_fbo=%u)",
+                     sent ? "sent" : "FAILED", w, h, shim_capture_flip_counter, game_fbo);
+        return;
+    }
 
     static void (*real_glReadPixels)(int, int, int, int, unsigned, unsigned, void*) = NULL;
     static void (*real_glGetIntegerv)(unsigned, int*) = NULL;

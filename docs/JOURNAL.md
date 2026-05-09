@@ -8734,3 +8734,24 @@ For game runs: `GL_DAEMON=1 ./run_game.sh ...` spawns daemon automatically.
 - `_emulation/gles_probe6.c` — NEW. FBO render-to-texture + sample.
 - `_emulation/docs/JOURNAL.md` — this Step 96.1 entry appended.
 
+### Step 96.2 — Phase 3d mechanical landings: EGLImage marshal, frame-capture relay, Renderer.reset (2026-05-09)
+
+Three of the five Phase 3d open items landed without surfacing surprises. `spi_shim.so` 367168 → 367264 bytes; all four probes still pass through the daemon.
+
+**Renderer.reset()** — `gl_daemon.py::Renderer` now tracks every id it hands out (programs, shaders, buffers, vaos, textures, framebuffers) and scrubs them on every `bind()` after the first. Verified: a single daemon process serving probes 3 → 4 → 5 → 6 in sequence shows `renderer reset: scrubbed {programs:1, shaders:2, buffers:1, ...}` between connections, with each probe's tex/program/buffer ids restarting at 1. The first-bind branch keeps the GL_VERSION/GL_RENDERER log; subsequent binds skip it.
+
+**glEGLImageTargetTexture2DOES daemon path** — when `SPIKE3_GL_DAEMON=1`, the EGLImage hook now ships the rgba_ptr's RGBA payload (or empty allocation for non-video FBO storage) as `OP_GL_TEX_IMAGE_2D` against the currently-bound 2D texture (which the game already bound through marshalled `glBindTexture`). Trade-off: always full TEX_IMAGE_2D, never TEX_SUB_IMAGE_2D — without a sync `GETINTEGERV(TEXTURE_BINDING_2D)` opcode the shim can't query daemon-side bound id to gate on size match. Re-allocation cost is a known follow-up if profiling demands it. Local-Mesa path with the 128-slot reuse table is preserved untouched for `GL_DAEMON=0`.
+
+**shim_frame_capture_at_page_flip relay** — daemon-mode branch added at the top of the function. Sequence: async `glBindFramebuffer(GL_READ_FRAMEBUFFER, shim_last_draw_fbo)` if non-zero → sync `OP_GL_READ_PIXELS{0,0,W,H,RGBA,UBYTE}` → response payload flows into `shim_frame_buf` and `shim_frame_send` exactly as today → async restore-bind to 0. Frame viewer is wire-compatible. Restore-to-0 (rather than save/restore prev_read) is the conscious shortcut: `GL_READ_FRAMEBUFFER=0` is the spec default and matches what page-flip-time game state should be; if it doesn't, future glBindFramebuffer marshals will overwrite. `#include "gl_proto.h"` added to shim_bridges.c.
+
+**Bulk-add deferred** — the ~30 unmarshalled state-setter/uniform variants are deferred to the game-run iteration loop (per the plan's risk-table strategy: "daemon logs unknown opcodes loud; surface mismatch caught immediately"). **Mixed-mode caveat**: when daemon is active, any unmarshalled GL hook that falls through to local-Mesa via `FWD_VOID` is operating on a different GL context than the daemon owns — buffers/textures/shaders/programs created on the daemon side don't exist in Mesa's namespace. So game-run iteration won't be "marshal what's missing for correctness" — it'll be "marshal what's missing because the alternative is namespace split." Plan accordingly: every game-touched GL hook needs a daemon path before the next stable run.
+
+**Phase 3d remaining**: item 5 — game run with `GL_DAEMON=1` and TIMER markers. Per `feedback_baseline_runs_ask_first.md` user drives this; the assistant only does mechanical iteration on whatever surfaces.
+
+#### Touched (Step 96.2)
+
+- `_emulation/gl_daemon.py` — Renderer adds `_first_bind`, `_tracked` dict, `reset()` method; bind() conditionally calls reset(); gen/create methods add to tracked sets, delete methods discard.
+- `_emulation/shim_gl.c` — `glEGLImageTargetTexture2DOES` gains a daemon-mode branch directly after `shim_egl_image_lookup`, before the `dlsym(RTLD_NEXT, ...)` setup. The local Mesa path (with tex_alloc reuse table) is preserved untouched.
+- `_emulation/shim_bridges.c` — `#include "gl_proto.h"` added; `shim_frame_capture_at_page_flip` gains a daemon-mode branch at the top that marshals BIND_FRAMEBUFFER + sync READ_PIXELS + restore-BIND, with the response replacing local glReadPixels.
+- `_emulation/docs/JOURNAL.md` — this Step 96.2 entry appended.
+

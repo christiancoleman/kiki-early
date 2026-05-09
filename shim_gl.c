@@ -430,6 +430,11 @@ void *eglGetDisplay(void *native_display) {
 }
 
 void *eglGetPlatformDisplay(unsigned platform, void *native_display, const intptr_t *attrib_list) {
+    if (shim_gl_marshal_active()) {
+        SHIM_LOG("eglGetPlatformDisplay(platform=0x%x, dpy=%p) -> fake [daemon]",
+                 platform, native_display);
+        (void)attrib_list; return FAKE_EGL_DISPLAY;
+    }
     if (is_real_gl()) {
         SHIM_LOG("FWD eglGetPlatformDisplay(platform=0x%x, dpy=%p) — translating to SURFACELESS_MESA",
                  platform, native_display);
@@ -442,6 +447,11 @@ void *eglGetPlatformDisplay(unsigned platform, void *native_display, const intpt
 }
 
 void *eglGetPlatformDisplayEXT(unsigned platform, void *native_display, const int *attrib_list) {
+    if (shim_gl_marshal_active()) {
+        SHIM_LOG("eglGetPlatformDisplayEXT(platform=0x%x, dpy=%p) -> fake [daemon]",
+                 platform, native_display);
+        (void)attrib_list; return FAKE_EGL_DISPLAY;
+    }
     if (is_real_gl()) {
         /* Mesa may or may not export the EXT symbol as a direct dynamic symbol.
          * Try it first; if NULL, fall back to the non-EXT EGL 1.5 path. */
@@ -481,12 +491,15 @@ unsigned eglInitialize(void *display, int *major, int *minor) {
 }
 
 unsigned eglTerminate(void *display) {
+    if (shim_gl_marshal_active()) { (void)display; return EGL_TRUE; }
     FWD_RET_V(unsigned, eglTerminate, (void*), (display));
     (void)display; return EGL_TRUE;
 }
 
 const char *eglQueryString(void *display, int name) {
-    FWD_RET_V(const char*, eglQueryString, (void*, int), (display, name));
+    if (!shim_gl_marshal_active()) {
+        FWD_RET_V(const char*, eglQueryString, (void*, int), (display, name));
+    }
     (void)display;
     switch (name) {
     case 0x3053: return "1.5";                       /* EGL_VERSION */
@@ -508,8 +521,10 @@ unsigned eglBindAPI(unsigned api) {
 }
 
 unsigned eglGetConfigs(void *display, void **configs, int config_size, int *num_config) {
-    FWD_RET_V(unsigned, eglGetConfigs, (void*, void**, int, int*),
-            (display, configs, config_size, num_config));
+    if (!shim_gl_marshal_active()) {
+        FWD_RET_V(unsigned, eglGetConfigs, (void*, void**, int, int*),
+                (display, configs, config_size, num_config));
+    }
     (void)display;
     if (num_config) *num_config = 1;
     if (configs && config_size >= 1) configs[0] = FAKE_EGL_CONFIG;
@@ -609,7 +624,7 @@ unsigned eglChooseConfig(void *display, const int *attrib_list,
 }
 
 unsigned eglGetConfigAttrib(void *display, void *config, int attribute, int *value) {
-    if (__builtin_expect(is_real_gl(), 0)) {
+    if (!shim_gl_marshal_active() && __builtin_expect(is_real_gl(), 0)) {
         static unsigned (*_real)(void*, void*, int, int*) = NULL;
         if (!_real) _real = (unsigned(*)(void*, void*, int, int*))
                             dlsym(RTLD_NEXT, "eglGetConfigAttrib");
@@ -662,12 +677,18 @@ void *eglCreateContext(void *display, void *config, void *share_context,
 }
 
 unsigned eglDestroyContext(void *display, void *context) {
+    if (shim_gl_marshal_active()) { (void)display; (void)context; return EGL_TRUE; }
     FWD_RET_V(unsigned, eglDestroyContext, (void*, void*), (display, context));
     (void)display; (void)context; return EGL_TRUE;
 }
 
 void *eglCreateWindowSurface(void *display, void *config, void *native_window,
                              const int *attrib_list) {
+    if (shim_gl_marshal_active()) {
+        SHIM_LOG("eglCreateWindowSurface(native=%p) -> fake surface [daemon]", native_window);
+        (void)display; (void)config; (void)attrib_list;
+        return FAKE_EGL_SURFACE;
+    }
     /* Step 55.2 — in real-GL mode, window surfaces don't work because our
      * "native_window" is a fake GBM surface that Mesa's GBM platform cannot
      * consume (no real DRM device). Redirect to a surfaceless pbuffer of
@@ -708,6 +729,7 @@ void *eglCreatePbufferSurface(void *display, void *config, const int *attrib_lis
 }
 
 unsigned eglDestroySurface(void *display, void *surface) {
+    if (shim_gl_marshal_active()) { (void)display; (void)surface; return EGL_TRUE; }
     FWD_RET_V(unsigned, eglDestroySurface, (void*, void*), (display, surface));
     (void)display; (void)surface; return EGL_TRUE;
 }
@@ -801,6 +823,7 @@ unsigned eglMakeCurrent(void *display, void *draw, void *read, void *context) {
 }
 
 unsigned eglSwapBuffers(void *display, void *surface) {
+    if (shim_gl_marshal_active()) { (void)display; (void)surface; return EGL_TRUE; }
     /* Plain forward — capture trigger moved to MODE_PAGE_FLIP (Step 57.2)
      * because this game uses DRM page-flip for presentation and never
      * actually calls eglSwapBuffers in practice. Left in place as a pure
@@ -810,19 +833,25 @@ unsigned eglSwapBuffers(void *display, void *surface) {
 }
 
 unsigned eglSwapInterval(void *display, int interval) {
+    if (shim_gl_marshal_active()) { (void)display; (void)interval; return EGL_TRUE; }
     FWD_RET_V(unsigned, eglSwapInterval, (void*, int), (display, interval));
     (void)display; (void)interval; return EGL_TRUE;
 }
 
 unsigned eglSurfaceAttrib(void *display, void *surface, int attribute, int value) {
+    if (shim_gl_marshal_active()) {
+        (void)display; (void)surface; (void)attribute; (void)value; return EGL_TRUE;
+    }
     FWD_RET_V(unsigned, eglSurfaceAttrib, (void*, void*, int, int),
             (display, surface, attribute, value));
     (void)display; (void)surface; (void)attribute; (void)value; return EGL_TRUE;
 }
 
 unsigned eglQuerySurface(void *display, void *surface, int attribute, int *value) {
-    FWD_RET_V(unsigned, eglQuerySurface, (void*, void*, int, int*),
-            (display, surface, attribute, value));
+    if (!shim_gl_marshal_active()) {
+        FWD_RET_V(unsigned, eglQuerySurface, (void*, void*, int, int*),
+                (display, surface, attribute, value));
+    }
     (void)display; (void)surface;
     if (!value) return EGL_FALSE;
     switch (attribute) {
@@ -834,6 +863,7 @@ unsigned eglQuerySurface(void *display, void *surface, int attribute, int *value
 }
 
 int eglGetError(void) {
+    if (shim_gl_marshal_active()) return EGL_SUCCESS;
     FWD_RET_V(int, eglGetError, (void), ());
     return EGL_SUCCESS;
 }
@@ -1009,6 +1039,31 @@ void glEGLImageTargetTexture2DOES(unsigned target, void *image) {
         SHIM_LOG("glEGLImageTargetTexture2DOES: unknown image %p, no-op", image);
         return;
     }
+
+    if (shim_gl_marshal_active()) {
+        /* Daemon path: ship the image's RGBA payload (or empty allocation
+         * for non-video FBO storage) as TEX_IMAGE_2D against whatever 2D
+         * texture the game already bound through our marshalled
+         * glBindTexture. We always use TEX_IMAGE_2D rather than SUB — without
+         * a sync GETINTEGERV opcode we can't query daemon-side bound id to
+         * gate on size match. */
+        size_t dsz = rgba_ptr ? (size_t)w * (size_t)h * 4 : 0;
+        size_t plen = sizeof(struct gl_payload_tex_image_2d) + dsz;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        if (buf) {
+            struct gl_payload_tex_image_2d *r = (struct gl_payload_tex_image_2d*)buf;
+            r->target = target; r->level = 0;
+            r->internal_format = 0x8058; r->width = w; r->height = h;
+            r->border = 0; r->format = 0x1908; r->type = 0x1401;
+            r->data_size = (uint32_t)dsz;
+            if (rgba_ptr && dsz) memcpy(buf + sizeof(*r), rgba_ptr, dsz);
+            shim_gl_marshal_send_async(GL_OP_GL_TEX_IMAGE_2D, buf, (uint32_t)plen);
+            free(buf);
+        }
+        shim_frametex_record(target, w, h);
+        return;
+    }
+
     static void (*real_glTexImage2D)(unsigned, int, int, int, int, int,
                                      unsigned, unsigned, const void *) = NULL;
     static void (*real_glTexSubImage2D)(unsigned, int, int, int, int, int,
@@ -1160,7 +1215,9 @@ unsigned glGetError(void) {
 }
 
 const unsigned char *glGetString(unsigned name) {
-    FWD_RET(const unsigned char*, glGetString, (unsigned), (name));
+    if (!shim_gl_marshal_active()) {
+        FWD_RET(const unsigned char*, glGetString, (unsigned), (name));
+    }
     switch (name) {
     case GL_VERSION:                  return (const unsigned char *)"OpenGL ES 3.1 (stub)";
     case GL_VENDOR:                   return (const unsigned char *)"shim";
@@ -1178,7 +1235,9 @@ const unsigned char *glGetString(unsigned name) {
 }
 
 const unsigned char *glGetStringi(unsigned name, unsigned index) {
-    FWD_RET(const unsigned char*, glGetStringi, (unsigned, unsigned), (name, index));
+    if (!shim_gl_marshal_active()) {
+        FWD_RET(const unsigned char*, glGetStringi, (unsigned, unsigned), (name, index));
+    }
     (void)name; (void)index; return (const unsigned char *)"";
 }
 
@@ -1193,7 +1252,9 @@ static void gl_getint_log_unknown(unsigned pname) {
 }
 
 void glGetIntegerv(unsigned pname, int *params) {
-    FWD_VOID(glGetIntegerv, (unsigned, int*), (pname, params));
+    if (!shim_gl_marshal_active()) {
+        FWD_VOID(glGetIntegerv, (unsigned, int*), (pname, params));
+    }
     if (!params) return;
     switch (pname) {
     case GL_MAX_TEXTURE_SIZE:                    *params = 4096; break;
@@ -1228,12 +1289,16 @@ void glGetIntegerv(unsigned pname, int *params) {
     }
 }
 void glGetFloatv(unsigned pname, float *params) {
-    FWD_VOID(glGetFloatv, (unsigned, float*), (pname, params));
+    if (!shim_gl_marshal_active()) {
+        FWD_VOID(glGetFloatv, (unsigned, float*), (pname, params));
+    }
     if (params) *params = 0.0f;
     (void)pname;
 }
 void glGetBooleanv(unsigned pname, unsigned char *params) {
-    FWD_VOID(glGetBooleanv, (unsigned, unsigned char*), (pname, params));
+    if (!shim_gl_marshal_active()) {
+        FWD_VOID(glGetBooleanv, (unsigned, unsigned char*), (pname, params));
+    }
     if (params) *params = GL_FALSE;
     (void)pname;
 }
@@ -1330,11 +1395,19 @@ void glDeleteFramebuffers(int n, const unsigned *ids) {
     (void)n; (void)ids;
 }
 void glGenRenderbuffers(int n, unsigned *out) {
+    if (shim_gl_marshal_active()) {
+        gl_marshal_gen_ids(GL_OP_GL_GEN_RENDERBUFFERS, n, out);
+        return;
+    }
     FWD_VOID(glGenRenderbuffers, (int, unsigned*), (n, out));
     for (int i = 0; i < n; i++) out[i] = gl_next_rb_id++;
     GLLOG(object_create, "glGenRenderbuffers(%d) -> [%u..]", n, n ? out[0] : 0);
 }
 void glDeleteRenderbuffers(int n, const unsigned *ids) {
+    if (shim_gl_marshal_active()) {
+        gl_marshal_delete_ids(GL_OP_GL_DELETE_RENDERBUFFERS, n, ids);
+        return;
+    }
     FWD_VOID(glDeleteRenderbuffers, (int, const unsigned*), (n, ids));
     (void)n; (void)ids;
 }
@@ -1452,6 +1525,11 @@ void glBindFramebuffer(unsigned target, unsigned fb) {
     (void)target; (void)fb;
 }
 void glBindRenderbuffer(unsigned target, unsigned rb) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_bind req = { target, rb };
+        shim_gl_marshal_send_async(GL_OP_GL_BIND_RENDERBUFFER, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glBindRenderbuffer, (unsigned, unsigned), (target, rb));
     (void)target; (void)rb;
 }
@@ -1550,6 +1628,20 @@ void glTexSubImage2D(unsigned target, int level, int xoff, int yoff,
 void glCompressedTexImage2D(unsigned target, int level, unsigned internalfmt,
                             int w, int h, int border, int size, const void *data) {
     target = shim_demote_external_oes(target);
+    if (shim_gl_marshal_active()) {
+        size_t isz = (data && size > 0) ? (size_t)size : 0;
+        size_t plen = sizeof(struct gl_payload_compressed_tex_image_2d) + isz;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        if (buf) {
+            struct gl_payload_compressed_tex_image_2d *r = (struct gl_payload_compressed_tex_image_2d*)buf;
+            r->target = target; r->level = level; r->internal_format = internalfmt;
+            r->width = w; r->height = h; r->border = border; r->image_size = (uint32_t)isz;
+            if (isz) memcpy(buf + sizeof(*r), data, isz);
+            shim_gl_marshal_send_async(GL_OP_GL_COMPRESSED_TEX_IMAGE_2D, buf, (uint32_t)plen);
+            free(buf);
+        }
+        return;
+    }
     FWD_VOID(glCompressedTexImage2D,
              (unsigned, int, unsigned, int, int, int, int, const void*),
              (target, level, internalfmt, w, h, border, size, data));
@@ -1560,6 +1652,22 @@ void glCompressedTexSubImage2D(unsigned target, int level, int xoff, int yoff,
                                int w, int h, unsigned format, int size,
                                const void *data) {
     target = shim_demote_external_oes(target);
+    if (shim_gl_marshal_active()) {
+        size_t isz = (data && size > 0) ? (size_t)size : 0;
+        size_t plen = sizeof(struct gl_payload_compressed_tex_sub_image_2d) + isz;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        if (buf) {
+            struct gl_payload_compressed_tex_sub_image_2d *r = (struct gl_payload_compressed_tex_sub_image_2d*)buf;
+            r->target = target; r->level = level;
+            r->xoffset = xoff; r->yoffset = yoff;
+            r->width = w; r->height = h;
+            r->format = format; r->image_size = (uint32_t)isz;
+            if (isz) memcpy(buf + sizeof(*r), data, isz);
+            shim_gl_marshal_send_async(GL_OP_GL_COMPRESSED_TEX_SUB_IMAGE_2D, buf, (uint32_t)plen);
+            free(buf);
+        }
+        return;
+    }
     FWD_VOID(glCompressedTexSubImage2D,
              (unsigned, int, int, int, int, int, unsigned, int, const void*),
              (target, level, xoff, yoff, w, h, format, size, data));
@@ -1578,6 +1686,11 @@ void glTexParameteri(unsigned target, unsigned pname, int param) {
 }
 void glTexParameterf(unsigned target, unsigned pname, float param) {
     target = shim_demote_external_oes(target);
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_tex_param_f req = { target, pname, param };
+        shim_gl_marshal_send_async(GL_OP_GL_TEX_PARAMETER_F, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glTexParameterf, (unsigned, unsigned, float), (target, pname, param));
     (void)target; (void)pname; (void)param;
 }
@@ -1592,6 +1705,11 @@ void glPixelStorei(unsigned pname, int param) {
 }
 void glGenerateMipmap(unsigned target) {
     target = shim_demote_external_oes(target);
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_1u req = { target };
+        shim_gl_marshal_send_async(GL_OP_GL_GENERATE_MIPMAP, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glGenerateMipmap, (unsigned), (target));
     (void)target;
 }
@@ -1614,16 +1732,107 @@ void glBufferData(unsigned target, intptr_t size, const void *data, unsigned usa
     (void)target; (void)size; (void)data; (void)usage;
 }
 void glBufferSubData(unsigned target, intptr_t offset, intptr_t size, const void *data) {
+    if (shim_gl_marshal_active()) {
+        size_t dsz = (data && size > 0) ? (size_t)size : 0;
+        size_t plen = sizeof(struct gl_payload_buffer_sub_data) + dsz;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        if (buf) {
+            struct gl_payload_buffer_sub_data *r = (struct gl_payload_buffer_sub_data*)buf;
+            r->target = target; r->offset = (int64_t)offset; r->size = (uint32_t)dsz;
+            if (dsz) memcpy(buf + sizeof(*r), data, dsz);
+            shim_gl_marshal_send_async(GL_OP_GL_BUFFER_SUB_DATA, buf, (uint32_t)plen);
+            free(buf);
+        }
+        return;
+    }
     FWD_VOID(glBufferSubData, (unsigned, intptr_t, intptr_t, const void*),
              (target, offset, size, data));
     (void)target; (void)offset; (void)size; (void)data;
 }
+/* Per-target buffer-map shadow table (max 8 simultaneous mappings; GL spec
+ * permits one mapping per target).
+ *
+ * Daemon mode requirement: glMapBufferRange must return writable host-process
+ * memory the game can deref. The daemon's GL state is in another process —
+ * its mapped pointer is unreachable here. We allocate scratch sized to the
+ * mapping, hand it to the game, and on glUnmapBuffer ship the bytes via
+ * glBufferSubData(target, offset, len, scratch). MAP_READ_BIT is best-effort:
+ * we don't fetch from daemon first, so a read-only map sees zeros. The game's
+ * actual usage (glMap+memcpy+glUnmap) is the WRITE pattern so this is fine. */
+struct shim_gl_map_entry {
+    unsigned target;
+    void    *ptr;
+    intptr_t offset;
+    intptr_t len;
+    unsigned access;
+};
+static struct shim_gl_map_entry shim_gl_map_table[8];
+static pthread_mutex_t shim_gl_map_lock = PTHREAD_MUTEX_INITIALIZER;
+
 void *glMapBufferRange(unsigned target, intptr_t offset, intptr_t len, unsigned access) {
+    if (shim_gl_marshal_active()) {
+        if (len <= 0) return NULL;
+        void *ptr = malloc((size_t)len);
+        if (!ptr) return NULL;
+        memset(ptr, 0, (size_t)len);
+        pthread_mutex_lock(&shim_gl_map_lock);
+        int slot = -1;
+        for (int i = 0; i < 8; i++) {
+            if (!shim_gl_map_table[i].ptr) { slot = i; break; }
+        }
+        if (slot >= 0) {
+            shim_gl_map_table[slot].target = target;
+            shim_gl_map_table[slot].ptr    = ptr;
+            shim_gl_map_table[slot].offset = offset;
+            shim_gl_map_table[slot].len    = len;
+            shim_gl_map_table[slot].access = access;
+        }
+        pthread_mutex_unlock(&shim_gl_map_lock);
+        if (slot < 0) {
+            SHIM_LOG("[gl_map] no free slot for map(target=0x%x len=%ld); leaking", target, (long)len);
+            free(ptr);
+            return NULL;
+        }
+        return ptr;
+    }
     FWD_RET(void*, glMapBufferRange, (unsigned, intptr_t, intptr_t, unsigned),
             (target, offset, len, access));
     (void)target; (void)offset; (void)len; (void)access; return NULL;
 }
 unsigned char glUnmapBuffer(unsigned target) {
+    if (shim_gl_marshal_active()) {
+        void *ptr = NULL;
+        intptr_t offset = 0, len = 0;
+        unsigned access = 0;
+        pthread_mutex_lock(&shim_gl_map_lock);
+        for (int i = 0; i < 8; i++) {
+            if (shim_gl_map_table[i].target == target && shim_gl_map_table[i].ptr) {
+                ptr     = shim_gl_map_table[i].ptr;
+                offset  = shim_gl_map_table[i].offset;
+                len     = shim_gl_map_table[i].len;
+                access  = shim_gl_map_table[i].access;
+                shim_gl_map_table[i].ptr = NULL;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&shim_gl_map_lock);
+        if (!ptr) return GL_TRUE;
+        /* GL_MAP_WRITE_BIT = 0x2; ship contents back if the game might have
+         * written. UNSYNCHRONIZED/INVALIDATE bits don't change correctness here. */
+        if ((access & 0x2) && len > 0) {
+            size_t plen = sizeof(struct gl_payload_buffer_sub_data) + (size_t)len;
+            unsigned char *buf = (unsigned char*)malloc(plen);
+            if (buf) {
+                struct gl_payload_buffer_sub_data *r = (struct gl_payload_buffer_sub_data*)buf;
+                r->target = target; r->offset = (int64_t)offset; r->size = (uint32_t)len;
+                memcpy(buf + sizeof(*r), ptr, (size_t)len);
+                shim_gl_marshal_send_async(GL_OP_GL_BUFFER_SUB_DATA, buf, (uint32_t)plen);
+                free(buf);
+            }
+        }
+        free(ptr);
+        return GL_TRUE;
+    }
     FWD_RET(unsigned char, glUnmapBuffer, (unsigned), (target));
     (void)target; return GL_TRUE;
 }
@@ -1747,6 +1956,11 @@ void glAttachShader(unsigned program, unsigned shader) {
     (void)program; (void)shader;
 }
 void glDetachShader(unsigned program, unsigned shader) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_two_id req = { program, shader };
+        shim_gl_marshal_send_async(GL_OP_GL_DETACH_SHADER, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glDetachShader, (unsigned, unsigned), (program, shader));
     (void)program; (void)shader;
 }
@@ -1760,6 +1974,11 @@ void glLinkProgram(unsigned program) {
     (void)program;
 }
 void glValidateProgram(unsigned program) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_id_op req = { program };
+        shim_gl_marshal_send_async(GL_OP_GL_VALIDATE_PROGRAM, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glValidateProgram, (unsigned), (program));
     (void)program;
 }
@@ -1815,15 +2034,19 @@ void glGetProgramiv(unsigned program, unsigned pname, int *params) {
     }
 }
 void glGetShaderInfoLog(unsigned shader, int max, int *len, char *log) {
-    FWD_VOID(glGetShaderInfoLog, (unsigned, int, int*, char*),
-             (shader, max, len, log));
+    if (!shim_gl_marshal_active()) {
+        FWD_VOID(glGetShaderInfoLog, (unsigned, int, int*, char*),
+                 (shader, max, len, log));
+    }
     (void)shader; (void)max;
     if (len) *len = 0;
     if (log && max > 0) log[0] = 0;
 }
 void glGetProgramInfoLog(unsigned program, int max, int *len, char *log) {
-    FWD_VOID(glGetProgramInfoLog, (unsigned, int, int*, char*),
-             (program, max, len, log));
+    if (!shim_gl_marshal_active()) {
+        FWD_VOID(glGetProgramInfoLog, (unsigned, int, int*, char*),
+                 (program, max, len, log));
+    }
     (void)program; (void)max;
     if (len) *len = 0;
     if (log && max > 0) log[0] = 0;
@@ -1860,6 +2083,19 @@ int glGetAttribLocation(unsigned program, const char *name) {
     (void)program; (void)name; return 0;
 }
 void glBindAttribLocation(unsigned program, unsigned index, const char *name) {
+    if (shim_gl_marshal_active() && name) {
+        size_t nlen = strlen(name);
+        size_t plen = sizeof(struct gl_payload_bind_attrib_loc) + nlen;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        if (buf) {
+            struct gl_payload_bind_attrib_loc *r = (struct gl_payload_bind_attrib_loc*)buf;
+            r->program = program; r->index = index; r->name_len = (uint32_t)nlen;
+            memcpy(buf + sizeof(*r), name, nlen);
+            shim_gl_marshal_send_async(GL_OP_GL_BIND_ATTRIB_LOC, buf, (uint32_t)plen);
+            free(buf);
+        }
+        return;
+    }
     FWD_VOID(glBindAttribLocation, (unsigned, unsigned, const char*),
              (program, index, name));
     (void)program; (void)index; (void)name;
@@ -1876,26 +2112,56 @@ void glUniform1i(int loc, int v0) {
     (void)loc; (void)v0;
 }
 void glUniform2i(int loc, int v0, int v1) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_uniform_2i req = { loc, v0, v1 };
+        shim_gl_marshal_send_async(GL_OP_GL_UNIFORM_2I, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glUniform2i, (int, int, int), (loc, v0, v1));
     (void)loc; (void)v0; (void)v1;
 }
 void glUniform3i(int loc, int v0, int v1, int v2) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_uniform_3i req = { loc, v0, v1, v2 };
+        shim_gl_marshal_send_async(GL_OP_GL_UNIFORM_3I, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glUniform3i, (int, int, int, int), (loc, v0, v1, v2));
     (void)loc; (void)v0; (void)v1; (void)v2;
 }
 void glUniform4i(int loc, int v0, int v1, int v2, int v3) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_uniform_4i req = { loc, v0, v1, v2, v3 };
+        shim_gl_marshal_send_async(GL_OP_GL_UNIFORM_4I, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glUniform4i, (int, int, int, int, int), (loc, v0, v1, v2, v3));
     (void)loc; (void)v0; (void)v1; (void)v2; (void)v3;
 }
 void glUniform1f(int loc, float v0) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_uniform_1f req = { loc, v0 };
+        shim_gl_marshal_send_async(GL_OP_GL_UNIFORM_1F, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glUniform1f, (int, float), (loc, v0));
     (void)loc; (void)v0;
 }
 void glUniform2f(int loc, float v0, float v1) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_uniform_2f req = { loc, v0, v1 };
+        shim_gl_marshal_send_async(GL_OP_GL_UNIFORM_2F, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glUniform2f, (int, float, float), (loc, v0, v1));
     (void)loc; (void)v0; (void)v1;
 }
 void glUniform3f(int loc, float v0, float v1, float v2) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_uniform_3f req = { loc, v0, v1, v2 };
+        shim_gl_marshal_send_async(GL_OP_GL_UNIFORM_3F, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glUniform3f, (int, float, float, float), (loc, v0, v1, v2));
     (void)loc; (void)v0; (void)v1; (void)v2;
 }
@@ -1908,27 +2174,74 @@ void glUniform4f(int loc, float v0, float v1, float v2, float v3) {
     FWD_VOID(glUniform4f, (int, float, float, float, float), (loc, v0, v1, v2, v3));
     (void)loc; (void)v0; (void)v1; (void)v2; (void)v3;
 }
+/* Helper: marshal a uniform-array op (1iv/1fv/2fv/3fv/4fv) with header + data. */
+static void gl_marshal_uniform_xv(uint16_t op, int loc, int count,
+                                   const void *data, size_t bytes_per_elem) {
+    if (count <= 0 || !data) return;
+    size_t data_bytes = (size_t)count * bytes_per_elem;
+    size_t plen = sizeof(struct gl_payload_uniform_xfv) + data_bytes;
+    unsigned char *buf = (unsigned char*)malloc(plen);
+    if (!buf) return;
+    struct gl_payload_uniform_xfv *r = (struct gl_payload_uniform_xfv*)buf;
+    r->location = loc; r->count = count;
+    memcpy(buf + sizeof(*r), data, data_bytes);
+    shim_gl_marshal_send_async(op, buf, (uint32_t)plen);
+    free(buf);
+}
 void glUniform1iv(int loc, int count, const int *v) {
+    if (shim_gl_marshal_active()) {
+        gl_marshal_uniform_xv(GL_OP_GL_UNIFORM_1IV, loc, count, v, 1 * sizeof(int));
+        return;
+    }
     FWD_VOID(glUniform1iv, (int, int, const int*), (loc, count, v));
     (void)loc; (void)count; (void)v;
 }
 void glUniform1fv(int loc, int count, const float *v) {
+    if (shim_gl_marshal_active()) {
+        gl_marshal_uniform_xv(GL_OP_GL_UNIFORM_1FV, loc, count, v, 1 * sizeof(float));
+        return;
+    }
     FWD_VOID(glUniform1fv, (int, int, const float*), (loc, count, v));
     (void)loc; (void)count; (void)v;
 }
 void glUniform2fv(int loc, int count, const float *v) {
+    if (shim_gl_marshal_active()) {
+        gl_marshal_uniform_xv(GL_OP_GL_UNIFORM_2FV, loc, count, v, 2 * sizeof(float));
+        return;
+    }
     FWD_VOID(glUniform2fv, (int, int, const float*), (loc, count, v));
     (void)loc; (void)count; (void)v;
 }
 void glUniform3fv(int loc, int count, const float *v) {
+    if (shim_gl_marshal_active()) {
+        gl_marshal_uniform_xv(GL_OP_GL_UNIFORM_3FV, loc, count, v, 3 * sizeof(float));
+        return;
+    }
     FWD_VOID(glUniform3fv, (int, int, const float*), (loc, count, v));
     (void)loc; (void)count; (void)v;
 }
 void glUniform4fv(int loc, int count, const float *v) {
+    if (shim_gl_marshal_active()) {
+        gl_marshal_uniform_xv(GL_OP_GL_UNIFORM_4FV, loc, count, v, 4 * sizeof(float));
+        return;
+    }
     FWD_VOID(glUniform4fv, (int, int, const float*), (loc, count, v));
     (void)loc; (void)count; (void)v;
 }
 void glUniformMatrix3fv(int loc, int count, unsigned char trans, const float *v) {
+    if (shim_gl_marshal_active() && count > 0 && v) {
+        size_t data_bytes = (size_t)count * 9 * sizeof(float);
+        size_t plen = sizeof(struct gl_payload_uniform_matrix_3fv) + data_bytes;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        if (buf) {
+            struct gl_payload_uniform_matrix_3fv *r = (struct gl_payload_uniform_matrix_3fv*)buf;
+            r->location = loc; r->count = count; r->transpose = trans;
+            memcpy(buf + sizeof(*r), v, data_bytes);
+            shim_gl_marshal_send_async(GL_OP_GL_UNIFORM_MATRIX_3FV, buf, (uint32_t)plen);
+            free(buf);
+        }
+        return;
+    }
     FWD_VOID(glUniformMatrix3fv, (int, int, unsigned char, const float*),
              (loc, count, trans, v));
     (void)loc; (void)count; (void)trans; (void)v;
@@ -1974,6 +2287,11 @@ void glEnableVertexAttribArray(unsigned idx) {
     (void)idx;
 }
 void glDisableVertexAttribArray(unsigned idx) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_1u req = { idx };
+        shim_gl_marshal_send_async(GL_OP_GL_DISABLE_VERTEX_ATTRIB, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glDisableVertexAttribArray, (unsigned), (idx));
     (void)idx;
 }
@@ -2012,11 +2330,21 @@ void glFramebufferTextureLayer(unsigned target, unsigned att, unsigned tex,
 }
 void glFramebufferRenderbuffer(unsigned target, unsigned att, unsigned rbtarget, unsigned rb) {
     SHIM_GL_DBG_HOOK(glFramebufferRenderbuffer);
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_framebuffer_rb req = { target, att, rbtarget, rb };
+        shim_gl_marshal_send_async(GL_OP_GL_FRAMEBUFFER_RB, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glFramebufferRenderbuffer, (unsigned, unsigned, unsigned, unsigned),
              (target, att, rbtarget, rb));
     (void)target; (void)att; (void)rbtarget; (void)rb;
 }
 void glRenderbufferStorage(unsigned target, unsigned internalfmt, int w, int h) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_renderbuffer_storage req = { target, internalfmt, w, h };
+        shim_gl_marshal_send_async(GL_OP_GL_RENDERBUFFER_STORAGE, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glRenderbufferStorage, (unsigned, unsigned, int, int),
              (target, internalfmt, w, h));
     (void)target; (void)internalfmt; (void)w; (void)h;
@@ -2083,19 +2411,39 @@ void glBlendFunc(unsigned src, unsigned dst) {
     (void)src; (void)dst;
 }
 void glBlendFuncSeparate(unsigned srcRGB, unsigned dstRGB, unsigned srcA, unsigned dstA) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_blend_func_separate req = { srcRGB, dstRGB, srcA, dstA };
+        shim_gl_marshal_send_async(GL_OP_GL_BLEND_FUNC_SEPARATE, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glBlendFuncSeparate, (unsigned, unsigned, unsigned, unsigned),
              (srcRGB, dstRGB, srcA, dstA));
     (void)srcRGB; (void)dstRGB; (void)srcA; (void)dstA;
 }
 void glBlendEquation(unsigned mode) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_1u req = { mode };
+        shim_gl_marshal_send_async(GL_OP_GL_BLEND_EQUATION, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glBlendEquation, (unsigned), (mode));
     (void)mode;
 }
 void glBlendEquationSeparate(unsigned rgb, unsigned a) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_blend_eq_separate req = { rgb, a };
+        shim_gl_marshal_send_async(GL_OP_GL_BLEND_EQUATION_SEPARATE, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glBlendEquationSeparate, (unsigned, unsigned), (rgb, a));
     (void)rgb; (void)a;
 }
 void glBlendColor(float r, float g, float b, float a) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_4f req = { r, g, b, a };
+        shim_gl_marshal_send_async(GL_OP_GL_BLEND_COLOR, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glBlendColor, (float, float, float, float), (r, g, b, a));
     (void)r; (void)g; (void)b; (void)a;
 }
@@ -2144,6 +2492,11 @@ void glDepthMask(unsigned char mask) {
     (void)mask;
 }
 void glDepthRangef(float n, float f) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_2f req = { n, f };
+        shim_gl_marshal_send_async(GL_OP_GL_DEPTH_RANGEF, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glDepthRangef, (float, float), (n, f));
     (void)n; (void)f;
 }
@@ -2157,18 +2510,38 @@ void glCullFace(unsigned mode) {
     (void)mode;
 }
 void glFrontFace(unsigned mode) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_1u req = { mode };
+        shim_gl_marshal_send_async(GL_OP_GL_FRONT_FACE, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glFrontFace, (unsigned), (mode));
     (void)mode;
 }
 void glStencilFunc(unsigned func, int ref, unsigned mask) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_3u req = { func, (uint32_t)ref, mask };
+        shim_gl_marshal_send_async(GL_OP_GL_STENCIL_FUNC, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glStencilFunc, (unsigned, int, unsigned), (func, ref, mask));
     (void)func; (void)ref; (void)mask;
 }
 void glStencilMask(unsigned mask) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_1u req = { mask };
+        shim_gl_marshal_send_async(GL_OP_GL_STENCIL_MASK, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glStencilMask, (unsigned), (mask));
     (void)mask;
 }
 void glStencilOp(unsigned f, unsigned zf, unsigned zp) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_3u req = { f, zf, zp };
+        shim_gl_marshal_send_async(GL_OP_GL_STENCIL_OP, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glStencilOp, (unsigned, unsigned, unsigned), (f, zf, zp));
     (void)f; (void)zf; (void)zp;
 }
@@ -2183,10 +2556,20 @@ void glColorMask(unsigned char r, unsigned char g, unsigned char b, unsigned cha
     (void)r; (void)g; (void)b; (void)a;
 }
 void glLineWidth(float w) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_1f req = { w };
+        shim_gl_marshal_send_async(GL_OP_GL_LINE_WIDTH, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glLineWidth, (float), (w));
     (void)w;
 }
 void glPolygonOffset(float f, float u) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_2f req = { f, u };
+        shim_gl_marshal_send_async(GL_OP_GL_POLYGON_OFFSET, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glPolygonOffset, (float, float), (f, u));
     (void)f; (void)u;
 }
@@ -2200,10 +2583,20 @@ void glClearColor(float r, float g, float b, float a) {
     (void)r; (void)g; (void)b; (void)a;
 }
 void glClearDepthf(float d) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_1f req = { d };
+        shim_gl_marshal_send_async(GL_OP_GL_CLEAR_DEPTHF, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glClearDepthf, (float), (d));
     (void)d;
 }
 void glClearStencil(int s) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_1i req = { s };
+        shim_gl_marshal_send_async(GL_OP_GL_CLEAR_STENCIL, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glClearStencil, (int), (s));
     (void)s;
 }
@@ -2240,16 +2633,32 @@ void glDrawElements(unsigned mode, int count, unsigned type, const void *idx) {
     GLLOG(draw, "glDrawElements(count=%d)", count);
 }
 void glDrawArraysInstanced(unsigned mode, int first, int count, int inst) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_draw_arrays_instanced req = { mode, first, count, inst };
+        shim_gl_marshal_send_async(GL_OP_GL_DRAW_ARRAYS_INSTANCED, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glDrawArraysInstanced, (unsigned, int, int, int),
              (mode, first, count, inst));
     (void)mode; (void)first; (void)count; (void)inst;
 }
 void glDrawElementsInstanced(unsigned mode, int count, unsigned type, const void *idx, int inst) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_draw_elements_instanced req = {
+            mode, count, type, (uint64_t)(uintptr_t)idx, inst };
+        shim_gl_marshal_send_async(GL_OP_GL_DRAW_ELEMENTS_INSTANCED, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glDrawElementsInstanced, (unsigned, int, unsigned, const void*, int),
              (mode, count, type, idx, inst));
     (void)mode; (void)count; (void)type; (void)idx; (void)inst;
 }
 void glVertexAttribDivisor(unsigned idx, unsigned divisor) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_2u req = { idx, divisor };
+        shim_gl_marshal_send_async(GL_OP_GL_VERTEX_ATTRIB_DIVISOR, &req, sizeof(req));
+        return;
+    }
     FWD_VOID(glVertexAttribDivisor, (unsigned, unsigned), (idx, divisor));
     (void)idx; (void)divisor;
 }
@@ -2264,6 +2673,10 @@ void glFinish(void) {
     FWD_VOID(glFinish, (void), ());
 }
 void glFlush(void) {
+    if (shim_gl_marshal_active()) {
+        shim_gl_marshal_send_async(GL_OP_GL_FLUSH, NULL, 0);
+        return;
+    }
     FWD_VOID(glFlush, (void), ());
 }
 void glReadPixels(int x, int y, int w, int h, unsigned fmt, unsigned type, void *data) {
@@ -2297,6 +2710,316 @@ void glReadPixels(int x, int y, int w, int h, unsigned fmt, unsigned type, void 
              (x, y, w, h, fmt, type, data));
     (void)x; (void)y; (void)fmt; (void)type;
     if (data) memset(data, 0, (size_t)w * (size_t)h * 4);
+}
+
+/* ---------------------------------------------------------------------------
+ * ES3 functions referenced by game.elf that the shim previously didn't export.
+ * Without these the dynamic linker resolves them in Mesa overlay → uninitialised
+ * Mesa state → silent corruption. All marshal to the daemon when active; when
+ * not active they fall through to FWD_* / canned stub values exactly as the
+ * other GL hooks. */
+
+void glBindBufferBase(unsigned target, unsigned index, unsigned buffer) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_bind_buffer_base req = { target, index, buffer };
+        shim_gl_marshal_send_async(GL_OP_GL_BIND_BUFFER_BASE, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glBindBufferBase, (unsigned, unsigned, unsigned), (target, index, buffer));
+    (void)target; (void)index; (void)buffer;
+}
+void glBindBufferRange(unsigned target, unsigned index, unsigned buffer,
+                       intptr_t offset, intptr_t size) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_bind_buffer_range req = {
+            target, index, buffer, (int64_t)offset, (int64_t)size };
+        shim_gl_marshal_send_async(GL_OP_GL_BIND_BUFFER_RANGE, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glBindBufferRange, (unsigned, unsigned, unsigned, intptr_t, intptr_t),
+             (target, index, buffer, offset, size));
+    (void)target; (void)index; (void)buffer; (void)offset; (void)size;
+}
+void glUniformBlockBinding(unsigned program, unsigned block_index, unsigned binding) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_uniform_block_binding req = { program, block_index, binding };
+        shim_gl_marshal_send_async(GL_OP_GL_UNIFORM_BLOCK_BINDING, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glUniformBlockBinding, (unsigned, unsigned, unsigned),
+             (program, block_index, binding));
+    (void)program; (void)block_index; (void)binding;
+}
+unsigned glGetUniformBlockIndex(unsigned program, const char *name) {
+    if (shim_gl_marshal_active() && name) {
+        size_t nlen = strlen(name);
+        size_t plen = sizeof(struct gl_payload_get_ublock_index) + nlen;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        unsigned ret = 0xFFFFFFFFu; /* GL_INVALID_INDEX */
+        if (buf) {
+            struct gl_payload_get_ublock_index *r = (struct gl_payload_get_ublock_index*)buf;
+            r->program = program; r->name_len = (uint32_t)nlen;
+            memcpy(buf + sizeof(*r), name, nlen);
+            struct gl_payload_rep_value reply = {0};
+            uint32_t rl = 0;
+            int rep_op = shim_gl_marshal_send_sync(GL_OP_GL_GET_UBLOCK_INDEX,
+                                                    buf, (uint32_t)plen,
+                                                    &reply, sizeof(reply), &rl);
+            if (rep_op == GL_OP_REP_VALUE) ret = reply.value;
+            free(buf);
+        }
+        return ret;
+    }
+    FWD_RET(unsigned, glGetUniformBlockIndex, (unsigned, const char*), (program, name));
+    (void)program; (void)name; return 0xFFFFFFFFu;
+}
+void glBlitFramebuffer(int sx0, int sy0, int sx1, int sy1,
+                       int dx0, int dy0, int dx1, int dy1,
+                       unsigned mask, unsigned filt) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_blit_framebuffer req = {
+            sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filt };
+        shim_gl_marshal_send_async(GL_OP_GL_BLIT_FRAMEBUFFER, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glBlitFramebuffer,
+             (int, int, int, int, int, int, int, int, unsigned, unsigned),
+             (sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filt));
+    (void)sx0; (void)sy0; (void)sx1; (void)sy1;
+    (void)dx0; (void)dy0; (void)dx1; (void)dy1;
+    (void)mask; (void)filt;
+}
+void glDrawBuffers(int n, const unsigned *bufs) {
+    if (shim_gl_marshal_active() && n > 0 && bufs) {
+        size_t plen = sizeof(struct gl_payload_draw_buffers) + (size_t)n * 4;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        if (buf) {
+            struct gl_payload_draw_buffers *r = (struct gl_payload_draw_buffers*)buf;
+            r->count = (uint32_t)n;
+            memcpy(buf + sizeof(*r), bufs, (size_t)n * 4);
+            shim_gl_marshal_send_async(GL_OP_GL_DRAW_BUFFERS, buf, (uint32_t)plen);
+            free(buf);
+        }
+        return;
+    }
+    FWD_VOID(glDrawBuffers, (int, const unsigned*), (n, bufs));
+    (void)n; (void)bufs;
+}
+void glReadBuffer(unsigned src) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_1u req = { src };
+        shim_gl_marshal_send_async(GL_OP_GL_READ_BUFFER, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glReadBuffer, (unsigned), (src));
+    (void)src;
+}
+void glClearBufferfv(unsigned buffer, int drawbuffer, const float *value) {
+    if (shim_gl_marshal_active() && value) {
+        size_t plen = sizeof(struct gl_payload_clear_buffer_fv) + 16;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        if (buf) {
+            struct gl_payload_clear_buffer_fv *r = (struct gl_payload_clear_buffer_fv*)buf;
+            r->buffer = buffer; r->drawbuffer = drawbuffer;
+            memcpy(buf + sizeof(*r), value, 16);
+            shim_gl_marshal_send_async(GL_OP_GL_CLEAR_BUFFER_FV, buf, (uint32_t)plen);
+            free(buf);
+        }
+        return;
+    }
+    FWD_VOID(glClearBufferfv, (unsigned, int, const float*), (buffer, drawbuffer, value));
+    (void)buffer; (void)drawbuffer; (void)value;
+}
+void glInvalidateFramebuffer(unsigned target, int n, const unsigned *atts) {
+    if (shim_gl_marshal_active() && n >= 0) {
+        size_t plen = sizeof(struct gl_payload_invalidate_fb) + (size_t)n * 4;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        if (buf) {
+            struct gl_payload_invalidate_fb *r = (struct gl_payload_invalidate_fb*)buf;
+            r->target = target; r->count = (uint32_t)n;
+            if (n > 0 && atts) memcpy(buf + sizeof(*r), atts, (size_t)n * 4);
+            shim_gl_marshal_send_async(GL_OP_GL_INVALIDATE_FB, buf, (uint32_t)plen);
+            free(buf);
+        }
+        return;
+    }
+    FWD_VOID(glInvalidateFramebuffer, (unsigned, int, const unsigned*),
+             (target, n, atts));
+    (void)target; (void)n; (void)atts;
+}
+void glVertexAttribIPointer(unsigned idx, int size, unsigned type,
+                             int stride, const void *ptr) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_vap_i req = { idx, size, type, stride, (uint64_t)(uintptr_t)ptr };
+        shim_gl_marshal_send_async(GL_OP_GL_VERTEX_ATTRIB_I_PTR, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glVertexAttribIPointer,
+             (unsigned, int, unsigned, int, const void*),
+             (idx, size, type, stride, ptr));
+    (void)idx; (void)size; (void)type; (void)stride; (void)ptr;
+}
+void glDrawRangeElements(unsigned mode, unsigned start, unsigned end,
+                         int count, unsigned type, const void *idx) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_draw_range_elements req = {
+            mode, start, end, count, type, (uint64_t)(uintptr_t)idx };
+        shim_gl_marshal_send_async(GL_OP_GL_DRAW_RANGE_ELEMENTS, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glDrawRangeElements,
+             (unsigned, unsigned, unsigned, int, unsigned, const void*),
+             (mode, start, end, count, type, idx));
+    (void)mode; (void)start; (void)end; (void)count; (void)type; (void)idx;
+}
+void glCopyBufferSubData(unsigned rt, unsigned wt, intptr_t ro, intptr_t wo, intptr_t sz) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_copy_buffer_sub_data req = {
+            rt, wt, (int64_t)ro, (int64_t)wo, (int64_t)sz };
+        shim_gl_marshal_send_async(GL_OP_GL_COPY_BUFFER_SUB_DATA, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glCopyBufferSubData,
+             (unsigned, unsigned, intptr_t, intptr_t, intptr_t),
+             (rt, wt, ro, wo, sz));
+    (void)rt; (void)wt; (void)ro; (void)wo; (void)sz;
+}
+void glTexImage3D(unsigned target, int level, int internal, int w, int h, int d,
+                  int border, unsigned format, unsigned type, const void *data) {
+    if (shim_gl_marshal_active()) {
+        size_t dsz = data ? (size_t)w * (size_t)h * (size_t)d * gl_pixel_size(format, type) : 0;
+        size_t plen = sizeof(struct gl_payload_tex_image_3d) + dsz;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        if (buf) {
+            struct gl_payload_tex_image_3d *r = (struct gl_payload_tex_image_3d*)buf;
+            r->target = target; r->level = level; r->internal_format = internal;
+            r->width = w; r->height = h; r->depth = d; r->border = border;
+            r->format = format; r->type = type; r->data_size = (uint32_t)dsz;
+            if (dsz) memcpy(buf + sizeof(*r), data, dsz);
+            shim_gl_marshal_send_async(GL_OP_GL_TEX_IMAGE_3D, buf, (uint32_t)plen);
+            free(buf);
+        }
+        return;
+    }
+    FWD_VOID(glTexImage3D,
+             (unsigned, int, int, int, int, int, int, unsigned, unsigned, const void*),
+             (target, level, internal, w, h, d, border, format, type, data));
+    (void)target; (void)level; (void)internal; (void)w; (void)h; (void)d;
+    (void)border; (void)format; (void)type; (void)data;
+}
+void glTexSubImage3D(unsigned target, int level, int xo, int yo, int zo,
+                     int w, int h, int d, unsigned format, unsigned type,
+                     const void *data) {
+    if (shim_gl_marshal_active()) {
+        size_t dsz = data ? (size_t)w * (size_t)h * (size_t)d * gl_pixel_size(format, type) : 0;
+        size_t plen = sizeof(struct gl_payload_tex_sub_image_3d) + dsz;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        if (buf) {
+            struct gl_payload_tex_sub_image_3d *r = (struct gl_payload_tex_sub_image_3d*)buf;
+            r->target = target; r->level = level;
+            r->xoffset = xo; r->yoffset = yo; r->zoffset = zo;
+            r->width = w; r->height = h; r->depth = d;
+            r->format = format; r->type = type; r->data_size = (uint32_t)dsz;
+            if (dsz) memcpy(buf + sizeof(*r), data, dsz);
+            shim_gl_marshal_send_async(GL_OP_GL_TEX_SUB_IMAGE_3D, buf, (uint32_t)plen);
+            free(buf);
+        }
+        return;
+    }
+    FWD_VOID(glTexSubImage3D,
+             (unsigned, int, int, int, int, int, int, int, unsigned, unsigned, const void*),
+             (target, level, xo, yo, zo, w, h, d, format, type, data));
+    (void)target; (void)level; (void)xo; (void)yo; (void)zo;
+    (void)w; (void)h; (void)d; (void)format; (void)type; (void)data;
+}
+void glTexStorage2D(unsigned target, int levels, unsigned internal, int w, int h) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_tex_storage_2d req = { target, levels, internal, w, h };
+        shim_gl_marshal_send_async(GL_OP_GL_TEX_STORAGE_2D, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glTexStorage2D, (unsigned, int, unsigned, int, int),
+             (target, levels, internal, w, h));
+    (void)target; (void)levels; (void)internal; (void)w; (void)h;
+}
+void glTexStorage3D(unsigned target, int levels, unsigned internal, int w, int h, int d) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_tex_storage_3d req = { target, levels, internal, w, h, d };
+        shim_gl_marshal_send_async(GL_OP_GL_TEX_STORAGE_3D, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glTexStorage3D, (unsigned, int, unsigned, int, int, int),
+             (target, levels, internal, w, h, d));
+    (void)target; (void)levels; (void)internal; (void)w; (void)h; (void)d;
+}
+
+/* Functions safe to no-op when daemon active: debug callbacks, transform
+ * feedback (game uses for HEVC out-path which we replace via shim_avforward),
+ * occlusion queries, OVR multiview, sync objects (we synthesise sentinels),
+ * program-binary cache (game falls back to source-compile on no-format). */
+
+void glDebugMessageCallback(void *cb, const void *userParam) {
+    (void)cb; (void)userParam;
+}
+void glDebugMessageCallbackKHR(void *cb, const void *userParam) {
+    (void)cb; (void)userParam;
+}
+void glBeginTransformFeedback(unsigned mode) { (void)mode; }
+void glEndTransformFeedback(void) { }
+void glTransformFeedbackVaryings(unsigned program, int count,
+                                 const char *const *varyings, unsigned mode) {
+    (void)program; (void)count; (void)varyings; (void)mode;
+}
+void glGenQueries(int n, unsigned *out) {
+    static uint32_t qid = 1;
+    if (out) for (int i = 0; i < n; i++) out[i] = qid++;
+}
+void glDeleteQueries(int n, const unsigned *ids) { (void)n; (void)ids; }
+void glFramebufferTextureMultiviewOVR(unsigned target, unsigned att, unsigned tex,
+                                       int level, int baseViewIndex, int numViews) {
+    (void)target; (void)att; (void)tex; (void)level; (void)baseViewIndex; (void)numViews;
+}
+void glFramebufferTextureMultisampleMultiviewOVR(unsigned target, unsigned att, unsigned tex,
+                                                  int level, int samples,
+                                                  int baseViewIndex, int numViews) {
+    (void)target; (void)att; (void)tex; (void)level;
+    (void)samples; (void)baseViewIndex; (void)numViews;
+}
+/* Sync objects: return monotonic sentinels. ClientWaitSync always reports
+ * "already signaled" so the game's wait-loop terminates. */
+void *glFenceSync(unsigned condition, unsigned flags) {
+    static uintptr_t sync_seq = 0xfeed0000ull;
+    (void)condition; (void)flags;
+    return (void *)__atomic_add_fetch(&sync_seq, 1, __ATOMIC_RELAXED);
+}
+void glDeleteSync(void *sync) { (void)sync; }
+unsigned glClientWaitSync(void *sync, unsigned flags, uint64_t timeout) {
+    (void)sync; (void)flags; (void)timeout;
+    return 0x911A;  /* GL_ALREADY_SIGNALED */
+}
+void glWaitSync(void *sync, unsigned flags, uint64_t timeout) {
+    (void)sync; (void)flags; (void)timeout;
+}
+void glGetSynciv(void *sync, unsigned pname, int bufSize, int *length, int *values) {
+    (void)sync;
+    if (length) *length = 1;
+    if (values && bufSize >= 1) {
+        if (pname == 0x9114 /* SYNC_STATUS */)        values[0] = 0x9117 /* SIGNALED */;
+        else if (pname == 0x9112 /* OBJECT_TYPE */)   values[0] = 0x9116 /* SYNC_FENCE */;
+        else if (pname == 0x9113 /* SYNC_CONDITION */) values[0] = 0x9117;
+        else                                           values[0] = 0;
+    }
+}
+/* Program binary: report no formats; game falls back to source compile. */
+void glGetProgramBinary(unsigned program, int bufSize, int *length,
+                        unsigned *binaryFormat, void *binary) {
+    (void)program; (void)bufSize; (void)binary;
+    if (length) *length = 0;
+    if (binaryFormat) *binaryFormat = 0;
+}
+void glProgramBinary(unsigned program, unsigned binaryFormat,
+                     const void *binary, int length) {
+    (void)program; (void)binaryFormat; (void)binary; (void)length;
 }
 
 typedef void (*pfn_t)(void);
