@@ -233,18 +233,25 @@ const void *avcodec_find_decoder_by_name(const char *name) {
     }
     if (!real_avcodec_find_decoder_by_name) return NULL;
 
-    /* SPIKE3_DECODER_PATCH (default-on): redirect hardware HEVC decoder
-     * names to libavcodec's plain "hevc". Paired with the get_format
-     * NOP patch in shim_patch_get_format_callback. Required for both
-     * forward-decode and any diagnostic SW path to function — the V4L2
-     * stateless m2m HEVC slice device the game asks for doesn't exist
-     * in our env. */
+    /* SPIKE3_DECODER_PATCH (default-on): redirect hardware HEVC + H.264
+     * decoder names to libavcodec's plain SW codecs. Paired with the
+     * get_format NOP patch in shim_patch_get_format_callback. The V4L2
+     * stateless m2m slice devices the game asks for don't exist in our
+     * env — without the remap, h264_v4l2m2m fails with "Could not find
+     * a valid device" and the game asserts on a NULL decoder_context
+     * trying to play the 1360x768 H.264 attract clips (PROTOCOL §9
+     * "Radium video clips"). */
     const char *lookup = name;
-    if (shim_decoder_patch_enabled() && name &&
-        (strcmp(name, "hevc_v4l2request") == 0 ||
-         strcmp(name, "hevc_v4l2m2m")    == 0)) {
-        SHIM_LOG("[decoder_patch] remapping decoder name '%s' -> 'hevc'", name);
-        lookup = "hevc";
+    if (shim_decoder_patch_enabled() && name) {
+        if (strcmp(name, "hevc_v4l2request") == 0 ||
+            strcmp(name, "hevc_v4l2m2m")    == 0) {
+            SHIM_LOG("[decoder_patch] remapping decoder name '%s' -> 'hevc'", name);
+            lookup = "hevc";
+        } else if (strcmp(name, "h264_v4l2request") == 0 ||
+                   strcmp(name, "h264_v4l2m2m")    == 0) {
+            SHIM_LOG("[decoder_patch] remapping decoder name '%s' -> 'h264'", name);
+            lookup = "h264";
+        }
     }
 
     const void *ret = real_avcodec_find_decoder_by_name(lookup);

@@ -1018,7 +1018,7 @@ static pid_t shim_find_thread_by_name(const char *name) {
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (de->d_name[0] == '.') continue;
-        char path[256];
+        char path[320];
         snprintf(path, sizeof(path), "/proc/self/task/%s/comm", de->d_name);
         int fd = open(path, O_RDONLY);
         if (fd < 0) continue;
@@ -1086,7 +1086,7 @@ static void *shim_dispatch_watchdog_thread(void *arg) {
             struct dirent *de;
             while ((de = readdir(d)) != NULL) {
                 if (de->d_name[0] == '.') continue;
-                char path[256], buf[32] = {0};
+                char path[320], buf[32] = {0};
                 snprintf(path, sizeof(path), "/proc/self/task/%s/comm", de->d_name);
                 int fd = open(path, O_RDONLY);
                 if (fd < 0) continue;

@@ -8532,6 +8532,15 @@ Tonight's auto-press was 4 × Service Select with no Back. So the runs that "end
 
 Practical consequence: tonight's manual-press flow + observation timer (Step 94g/h) lets the user explicitly drive Service Back to test the press-driven attract path, separate from the auto-timeout path.
 
+### Step 94m — Fresh-state runs achieve full stable attract loop (2026-05-09 ~02:30)
+
+User added `_emulation/scripts/reset_run_state.sh` (delete by default; `--keep` preserves backup dirs). Before each test run, it clears: `/data/nv/pokemon_le/` (NVRAM), `/tmp/cache/mesa/` (Mesa shader cache), `/tmp/cache/shader_cache/` (Godot/other shader cache). With this discipline:
+
+- Run survives **full 60-second first attract clip** → ~30 s black period (the `ATTRACT_LOOP_SERVICE_S` slot per PROTOCOL §9 attract sequencer, falling through cleanly when service_s_worker isn't running) → **second attract clip starts** = native attract loop. No crashes. No status 5 / 134 / stack smash. Game is fundamentally healthy.
+- Audio singleton vtable is **healthy in fresh-state runs** — slot 5 holds a real game function (e.g. `0x25607f0`) instead of `_ZSt10unexpectedv`. The Step-93d corruption hypothesis was correct; whatever NVRAM or shader-cache state was carrying corruption between runs no longer carries.
+- Sound: the SM's "cascading item-selection sound spam" cuts off (raggedly) when the user presses Service Back; attract is silent (likely Service S-gated audio paths the game skips when service_s_worker isn't up).
+- One late-attract crash discovered + fixed: `h264_v4l2m2m` was not in the SPIKE3_DECODER_PATCH remap list (only `hevc_v4l2*` variants were). Game hits an `assert(decoder_context)` in `SpiVideoStreamDecoderBase::SendPacket` (cpp:1222) when the H.264 decoder fails to find a valid V4L2 device. Fix in `shim_patches.c::avcodec_find_decoder_by_name`: add `h264_v4l2request` / `h264_v4l2m2m` → `h264` SW remap alongside the existing HEVC pair. Per PROTOCOL §9 the 1360×768 attract clips are H.264 Constrained Baseline so this path is hit on every attract cycle.
+
 ### Open / next session
 
 - **In-attract video display:** decoder is producing 1500+ frames at full rate but the visible attract is black/static behind the overlay text. Investigate AVFrame `data[]` / `linesize[]` / `format` plane layout in `shim_avforward.c::shim_avforward_receive_frame` against what the game's render path expects. PROTOCOL §10 + §12 "Forward-decode bridge" hold the field offsets we already trust; this is about whether the bytes are being consumed correctly downstream.
@@ -8557,5 +8566,7 @@ Practical consequence: tonight's manual-press flow + observation timer (Step 94g
 - `games/pokemon_le/_emulation/decode_daemon.py` — `REQ_FLUSH = 0x05`; `handle_flush()` (PyAV `flush_buffers()` fast path with recreate-with-extradata fallback); save `codec_id + extradata` at OPEN for fallback path.
 - `games/pokemon_le/_emulation/marker_button.py` — full rewrite: elapsed timer top of GUI, new observation presets, PRESS buttons writing `runs/latest/press_request.txt`, retained KILL.
 - `games/pokemon_le/_emulation/run_game.sh` — `cd /games` (was `cd "$GAME_DIR"` = `/games/pokemon_le/`); exec `/games/game` (was `./game`); `SHIM_MANUAL_PRESS` defaults; `SHIM_SELECT_PRESS` default flipped to 0; `GDB_PORT` env-gate appends `-g $GDB_PORT` to qemu cmdline; auto-forward of every exported `SHIM_*` env var to qemu via `-E`.
-- `/mnt/c/Workspace/pokemon-le-0.81.0/games/game` — was a 71 MB regular file duplicating `pokemon_le/game`. First attempt: relative symlink — rejected because git-on-Windows doesn't track POSIX symlinks reliably. Final: **NTFS hard link** (`ln pokemon_le/game game`). Both paths share inode `1125899907059074`, link count 2, single 71 MB on disk; git on either Windows or WSL sees two regular files with identical content and dedups blobs naturally via content-addressed storage.
+- `/mnt/c/Workspace/pokemon-le-0.81.0/games/game` — was a 71 MB regular file duplicating `pokemon_le/game`; replaced with a relative POSIX symlink (`ln -s pokemon_le/game game`). A hard-link substitute was tested mid-session and crashed at ~10 s every run; symlink survives 2+ minutes. Mechanism uninvestigated.
+- `games/pokemon_le/_emulation/scripts/reset_run_state.sh` — NEW. Clears `/data/nv/pokemon_le/`, `/tmp/cache/mesa/`, `/tmp/cache/shader_cache/`. Default deletes; `--keep` moves to `*.backup_<TS>`. Pair with each test run for a clean baseline.
+- `games/pokemon_le/_emulation/shim_patches.c::avcodec_find_decoder_by_name` — added `h264_v4l2request` / `h264_v4l2m2m` → `h264` SW remap, alongside the existing HEVC pair. Required for the 1360×768 H.264 attract clips per PROTOCOL §9.
 - `_emulation/docs/JOURNAL.md` — this step appended.
