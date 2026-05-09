@@ -8570,3 +8570,59 @@ User added `_emulation/scripts/reset_run_state.sh` (delete by default; `--keep` 
 - `games/pokemon_le/_emulation/scripts/reset_run_state.sh` — NEW. Clears `/data/nv/pokemon_le/`, `/tmp/cache/mesa/`, `/tmp/cache/shader_cache/`. Default deletes; `--keep` moves to `*.backup_<TS>`. Pair with each test run for a clean baseline.
 - `games/pokemon_le/_emulation/shim_patches.c::avcodec_find_decoder_by_name` — added `h264_v4l2request` / `h264_v4l2m2m` → `h264` SW remap, alongside the existing HEVC pair. Required for the 1360×768 H.264 attract clips per PROTOCOL §9.
 - `_emulation/docs/JOURNAL.md` — this step appended.
+
+## Step 95: Attract video renders — glShaderSource samplerExternalOES define injection unblocks Mesa swrast (2026-05-09)
+
+Direct continuation of Step 94. Tonight: visible attract-area video frames go from "decoded but invisible" to "rendered correctly, just slow." The unblock turned out to be a one-line `#define samplerExternalOES sampler2D` injected at shader-compile time; under Mesa swrast llvmpipe a `samplerExternalOES` uniform sampling a non-EXTERNAL_OES-typed texture returns zero, and the spec-blessed alternative (real DMA-BUF EGLImage import) requires kernel-side dma-buf support that WSL2's environment doesn't provide. Two perf optimizations followed (host-side RGBA conversion in `decode_daemon.py`, `glTexSubImage2D` reuse on repeat texture uploads); neither moved the framerate needle, so the remaining bottleneck is elsewhere and not on the upload chain.
+
+### Step 95a — Mesa rejects `glTexImage2D(GL_TEXTURE_EXTERNAL_OES, ...)`
+
+The Step 89d empty-`AVDRMFrameDescriptor` redirect prevented SIGSEGV at the game's DRM-prime walker but silently dropped pixels — verified tonight by wiring up a `glGetError()` round-trip around the shim's `real_glTexImage2D` call. Every video upload returned `0x500` (`GL_INVALID_ENUM`). Per the `GL_OES_EGL_image_external` spec, only `glEGLImageTargetTexture2DOES` may set EXTERNAL_OES texture state — `glTexImage2D` / `glTexSubImage2D` / `glTexParameter*` are explicitly invalid on that target. Cross-checked the conversion math itself with a one-shot dump of two `shim_video_<seq>_<W>x<H>.rgba` files to disk; PIL renders them as legible video frames, so the BT.601 NV12→RGBA path was fine — the upload was the problem.
+
+### Step 95b — Path C dead end: real Mesa EGLImage via `EGL_KHR_gl_texture_2D_image`
+
+The "right" fix per spec is to wrap a 2D RGBA texture as an `EGLImageKHR` via `eglCreateImageKHR(target=EGL_GL_TEXTURE_2D_KHR=0x30B1, buffer=tex_id)` and forward the game's `glEGLImageTargetTexture2DOES` to Mesa's real impl, which imports the 2D-texture-backed image into the bound EXTERNAL_OES texture so the sampler reads it correctly. Implemented this in a `shim_egl_image_build_video` helper with both `dlsym(RTLD_NEXT)` and `eglGetProcAddress` fallback for symbol resolution. Result: Mesa's `eglCreateImageKHR` reproducibly SIGSEGVs three frames into libEGL with `fault_addr=0x68` (NULL+0x68 deref). Tried `EGL_NO_CONTEXT` for ctx + explicit `{EGL_GL_TEXTURE_LEVEL_KHR=0, EGL_NONE}` attribs list per spec — same crash. Mesa's surfaceless software backend evidently doesn't support `EGL_KHR_gl_texture_2D_image` end-to-end in this overlay build. Reverted Path C entirely.
+
+### Step 95c — Path B: EXTERNAL_OES → 2D demotion + counter-based sentinels
+
+Demote `GL_TEXTURE_EXTERNAL_OES` (0x8D65) to `GL_TEXTURE_2D` (0x0DE1) consistently across `glBindTexture`, `glTexImage2D`, `glTexSubImage2D`, `glCompressedTex{,Sub}Image2D`, `glTexParameter{i,f}`, `glGenerateMipmap` (paired with the pre-existing demotion in `glFramebufferTexture2D/Layer`). With this, `glTexImage2D` upload succeeds (`glGetError` returns 0). Verified via `[frame_cap] tracking tex=N target=0xde1 1940x1100` log lines that 1940×1100 (HEVC) and 1360×768 (H.264 attract) textures both reach the upload path.
+
+EGLImage sentinels switched from `malloc(1)` to a monotonic atomic counter (`(void *)(0xdeadbeef0000 + 8*N)`). Backstory: the game's `FUN_01df8b40` caches the last EGLImage pointer at `param_3 + 0x2b8` and skips re-binding when a new image's pointer matches. With `malloc(1)`, freed addresses got reused on the next allocation, the cache false-hit, and only ~8 of 491 video frames actually triggered re-bind. Counter sentinels guarantee uniqueness — bind ratio went back to 1:1.
+
+### Step 95d — Shader source rewrite: the unblock
+
+Path B got pixels into the texture but the user still saw black. Diagnosed by toggling on a `SPIKE3_VIDEO_TESTPATTERN=1` env that overrides the conversion with a hot-pink + green checkerboard — still all black. Means the fragment shader doesn't sample the texture at all under Mesa swrast llvmpipe.
+
+Hint came from `strings game | grep samplerExternalOES`: the binary contains the Stern Radium video fragment shader (`uniform samplerExternalOES textureSampler; ... texture2D(textureSampler, textureCoordinate);`) AND a separate Godot shader with `#define samplerExternalOES sampler2D`. Stern's video shader has no fallback, so `samplerExternalOES` stays a sampler-of-EXTERNAL_OES type, and Mesa swrast returns zero when sampling such a sampler from a 2D-bound texture (samplers and bindings are typed independently — GLSL won't downcast).
+
+Fix in `shim_gl.c::glShaderSource`: concatenate the input strings into a single buffer, search for `samplerExternalOES`, find the safe insertion point (right after the matching `#extension GL_OES_EGL_image_external` line, else after `#version`, else at top), inject `#define samplerExternalOES sampler2D\n`, hand the rewritten single-string source to Mesa's real `glShaderSource`. The GLSL preprocessor textually substitutes the type to `sampler2D`, the bound texture (demoted to TEXTURE_2D in 95c) matches the sampler, and pixels reach the fragment shader. **Video renders correctly in attract mode for the first time.**
+
+### Step 95e — Daemon-side RGBA conversion (perf cleanup, no framerate change)
+
+The shim's NV12→RGBA conversion ran inside qemu-aarch64 user-mode where every instruction is TCG-translated — roughly 5–10× slower than native. Moved the conversion to `decode_daemon.py`: `frame.reformat(format='rgba')` + `to_ndarray(format='rgba')` produces a tightly-packed RGBA buffer on the host side, daemon ships it as a single-plane wire payload (`fmt = AV_PIX_FMT_RGBA = 26`, `n_planes = 1`, `stride = w*4`).
+
+Shim side dropped: the entire `shim_nv12_to_rgba` helper, the `y_ptr` / `uv_ptr` / `stride_y` / `stride_uv` distinction in the side-table (now a single `rgba_ptr` + `stride`), and the matching parameters in `shim_avforward_pixel_lookup` / `shim_egl_image_register` / `shim_egl_image_lookup` / `shim_egl_image_entry`. The DRM descriptor builder switched from NV12 (2 planes, fourcc `'N','V','1','2'` = `0x3231564E`) to single-plane RGBA (`DRM_FORMAT_ABGR8888` = fourcc `'A','B','2','4'` = `0x34324241`, byte order R,G,B,A in memory matching PyAV's `rgba` output).
+
+Wire payload grew ~2.5× (NV12 = 1.5 bpp → RGBA = 4 bpp); AF_UNIX abstract socket easily absorbs this. No measurable framerate change observed by the user, so YUV→RGB conversion is **not** on the critical path — the bottleneck is downstream of the shim's `glTexImage2D`.
+
+### Step 95f — `glTexSubImage2D` storage reuse (also no framerate change)
+
+`glEGLImageTargetTexture2DOES` was previously calling `real_glTexImage2D` every frame, forcing Mesa to reallocate the bound texture's storage on each upload. Added per-`tex_id` allocation tracking: query `GL_TEXTURE_BINDING_2D` (= `0x8069`) on entry, look up a 128-slot `{tex_id, w, h}` table, use `real_glTexSubImage2D` when the size matches an existing record (preserves storage), fall through to `real_glTexImage2D` only on first encounter or size change.
+
+Also no measurable framerate change. So the bottleneck isn't texture allocation either. Working hypothesis: the 1920×1080×4-byte `glReadPixels` that fires every other page-flip in `shim_frame_capture_at_page_flip` is the dominant cost (~250 MB/sec of TCG-translated readback). Untested this session.
+
+### Open / next session
+
+- **Frame-bridge readback as suspected bottleneck:** test with `FRAME_BRIDGE=0`. If framerate jumps, drop the per-flip capture frequency (every 8th flip instead of every 2nd) or move the readback to a worker thread.
+- **`LP_NUM_THREADS=N`:** Mesa llvmpipe parallelizes fragment shading by default; needs verification under qemu-user that the threads actually fan out vs. serialize through TCG.
+- **Profiling:** instrument `clock_gettime(CLOCK_MONOTONIC)` around `read_all` (socket recv), the per-plane `memcpy` loop, the texture upload, and `glReadPixels` in the frame-bridge path. Get hard numbers before guessing again.
+- **Service Select press for `RUN_QEMU.sh` (system-mode):** the user-mode shim's `shim_manual_press_thread` watches `runs/latest/press_request.txt` (Step 94g/h), but system-mode runs out of `/games/.../runs/...` from inside the VM where the host's `marker_button.py` can't write. Need either an in-VM equivalent or a host-to-guest channel that survives the kernel namespace boundary.
+- **Path C fallback:** if a future Mesa overlay build supports `EGL_KHR_gl_texture_2D_image` fully, swap the shader-rewrite hack for the spec-correct EGLImage path. Until then the rewrite is load-bearing.
+
+### Touched
+
+- `games/pokemon_le/_emulation/shim_gl.c` — NEW `shim_demote_external_oes` helper applied to `glBindTexture`, `glTexImage2D`, `glTexSubImage2D`, `glCompressedTex{,Sub}Image2D`, `glTexParameter{i,f}`, `glGenerateMipmap`, and the upload inside `glEGLImageTargetTexture2DOES`. EGL image map struct reduced to `{egl_image, w, h, fourcc, rgba_ptr, stride}`; sentinel allocator switched from `malloc(1)` to `shim_egl_image_alloc_sentinel` (atomic counter at `0xdeadbeef0000+8*N`). `shim_egl_image_register` / `shim_egl_image_lookup` / `eglCreateImageKHR` / `eglDestroyImageKHR` / `glEGLImageTargetTexture2DOES` rewritten. NEW `glShaderSource` interceptor that injects `#define samplerExternalOES sampler2D` into shaders that reference the type. NEW `glTexSubImage2D` storage-reuse tracking via 128-slot per-`tex_id` table.
+- `games/pokemon_le/_emulation/shim_avforward.c` — `forward_sess_t` gained a `drm_desc[528]` per-session DRM descriptor buffer. `g_video_pixel_table` reduced from `{y_ptr, uv_ptr, width, height, stride_y, stride_uv}` to `{rgba_ptr, width, height, stride}`. NEW `shim_avforward_alloc_sentinel` (monotonic counter starting at `0x10000000`). NEW `shim_avforward_build_rgba_descriptor` replaces the previous NV12 builder (single object, single layer, `DRM_FORMAT_ABGR8888`, single plane). `shim_avforward_receive_frame` reads `fdata[0]` as the sole RGBA pointer (was `fdata[0]` + `fdata[1]` for Y/UV); per-plane height heuristic dropped (single-plane only).
+- `games/pokemon_le/_emulation/spi_shim.h` — `shim_avforward_pixel_lookup` signature changed from `(fd, y, uv, w, h, sy, su)` to `(fd, rgba, w, h, stride)`.
+- `games/pokemon_le/_emulation/decode_daemon.py` — `handle_receive` calls `frame.reformat(format='rgba')` + `to_ndarray(format='rgba')`, ships `n_planes=1` `AV_PIX_FMT_RGBA=26` single-plane payload (`stride = w*4`). Log message tag updated `nv12 → rgba`.
+- `_emulation/docs/JOURNAL.md` — this step appended.

@@ -226,48 +226,39 @@ class Session:
                 send_msg(self.sock, REP_EAGAIN)
             return
         frame = self._frame_queue.pop(0)
-        # Convert to NV12 in system memory. If frame is already NV12 / on CPU
-        # this is a fast path; for hwaccel frames it triggers a download.
+        # Convert to RGBA on the host. PyAV/sws_scale runs native x86_64;
+        # doing the YUV→RGB math here saves ~6 multiplies per pixel inside
+        # qemu-aarch64 user-mode where every instruction is TCG-translated.
+        # Wire payload grows ~2.5× (NV12 = 1.5 bpp → RGBA = 4 bpp) but the
+        # AF_UNIX abstract socket is plenty fast for local IPC; the win on
+        # the guest CPU side is the dominant factor.
+        AV_PIX_FMT_RGBA = 26
+        pts = frame.pts if frame.pts is not None else -0x8000000000000000
         try:
-            nv12 = frame.reformat(format="nv12")
+            rgba = frame.reformat(format="rgba")
         except Exception as exc:
-            send_err(self.sock, -22, f"reformat to nv12: {exc}")
+            send_err(self.sock, -22, f"reformat to rgba: {exc}")
             return
-
-        AV_PIX_FMT_NV12 = 23
-        pts = nv12.pts if nv12.pts is not None else -0x8000000000000000
-        # PyAV's bytes(plane) is unreliable for NV12 plane[1] (the planes
-        # share a single underlying buffer; the UV view doesn't always
-        # expose its bytes through the buffer protocol). Use to_ndarray,
-        # which returns a contiguous (h*3/2, w) uint8 view: rows [0:h] are
-        # Y, rows [h:h+h/2] are interleaved UV.
         try:
-            arr = nv12.to_ndarray(format="nv12")
+            arr = rgba.to_ndarray(format="rgba")
         except Exception as exc:
-            send_err(self.sock, -22, f"to_ndarray nv12: {exc}")
+            send_err(self.sock, -22, f"to_ndarray rgba: {exc}")
             return
-        h = nv12.height
-        w = nv12.width
-        y_bytes = arr[:h, :].tobytes()
-        uv_bytes = arr[h : h + h // 2, :].tobytes()
-        n_planes = 2
-        # Wire layout (per protocol docstring): header, then per-plane
-        # [stride][size][bytes] interleaved. Stride = w (to_ndarray returns
-        # tightly packed rows).
-        header = struct.pack(
-            "<iiiqI", w, h, AV_PIX_FMT_NV12, pts, n_planes
-        )
-        plane0 = struct.pack("<II", w, len(y_bytes)) + y_bytes
-        plane1 = struct.pack("<II", w, len(uv_bytes)) + uv_bytes
-        send_msg(self.sock, REP_FRAME, header + plane0 + plane1)
+        h = rgba.height
+        w = rgba.width
+        rgba_bytes = arr.tobytes()
+        n_planes = 1
+        header = struct.pack("<iiiqI", w, h, AV_PIX_FMT_RGBA, pts, n_planes)
+        plane0 = struct.pack("<II", w * 4, len(rgba_bytes)) + rgba_bytes
+        send_msg(self.sock, REP_FRAME, header + plane0)
         self.frames_decoded += 1
         if self.frames_decoded <= 3 or (self.frames_decoded % 100) == 0:
             self.log.info(
-                "[%s] frame #%d %dx%d nv12 pts=%s",
+                "[%s] frame #%d %dx%d rgba pts=%s",
                 self.peer,
                 self.frames_decoded,
-                nv12.width,
-                nv12.height,
+                w,
+                h,
                 pts,
             )
 

@@ -1410,8 +1410,9 @@ Each BO is registered in a side-table (32 slots, mutex-guarded) holding its `(wi
 | `eglMakeCurrent` (with `draw=NULL` → fabricates fallback pbuffer from `shim_last_real_config`), `eglSwapBuffers`, `eglSwapInterval`, `eglQuerySurface`, `eglSurfaceAttrib` | normal |
 | `eglGetError` | always `EGL_SUCCESS` |
 | `eglGetProcAddress` | routes to shim-owned stubs for `eglGetPlatformDisplayEXT`, `eglCreateImageKHR` / `DestroyImageKHR`, `eglCreateSyncKHR` / `DestroySyncKHR` / `WaitSyncKHR` / `ClientWaitSyncKHR`, `glEGLImageTargetTexture2DOES`. Never forwards |
-| `eglCreateImageKHR` (shim-owned) | Never forwards to Mesa; registers `{w, h, fourcc}` in side-table, returns sentinel |
-| `glEGLImageTargetTexture2DOES` | Looks up the side-table + does real `glTexImage2D(0, RGBA8, w, h, ..., NULL)` to give the bound texture storage; tracks in `shim_frametex` for capture targeting |
+| `eglCreateImageKHR` (shim-owned) | Never forwards to Mesa. Parses `EGL_DMA_BUF_PLANE0_FD_EXT`; if the fd is one of `shim_avforward`'s sentinels, looks up the live RGBA buffer pointer + stride. Registers `{w, h, fourcc, rgba_ptr, stride}` in a side-table and returns a counter-cast opaque handle (`(void *)(0xdeadbeef0000 + 8N)`) — never `malloc`'d, never freed |
+| `eglDestroyImageKHR` (shim-owned) | Drops the entry from the side-table. Sentinel handles are not freed (counter-cast pointers, not heap allocations) |
+| `glEGLImageTargetTexture2DOES` | Demotes EXTERNAL_OES → TEXTURE_2D. If the entry has an `rgba_ptr`, uploads via real `glTexImage2D` on first call for that bound `tex_id` at this `(w, h)`, then `glTexSubImage2D` on subsequent calls (per a 128-slot per-`tex_id` allocation table that preserves storage across frames). Else uploads `NULL` storage for FBO color-attachment use. Tracks via `shim_frametex_record` for capture targeting |
 
 ### GLES 3 hooks (~70 entry points)
 
@@ -1443,7 +1444,8 @@ Each BO is registered in a side-table (32 slots, mutex-guarded) holding its `(wi
 - `eglCreateWindowSurface` → redirects to `eglCreatePbufferSurface(1920×1080)`
 - `eglMakeCurrent(draw=NULL)` → fabricates fallback pbuffer from `shim_last_real_config`
 - `eglGetConfigAttrib(EGL_NATIVE_VISUAL_ID)` → forces XR24 fourcc
-- `glFramebufferTexture2D/Layer` → swaps `GL_TEXTURE_EXTERNAL_OES → GL_TEXTURE_2D`
+- All texture-target hooks (`glBindTexture`, `glTexImage2D`, `glTexSubImage2D`, `glCompressedTex{,Sub}Image2D`, `glTexParameter{i,f}`, `glGenerateMipmap`, `glFramebufferTexture2D/Layer`, and the upload inside `glEGLImageTargetTexture2DOES`) demote `GL_TEXTURE_EXTERNAL_OES` (`0x8D65`) to `GL_TEXTURE_2D` (`0x0DE1`). Mesa swrast llvmpipe rejects every state-setting operation other than `glEGLImageTargetTexture2DOES` on EXTERNAL_OES with `GL_INVALID_ENUM` (per the `GL_OES_EGL_image_external` spec); demotion lets the texture object live as a 2D RGBA8 throughout the upload chain.
+- `glShaderSource` → concatenates the input strings; if the source references `samplerExternalOES`, injects `#define samplerExternalOES sampler2D` after the matching `#extension GL_OES_EGL_image_external` line (else after `#version`, else at top), then forwards a single rewritten string to Mesa. Required because Mesa swrast llvmpipe samples `samplerExternalOES` from a 2D-bound texture as zero — the OES extension's distinguishing behavior is YUV→RGB on DMA-BUF-imported YUV textures, irrelevant for our RGBA-from-host data path. The game's own Godot shaders use this same `#define` pattern unconditionally; Stern's Radium video shader doesn't, so the shim adds it.
 
 #### dlopen/dlsym interception (in `spi_shim.c`)
 
@@ -1999,25 +2001,32 @@ The shim (`spi_shim.so`) intercepts every device the game expects and emulates i
 
 ### Forward-decode bridge (host NVDEC)
 
-The game's HEVC video decode path is intercepted in-shim and routed to a host-side daemon over an abstract AF_UNIX socket, where it is decoded via NVDEC and the resulting NV12 frames are returned to the game.
+The game's HEVC and H.264 video decode paths are intercepted in-shim and routed to a host-side daemon over an abstract AF_UNIX socket, where decoding happens via NVDEC and the resulting RGBA frames (post-conversion) are shipped back to the game.
 
 | Component | File | Role |
 |---|---|---|
-| Shim client | `_emulation/shim_avforward.c` | C library inside `spi_shim.so`. 8-slot session table; each `avcodec_open2(HEVC)` from the game allocates a slot and connects to `@spike3_decode`. `avcodec_send_packet` / `avcodec_receive_frame` (in `shim_patches.c`) dispatch into this TU |
-| Host daemon | `_emulation/decode_daemon.py` | AF_UNIX server. Per-connection `Session` opens an `av.codec.CodecContext.create("hevc_cuvid", "r")`. NVDEC outputs are downloaded via `frame.reformat(format="nv12")` + `to_ndarray` and sent back as `(Y_plane, UV_plane)` |
+| Shim client | `_emulation/shim_avforward.c` | C library inside `spi_shim.so`. 8-slot session table; each `avcodec_open2(HEVC \| H.264)` from the game allocates a slot and connects to `@spike3_decode`. `avcodec_send_packet` / `avcodec_receive_frame` (in `shim_patches.c`) dispatch into this TU. Every successful `avcodec_receive_frame` registers the decoded RGBA buffer in a sentinel-keyed side-table that `shim_gl::eglCreateImageKHR` later reads via the `EGL_DMA_BUF_PLANE0_FD_EXT` attrib. Builds a single-plane `AVDRMFrameDescriptor` (`DRM_FORMAT_ABGR8888`) into the per-session 528-byte buffer, points `frame->data[0]` at it. |
+| Host daemon | `_emulation/decode_daemon.py` | AF_UNIX server. Per-connection `Session` opens `av.codec.CodecContext.create("hevc_cuvid" \| "h264_cuvid", "r")` (codec_id mapped from the OPEN payload). NVDEC outputs are downloaded via `frame.reformat(format="rgba")` + `to_ndarray(format="rgba")` and sent back as a single tightly-packed RGBA8 plane (W·H·4 bytes). Doing the YUV→RGB on the host saves the cross-arch TCG translation cost of running the conversion inside qemu-aarch64 |
 | Launcher | `_emulation/run_game.sh` | When `FORWARD_DECODE=1` (default), launches the daemon before qemu and forwards `SPIKE3_FORWARD_DECODE=1` into the game env |
 
 **Wire protocol** (length-prefixed messages on `@spike3_decode`):
 
+Each message is `[u32 type][u32 length][payload]` little-endian. Length is payload bytes only (header excluded).
+
 | Direction | Message (opcode) | Payload |
 |---|---|---|
-| Game → daemon | `REQ_OPEN` (0x01) | session_id, extradata_size, extradata bytes |
-| | `REQ_PACKET` (0x02) | session_id, pts, dts, flags, packet bytes |
-| | `REQ_RECEIVE` (0x03) | session_id |
-| | `REQ_CLOSE` (0x04) | session_id |
+| Game → daemon | `REQ_OPEN` (0x01) | `u32 codec_id`, `u32 extradata_len`, extradata bytes |
+| | `REQ_PACKET` (0x02) | `i64 pts`, `i64 dts`, `u32 flags`, `u32 size`, packet bytes |
+| | `REQ_RECEIVE` (0x03) | (no payload) |
+| | `REQ_CLOSE` (0x04) | (no payload) |
+| | `REQ_FLUSH` (0x05) | (no payload — issued after `avcodec_flush_buffers`; resets the daemon's PyAV codec context for a post-seek packet stream) |
 | Daemon → game | `REP_OPEN_OK` (0x81) | (no payload) |
-| | `REP_FRAME` (0x83) | width, height, pts, Y plane (W·H bytes), UV plane (W·H/2 bytes) |
+| | `REP_PACKET_OK` (0x82) | (no payload — ack for `REQ_PACKET`) |
+| | `REP_FRAME` (0x83) | `i32 width`, `i32 height`, `i32 fmt` (`AV_PIX_FMT_RGBA` = 26), `i64 pts`, `u32 n_planes` = 1, then plane[0]: `u32 stride` = W·4, `u32 size` = W·H·4, RGBA bytes |
+| | `REP_OK` (0x84) | (no payload — ack for `REQ_CLOSE` and `REQ_FLUSH`) |
+| | `REP_ERR` (0xF0) | `i32 errno_or_avcode`, `u32 msg_len`, msg bytes |
 | | `REP_EAGAIN` (0xF1) | (no payload — packet queue empty, retry later) |
+| | `REP_EOF` (0xF2) | (no payload — codec drained, no more frames coming) |
 
 **libavcodec ABI offsets** the shim pokes (defined in `shim_avforward.c`):
 - `AVPacket`: `pts=8`, `dts=16`, `data=24`, `size=32`, `flags=40`
@@ -2025,7 +2034,7 @@ The game's HEVC video decode path is intercepted in-shim and routed to a host-si
 
 When the daemon is unreachable, `avcodec_send_packet` / `avcodec_receive_frame` return `-EIO` and the game raises `SIGABRT` from `SpiVideoStreamDecoderBase`.
 
-*Verified by:* JOURNAL Step 87 — daemon round-trip 49 fps NVDEC against `Lake_01_22_26_h265.mp4` (1940×1100, extradata=2490B); real game run `runs/2026-05-06T12.45.39_hw_refactor` shows 449/551 frame/EAGAIN ratio across 1000 `avcodec_receive_frame` calls.
+*Verified by:* JOURNAL Step 87 — daemon round-trip 49 fps NVDEC against `Lake_01_22_26_h265.mp4` (1940×1100, extradata=2490B); real game run `runs/2026-05-06T12.45.39_hw_refactor` shows 449/551 frame/EAGAIN ratio across 1000 `avcodec_receive_frame` calls. RGBA single-plane wire format + host-side `frame.reformat('rgba')` introduced in JOURNAL Step 95 (alongside the `samplerExternalOES` shader-source rewrite that unblocks Mesa swrast sampling — see PROTOCOL §10 "Real-GL translation glue"); H.264 attract clips at 1360×768 and HEVC in-game clips at 1940×1100 / 1920×1080 confirmed flowing through the pipeline.
 
 ### Runtime binary patches (`shim_patches.c`)
 
