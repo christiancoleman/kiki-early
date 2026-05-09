@@ -157,6 +157,22 @@ def _kill_followup(root, status_var):
         status_var.set(f"KILL KILL failed: {e}")
 
 
+def fire_preset(label: str, status_var, count_ref):
+    """Drop a marker with a fixed label — for one-click observation tagging
+    so the user doesn't have to type while watching the game."""
+    saved = tk.StringVar(value=label)
+    write_marker(saved, status_var, count_ref)
+
+
+_PRESETS = [
+    ("VISUAL CHANGE",                    "#1565c0"),  # blue
+    ("AURAL CHANGE",                     "#6a1b9a"),  # purple
+    ("TECH ALERT SHOWN",                 "#ef6c00"),  # orange
+    ("VERSION INFO SCREEN SHOWN",        "#2e7d32"),  # green
+    ("SOMETHING NEW - MASSIVE BREAKTHROUGH", "#c62828"),  # red
+]
+
+
 def main():
     # Startup diagnostic — proves the script ran. If user reports "no markers"
     # and this line is absent, marker_button.py never spawned (env / TIMER=ON
@@ -168,37 +184,51 @@ def main():
 
     root = tk.Tk()
     root.title("Spike 3 Marker")
-    root.geometry("420x240")
+    root.geometry("440x520")
 
     label_var = tk.StringVar(value="event")
-    status_var = tk.StringVar(value="Edit label, then press MARK to log a timestamp.")
+    status_var = tk.StringVar(value="Click a preset OR edit label + MARK.")
     count_ref = [0]
 
-    tk.Label(root, text="Label:").pack(pady=(10, 0))
+    # Preset observation buttons — one-click tagging for common observations.
+    tk.Label(root, text="Quick observation:", font=("monospace", 10)).pack(pady=(8, 0))
+    for label, color in _PRESETS:
+        tk.Button(
+            root,
+            text=label,
+            command=lambda l=label: fire_preset(l, status_var, count_ref),
+            bg=color,
+            fg="white",
+            font=("monospace", 10, "bold"),
+            height=2,
+        ).pack(padx=20, pady=2, fill=tk.X)
+
+    # Free-form label entry + MARK button (kept for arbitrary notes).
+    tk.Label(root, text="Custom label:", font=("monospace", 10)).pack(pady=(10, 0))
     tk.Entry(root, textvariable=label_var, font=("monospace", 12)).pack(
-        padx=20, pady=(2, 8), fill=tk.X
+        padx=20, pady=(2, 4), fill=tk.X
     )
     tk.Button(
         root,
-        text="MARK",
+        text="MARK (custom)",
         command=lambda: write_marker(label_var, status_var, count_ref),
         bg="#ff8c00",
         fg="white",
-        font=("monospace", 16, "bold"),
-        height=2,
-    ).pack(padx=20, pady=4, fill=tk.X)
+        font=("monospace", 12, "bold"),
+        height=1,
+    ).pack(padx=20, pady=2, fill=tk.X)
+
     tk.Button(
         root,
         text="KILL GAME (SIGTERM → SIGKILL)",
         command=lambda: kill_game(root, status_var),
         bg="#b00020",
         fg="white",
-        font=("monospace", 11, "bold"),
+        font=("monospace", 10, "bold"),
         height=1,
-    ).pack(padx=20, pady=2, fill=tk.X)
-    tk.Label(root, textvariable=status_var, wraplength=380, fg="#444").pack(
-        pady=8, padx=10
-    )
+    ).pack(padx=20, pady=(8, 2), fill=tk.X)
+    tk.Label(root, textvariable=status_var, wraplength=400, fg="#444",
+             font=("monospace", 9)).pack(pady=4, padx=10)
 
     # NOTE: no global keyboard shortcut. Earlier <space> binding fired even
     # when the user was typing labels containing spaces ("FROZEN SCREEN" etc.)

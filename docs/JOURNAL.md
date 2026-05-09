@@ -7894,7 +7894,7 @@ For shim purposes: any of these chip IDs in `response[4..7]` will make `mcp_node
 
 ## Step 90: Per-slot chip-IDs land all Tech Alerts rows on "Not Initialized"; switch-press injection unsolved (2026-05-07)
 
-Direct continuation of Step 89. Goal: turn the Tech Alerts UI breakthrough (visible test menu showing "Check Node Board N : Invalid/Not Initialized") into something we can advance past. Outcome: per-slot chip-ID synth flips every alert row from "Invalid" to "Not Initialized" (visual proof via frame capture). The 200ms cipher response delay is now a hardcoded shim default, and `run_game.sh`'s env-toggle plumbing is back to a clean state. Two Sidekick-driven attempts at switch-press injection failed empirical test — the Tech Alerts "Press Select" dispatcher is not driven by `g_switch_state_array` writes nor by `translate_switch_state_changes(5, …)`. Switch-press path remains unsolved; chip-ID + cipher-delay work landed clean.
+Direct continuation of Step 89. Goal: turn the Tech Alerts UI breakthrough (visible Tech Alerts screen showing "Check Node Board N : Invalid/Not Initialized") into something we can advance past. Outcome: per-slot chip-ID synth flips every alert row from "Invalid" to "Not Initialized" (visual proof via frame capture). The 200ms cipher response delay is now a hardcoded shim default, and `run_game.sh`'s env-toggle plumbing is back to a clean state. Two Sidekick-driven attempts at switch-press injection failed empirical test — the Tech Alerts "Press Select" dispatcher is not driven by `g_switch_state_array` writes nor by `translate_switch_state_changes(5, …)`. Switch-press path remains unsolved; chip-ID + cipher-delay work landed clean.
 
 ### Step 90a — Per-slot chip-IDs flip "Invalid" → "Not Initialized"
 
@@ -8200,9 +8200,9 @@ Remaining hypotheses (untested):
 ### Reproducible state
 Plain `./run_game.sh --debug` (no env) lands on Tech Alerts at +200 s with same alert rows as Step 90. Diagnostic dump: `SHIM_NODE_PROBE=1 SHIM_NODE_PROBE_DELAY_S=60 ./run_game.sh --debug --note "node_probe"` then grep `node_probe|fw_record|slot\[` in `runs/<TS>/game.log`.
 
-## Step 92: Nodebus init complete: service menu reached, Tech Alerts empty (2026-05-08)
+## Step 92: Nodebus init complete: Service Menu reached, Tech Alerts empty (2026-05-08)
 
-Investigation arc from "all 5 Tech Alerts rows on Not Initialized" (Step 90) to "all 11 populated nodebus slots at flag=0x03 status=2; Tech Alerts empty; game progresses to service menu showing Game V0.81.0 / Nodebus 1.31.0 / Bridge 39.83.127". Five distinct findings folded into a modular FE-probe + node-enumeration path in `shim_nodebus.c`.
+Investigation arc from "all 5 Tech Alerts rows on Not Initialized" (Step 90) to "all 11 populated nodebus slots at flag=0x03 status=2; Tech Alerts empty; game progresses to **Service Menu** showing Game V0.81.0 / Nodebus 1.31.0 / Bridge 39.83.127". Five distinct findings folded into a modular FE-probe + node-enumeration path in `shim_nodebus.c`.
 
 ### Step 92a — FE-probe inner-payload was failing checksum, not size
 
@@ -8246,7 +8246,7 @@ Fix: pinnode slots 8/9/10/13 → LPC1112_101 (`0x042D502B`, vtable[2], type_idx=
 
 ### Step 92f — Result
 
-All 11 populated slots (0/1/2/4/7/8/9/10/12/13/14) probed at +80s: `flag=0x00000003 status=2`. Tech Alerts renders empty. Game advances to a service-menu screen with version line:
+All 11 populated slots (0/1/2/4/7/8/9/10/12/13/14) probed at +80s: `flag=0x00000003 status=2`. Tech Alerts renders empty. Game advances to the **Service Menu** with version line:
 
 ```
 Game: V0.81.0      CPU: Spike 3
@@ -8257,11 +8257,11 @@ Service S Agent: 1.00.16  PDB Boot: 1.00.0
                    Video Processor: 0.00.12
 ```
 
-`Nodebus: 1.31.0` and `Bridge: 39.83.127` are read from our shim's responses + loaded firmware records — visual confirmation the synthesis works end-to-end. Audio init runs (long-standing audio spam now correlates with this point). Footer prompt: "Press 'Select' to continue". Idle eventually advances to a Test Menu screen with no further visual feedback. Test cycle baseline shortened from 240s to 120s (`SHIM_NODE_PROBE_DELAY_S=80`).
+`Nodebus: 1.31.0` and `Bridge: 39.83.127` are read from our shim's responses + loaded firmware records — visual confirmation the synthesis works end-to-end. Audio init runs (long-standing audio spam now correlates with this point). Footer prompt: "Press 'Select' to continue". **(2026-05-08 correction: the original draft of this paragraph also claimed "Idle eventually advances to a Test Menu screen with no further visual feedback." That advance was never reproduced in any subsequent run — see Step 93. The Service Menu has been the steady state in every run since this Step's fix landed.)** Test-cycle observation baseline shortened from 240s to 120s (`SHIM_NODE_PROBE_DELAY_S=80`).
 
 ### Open / next session
 
-- Switch-press injection to advance the service menu — Step 90 #1 was empirically falsified on the Tech Alerts screen, but may behave differently on this screen.
+- Switch-press injection to advance the **Service Menu** — Step 90 #1 was empirically falsified on the Tech Alerts screen, but may behave differently on the SM.
 - LPC1313 special branch in `FUN_00674680` (`FUN_008f5390` = cmd 0xF2 × 8 per slot) — currently bypassed for pinnode slots by reporting LPC1112_101 chip_ids; ws2812node slots take the LPC1313 path successfully without cmd 0xF2 synth (FUN_008f5390 fails but `vtable+0x10=5` still drives correct lookup). cmd 0xF2 synth would close the gap properly.
 - Star Wars LE 0.85 cross-validation — modular version lookup should make the same shim work, validating game-portability.
 
@@ -8269,3 +8269,107 @@ Service S Agent: 1.00.16  PDB Boot: 1.00.0
 
 - `games/pokemon_le/_emulation/shim_nodebus.c` — FE-probe synth (checksum + boot-mode + version lookup), `nodebus_version_for_slot()`, `case 0x25` enum + cmd 0xF0 reset, `nodebus_chip_id_for_slot()` per-slot table.
 - `games/pokemon_le/_emulation/shim_inject.c` — probe extensions: record bytes, version bytes per record, vtable entries (env-gated).
+
+## Step 93: Switch-press injection works mechanically; audio-singleton vtable corruption blocks Service Menu advance; screen nomenclature canonicalized (2026-05-08)
+
+Direct continuation of Step 92's "Open / next session" item 1 (switch-press injection on the Service Menu). Mechanical end of the press path is now fully verified; visual scene transition still does not happen. The actual blocker has been narrowed to an audio-singleton vtable corruption that the Service-Menu transition path appears to depend on. Five sub-steps + a nomenclature-canonicalization pass.
+
+### Step 93a — Nomenclature canonicalization
+
+User clarified that across the whole project there are exactly two top-level post-boot screens, and that earlier prose conflated them under several aliases. Canon going forward (folded into PROTOCOL §3 "Canonical post-boot screen names"):
+
+- **Tech Alerts (TA)** — the node-bus status screen.
+- **Service Menu (SM)** — the version-info screen with `"Press 'Select' to continue"` footer.
+
+Anything in earlier prose that used `"version-info screen"`, `"version info screen"`, `"test menu screen"`, or `"tech menu"` was referring to one of these two and is now corrected. **There is no top-level "Test Menu" screen** — Step 92's "Open / next session" item 1 originally claimed the SM auto-advances to one; the user has never reproduced that advance, and that paragraph now carries the correction inline.
+
+The string `"test menu"` legitimately appears in the binary's NuklearScene operator UI tree as a SUB-MENU label inside the SM (`"Active Switch Test"`, `"Game Adjustments"`, `"Pikachu Tests and Calibration"`, `"Exit the test menu"`, etc.) — but only as a sub-menu, never as a top-level screen.
+
+PROTOCOL fixes from this step: §1 "Repository layout" (`spike_menu` row), §5.4 "Per-slot chip-ID synth" + its *Verified by:* footnote, §6 "Multi-image sub-files" (the `scene_config_table` misnaming subsection was DELETED — see Step 93g), §9 "Scene role classification" (the `cbe7806d` asset descriptor), §11 "Tech Alerts row dispatcher" heading, §11 "Flag-bit-1 paths" *Verified by:*, §12 "Persistence gap", §12 "Translation units" NuklearScene row.
+
+### Step 93b — Switch-press injection mechanism verified
+
+The press path is fully mechanical: SPI override (`shim_spi_rx_extra[]` defined in `shim_ioctl.c`, declared in `spi_shim.h`, OR'd into the SPI MESSAGE_1 RX buffer) + force-poll `sub_674b90(0)` from the press thread in `shim_inject.c::shim_switch_table_probe_thread`. With both in place, pressing sw_id=90 (Service Select) produces verified `state` byte `0 → 1 → 0` transitions and `edge_counter` increments at `g_switch_state_array[90] +0x28 / +0x26`.
+
+A subtle off-by-one was uncovered when the press initially failed to register: the SPI thread `sub_8fa820` builds `DAT_0450d9b0` via `CONCAT44(uStack_54, CONCAT13(bStack_55, CONCAT21(uStack_57, local_58)))`. `local_58` is a stack variable BEFORE the rx_buf (`puStack_78 = &uStack_57`), so `DAT_0450d9b0` byte 0 = `local_58` (always zero), byte N = `rx[N-1]` for N=1..7, and `rx[7]` is dropped. The probe's `byte=N` (per `bit_idx >> 3`) refers to the channel buffer position (= DAT byte position), so for sw_id=90 (channel 0, byte 1, bit 0) the correct rx index to OR a press bit into is `rx[0]`, not `rx[1]`. Fix: `rx_off = byte_off - 1` for channel 0 in the press code.
+
+`sub_720cf0` (the procDispatch tick) does NOT call `sub_674b90(0)` periodically post-init — only `sub_675a10` calls it once, gated by `DAT_04482194`, and the node-enum loops `sub_675df0`/`sub_6750e0` only call it during init. So an SPI-rx bit alone, set without a follow-up `sub_674b90(0)` call, sits unread in `DAT_0450d9b0`. The shim's press thread therefore performs a manual `sub_674b90(0)` invocation (game-base + `0x674b90`) immediately after setting the rx bit.
+
+### Step 93c — Service-button handler chain traced
+
+Per BN export entry 326, the canonical switch dispatch pipeline is:
+1. Bridge cmd `0x27` / SPI poll → channel buffer
+2. `sub_674b90(channel_id)` → `sub_651610(channel_id, &local_50)` (= `translate_switch_state_changes`)
+3. Push to `g_pending_switch_events_head @ 0x4480278`
+4. `sub_6511c0` (`drain_pending_switch_events`) drains the queue and schedules a fiber via `sub_729c10(event_id, handler_fn, priority)`
+5. `sub_720cf0` (procDispatch tick) runs `sub_6511c0` every iteration
+
+For sw_id=90 the scheduled fiber runs `sub_5902f0` (the service-button handler), which:
+- Reads `sw_id` and `param_2` from the fiber's `+0x108` / `+0x110` (set by `sub_6511c0` from `*plVar13`/`plVar13[1]`)
+- Gates on bits 3 and 4 of the 36-bit mode bitmap at `DAT_044cb9f0` (`sub_7a8de0(3)` / `sub_7a8de0(4)`); if either is set, exits without action
+- Otherwise calls `sub_58ff40(sw_id, param_2, 1)`
+
+`sub_58ff40` dispatches by `param_2` (= config[+0x08] per Step 93f's table) and `*PTR_DAT_04353468` bit 8 (the "service mode active" flag):
+
+| `param_2` | Press path (bit 8 = 0) | Press path (bit 8 = 1) |
+|---|---|---|
+| 1 (Service Back per game convention) | Multi-step gated chain: `sub_72a5c0(0x1a)` → `sub_5d0c10` (= `DAT_0445f838 & 1`) → `sub_6d2ca0(5)` → `sub_769460(*PTR_DAT_0434f980, 1)` → `fire_event(0xa5, 0)` + `sub_583e30(0x69, 1)` → `sub_5d6480(0x1b, ...)` | `sub_58f840(&DAT_0445d960, sw_id, 0x11, ...)` |
+| 8 (Service Select per game convention) | `sub_5d0870(0)` + `sub_72fdf0` + **`sub_58fcc0(0)`**, which fires `event 0xbb` → on success allocs fiber + sets bit 8 of `*PTR_DAT_04353468` + fires events `0x48` and `0x49` → unconditional `event 0xbc` | `sub_58f840(&DAT_0445d978, sw_id, 0x14, ...)` |
+
+In runtime probe state (Step 93e), the mode bitmap = `04 00 00 00 00` (only mode 2 active), `DAT_0445f838` boot-state mask = `0`, and `*PTR_DAT_04353468` bit 8 starts at 0. So the press takes the bit-8-clear path and successfully fires the chain.
+
+### Step 93d — Audio singleton vtable corruption
+
+Pressing sw_id=77 (Action Button, channel 1 byte 0 bit 2 = `1-SW-2`) or sw_id=91 (Service Plus, channel 0 byte 1 bit 1 = `0-SW-9`) triggers a SIGABRT via `__cxa_pure_virtual` deep in the audio subsystem.
+
+Crash site (audio-singleton dump auto-emitted by the SHIM SIGABRT handler): the audio singleton at `data_451ac48` has its vtable @ `0x4324a30` populated entirely with `_ZSt10unexpected` (libstdc++'s pure-virtual handler) — every slot reads `ELF_VA=0x10dda960` (a libstdc++ address). The destructor `sub_23737f0` is the function that resets vtable to that abstract-base state via `*param_1 = (long)&PTR___cxa_pure_virtual_04324a30`; it has either run already (cleaning up after a failed init) or the derived constructor never wrote the vtable in the first place. Service Select (sw_id 90 / sw_id 93, both channel 0 byte 1) avoids the audio call paths inside `sub_58ff40` so its press survives, but Action Button + Service Plus + Service Minus all touch the audio chain and crash.
+
+This is **likely the actual blocker** preventing the SM from advancing visually: any scene-transition path the press chain triggers also calls into the audio singleton's vtable and silently fails (or crashes) before the renderer commits the new scene. Confirmation: every successful Service-Select press produced a clear AURAL CHANGE (audio spam paused or shifted, marked by user with the marker_button) — proof the handler chain reached into audio code — but no VISUAL CHANGE in any run.
+
+### Step 93e — Mode-state runtime probe
+
+The 36-bit mode bitmap at `DAT_044cb9f0` (calloc'd by `sub_7a8b90` to `(*PTR_DAT_043527d0 >> 3) + 1` bytes; `*PTR_DAT_043527d0 = 36`) decodes as `04 00 00 00 00` in the steady SM state — only mode 2 active. Bits 3 and 4 are clear so `sub_5902f0`'s mode gate passes. `DAT_0445f838` boot-state mask reads `0x00000000` so `sub_5d0c10` returns 0 and the bit-8-clear branch of `sub_58ff40` is taken.
+
+Probe added to `shim_inject.c::shim_switch_table_probe_thread`: dumps `mode_bitmap @ <ptr> bytes=...` and `boot_state_mask @ <addr> = 0x...` at +80s.
+
+### Step 93f — Switch-table dump (folded into PROTOCOL §11)
+
+Runtime probe `SHIM_SWITCH_TABLE_PROBE=1` enumerates all 99 entries of `g_switch_state_array @ 0x4480220` with `(channel, byte, bit, state, handler_fn VA, param_2, event_id, priority, flags_2e, flags_30)`. Per-channel summary:
+
+| Channel | sw_id range | Source | Manual prefix |
+|---|---|---|---|
+| 0 | 90..98 (9) | CPU SPI | `0-SW-N` |
+| 1 | 77..89 (13) | Derived from CPU-SPI byte 3 via `sub_674b90`'s state machine | `1-SW-N` |
+| 4 | 1..16 (16) | cmd `0x41` inner_cmd `0x11` to slot 4 (QR Reader) | `4-SW-N` |
+| 8 | 17..46 (30) | cmd `0x41` inner_cmd `0x11` to slot 8 (Lower Playfield Core-Driver) | `8-SW-N` |
+| 9 | 47..76 (30) | cmd `0x41` inner_cmd `0x11` to slot 9 (Mid-upper Playfield Core-Driver) | `9-SW-N` |
+
+Total = 99 (Pokémon manual lists "over 100" because some entries are reserved/uninstalled jumpers without runtime allocation).
+
+Per-switch handler config layout discovered via Step 93c trace + runtime dump: handler_fn at config+0x00, param_2 at +0x08, priority at +0x2c, flags at +0x2e, more flags at +0x30, event_id at +0x34. Service-button param_2 values: sw_id 90 = 8 (Select per game-side `sub_58ff40` event-id mapping: event 0x14), 91 = 4 (Plus), 92 = 2 (Minus), 93 = 1 (Back). Note this REVERSES the manual's bit-position-based naming convention — manual's `0-SW-8` = bit_idx 8 = byte 1 bit 0 = sw_id 90, but the game internally treats sw_id 90 as Select (param=8 fires `event 0x14`). The full table is now in PROTOCOL §11 "Runtime switch table — full sw_id → channel/byte/bit mapping".
+
+### Step 93g — Documentation cleanup
+
+Per user, anything in PROTOCOL that referenced files in `_extraction/_outdated/` was stale. The audit showed only one such ref — the §6 "Sub-section: cmode 'scene_config_table' misnaming" which cited a 1,254-line `scene_config_table.c` export that no longer exists in the repo. Subsection deleted in this step. The implied claim (real `scene_config_table` at VA `0x47fcf10`, with the operator-menu-tree at `0x48071d0`) cannot be confirmed without the exported file, so it is not preserved elsewhere; future work can re-verify directly against the binary if needed.
+
+`_emulation/reference/switch_table.md` (created earlier this session) was deleted; its content is now folded into PROTOCOL §11's "Runtime switch table" subsection.
+
+Memory file `project_version_info_screen_blocker.md` was renamed to `project_service_menu_blocker.md` and slimmed to a one-paragraph hook + pointer to PROTOCOL §3 "Canonical post-boot screen names" + this step. The MEMORY.md top-line "CURRENT INVESTIGATION" pointer was updated.
+
+### Open / next session
+
+- **Audio singleton vtable population** (Step 93d): trace the constructor that should populate `0x4324a30`. Identify which of `/dev/snd/*`, ALSA stub return values, or shim_diagnostics audio init triggers the destructor `sub_23737f0`. Once the vtable holds real function pointers, sw_id 77 / 91 / 92 will stop crashing and any scene-transition path that touches audio may complete.
+- **SM scene-transition chain trace** (Step 93c): find what consumes events `0x48` / `0x49` / `0xbb` / `0xbc` / `0xa5`. If a handler in those chains triggers a `select_and_load_scene` call that fails silently due to the audio-vtable issue, fixing audio fixes both crashes and SM advance simultaneously.
+- **Star Wars LE 0.85 parity check**: the `_extraction/_outdated/scene_config_table.c` claim was the only Pokémon-specific evidence for the `0x47fcf10` real-table VA hypothesis. If we want that hypothesis preserved, re-verify directly against the binary at the start of the next deeper Radium session.
+- **TIMER preset buttons in `marker_button.py`** are now part of the standard debug toolkit (5 presets + free-form: `VISUAL CHANGE`, `AURAL CHANGE`, `TECH ALERT SHOWN`, `VERSION INFO SCREEN SHOWN`, `SOMETHING NEW - MASSIVE BREAKTHROUGH`). The "VERSION INFO SCREEN SHOWN" preset is retained even though "version info screen" is now retired terminology — it's the closest thing the user has used as a casual alias for "SM reached" and changing the button label mid-investigation would lose its calibration.
+
+### Touched
+
+- `games/pokemon_le/_emulation/shim_inject.c` — `shim_switch_table_probe_thread` (with mode-bitmap + boot-state-mask + per-switch handler-config dump + SPI press injection with force-poll), `shim_install_channel1_idle` (writes channel-1 idle bytes to `DAT_0436b020` at +2s to silence cabinet-side audio spam), `shim_edge_snapshot_thread`.
+- `games/pokemon_le/_emulation/shim_ioctl.c` — `shim_spi_rx_extra[8]` (volatile, applied to SPI MESSAGE_1 RX after env override + default).
+- `games/pokemon_le/_emulation/spi_shim.h` — extern declaration for `shim_spi_rx_extra`.
+- `games/pokemon_le/_emulation/shim_nodebus.c` — cmd `0x41` inner_cmd `0x11` "switch_poll" synth (returns the channel's POST-INIT idle bytes from `&DAT_044804b8 + 0x18 + 0xb0*slot` so translate sees no edges → no audio spam from non-zero channels).
+- `games/pokemon_le/_emulation/marker_button.py` — 5 preset categorization buttons + retained custom-label MARK + KILL GAME.
+- `_emulation/docs/PROTOCOL.md` — §3 "Canonical post-boot screen names" added; §11 "Runtime switch table" subsection added; §6 "scene_config_table misnaming" subsection deleted; screen-name fixes across §1, §5.4, §9, §11, §12.
+- `_emulation/docs/JOURNAL.md` — Step 90 + Step 92 prose fixes; this step appended.
+- `_emulation/reference/switch_table.md` — DELETED (content migrated to PROTOCOL §11).

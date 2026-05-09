@@ -286,8 +286,6 @@ Implication: the wait loop is **time-bounded regardless** — even if the asset 
 
 *Verified by:* runtime hardware-read-watchpoint observation 2026-05-05 (PC `0x7a64ec`, LR `0x5cdf90`); BN decompile of the listed functions; `get_xrefs_to(0x445f838)` to enumerate writers, `get_xrefs_to(0x5d0930)` to confirm only the two orchestrator call-sites; `get_xrefs_to(0x4482108)` to find the `SceneCache_PreLoadRadiumAssets` writer; chain confirmed by user (system-mode and user-mode both reach the post-overlay state).
 
----
-
 ## 4. CPU ↔ netbridge UART bridge protocol
 
 ### Architecture
@@ -953,7 +951,7 @@ Indices 13/19, 14/20, 21/22 share chip IDs across package variants — the chip-
 | 14 | Universal Topper | `0x2C40102B` | LPC1313 (13) | 5 | `ws2812node-LPC1313-1_31_0.hex` |
 | any other | — | `0x041E502B` | LPC1111_101 (0) | 0 | fallback (no shipped firmware match) |
 
-Result: all 11 populated slots reach `status=2 + flag=0x03` — every row hidden in Tech Alerts; game advances past Tech Alerts to the service-menu screen. See §11 for the status writer success path and the flag-bit-1 paths driven by bridge cmd `0x25` enumeration.
+Result: all 11 populated slots reach `status=2 + flag=0x03` — every row hidden in Tech Alerts; game advances past Tech Alerts to the **Service Menu**. See §11 for the status writer success path and the flag-bit-1 paths driven by bridge cmd `0x25` enumeration.
 
 LPC1342 entries (vtable 21/22, chip_id `0x3D01402B`) have `type_idx=0` — using that chip_id causes `sub_840d30` lookup miss (no shipped firmware record has `key2=0`) → status 4. Pinnode slots therefore take the simple chip_id path via LPC1112_101 (type_idx=1), which bypasses the LPC1313 special branch (`sub_8f5390` cmd `0xF2 × 8`) in `sub_674680`. ws2812node slots take the real LPC1313 chip_id (`0x2C40102B`, vtable entry 13) since the only ws2812node firmware shipped is LPC1313.
 
@@ -961,7 +959,7 @@ Topology per cabinet manual: `0 → 10 → 9 → 8 → 4` (playfield daisy chain
 
 Synth requires a wall-clock pause before each `bridge_send_response` to preserve the timeout-driven timing real hardware imposes — empirically 200 ms (`shim_nodebus.c::NODEBUS_SYNTH_DELAY_US`). Immediate replies regress the run from frame-decode-active to "Godot init never fires".
 
-*Verified by:* JOURNAL Step 92 — runtime vtable dump (`game_base + 0x42317c8`, 28 entries × 0x28) confirms `type_idx` per entry; runtime probe of all 11 populated slots reaching `flag=0x03 status=2` after shim synthesis with the chip_id table above plus bridge cmd `0x25` enumeration. Visual confirmation: Tech Alerts panel rendering empty + game advancing to service-menu screen. Earlier Step 90 captures of the "Not Initialized" intermediate state are archived in `_emulation/reference/` (file naming `tech_alerts_v*.png`; ask the user which capture is most current for any given regression check).
+*Verified by:* JOURNAL Step 92 — runtime vtable dump (`game_base + 0x42317c8`, 28 entries × 0x28) confirms `type_idx` per entry; runtime probe of all 11 populated slots reaching `flag=0x03 status=2` after shim synthesis with the chip_id table above plus bridge cmd `0x25` enumeration. Visual confirmation: Tech Alerts panel rendering empty + game advancing to the **Service Menu**. Earlier Step 90 captures of the "Not Initialized" intermediate state are archived in `_emulation/reference/` — the `tech_alerts_v*.png` filename is **legacy**: v1-v6 depict the actual Tech Alerts screen mid-init; v7_huge.png post-dates Step 92's fix and depicts the Service Menu (Tech Alerts empty by then).
 
 ---
 
@@ -1155,12 +1153,6 @@ So image_id 0 → `image.bin`; image_id N → `image-sc01.bin`, `image-sc02.bin`
 Pokémon LE 0.81 ships **only `image.bin`** — no `image-sc??.bin` files. The 16-bit `image_id` portion of every `asset_id` (the upper 16 bits, `asset_id >> 16`) is `0` for every asset extracted to date. Other Spike 3 games (e.g. Spike 2 cabinets per the user's reference list of 29 sub-files) split assets across `image-sc01.bin` through `image-sc29.bin`.
 
 *Verified by:* directory listing of `games/pokemon_le/` (no `image-sc*` files); BN decompile of `load_image_bin_file` and `get_image_filename @ 0x846cd8`.
-
-### Sub-section: cmode "scene_config_table" misnaming
-
-The 1,254-line `scene_config_table.c` export in `_extraction/_outdated/` covers VA 0x48071d0 onward, which holds the Spike 3 **service/test/adjustments menu tree** (Active Switch Test, Game Adjustments, Pikachu Tests and Calibration, Exit the test menu, plus a handful of audio-test items: "MUSIC: MAINPLAY", "SOUND: SUPER SKILL SHOT", "SPEECH: 'SQUIRTLE'"). Each entry is a `{function_ptr, label_string, u16_index, u16_parent_id}` quadruple. This is the menu structure Nuklear walks when the operator enters test mode.
-
-The **real `scene_config_table`** is at VA `0x47fcf10` (Pokémon LE 0.81), 41,664 bytes earlier.
 
 ---
 
@@ -1564,6 +1556,41 @@ uintptr_t sw_struct = arr + sw_id * 0x30;     // live heap struct
 
 *Verified by:* JOURNAL Step 51, 72f.
 
+#### Runtime switch table — full sw_id → channel/byte/bit mapping
+
+`g_switch_state_array @ 0x4480220` (heap-allocated by `FUN_00650f00` at boot) holds 99 entries for Pokémon LE 0.81 — runtime probe in `shim_inject.c::shim_switch_table_probe_thread` (env-gated by `SHIM_SWITCH_TABLE_PROBE=1`) walks the array and dumps `(sw_id, channel, byte, bit, state)` tuples.
+
+The "channel" each switch belongs to determines how its state is polled:
+
+| Channel | Source | sw_id range | Manual prefix |
+|---|---|---|---|
+| 0 | CPU SPI bus (`/dev/spidev4.0`) — 8-byte RX read by `sub_8fa820`, stored in `DAT_0450d9b0`, read by `sub_8fab80` and fed to `sub_651610(0, ...)` from `sub_674b90(0)`. | 90..98 (9 entries) | `0-SW-N` |
+| 1 | Derived inside `sub_674b90`'s channel-0 path from CPU-SPI byte 3 bits + state machine. Saved-state restore from `DAT_0436b020` (BSS-zero by default; needs shim fix at `shim_inject.c::shim_install_channel1_idle` to load idle bytes). | 77..89 (13 entries) | `1-SW-N` |
+| 4 | cmd `0x41` inner_cmd `0x11` to remote node slot 4 (QR Reader / Bottom Arch). Synthesized by shim's `synthesize_bridge_response → switch_poll RESP` since 2026-05-08. | 1..16 (16 entries) | `4-SW-N` (per BN extraction; not in Pokémon manual) |
+| 8 | cmd `0x41` inner_cmd `0x11` to remote node slot 8 (Lower Playfield Core-Driver). | 17..46 (30 entries) | `8-SW-N` |
+| 9 | cmd `0x41` inner_cmd `0x11` to remote node slot 9 (Mid-upper Playfield Core-Driver). | 47..76 (30 entries) | `9-SW-N` |
+
+Total = 99 entries. Manual lists "over 100" because some manual entries are reserved/uninstalled jumpers without runtime allocation.
+
+`bit_idx` (stored at `+0x22` of each entry) is `byte * 8 + bit` ∈ [0..63]. The Pokémon manual's `N-SW-K` notation maps to `(channel=N, bit_idx=K)` — i.e. `0-SW-8` (Service Select) = channel 0, bit_idx 8 = byte 1 bit 0.
+
+**Per-switch handler config** at `g_switch_state_array[sw_id] + 0x10` (the `config_ptr`). On a press-or-release transition, `sub_6511c0` (the queue drain — see "Switch → event dispatch is two-stage" below) calls `sub_729c10(event_id, handler_fn, priority)`:
+
+| Config offset | Field | Notes |
+|---|---|---|
+| `+0x00` | `handler_fn` (u64) | function pointer scheduled as a fiber — the actual code that runs on transition |
+| `+0x08` | `param_2` (u64; 4-byte int truncation in handler) | per-switch discriminator. Service buttons: 1 = Select, 2 = Plus, 4 = Minus, 8 = Back. |
+| `+0x2c` | `priority` (u16) | fiber priority |
+| `+0x2e` | `flags` (u16) | bit 10 = fire-on-release; bit 11 = fire-on-press; bit 12 = also call `sub_79fe00`; bit 13 = also call `sub_79fd70`; bit 14 = wraps `edge_counter` mod 2 |
+| `+0x30` | flag byte (u8) | misc per-switch flags |
+| `+0x34` | `event_id` (u16) | tag passed to `sub_729c10` (mostly `0x0005` = generic switch-event tag) |
+
+Shim probes:
+- `SHIM_SWITCH_TABLE_PROBE=1` — dumps the (sw_id → channel, byte, bit, state, handler_fn, event_id, flags) table once at +80s.
+- `SHIM_EDGE_SNAPSHOT=1` (with `SHIM_EDGE_SNAPSHOT_DELAY_S` / `_INTERVAL_S` / `_CYCLES`) — periodic snapshot of each switch's `edge_counter` (`+0x26`); logs only switches whose counter changed. Identifies which switches are firing edges continuously.
+
+*Verified by:* JOURNAL Step 93 — runtime probe output captured 2026-05-08 with all 99 entries enumerated; per-channel summary cross-checked against the Pokémon LE Lite manual's switch matrix.
+
 ### `fire_event` dispatcher
 
 `sub_5c12a0 @ 0x5c12a0`.
@@ -1814,7 +1841,7 @@ The shim's `state_bridge` (when `STATE_BRIDGE=1`) polls cmode `+0x308` at 10 Hz 
 
 ### Tech Alerts row dispatcher
 
-The service-mode "Tech Alerts" UI lists per-slot node-bus issues. Each row is formatted by `sub_7da460` as `"Check Node Board %d : %s"` (msgid `0x37f`). The screen reads from a per-slot struct array, applies a filter, and indexes into a 10-entry msgid table for the status string.
+The Tech Alerts screen (rendered while the operator is in service mode) lists per-slot node-bus issues. Each row is formatted by `sub_7da460` as `"Check Node Board %d : %s"` (msgid `0x37f`). The screen reads from a per-slot struct array, applies a filter, and indexes into a 10-entry msgid table for the status string.
 
 #### Per-slot Tech Alerts struct
 
@@ -1947,7 +1974,7 @@ Status alone doesn't hide a row — `sub_7da460`'s "Not Responding/Not Registere
 - **A/B** — `sub_7da920(list, 32, 2)` walks 32 slots; for each slot index `N`, if `list[N] == N` and `slot[+0x00] == N`, OR-s bit 1; else clears bit 1. List is built by `sub_674600` calling `sub_8ede50` in a loop. `sub_8ede50` issues bridge cmd `0x25` (no payload, 1-byte response = next slot ID; 0 terminates). The orchestrator brackets each enumeration cycle in `sub_8f1100(0, 0)` reset calls (cmd `0x41` inner cmd `0xF0`, slot=0, payload byte `0x22`); the bridge resets its iterator on each. Called from the first while-loop and again in each retry-with-power-cycle iteration (up to 6 retries).
 - **C** — direct `flag |= 2` write in the orchestrator's LAB_00675424 pass, gated on `slot[+0x20] == 2` AND `slot[+0x10] != NULL` AND `sub_8f5cd0(slot)` success. `sub_8f5cd0` issues cmd `0x41` inner cmd `0xFF` (hint=8 → 10-byte inner response).
 
-*Verified by:* JOURNAL Step 92 — Ghidra decompile of `sub_8f5390`/`sub_8f5cd0`/`sub_675110`/`sub_674600`/`sub_7da920`/`sub_8ede50`/`sub_8f1100`/`sub_8f88b0`; runtime vtable dump (`game_base + 0x42317c8`, 28 entries × 0x28); runtime probe of all 11 populated slots reaching `flag=0x03 status=2` after shim synthesis of bridge cmd `0x25` enumeration (with cmd `0xF0` reset detection) and per-slot chip_id-driven FE-probe responses; visual confirmation via Tech Alerts panel rendering empty and game advancing to a service-menu screen displaying `Nodebus: 1.31.0` and `Bridge: 39.83.127`.
+*Verified by:* JOURNAL Step 92 — Ghidra decompile of `sub_8f5390`/`sub_8f5cd0`/`sub_675110`/`sub_674600`/`sub_7da920`/`sub_8ede50`/`sub_8f1100`/`sub_8f88b0`; runtime vtable dump (`game_base + 0x42317c8`, 28 entries × 0x28); runtime probe of all 11 populated slots reaching `flag=0x03 status=2` after shim synthesis of bridge cmd `0x25` enumeration (with cmd `0xF0` reset detection) and per-slot chip_id-driven FE-probe responses; visual confirmation via Tech Alerts panel rendering empty and game advancing to the **Service Menu** displaying `Nodebus: 1.31.0` and `Bridge: 39.83.127`.
 
 ---
 
@@ -2141,7 +2168,7 @@ Confirmed shared Stern code with byte-shape-identical structure:
 | Subclass | Where | Notes |
 |---|---|---|
 | `RadiumScene` | both PLE + SW LE | The shared Stern UI subclass — handles all attract/HUD/menu Radium scenes |
-| `NuklearScene` | both | Nuklear immediate-mode UI for system/test menus |
+| `NuklearScene` | both | Nuklear immediate-mode UI for the Service Menu and its sub-menus |
 | `DMDEmulationScene` | both | The 1024×256 DMD path (or per-CPU-board variant) |
 | `GodotRenderer` | **PLE only** | Pokémon-port-specific. PLE's IScene vtable at `0x42a4d10` has 11 slots; GodotRenderer fills the 4 pure virtuals + the 4 default-overridden flag accessors |
 
