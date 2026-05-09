@@ -128,6 +128,88 @@ class Renderer:
                             fmt: int, typ: int) -> bytes:
         return bytes(self._GL.glReadPixels(x, y, w, h, fmt, typ))
 
+    def gen_buffers(self, n: int) -> list:
+        return [int(i) for i in self._GL.glGenBuffers(n)] if n != 1 else [int(self._GL.glGenBuffers(1))]
+
+    def delete_buffers(self, ids: list) -> None:
+        self._GL.glDeleteBuffers(len(ids), ids)
+
+    def bind_buffer(self, target: int, buf_id: int) -> None:
+        self._GL.glBindBuffer(target, buf_id)
+
+    def buffer_data(self, target: int, size: int, usage: int, data: bytes) -> None:
+        self._GL.glBufferData(target, size, data if data else None, usage)
+
+    def gen_vertex_arrays(self, n: int) -> list:
+        return [int(i) for i in self._GL.glGenVertexArrays(n)] if n != 1 else [int(self._GL.glGenVertexArrays(1))]
+
+    def delete_vertex_arrays(self, ids: list) -> None:
+        self._GL.glDeleteVertexArrays(len(ids), ids)
+
+    def bind_vertex_array(self, vao_id: int) -> None:
+        self._GL.glBindVertexArray(vao_id)
+
+    def create_shader(self, shader_type: int) -> int:
+        return int(self._GL.glCreateShader(shader_type))
+
+    def delete_shader(self, shader_id: int) -> None:
+        self._GL.glDeleteShader(shader_id)
+
+    def shader_source(self, shader_id: int, source: bytes) -> None:
+        self._GL.glShaderSource(shader_id, [source.decode("utf-8", "replace")])
+
+    def compile_shader(self, shader_id: int) -> None:
+        self._GL.glCompileShader(shader_id)
+
+    def get_shader_iv(self, shader_id: int, pname: int) -> int:
+        return int(self._GL.glGetShaderiv(shader_id, pname))
+
+    def create_program(self) -> int:
+        return int(self._GL.glCreateProgram())
+
+    def delete_program(self, prog: int) -> None:
+        self._GL.glDeleteProgram(prog)
+
+    def attach_shader(self, prog: int, shader: int) -> None:
+        self._GL.glAttachShader(prog, shader)
+
+    def link_program(self, prog: int) -> None:
+        self._GL.glLinkProgram(prog)
+
+    def get_program_iv(self, prog: int, pname: int) -> int:
+        return int(self._GL.glGetProgramiv(prog, pname))
+
+    def use_program(self, prog: int) -> None:
+        self._GL.glUseProgram(prog)
+
+    def get_attrib_location(self, prog: int, name: bytes) -> int:
+        return int(self._GL.glGetAttribLocation(prog, name.decode("utf-8", "replace")))
+
+    def get_uniform_location(self, prog: int, name: bytes) -> int:
+        return int(self._GL.glGetUniformLocation(prog, name.decode("utf-8", "replace")))
+
+    def vertex_attrib_pointer(self, idx: int, size: int, typ: int,
+                              normalized: int, stride: int, offset: int) -> None:
+        self._GL.glVertexAttribPointer(idx, size, typ, bool(normalized), stride,
+                                       ctypes.c_void_p(offset))
+
+    def enable_vertex_attrib_array(self, idx: int) -> None:
+        self._GL.glEnableVertexAttribArray(idx)
+
+    def uniform_1i(self, location: int, value: int) -> None:
+        self._GL.glUniform1i(location, value)
+
+    def uniform_4f(self, location: int, v0: float, v1: float, v2: float, v3: float) -> None:
+        self._GL.glUniform4f(location, v0, v1, v2, v3)
+
+    def uniform_matrix4fv(self, location: int, count: int, transpose: int, data: bytes) -> None:
+        import numpy as np
+        floats = np.frombuffer(data, dtype=np.float32, count=count*16).reshape(count, 4, 4)
+        self._GL.glUniformMatrix4fv(location, count, bool(transpose), floats)
+
+    def draw_arrays(self, mode: int, first: int, count: int) -> None:
+        self._GL.glDrawArrays(mode, first, count)
+
 
 def read_all(sock: socket.socket, n: int) -> bytes:
     buf = bytearray()
@@ -217,6 +299,120 @@ class Session:
             data = self.renderer.execute_read_pixels(x, y, w, h, fmt, typ)
             hdr = struct.pack(P.REP_PIXELS_FMT, w, h, fmt, typ, len(data))
             send_reply(self.sock, P.GL_OP_REP_PIXELS, hdr + data)
+
+        elif op == P.GL_OP_GL_GEN_BUFFERS:
+            (n,) = struct.unpack(P.COUNT_FMT, payload)
+            ids = self.renderer.gen_buffers(n)
+            send_reply(self.sock, P.GL_OP_REP_IDS,
+                       struct.pack(P.REP_IDS_FMT, len(ids)) +
+                       b''.join(struct.pack("<I", i) for i in ids))
+        elif op == P.GL_OP_GL_DELETE_BUFFERS:
+            (n,) = struct.unpack(P.COUNT_FMT, payload[:4])
+            ids = list(struct.unpack(f"<{n}I", payload[4:4+4*n]))
+            self.renderer.delete_buffers(ids)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BIND_BUFFER:
+            target, bid = struct.unpack(P.BIND_FMT, payload)
+            self.renderer.bind_buffer(target, bid)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BUFFER_DATA:
+            target, size, usage = struct.unpack(P.BUFFER_DATA_FMT, payload[:12])
+            self.renderer.buffer_data(target, size, usage, payload[12:12+size])
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_GEN_VERTEX_ARRAYS:
+            (n,) = struct.unpack(P.COUNT_FMT, payload)
+            ids = self.renderer.gen_vertex_arrays(n)
+            send_reply(self.sock, P.GL_OP_REP_IDS,
+                       struct.pack(P.REP_IDS_FMT, len(ids)) +
+                       b''.join(struct.pack("<I", i) for i in ids))
+        elif op == P.GL_OP_GL_DELETE_VERTEX_ARRAYS:
+            (n,) = struct.unpack(P.COUNT_FMT, payload[:4])
+            ids = list(struct.unpack(f"<{n}I", payload[4:4+4*n]))
+            self.renderer.delete_vertex_arrays(ids)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_BIND_VERTEX_ARRAY:
+            (vid,) = struct.unpack(P.ID_FMT, payload)
+            self.renderer.bind_vertex_array(vid)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+
+        elif op == P.GL_OP_GL_CREATE_SHADER:
+            (st,) = struct.unpack(P.CREATE_SHADER_FMT, payload)
+            sid = self.renderer.create_shader(st)
+            send_reply(self.sock, P.GL_OP_REP_VALUE, struct.pack(P.REP_VALUE_FMT, sid))
+        elif op == P.GL_OP_GL_DELETE_SHADER:
+            (sid,) = struct.unpack(P.ID_FMT, payload)
+            self.renderer.delete_shader(sid)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_SHADER_SOURCE:
+            sid, slen = struct.unpack(P.SHADER_SOURCE_FMT, payload[:8])
+            self.renderer.shader_source(sid, payload[8:8+slen])
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_COMPILE_SHADER:
+            (sid,) = struct.unpack(P.ID_FMT, payload)
+            self.renderer.compile_shader(sid)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_GET_SHADER_IV:
+            sid, pname = struct.unpack(P.GET_IV_FMT, payload)
+            v = self.renderer.get_shader_iv(sid, pname)
+            send_reply(self.sock, P.GL_OP_REP_VALUE, struct.pack(P.REP_VALUE_FMT, v))
+
+        elif op == P.GL_OP_GL_CREATE_PROGRAM:
+            pid = self.renderer.create_program()
+            send_reply(self.sock, P.GL_OP_REP_VALUE, struct.pack(P.REP_VALUE_FMT, pid))
+        elif op == P.GL_OP_GL_DELETE_PROGRAM:
+            (pid,) = struct.unpack(P.ID_FMT, payload)
+            self.renderer.delete_program(pid)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_ATTACH_SHADER:
+            pid, sid = struct.unpack(P.TWO_ID_FMT, payload)
+            self.renderer.attach_shader(pid, sid)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_LINK_PROGRAM:
+            (pid,) = struct.unpack(P.ID_FMT, payload)
+            self.renderer.link_program(pid)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_GET_PROGRAM_IV:
+            pid, pname = struct.unpack(P.GET_IV_FMT, payload)
+            v = self.renderer.get_program_iv(pid, pname)
+            send_reply(self.sock, P.GL_OP_REP_VALUE, struct.pack(P.REP_VALUE_FMT, v))
+        elif op == P.GL_OP_GL_USE_PROGRAM:
+            (pid,) = struct.unpack(P.ID_FMT, payload)
+            self.renderer.use_program(pid)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+
+        elif op == P.GL_OP_GL_GET_ATTRIB_LOCATION:
+            pid, nlen = struct.unpack(P.GET_LOC_FMT, payload[:8])
+            loc = self.renderer.get_attrib_location(pid, payload[8:8+nlen])
+            send_reply(self.sock, P.GL_OP_REP_LOC, struct.pack(P.REP_LOC_FMT, loc))
+        elif op == P.GL_OP_GL_GET_UNIFORM_LOCATION:
+            pid, nlen = struct.unpack(P.GET_LOC_FMT, payload[:8])
+            loc = self.renderer.get_uniform_location(pid, payload[8:8+nlen])
+            send_reply(self.sock, P.GL_OP_REP_LOC, struct.pack(P.REP_LOC_FMT, loc))
+        elif op == P.GL_OP_GL_VERTEX_ATTRIB_PTR:
+            idx, size, typ_, norm, stride, offset = struct.unpack(P.VAP_FMT, payload)
+            self.renderer.vertex_attrib_pointer(idx, size, typ_, norm, stride, offset)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_ENABLE_VERTEX_ATTRIB:
+            (idx,) = struct.unpack(P.ID_FMT, payload)
+            self.renderer.enable_vertex_attrib_array(idx)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_1I:
+            loc, val = struct.unpack(P.UNIFORM_1I_FMT, payload)
+            self.renderer.uniform_1i(loc, val)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_4F:
+            loc, v0, v1, v2, v3 = struct.unpack(P.UNIFORM_4F_FMT, payload)
+            self.renderer.uniform_4f(loc, v0, v1, v2, v3)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_MATRIX4FV:
+            loc, count, transp = struct.unpack(P.UNIFORM_MAT4_FMT, payload[:12])
+            self.renderer.uniform_matrix4fv(loc, count, transp, payload[12:])
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+
+        elif op == P.GL_OP_GL_DRAW_ARRAYS:
+            mode, first, count = struct.unpack(P.DRAW_ARRAYS_FMT, payload)
+            self.renderer.draw_arrays(mode, first, count)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
 
         else:
             self.log.warning("unknown op 0x%04x flags=0x%04x payload=%db",

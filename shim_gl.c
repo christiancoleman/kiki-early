@@ -412,6 +412,10 @@ static void *shim_real_platform_display(unsigned platform) {
 }
 
 void *eglGetDisplay(void *native_display) {
+    if (shim_gl_marshal_active()) {
+        SHIM_LOG("eglGetDisplay(%p) -> fake display [daemon]", native_display);
+        return FAKE_EGL_DISPLAY;
+    }
     if (is_real_gl()) {
         SHIM_LOG("FWD eglGetDisplay(%p) — translating to SURFACELESS_MESA", native_display);
         void *d = shim_real_platform_display(0);
@@ -460,6 +464,12 @@ void *eglGetPlatformDisplayEXT(unsigned platform, void *native_display, const in
 }
 
 unsigned eglInitialize(void *display, int *major, int *minor) {
+    if (shim_gl_marshal_active()) {
+        if (major) *major = 1;
+        if (minor) *minor = 5;
+        SHIM_LOG("eglInitialize(%p) -> 1.5 [daemon]", display);
+        return EGL_TRUE;
+    }
     FWD_RET_V(unsigned, eglInitialize, (void*, int*, int*), (display, major, minor));
     if (major) *major = 1;
     if (minor) *minor = 5;
@@ -485,6 +495,10 @@ const char *eglQueryString(void *display, int name) {
 }
 
 unsigned eglBindAPI(unsigned api) {
+    if (shim_gl_marshal_active()) {
+        SHIM_LOG("eglBindAPI(0x%x) [daemon]", api);
+        return EGL_TRUE;
+    }
     FWD_RET_V(unsigned, eglBindAPI, (unsigned), (api));
     SHIM_LOG("eglBindAPI(0x%x)", api);
     return EGL_TRUE;
@@ -526,6 +540,12 @@ static const char *shim_egl_attr_name(int a) {
 
 unsigned eglChooseConfig(void *display, const int *attrib_list,
                          void **configs, int config_size, int *num_config) {
+    if (shim_gl_marshal_active()) {
+        (void)display; (void)attrib_list;
+        if (num_config) *num_config = 1;
+        if (configs && config_size >= 1) configs[0] = FAKE_EGL_CONFIG;
+        return EGL_TRUE;
+    }
     if (__builtin_expect(is_real_gl(), 0)) {
         /* Copy the game's attrib list into a local scratch so we can patch
          * EGL_SURFACE_TYPE = EGL_WINDOW_BIT (0x4) → EGL_PBUFFER_BIT (0x1).
@@ -627,6 +647,10 @@ unsigned eglGetConfigAttrib(void *display, void *config, int attribute, int *val
 
 void *eglCreateContext(void *display, void *config, void *share_context,
                        const int *attrib_list) {
+    if (shim_gl_marshal_active()) {
+        (void)display; (void)config; (void)share_context; (void)attrib_list;
+        return FAKE_EGL_CONTEXT;
+    }
     FWD_RET_V(void*, eglCreateContext, (void*, void*, void*, const int*),
             (display, config, share_context, attrib_list));
     SHIM_LOG("eglCreateContext -> fake context");
@@ -670,6 +694,10 @@ void *eglCreateWindowSurface(void *display, void *config, void *native_window,
 }
 
 void *eglCreatePbufferSurface(void *display, void *config, const int *attrib_list) {
+    if (shim_gl_marshal_active()) {
+        (void)display; (void)config; (void)attrib_list;
+        return FAKE_EGL_SURFACE;
+    }
     FWD_RET_V(void*, eglCreatePbufferSurface, (void*, void*, const int*),
             (display, config, attrib_list));
     (void)display; (void)config; (void)attrib_list;
@@ -690,6 +718,11 @@ void *shim_last_real_config  = NULL;
 void *shim_fallback_pbuf     = NULL;
 
 unsigned eglMakeCurrent(void *display, void *draw, void *read, void *context) {
+    if (shim_gl_marshal_active()) {
+        SHIM_LOG("eglMakeCurrent(dpy=%p, draw=%p, read=%p, ctx=%p) [daemon]",
+                 display, draw, read, context);
+        return EGL_TRUE;
+    }
     if (__builtin_expect(is_real_gl(), 0)) {
         /* The game calls eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)
          * — a surfaceless context binding. On real hardware its eglCreateWindowSurface
@@ -1734,16 +1767,15 @@ void glBlendColor(float r, float g, float b, float a) {
     (void)r; (void)g; (void)b; (void)a;
 }
 void glViewport(int x, int y, int w, int h) {
-    /* Throttled logger: only log on CHANGE — the game sets viewport every
-     * draw call, so unfiltered logging would drown game.log. Tracks last
-     * (x,y,w,h) tuple and emits a [viewport] line only when it differs.
-     * Visual: small viewport pinned at top-left = NuklearScene (Service
-     * Menu / operator UI) drawing into a sub-region of the 1920x1080 EGL
-     * pbuffer; full 1920x1080 = Radium scene (boot splash, attract, HUD). */
     static int last_x = -1, last_y = -1, last_w = -1, last_h = -1;
     if (x != last_x || y != last_y || w != last_w || h != last_h) {
         SHIM_LOG("[viewport] glViewport(%d, %d, %d, %d)", x, y, w, h);
         last_x = x; last_y = y; last_w = w; last_h = h;
+    }
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_viewport pl = { x, y, w, h };
+        shim_gl_marshal_send_async(GL_OP_GL_VIEWPORT, &pl, sizeof(pl));
+        return;
     }
     FWD_VOID(glViewport, (int, int, int, int), (x, y, w, h));
 }
@@ -1801,6 +1833,11 @@ void glPolygonOffset(float f, float u) {
     (void)f; (void)u;
 }
 void glClearColor(float r, float g, float b, float a) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_clear_color pl = { r, g, b, a };
+        shim_gl_marshal_send_async(GL_OP_GL_CLEAR_COLOR, &pl, sizeof(pl));
+        return;
+    }
     FWD_VOID(glClearColor, (float, float, float, float), (r, g, b, a));
     (void)r; (void)g; (void)b; (void)a;
 }
@@ -1816,6 +1853,7 @@ void glClear(unsigned mask) {
     if (shim_gl_marshal_active()) {
         struct gl_payload_clear pl = { .mask = mask };
         shim_gl_marshal_send_async(GL_OP_GL_CLEAR, &pl, sizeof(pl));
+        return;
     }
     FWD_VOID(glClear, (unsigned), (mask));
     (void)mask;
@@ -1849,12 +1887,44 @@ void glVertexAttribDivisor(unsigned idx, unsigned divisor) {
 }
 
 void glFinish(void) {
+    if (shim_gl_marshal_active()) {
+        uint32_t reply_len = 0;
+        (void)shim_gl_marshal_send_sync(GL_OP_GL_FINISH, NULL, 0,
+                                        NULL, 0, &reply_len);
+        return;
+    }
     FWD_VOID(glFinish, (void), ());
 }
 void glFlush(void) {
     FWD_VOID(glFlush, (void), ());
 }
 void glReadPixels(int x, int y, int w, int h, unsigned fmt, unsigned type, void *data) {
+    if (shim_gl_marshal_active() && data) {
+        struct gl_payload_read_pixels req = { x, y, w, h, fmt, type };
+        size_t bytes = (size_t)w * (size_t)h * 4;
+        size_t reply_size = sizeof(struct gl_payload_rep_pixels) + bytes;
+        unsigned char *reply = (unsigned char*)malloc(reply_size);
+        if (reply) {
+            uint32_t reply_len = 0;
+            int rep_op = shim_gl_marshal_send_sync(GL_OP_GL_READ_PIXELS,
+                                                   &req, sizeof(req),
+                                                   reply, (uint32_t)reply_size,
+                                                   &reply_len);
+            if (rep_op == GL_OP_REP_PIXELS &&
+                reply_len >= sizeof(struct gl_payload_rep_pixels)) {
+                size_t got = reply_len - sizeof(struct gl_payload_rep_pixels);
+                if (got > bytes) got = bytes;
+                memcpy(data, reply + sizeof(struct gl_payload_rep_pixels), got);
+                if (got < bytes) memset((unsigned char*)data + got, 0, bytes - got);
+            } else {
+                memset(data, 0, bytes);
+            }
+            free(reply);
+        } else {
+            memset(data, 0, bytes);
+        }
+        return;
+    }
     FWD_VOID(glReadPixels, (int, int, int, int, unsigned, unsigned, void*),
              (x, y, w, h, fmt, type, data));
     (void)x; (void)y; (void)fmt; (void)type;

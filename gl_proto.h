@@ -18,10 +18,43 @@
 #define GL_OP_GL_FINISH       0x0403
 #define GL_OP_GL_READ_PIXELS  0x0404
 
+#define GL_OP_GL_GEN_BUFFERS         0x0201
+#define GL_OP_GL_DELETE_BUFFERS      0x0202
+#define GL_OP_GL_BIND_BUFFER         0x0203
+#define GL_OP_GL_BUFFER_DATA         0x0301
+#define GL_OP_GL_GEN_VERTEX_ARRAYS   0x0204
+#define GL_OP_GL_DELETE_VERTEX_ARRAYS 0x0205
+#define GL_OP_GL_BIND_VERTEX_ARRAY   0x0206
+
+#define GL_OP_GL_CREATE_SHADER       0x0207
+#define GL_OP_GL_DELETE_SHADER       0x0208
+#define GL_OP_GL_SHADER_SOURCE       0x0302
+#define GL_OP_GL_COMPILE_SHADER      0x0405
+#define GL_OP_GL_GET_SHADER_IV       0x0406
+
+#define GL_OP_GL_CREATE_PROGRAM      0x0209
+#define GL_OP_GL_DELETE_PROGRAM      0x020A
+#define GL_OP_GL_ATTACH_SHADER       0x020B
+#define GL_OP_GL_LINK_PROGRAM        0x0407
+#define GL_OP_GL_GET_PROGRAM_IV      0x0408
+#define GL_OP_GL_USE_PROGRAM         0x020C
+
+#define GL_OP_GL_GET_ATTRIB_LOCATION 0x0409
+#define GL_OP_GL_VERTEX_ATTRIB_PTR   0x010A
+#define GL_OP_GL_ENABLE_VERTEX_ATTRIB 0x010B
+#define GL_OP_GL_GET_UNIFORM_LOCATION 0x040A
+#define GL_OP_GL_UNIFORM_1I          0x010C
+#define GL_OP_GL_UNIFORM_4F          0x010D
+#define GL_OP_GL_UNIFORM_MATRIX4FV   0x010E
+
+#define GL_OP_GL_DRAW_ARRAYS         0x040B
+
 #define GL_OP_REP_OK          0x0F01
 #define GL_OP_REP_VALUE       0x0F02
 #define GL_OP_REP_ERR         0x0F03
 #define GL_OP_REP_PIXELS      0x0F04
+#define GL_OP_REP_IDS         0x0F05
+#define GL_OP_REP_LOC         0x0F06
 
 #pragma pack(push, 1)
 struct gl_msg_header {
@@ -61,6 +94,90 @@ struct gl_payload_rep_pixels {
     uint32_t format;
     uint32_t type;
     uint32_t byte_size;
+};
+
+struct gl_payload_count {
+    uint32_t count;
+};
+
+struct gl_payload_id_op {
+    uint32_t id;
+};
+
+struct gl_payload_two_id {
+    uint32_t id_a;
+    uint32_t id_b;
+};
+
+struct gl_payload_bind {
+    uint32_t target;
+    uint32_t id;
+};
+
+struct gl_payload_buffer_data {
+    uint32_t target;
+    uint32_t size;
+    uint32_t usage;
+};
+
+struct gl_payload_create_shader {
+    uint32_t shader_type;
+};
+
+struct gl_payload_shader_source {
+    uint32_t shader_id;
+    uint32_t source_len;
+};
+
+struct gl_payload_get_iv {
+    uint32_t id;
+    uint32_t pname;
+};
+
+struct gl_payload_get_location {
+    uint32_t program;
+    uint32_t name_len;
+};
+
+struct gl_payload_vap {
+    uint32_t index;
+    int32_t  size;
+    uint32_t type;
+    uint8_t  normalized;
+    uint8_t  pad[3];
+    int32_t  stride;
+    uint64_t offset;
+};
+
+struct gl_payload_uniform_1i {
+    int32_t location;
+    int32_t value;
+};
+
+struct gl_payload_uniform_4f {
+    int32_t location;
+    float v0, v1, v2, v3;
+};
+
+struct gl_payload_uniform_matrix4fv {
+    int32_t  location;
+    int32_t  count;
+    uint8_t  transpose;
+    uint8_t  pad[3];
+};
+
+struct gl_payload_draw_arrays {
+    uint32_t mode;
+    int32_t  first;
+    int32_t  count;
+};
+
+struct gl_payload_rep_ids {
+    uint32_t count;
+};
+
+struct gl_payload_rep_loc {
+    int32_t location;
 };
 
 struct gl_payload_rep_err {
