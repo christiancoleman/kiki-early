@@ -102,11 +102,115 @@ typedef struct {
     int   sockfd;
     int   opened;
     pthread_mutex_t mu;
+    /* Per-frame DRM descriptor, overwritten on every successful decode.
+     * Game's FUN_00e3e150 reads frame.data[0] as AVDRMFrameDescriptor*,
+     * walks layers/planes/objects, and emits an EGL_LINUX_DMA_BUF_EXT
+     * attribute list to eglCreateImageKHR. 528 bytes matches libavutil 57's
+     * AVDRMFrameDescriptor (8 + 4*24 objects + 8 + 4*104 layers). */
+    uint8_t drm_desc[528];
 } forward_sess_t;
 
 #define FORWARD_MAX_SESSIONS 8
 static forward_sess_t g_sessions[FORWARD_MAX_SESSIONS];
 static pthread_mutex_t g_sessions_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Sentinel fd → live AVFrame plane pointers. Game's FUN_00e3e150 puts
+ * objects[].fd into the EGL attrib list (EGL_DMA_BUF_PLANE0_FD_EXT); the
+ * shim's eglCreateImageKHR uses that fd to look up the actual Y/UV bytes
+ * of the AVBufferRef storage and stash them on the EGL image entry. The
+ * pointers stay valid until the next av_frame_unref of the same frame —
+ * which the game does at the start of the next avcodec_receive_frame.
+ * That brackets the entire eglCreateImageKHR → glEGLImageTargetTexture2DOES
+ * sequence inside FUN_00e3e150, so reads are safe. */
+#define VIDEO_PIXEL_TABLE_SIZE 16
+static struct video_pixel_entry {
+    int sentinel_fd;
+    const uint8_t *y_ptr;
+    const uint8_t *uv_ptr;
+    int width, height;
+    int stride_y, stride_uv;
+} g_video_pixel_table[VIDEO_PIXEL_TABLE_SIZE];
+static int g_video_pixel_next = 0;
+static pthread_mutex_t g_video_pixel_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_sentinel_fd_counter = 0x10000000;  /* never collide with real fds */
+
+static int shim_avforward_alloc_sentinel(void) {
+    return __atomic_add_fetch(&g_sentinel_fd_counter, 1, __ATOMIC_RELAXED);
+}
+
+static void shim_avforward_pixel_register(int sentinel_fd,
+                                          const uint8_t *y_ptr,
+                                          const uint8_t *uv_ptr,
+                                          int w, int h,
+                                          int stride_y, int stride_uv) {
+    pthread_mutex_lock(&g_video_pixel_lock);
+    int slot = g_video_pixel_next;
+    g_video_pixel_next = (g_video_pixel_next + 1) % VIDEO_PIXEL_TABLE_SIZE;
+    g_video_pixel_table[slot] = (struct video_pixel_entry){
+        .sentinel_fd = sentinel_fd,
+        .y_ptr = y_ptr, .uv_ptr = uv_ptr,
+        .width = w, .height = h,
+        .stride_y = stride_y, .stride_uv = stride_uv,
+    };
+    pthread_mutex_unlock(&g_video_pixel_lock);
+}
+
+int shim_avforward_pixel_lookup(int sentinel_fd,
+                                const uint8_t **y_ptr, const uint8_t **uv_ptr,
+                                int *width, int *height,
+                                int *stride_y, int *stride_uv) {
+    if (sentinel_fd < 0x10000000) return 0;  /* not one of ours */
+    pthread_mutex_lock(&g_video_pixel_lock);
+    for (int i = 0; i < VIDEO_PIXEL_TABLE_SIZE; i++) {
+        if (g_video_pixel_table[i].sentinel_fd == sentinel_fd) {
+            if (y_ptr)     *y_ptr     = g_video_pixel_table[i].y_ptr;
+            if (uv_ptr)    *uv_ptr    = g_video_pixel_table[i].uv_ptr;
+            if (width)     *width     = g_video_pixel_table[i].width;
+            if (height)    *height    = g_video_pixel_table[i].height;
+            if (stride_y)  *stride_y  = g_video_pixel_table[i].stride_y;
+            if (stride_uv) *stride_uv = g_video_pixel_table[i].stride_uv;
+            pthread_mutex_unlock(&g_video_pixel_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&g_video_pixel_lock);
+    return 0;
+}
+
+#define DRM_FORMAT_NV12 0x3231564Eu  /* fourcc 'N','V','1','2' little-endian */
+
+/* Build an AVDRMFrameDescriptor for an NV12 frame, two planes sharing one
+ * virtual object. Field offsets verified against JOURNAL Step 89d's
+ * crash-site RE (`game+0xe3e1e4..0xe3e250`):
+ *   nb_objects @ 0
+ *   objects[0] @ 8         (24 B: fd@0, _pad@4, size@8, modifier@16)
+ *   nb_layers @ 104
+ *   layers[0]  @ 112       (104 B: format@0, nb_planes@4, planes[0..3]@8)
+ *     plane[j] @ layers[0]+8+j*24   (object_index@0, _pad@4,
+ *                                    offset@8 (i64), pitch@16 (i64))
+ * Total: 8 + 4*24 + 8 + 4*104 = 528 bytes. */
+static void shim_avforward_build_nv12_descriptor(uint8_t *desc,
+                                                 size_t desc_size,
+                                                 int sentinel_fd,
+                                                 int h,
+                                                 int stride_y,
+                                                 int stride_uv) {
+    memset(desc, 0, desc_size);
+    *(int32_t *)(desc + 0)            = 1;             /* nb_objects */
+    *(int32_t *)(desc + 8)             = sentinel_fd;  /* objects[0].fd */
+    *(int64_t *)(desc + 8 + 8)         = (int64_t)stride_y * h
+                                       + (int64_t)stride_uv * (h / 2);
+    *(uint64_t *)(desc + 8 + 16)       = 0;            /* DRM_FORMAT_MOD_LINEAR */
+    *(int32_t *)(desc + 104)           = 1;            /* nb_layers */
+    *(uint32_t *)(desc + 112 + 0)      = DRM_FORMAT_NV12;
+    *(int32_t *)(desc + 112 + 4)       = 2;            /* nb_planes */
+    *(int32_t *)(desc + 112 + 8 + 0)   = 0;            /* planes[0].object_index */
+    *(int64_t *)(desc + 112 + 8 + 8)   = 0;            /* planes[0].offset */
+    *(int64_t *)(desc + 112 + 8 + 16)  = stride_y;     /* planes[0].pitch */
+    *(int32_t *)(desc + 112 + 32 + 0)  = 0;            /* planes[1].object_index */
+    *(int64_t *)(desc + 112 + 32 + 8)  = 0;            /* planes[1].offset */
+    *(int64_t *)(desc + 112 + 32 + 16) = stride_uv;    /* planes[1].pitch */
+}
 
 int shim_avforward_enabled(void) {
     static int gate = -1;
@@ -485,26 +589,35 @@ int shim_avforward_receive_frame(void *avctx, void *frame, int *out_ret) {
     *(int64_t *)((char *)frame + AVFRAME_OFF_PTS)    = fpts;
     *(int64_t *)((char *)frame + AVFRAME_OFF_PKTDTS) = fpts;
 
-    /* DRM-prime consumer compatibility shim. JOURNAL Step 45 / Step 87:
-     * Step 87's NOP at game VA 0x920cf0 made get_format accept non-DRM-PRIME
-     * pix_fmts (so avcodec_open2 succeeds with the SW decoder), but a
-     * downstream consumer at game+0xe3e15c still walks frame->data[0] as
-     * AVDRMFrameDescriptor* — reading nb_layers at offset 104, then iterating
-     * planes[i].object_index*24 into objects[].fd. With our NV12 pixel bytes
-     * in data[0] the consumer faults on `ldr w9, [x6, x2]` at +0xe3e250.
+    /* Stern's video display path at game+0xe3e150 reads frame.data[0] as
+     * AVDRMFrameDescriptor* — there is no CPU-upload fallback. Build a real
+     * single-object NV12 descriptor with our sentinel fd in objects[0].fd;
+     * that fd ends up in the EGL_LINUX_DMA_BUF_EXT attrib list the game
+     * passes to eglCreateImageKHR, where the shim's hook fishes the live
+     * Y/UV pointers back out of the side-table. glEGLImageTargetTexture2DOES
+     * then converts NV12→RGBA and uploads.
      *
-     * Step 45 §47.5/§47.8 ruled out the proper fix (real DMA-BUF + GPU
-     * import) as out-of-scope under MESA_LOADER_DRIVER_OVERRIDE=swrast.
-     *
-     * Compat patch: redirect frame->data[0] to a zero-initialized buffer
-     * large enough for an AVDRMFrameDescriptor (528 bytes; we use 1024 for
-     * paranoia). nb_layers reads as 0 → consumer's `cmp w0, #0; b.le` at
-     * game+0xe3e204 branches to the early-out → no crash. Pixel data still
-     * lives in frame->buf[0] / data[1] (chroma); buf[0]'s AVBufferRef owns
-     * the original allocation and av_frame_unref frees it correctly even
-     * though data[0] points elsewhere. */
-    *(uint8_t **)((char *)frame + AVFRAME_OFF_DATA0) =
-        shim_avforward_empty_drm_descriptor;
+     * Fallback: empty zero-filled descriptor when the daemon delivers a
+     * non-NV12 frame or av_frame_get_buffer didn't produce both planes.
+     * The game's bounds check at game+0xe3e204 (`b.le` on nb_layers<=0)
+     * still keeps it from faulting, but no pixels land for that frame. */
+    uint8_t *y_ptr     = fdata[0];
+    uint8_t *uv_ptr    = fdata[1];
+    int      stride_y  = flinesize[0];
+    int      stride_uv = flinesize[1];
+    if (fmt == AV_PIX_FMT_NV12 && y_ptr && uv_ptr &&
+        stride_y > 0 && stride_uv > 0 && w > 0 && h > 0) {
+        int sentinel_fd = shim_avforward_alloc_sentinel();
+        shim_avforward_pixel_register(sentinel_fd, y_ptr, uv_ptr,
+                                      w, h, stride_y, stride_uv);
+        shim_avforward_build_nv12_descriptor(s->drm_desc, sizeof(s->drm_desc),
+                                             sentinel_fd, h,
+                                             stride_y, stride_uv);
+        *(uint8_t **)((char *)frame + AVFRAME_OFF_DATA0) = s->drm_desc;
+    } else {
+        *(uint8_t **)((char *)frame + AVFRAME_OFF_DATA0) =
+            shim_avforward_empty_drm_descriptor;
+    }
 
     pthread_mutex_unlock(&s->mu);
     *out_ret = 0;

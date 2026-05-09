@@ -821,51 +821,97 @@ static struct shim_egl_image_entry {
     int      width;
     int      height;
     unsigned fourcc;     /* DRM FOURCC from EGL_LINUX_DRM_FOURCC_EXT */
+    /* When the game's eglCreateImageKHR carried an avforward sentinel fd in
+     * EGL_DMA_BUF_PLANE0_FD_EXT, we cache the live AVFrame plane pointers
+     * here so glEGLImageTargetTexture2DOES can convert NV12→RGBA and upload
+     * the bytes via glTexImage2D. Both NULL for non-video FBO-storage
+     * images. */
+    const uint8_t *y_ptr;
+    const uint8_t *uv_ptr;
+    int      stride_y;
+    int      stride_uv;
 } shim_egl_image_map[SHIM_EGL_IMAGE_MAP_SIZE];
 static int shim_egl_image_map_count = 0;
 static pthread_mutex_t shim_egl_image_map_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Mesa's swrast llvmpipe rejects GL_TEXTURE_EXTERNAL_OES (0x8D65) on
+ * glTexImage2D / glTexSubImage2D / glTexParameter* with GL_INVALID_ENUM —
+ * per the GL_OES_EGL_image_external spec, only glEGLImageTargetTexture2DOES
+ * may set EXTERNAL_OES texture state. To get pixels into video textures we
+ * demote EXTERNAL_OES to GL_TEXTURE_2D consistently across the texture-state
+ * hooks, so the texture object lives as a 2D RGBA8 throughout. Mesa's GLSL
+ * accepts samplerExternalOES sampling a 2D RGBA texture with sampler2D
+ * semantics — the OES extension's distinguishing behavior is YUV→RGB which
+ * is irrelevant here since we hand it RGBA bytes. */
+static inline unsigned shim_demote_external_oes(unsigned target) {
+    return (target == 0x8D65) ? 0x0DE1 : target;
+}
+
+/* Counter-based EGLImage sentinel. Earlier versions used malloc(1) which
+ * caused address reuse after eglDestroyImageKHR's free() — the game's
+ * FUN_01df8b40 cache check (`if (cached == new) return;`) then false-hit
+ * and skipped re-binding. A monotonic counter cast to a pointer stays
+ * unique for the run; the game treats EGLImage as opaque. */
+static void *shim_egl_image_alloc_sentinel(void) {
+    static uintptr_t seq = 0xdeadbeef0000ull;
+    return (void *)__atomic_add_fetch(&seq, 8, __ATOMIC_RELAXED);
+}
+
 /* EGLImage attribute decoder. Called with the int32 attribute array the
  * game hands to eglCreateImageKHR for a EGL_LINUX_DMA_BUF_EXT import.
  * Attribute enums: EGL_WIDTH=0x3057, EGL_HEIGHT=0x3056,
- * EGL_LINUX_DRM_FOURCC_EXT=0x3271, terminator EGL_NONE=0x3038. */
+ * EGL_LINUX_DRM_FOURCC_EXT=0x3271, EGL_DMA_BUF_PLANE0_FD_EXT=0x3272,
+ * terminator EGL_NONE=0x3038. Loop bound 64 holds 4 planes' worth of
+ * key/value/modifier ints with headroom. */
 static void shim_egl_image_parse_attribs(const int *attrib_list,
-                                         int *w, int *h, unsigned *fmt) {
+                                         int *w, int *h, unsigned *fmt,
+                                         int *plane0_fd) {
     if (!attrib_list) return;
-    for (int i = 0; attrib_list[i] != 0x3038 && i < 32; i += 2) {
+    for (int i = 0; attrib_list[i] != 0x3038 && i < 64; i += 2) {
         switch (attrib_list[i]) {
-            case 0x3057: *w   = attrib_list[i+1]; break;
-            case 0x3056: *h   = attrib_list[i+1]; break;
-            case 0x3271: *fmt = (unsigned)attrib_list[i+1]; break;
+            case 0x3057: *w         = attrib_list[i+1]; break;
+            case 0x3056: *h         = attrib_list[i+1]; break;
+            case 0x3271: *fmt       = (unsigned)attrib_list[i+1]; break;
+            case 0x3272: *plane0_fd = attrib_list[i+1]; break;
         }
     }
 }
 
-static void *shim_egl_image_register(int w, int h, unsigned fmt) {
-    void *sentinel = malloc(1);  /* unique non-null pointer — game treats as opaque */
-    if (!sentinel) return FAKE_EGL_IMAGE;
+static void *shim_egl_image_register(int w, int h, unsigned fmt,
+                                     const uint8_t *y_ptr,
+                                     const uint8_t *uv_ptr,
+                                     int stride_y, int stride_uv) {
+    void *sentinel = shim_egl_image_alloc_sentinel();
     pthread_mutex_lock(&shim_egl_image_map_lock);
     if (shim_egl_image_map_count >= SHIM_EGL_IMAGE_MAP_SIZE) {
         pthread_mutex_unlock(&shim_egl_image_map_lock);
         SHIM_LOG("[egl_image] map full (%d); returning FAKE_EGL_IMAGE",
                  SHIM_EGL_IMAGE_MAP_SIZE);
-        free(sentinel);
         return FAKE_EGL_IMAGE;
     }
     shim_egl_image_map[shim_egl_image_map_count++] = (struct shim_egl_image_entry){
         .egl_image = sentinel, .width = w, .height = h, .fourcc = fmt,
+        .y_ptr = y_ptr, .uv_ptr = uv_ptr,
+        .stride_y = stride_y, .stride_uv = stride_uv,
     };
     pthread_mutex_unlock(&shim_egl_image_map_lock);
     return sentinel;
 }
 
-static int shim_egl_image_lookup(void *image, int *w, int *h, unsigned *fmt) {
+static int shim_egl_image_lookup(void *image, int *w, int *h, unsigned *fmt,
+                                 const uint8_t **y_ptr,
+                                 const uint8_t **uv_ptr,
+                                 int *stride_y, int *stride_uv) {
     pthread_mutex_lock(&shim_egl_image_map_lock);
     for (int i = 0; i < shim_egl_image_map_count; i++) {
         if (shim_egl_image_map[i].egl_image == image) {
-            *w = shim_egl_image_map[i].width;
-            *h = shim_egl_image_map[i].height;
-            *fmt = shim_egl_image_map[i].fourcc;
+            if (w)         *w         = shim_egl_image_map[i].width;
+            if (h)         *h         = shim_egl_image_map[i].height;
+            if (fmt)       *fmt       = shim_egl_image_map[i].fourcc;
+            if (y_ptr)     *y_ptr     = shim_egl_image_map[i].y_ptr;
+            if (uv_ptr)    *uv_ptr    = shim_egl_image_map[i].uv_ptr;
+            if (stride_y)  *stride_y  = shim_egl_image_map[i].stride_y;
+            if (stride_uv) *stride_uv = shim_egl_image_map[i].stride_uv;
             pthread_mutex_unlock(&shim_egl_image_map_lock);
             return 1;
         }
@@ -881,57 +927,138 @@ void *eglCreateImageKHR(void *display, void *ctx, unsigned target,
                         void *buffer, const int *attrib_list) {
     int      w = 0, h = 0;
     unsigned fmt = 0x34325258;  /* XR24 — matches GBM default */
-    shim_egl_image_parse_attribs(attrib_list, &w, &h, &fmt);
-    /* Sanity-clamp to our render mode if attribs were malformed. */
+    int      plane0_fd = 0;
+    shim_egl_image_parse_attribs(attrib_list, &w, &h, &fmt, &plane0_fd);
     if (w <= 0 || w > 8192)  w = FAKE_MODE_HDISPLAY;
     if (h <= 0 || h > 8192)  h = FAKE_MODE_VDISPLAY;
-    void *img = shim_egl_image_register(w, h, fmt);
+
+    /* If plane0_fd matches an avforward sentinel, pull the live Y/UV
+     * pointers out of avforward's side-table and stash them in our entry;
+     * glEGLImageTargetTexture2DOES below converts NV12→RGBA and uploads via
+     * glTexImage2D. Pointers stay valid until the next av_frame_unref of
+     * the same frame — the game runs FUN_00e3e150's eglCreateImageKHR +
+     * glEGLImageTargetTexture2DOES sequence synchronously. */
+    const uint8_t *y_ptr = NULL, *uv_ptr = NULL;
+    int stride_y = 0, stride_uv = 0;
+    if (plane0_fd > 0) {
+        shim_avforward_pixel_lookup(plane0_fd, &y_ptr, &uv_ptr,
+                                    NULL, NULL, &stride_y, &stride_uv);
+    }
+
+    void *img = shim_egl_image_register(w, h, fmt, y_ptr, uv_ptr,
+                                        stride_y, stride_uv);
     SHIM_LOG("eglCreateImageKHR(dpy=%p, target=0x%x, buf=%p) "
-             "[w=%d h=%d fourcc=0x%x] -> %p",
-             display, target, buffer, w, h, fmt, img);
+             "[w=%d h=%d fourcc=0x%x fd=%d %s] -> %p",
+             display, target, buffer, w, h, fmt, plane0_fd,
+             y_ptr ? "VIDEO" : "non-video", img);
     (void)ctx;
     return img;
 }
 
 unsigned eglDestroyImageKHR(void *display, void *image) {
-    /* Free the sentinel and remove from map. We don't glDeleteTextures the
-     * backing — the game's glFramebufferTexture2D has already stored a ref,
-     * and we don't track texture lifetimes. Bounded leak by map size. */
+    /* Sentinels are counter-cast pointers, not malloc'd — just remove from
+     * the map. The backing GL texture's lifetime is the game's concern (we
+     * never free state the game still holds via glFramebufferTexture2D). */
     pthread_mutex_lock(&shim_egl_image_map_lock);
     for (int i = 0; i < shim_egl_image_map_count; i++) {
         if (shim_egl_image_map[i].egl_image == image) {
-            free(shim_egl_image_map[i].egl_image);
             shim_egl_image_map[i] = shim_egl_image_map[--shim_egl_image_map_count];
             break;
         }
     }
     pthread_mutex_unlock(&shim_egl_image_map_lock);
-    SHIM_LOG("eglDestroyImageKHR(%p)", image);
     (void)display;
     return EGL_TRUE;
 }
 
+/* NV12 → RGBA8 conversion using BT.601 limited-range coefficients in Q10
+ * fixed-point. Single-threaded; ~30 fps at 1080p well within budget on a
+ * modern CPU. Output is interleaved RGBA, alpha=0xff, top-left origin
+ * matching the AVFrame layout libavcodec hands us. */
+static void shim_nv12_to_rgba(const uint8_t *y, int stride_y,
+                              const uint8_t *uv, int stride_uv,
+                              int w, int h, uint8_t *out) {
+    for (int row = 0; row < h; row++) {
+        const uint8_t *yrow  = y  + (size_t)row * (size_t)stride_y;
+        const uint8_t *uvrow = uv + (size_t)(row >> 1) * (size_t)stride_uv;
+        uint8_t       *orow  = out + (size_t)row * (size_t)w * 4u;
+        for (int col = 0; col < w; col++) {
+            int Y  = yrow[col];
+            int U  = (int)uvrow[(col & ~1)]     - 128;
+            int V  = (int)uvrow[(col & ~1) + 1] - 128;
+            int Yp = (1192 * (Y - 16)) >> 10;
+            int R  = Yp + (( 1634 * V) >> 10);
+            int G  = Yp - (( 832 * V + 401 * U) >> 10);
+            int B  = Yp + (( 2065 * U) >> 10);
+            if (R < 0) R = 0; else if (R > 255) R = 255;
+            if (G < 0) G = 0; else if (G > 255) G = 255;
+            if (B < 0) B = 0; else if (B > 255) B = 255;
+            orow[col * 4 + 0] = (uint8_t)R;
+            orow[col * 4 + 1] = (uint8_t)G;
+            orow[col * 4 + 2] = (uint8_t)B;
+            orow[col * 4 + 3] = 0xff;
+        }
+    }
+}
+
 void glEGLImageTargetTexture2DOES(unsigned target, void *image) {
+    /* Demote EXTERNAL_OES so the upcoming real_glTexImage2D succeeds (Mesa
+     * rejects EXTERNAL_OES on glTexImage2D with GL_INVALID_ENUM). The paired
+     * glBindTexture demotion keeps the texture object's target coherent. */
+    target = shim_demote_external_oes(target);
+
     int w = 0, h = 0; unsigned fmt = 0;
-    if (!shim_egl_image_lookup(image, &w, &h, &fmt)) {
+    const uint8_t *y_ptr = NULL, *uv_ptr = NULL;
+    int stride_y = 0, stride_uv = 0;
+    if (!shim_egl_image_lookup(image, &w, &h, &fmt,
+                               &y_ptr, &uv_ptr, &stride_y, &stride_uv)) {
         SHIM_LOG("glEGLImageTargetTexture2DOES: unknown image %p, no-op", image);
         return;
     }
-    /* Redefine the currently-bound texture's storage via Mesa's glTexImage2D.
-     * This is the non-zero-copy substitute for a DMA-BUF-backed EGLImage.
-     * The currently-bound texture (on 'target') becomes a w×h RGBA8 texture;
-     * the game's subsequent glFramebufferTexture2D attaches it to the FBO. */
-    static void (*real_glTexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void*) = NULL;
+    static void (*real_glTexImage2D)(unsigned, int, int, int, int, int,
+                                     unsigned, unsigned, const void *) = NULL;
     if (!real_glTexImage2D) real_glTexImage2D = (void (*)(unsigned, int, int, int, int, int, unsigned, unsigned, const void*))
-                                                 dlsym(RTLD_NEXT, "glTexImage2D");
-    if (!real_glTexImage2D) {
-        SHIM_LOG("glEGLImageTargetTexture2DOES: glTexImage2D unresolved; no-op");
-        return;
-    }
+                                                  dlsym(RTLD_NEXT, "glTexImage2D");
+    if (!real_glTexImage2D) return;
+
     /* GL_RGBA8 = 0x8058 internal, GL_RGBA = 0x1908 format, GL_UNSIGNED_BYTE = 0x1401. */
+    if (y_ptr && uv_ptr) {
+        size_t rgba_size = (size_t)w * (size_t)h * 4u;
+        uint8_t *rgba = (uint8_t *)malloc(rgba_size);
+        if (rgba) {
+            /* SPIKE3_VIDEO_TESTPATTERN=1: ignore the decoded NV12 and fill
+             * with a hot-pink + green checkerboard. Visual signal for
+             * "did the shader actually sample this texture?":
+             *   - Hot pink visible    → sampler reads our texture → conversion is wrong, OR display path correct
+             *   - Black where video   → sampler doesn't read 2D-bound texture (samplerExternalOES strict)
+             *   - Garbled colors      → sampler reads but with YUV→RGB transform applied to our RGBA */
+            const char *tp = getenv("SPIKE3_VIDEO_TESTPATTERN");
+            if (tp && tp[0] == '1') {
+                for (int row = 0; row < h; row++) {
+                    uint8_t *orow = rgba + (size_t)row * (size_t)w * 4u;
+                    int   row_block = (row / 64) & 1;
+                    for (int col = 0; col < w; col++) {
+                        int col_block = (col / 64) & 1;
+                        int hot_pink = row_block ^ col_block;
+                        orow[col*4+0] = hot_pink ? 0xff : 0x00;  /* R */
+                        orow[col*4+1] = hot_pink ? 0x14 : 0xff;  /* G */
+                        orow[col*4+2] = hot_pink ? 0x93 : 0x00;  /* B */
+                        orow[col*4+3] = 0xff;
+                    }
+                }
+            } else {
+                shim_nv12_to_rgba(y_ptr, stride_y, uv_ptr, stride_uv, w, h, rgba);
+            }
+            real_glTexImage2D(target, 0, 0x8058, w, h, 0, 0x1908, 0x1401, rgba);
+            free(rgba);
+            shim_frametex_record(target, w, h);
+            return;
+        }
+        SHIM_LOG("glEGLImageTargetTexture2DOES: rgba malloc(%zu) failed; storage-only fallback",
+                 rgba_size);
+    }
+    /* Non-video path: storage-only allocation for FBO color attachment. */
     real_glTexImage2D(target, 0, 0x8058, w, h, 0, 0x1908, 0x1401, NULL);
-    SHIM_LOG("glEGLImageTargetTexture2DOES(target=0x%x, image=%p) -> glTexImage2D %dx%d RGBA8",
-             target, image, w, h);
     shim_frametex_record(target, w, h);
 }
 
@@ -1167,6 +1294,7 @@ void glDeleteProgram(unsigned program) {
 }
 
 void glBindTexture(unsigned target, unsigned tex) {
+    target = shim_demote_external_oes(target);
     FWD_VOID(glBindTexture, (unsigned, unsigned), (target, tex));
     (void)target; (void)tex;
 }
@@ -1213,6 +1341,7 @@ void glActiveTexture(unsigned tex) {
 void glTexImage2D(unsigned target, int level, int internalfmt,
                   int w, int h, int border, unsigned format, unsigned type,
                   const void *data) {
+    target = shim_demote_external_oes(target);
     FWD_VOID(glTexImage2D,
              (unsigned, int, int, int, int, int, unsigned, unsigned, const void*),
              (target, level, internalfmt, w, h, border, format, type, data));
@@ -1223,6 +1352,7 @@ void glTexImage2D(unsigned target, int level, int internalfmt,
 void glTexSubImage2D(unsigned target, int level, int xoff, int yoff,
                      int w, int h, unsigned format, unsigned type,
                      const void *data) {
+    target = shim_demote_external_oes(target);
     FWD_VOID(glTexSubImage2D,
              (unsigned, int, int, int, int, int, unsigned, unsigned, const void*),
              (target, level, xoff, yoff, w, h, format, type, data));
@@ -1231,6 +1361,7 @@ void glTexSubImage2D(unsigned target, int level, int xoff, int yoff,
 }
 void glCompressedTexImage2D(unsigned target, int level, unsigned internalfmt,
                             int w, int h, int border, int size, const void *data) {
+    target = shim_demote_external_oes(target);
     FWD_VOID(glCompressedTexImage2D,
              (unsigned, int, unsigned, int, int, int, int, const void*),
              (target, level, internalfmt, w, h, border, size, data));
@@ -1240,6 +1371,7 @@ void glCompressedTexImage2D(unsigned target, int level, unsigned internalfmt,
 void glCompressedTexSubImage2D(unsigned target, int level, int xoff, int yoff,
                                int w, int h, unsigned format, int size,
                                const void *data) {
+    target = shim_demote_external_oes(target);
     FWD_VOID(glCompressedTexSubImage2D,
              (unsigned, int, int, int, int, int, unsigned, int, const void*),
              (target, level, xoff, yoff, w, h, format, size, data));
@@ -1247,10 +1379,12 @@ void glCompressedTexSubImage2D(unsigned target, int level, int xoff, int yoff,
     (void)w; (void)h; (void)format; (void)size; (void)data;
 }
 void glTexParameteri(unsigned target, unsigned pname, int param) {
+    target = shim_demote_external_oes(target);
     FWD_VOID(glTexParameteri, (unsigned, unsigned, int), (target, pname, param));
     (void)target; (void)pname; (void)param;
 }
 void glTexParameterf(unsigned target, unsigned pname, float param) {
+    target = shim_demote_external_oes(target);
     FWD_VOID(glTexParameterf, (unsigned, unsigned, float), (target, pname, param));
     (void)target; (void)pname; (void)param;
 }
@@ -1259,6 +1393,7 @@ void glPixelStorei(unsigned pname, int param) {
     (void)pname; (void)param;
 }
 void glGenerateMipmap(unsigned target) {
+    target = shim_demote_external_oes(target);
     FWD_VOID(glGenerateMipmap, (unsigned), (target));
     (void)target;
 }
@@ -1284,9 +1419,87 @@ unsigned char glUnmapBuffer(unsigned target) {
 }
 
 void glShaderSource(unsigned shader, int count, const char *const *string, const int *length) {
-    FWD_VOID(glShaderSource, (unsigned, int, const char* const*, const int*),
-             (shader, count, string, length));
-    (void)shader; (void)count; (void)string; (void)length;
+    /* Stub mode: no compilation happens, drop. */
+    if (!is_real_gl()) {
+        (void)shader; (void)count; (void)string; (void)length;
+        return;
+    }
+    static void (*real_fn)(unsigned, int, const char *const *, const int *) = NULL;
+    if (!real_fn) real_fn = (void(*)(unsigned, int, const char *const *, const int*))
+                              dlsym(RTLD_NEXT, "glShaderSource");
+    if (!real_fn || count <= 0 || !string) {
+        if (real_fn) real_fn(shader, count, string, length);
+        return;
+    }
+
+    /* Concatenate input strings into a single buffer so we can scan for
+     * samplerExternalOES and inject a sampler2D #define. */
+    size_t total = 1;  /* +1 for null terminator */
+    for (int i = 0; i < count; i++) {
+        if (!string[i]) continue;
+        size_t li = (length && length[i] >= 0) ? (size_t)length[i] : strlen(string[i]);
+        total += li;
+    }
+    char *buf = (char *)malloc(total);
+    if (!buf) { real_fn(shader, count, string, length); return; }
+    size_t off = 0;
+    for (int i = 0; i < count; i++) {
+        if (!string[i]) continue;
+        size_t li = (length && length[i] >= 0) ? (size_t)length[i] : strlen(string[i]);
+        memcpy(buf + off, string[i], li);
+        off += li;
+    }
+    buf[off] = '\0';
+
+    /* Stern's video fragment shader uses `samplerExternalOES textureSampler`
+     * unconditionally, expecting the OES extension's YUV-aware sampler.
+     * Under Mesa swrast llvmpipe a samplerExternalOES sampling a 2D-bound
+     * texture returns zero; the OES extension is supported but only for
+     * EXTERNAL_OES-typed textures (which require real DMA-BUF import).
+     *
+     * Inject `#define samplerExternalOES sampler2D` right after the relevant
+     * #extension line so the GLSL preprocessor textually substitutes the
+     * type to sampler2D. The bound texture (demoted to GL_TEXTURE_2D in
+     * glBindTexture) then matches the sampler type and our RGBA pixels reach
+     * the fragment shader. The game's own Godot shaders use this same trick
+     * already — we just extend it to the Stern Radium video shaders that
+     * lack the conditional fallback. */
+    if (strstr(buf, "samplerExternalOES")) {
+        const char *inject = "#define samplerExternalOES sampler2D\n";
+        size_t inject_len = strlen(inject);
+
+        char *insert_at = buf;
+        char *ext = strstr(buf, "#extension GL_OES_EGL_image_external");
+        char *ver = strstr(buf, "#version");
+        if (ext) {
+            char *eol = strchr(ext, '\n');
+            if (eol) insert_at = eol + 1;
+        } else if (ver) {
+            char *eol = strchr(ver, '\n');
+            if (eol) insert_at = eol + 1;
+        }
+
+        size_t prefix_len = (size_t)(insert_at - buf);
+        size_t tail_len = off - prefix_len;
+        char *new_buf = (char *)malloc(off + inject_len + 1);
+        if (new_buf) {
+            memcpy(new_buf, buf, prefix_len);
+            memcpy(new_buf + prefix_len, inject, inject_len);
+            memcpy(new_buf + prefix_len + inject_len, insert_at, tail_len);
+            new_buf[prefix_len + inject_len + tail_len] = '\0';
+            free(buf);
+            buf = new_buf;
+            static int log_count = 0;
+            if (log_count < 4) {
+                SHIM_LOG("[shader_patch] injected sampler2D define for shader=%u (rewrite #%d)",
+                         shader, ++log_count);
+            }
+        }
+    }
+
+    const char *src = buf;
+    real_fn(shader, 1, &src, NULL);
+    free(buf);
 }
 void glCompileShader(unsigned shader) {
     FWD_VOID(glCompileShader, (unsigned), (shader));

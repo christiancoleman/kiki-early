@@ -59,6 +59,16 @@ int shim_avforward_send_packet(void *avctx, const void *avpkt, int *out_ret);
 int shim_avforward_receive_frame(void *avctx, void *frame, int *out_ret);
 int shim_avforward_flush(void *avctx);
 
+/* Per-frame video pixel side-table. shim_avforward populates the entry when
+ * a frame is decoded; shim_gl::eglCreateImageKHR pulls it out of the EGL
+ * attribs (via EGL_DMA_BUF_PLANE0_FD_EXT, which carries our sentinel fd) so
+ * glEGLImageTargetTexture2DOES can upload real pixels instead of NULL.
+ * Returns 1 with all out-pointers populated on hit, 0 on miss. */
+int shim_avforward_pixel_lookup(int sentinel_fd,
+                                const uint8_t **y_ptr, const uint8_t **uv_ptr,
+                                int *width, int *height,
+                                int *stride_y, int *stride_uv);
+
 /* Runtime SPI RX override (defined in shim_ioctl.c).
  * Lets shim_inject.c inject CPU-local switch presses by OR-ing bits into
  * the 8-byte SPI MESSAGE_1 RX buffer. Each byte is OR'd in after the env
