@@ -1369,7 +1369,7 @@ The game presents frames via Linux's KMS/DRM stack with EGL on top of GBM. Three
 
 1. **`/dev/dri/card1`** — DRM ioctls intercepted before they'd reach the real device
 2. **GBM library hooks** — every `gbm_*` call goes to the shim
-3. **EGL + GLES library hooks** — two modes (stub / real-Mesa-overlay) controlled by `SPIKE3_REAL_GL`
+3. **EGL + GLES library hooks** — three modes (stub / Mesa-aarch64 overlay / host-native daemon) controlled by `SPIKE3_REAL_GL` and `GL_DAEMON`
 
 All three layers cooperate so the game's normal display pipeline (allocate GBM BO → wrap as EGL image → bind as GL texture → render → page-flip) succeeds end-to-end without real GPU hardware.
 
@@ -1645,6 +1645,7 @@ Total = 99 entries. Manual lists "over 100" because some manual entries are rese
 Shim probes:
 - `SHIM_SWITCH_TABLE_PROBE=1` — dumps the (sw_id → channel, byte, bit, state, handler_fn, event_id, flags) table once at +80s.
 - `SHIM_EDGE_SNAPSHOT=1` (with `SHIM_EDGE_SNAPSHOT_DELAY_S` / `_INTERVAL_S` / `_CYCLES`) — periodic snapshot of each switch's `edge_counter` (`+0x26`); logs only switches whose counter changed. Identifies which switches are firing edges continuously.
+- **Press injection (host → shim).** `run_game.sh`'s `SHIM_AUTO_PRESS=1` schedules a single timed switch press (default `sw_id=93` Service Back at T+60s; override with `SHIM_AUTO_PRESS_DELAY_S` / `SHIM_AUTO_PRESS_SW_ID` / `SHIM_AUTO_PRESS_LABEL`). `marker_button.py` (`TIMER=ON`) provides interactive presses via the same path. Both write the chosen sw_id as ASCII to `runs/latest/press_request.txt`; `shim_manual_press_thread` (env-gated by `SHIM_MANUAL_PRESS=1`, default on) polls that file and drives the press through the corrected-deref'd switch state byte described above. `SHIM_SELECT_PRESS=1` is the older auto-retry variant for service-button presses. See §2 for full env-knob defaults.
 
 *Verified by:* JOURNAL Step 93 — runtime probe output captured 2026-05-08 with all 99 entries enumerated; per-channel summary cross-checked against the Pokémon LE Lite manual's switch matrix.
 

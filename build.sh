@@ -41,6 +41,7 @@ SOURCES=(
     shim_gl_marshal.c
     shim_inject.c
     shim_net.c
+    shim_devbus.c
     games/pokemon_le_machine.c
 )
 

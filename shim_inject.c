@@ -1312,4 +1312,6 @@ void shim_inject_start(void) {
     pthread_t mp;
     if (pthread_create(&mp, NULL, shim_manual_press_thread, NULL) == 0)
         pthread_detach(mp);
+
+    shim_devbus_init();
 }

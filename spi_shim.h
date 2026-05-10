@@ -215,6 +215,8 @@ void shim_frame_capture_at_page_flip(void); /* called from the DRM PAGE_FLIP ioc
 void shim_audio_start(void);              /* audio bridge; no-op unless SPIKE3_AUDIO_BRIDGE=1 */
 void shim_audio_emit(const uint8_t *buf, size_t bytes); /* called from snd_pcm_writei */
 
+void shim_devbus_init(void);              /* devbus subscriber bridge — see shim_devbus.c */
+
 /* AF_UNIX abstract-namespace addressing.
  * WSL2's 9P mount of /mnt/c/... does NOT support AF_UNIX bind (errno 95
  * EOPNOTSUPP). Putting sockets under $SYSROOT/tmp/ on /mnt/c is therefore
