@@ -9098,3 +9098,42 @@ Touched:
 
 - `_emulation/marker_button.py` — added a Left Coin/Add Credit press button using the existing `press_request.txt` API path.
 - `_emulation/docs/PROTOCOL.md` — documented `1-SW-16` -> `sw_id=80` and clarified that Service Back is not the coin input.
+
+### 99b — Git history cleaned after generated artifacts blocked GitHub push
+
+The push blocker was not a normal source-code commit. It was the nested `games/pokemon_le` repo carrying generated analysis and runtime outputs: multi-GB Ghidra database chunks, repeated Binary Ninja `.bndb` snapshots, run logs, decoded audio/textures, extraction blobs, Python bytecode, and rebuilt `spi_shim.so`.
+
+The cleanup was done defensively:
+
+- Created `pre_history_rewrite_20260510` before rewriting.
+- Added ignore rules for generated artifacts in `games/pokemon_le/.gitignore` and `_emulation/.gitignore`.
+- Untracked generated artifacts with `git rm --cached`, preserving local files on disk.
+- Committed the cleanup as `3e73898 Clean generated artifacts from pokemon_le repo`.
+- Rewrote `games/pokemon_le` history with `git filter-branch` to remove those generated paths from all reachable commits.
+- Removed `refs/original/*`, expired reflogs, and ran `git gc --prune=now --aggressive`.
+- Moved nested `master` to the cleaned commit and updated the top-level `parent repository` submodule pointer in commit `276e590 Update pokemon_le submodule after history cleanup`.
+
+Verification:
+
+```text
+games/pokemon_le before: 8.31 GiB packed, plus 516.59 MiB loose
+games/pokemon_le after:  249.70 MiB packed, 0 loose
+largest remaining blob:  games/pokemon_le/game, 71,349,568 bytes
+remaining >100 MB blobs: none
+```
+
+The top-level repo still contains filesystem-shaped state and unrelated dirty generated files, but the GitHub hard blocker for `pokemon_le` is gone. Push order is nested repo first, then top-level repo:
+
+```bash
+cd /mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le
+git push --force origin master
+
+cd /mnt/c/Workspace/pokemon-le-0.81.0
+git push origin master
+```
+
+Touched:
+
+- `games/pokemon_le/.gitignore` — excludes generated analysis/runtime artifacts.
+- `games/pokemon_le/_emulation/.gitignore` — excludes run folders, pycache, and rebuilt binaries.
+- `games/pokemon_le/_emulation/docs/PROTOCOL.md` — documents source-control hygiene and `.bndb` locality.
