@@ -1041,17 +1041,9 @@ void glEGLImageTargetTexture2DOES(unsigned target, void *image) {
     }
 
     if (shim_gl_marshal_active()) {
-        /* Daemon path: ship the image's RGBA payload (or empty allocation
-         * for non-video FBO storage) as TEX_IMAGE_2D against whatever 2D
-         * texture the game already bound through our marshalled
-         * glBindTexture. We always use TEX_IMAGE_2D rather than SUB — without
-         * a sync GETINTEGERV opcode we can't query daemon-side bound id to
-         * gate on size match. */
+        /* JOURNAL Step 96.2 */
         size_t dsz = rgba_ptr ? (size_t)w * (size_t)h * 4 : 0;
         size_t plen = sizeof(struct gl_payload_tex_image_2d) + dsz;
-        /* Diagnostic: log first 8 calls + every 256th so we can verify the
-         * video upload path is firing at the expected ~30 Hz. Reset on
-         * non-video so FBO storage allocations don't drown out the count. */
         static unsigned long n_video = 0, n_nonvideo = 0;
         unsigned long n = rgba_ptr
             ? __atomic_add_fetch(&n_video,    1, __ATOMIC_RELAXED)
@@ -1776,16 +1768,7 @@ void glBufferSubData(unsigned target, intptr_t offset, intptr_t size, const void
              (target, offset, size, data));
     (void)target; (void)offset; (void)size; (void)data;
 }
-/* Per-target buffer-map shadow table (max 8 simultaneous mappings; GL spec
- * permits one mapping per target).
- *
- * Daemon mode requirement: glMapBufferRange must return writable host-process
- * memory the game can deref. The daemon's GL state is in another process —
- * its mapped pointer is unreachable here. We allocate scratch sized to the
- * mapping, hand it to the game, and on glUnmapBuffer ship the bytes via
- * glBufferSubData(target, offset, len, scratch). MAP_READ_BIT is best-effort:
- * we don't fetch from daemon first, so a read-only map sees zeros. The game's
- * actual usage (glMap+memcpy+glUnmap) is the WRITE pattern so this is fine. */
+/* JOURNAL Step 97d */
 struct shim_gl_map_entry {
     unsigned target;
     void    *ptr;
@@ -1844,9 +1827,7 @@ unsigned char glUnmapBuffer(unsigned target) {
         }
         pthread_mutex_unlock(&shim_gl_map_lock);
         if (!ptr) return GL_TRUE;
-        /* GL_MAP_WRITE_BIT = 0x2; ship contents back if the game might have
-         * written. UNSYNCHRONIZED/INVALIDATE bits don't change correctness here. */
-        if ((access & 0x2) && len > 0) {
+        if ((access & 0x2 /* GL_MAP_WRITE_BIT, ES3 spec */) && len > 0) {
             size_t plen = sizeof(struct gl_payload_buffer_sub_data) + (size_t)len;
             unsigned char *buf = (unsigned char*)malloc(plen);
             if (buf) {
@@ -2274,11 +2255,7 @@ void glUniformMatrix3fv(int loc, int count, unsigned char trans, const float *v)
     (void)loc; (void)count; (void)trans; (void)v;
 }
 
-/* ES3 uniform variants game uses but shim previously didn't hook. Without
- * marshal, these fall through to local Mesa with no context → silently
- * dropped → daemon's uniform stays at default 0 → shaders that depend on
- * these for alpha/mode produce wrong fragment alpha → blend equation kills
- * everything. */
+/* JOURNAL Step 97f */
 void glUniform1ui(int loc, unsigned v0) {
     if (shim_gl_marshal_active()) {
         struct gl_payload_uniform_1ui req = { loc, v0 };
@@ -2305,12 +2282,7 @@ void glUniform2iv(int loc, int count, const int *v) {
     (void)loc; (void)count; (void)v;
 }
 
-/* glVertexAttrib4f: sets a CONSTANT default value for a vertex attribute when
- * no per-vertex array is bound for that attribute. Game uses this for per-draw
- * tints/colors. If we don't marshal it, the daemon's attribute stays at the
- * GL default (0,0,0,1) — which means RGB=0 — and shaders that multiply by
- * this attribute produce final.rgb=0 → with blend on, FBO writes are killed
- * → exactly the "attract is black" symptom. */
+/* JOURNAL Step 97f */
 void glVertexAttrib4f(unsigned idx, float x, float y, float z, float w) {
     if (shim_gl_marshal_active()) {
         struct gl_payload_vertex_attrib_4f req = { idx, x, y, z, w };
@@ -2410,9 +2382,7 @@ void glTexStorage3DMultisample(unsigned target, int samples, unsigned internal,
     (void)target; (void)samples; (void)internal;
     (void)w; (void)h; (void)d; (void)fixed;
 }
-/* Reuse our existing glGetIntegerv stub-body for the 64-bit variant. Our
- * stub returns canned plausible values for known caps and 0 for unknowns,
- * which satisfies callers without needing daemon round-trip. */
+/* JOURNAL Step 97f */
 void glGetInteger64v(unsigned pname, int64_t *params) {
     if (!shim_gl_marshal_active() && is_real_gl()) {
         static void (*real_fn)(unsigned, int64_t*) = NULL;
@@ -2423,8 +2393,7 @@ void glGetInteger64v(unsigned pname, int64_t *params) {
     if (params) *params = 0;
     (void)pname;
 }
-/* EGL sync: top-level exports that delegate to existing stubs from the
- * eglGetProcAddress table (game uses both PLT and procaddr resolution). */
+/* JOURNAL Step 97f */
 extern void *eglCreateImageKHR(void *display, void *ctx, unsigned target,
                                 void *buffer, const int *attrib_list);
 void *eglCreateSyncKHR(void *display, unsigned type, const intptr_t *attrib_list) {
@@ -2440,7 +2409,7 @@ int eglWaitSyncKHR(void *display, void *sync, int flags) {
 }
 int eglClientWaitSyncKHR(void *display, void *sync, int flags, uint64_t timeout) {
     (void)display; (void)sync; (void)flags; (void)timeout;
-    return 0x30F6;  /* EGL_CONDITION_SATISFIED_KHR */
+    return 0x30F6 /* EGL_CONDITION_SATISFIED_KHR per EGL_KHR_fence_sync */;
 }
 unsigned eglReleaseThread(void) { return EGL_TRUE; }
 
@@ -3151,11 +3120,7 @@ void glTexStorage3D(unsigned target, int levels, unsigned internal, int w, int h
     (void)target; (void)levels; (void)internal; (void)w; (void)h; (void)d;
 }
 
-/* Functions safe to no-op when daemon active: debug callbacks, transform
- * feedback (game uses for HEVC out-path which we replace via shim_avforward),
- * occlusion queries, OVR multiview, sync objects (we synthesise sentinels),
- * program-binary cache (game falls back to source-compile on no-format). */
-
+/* JOURNAL Step 97f */
 void glDebugMessageCallback(void *cb, const void *userParam) {
     (void)cb; (void)userParam;
 }
@@ -3183,8 +3148,7 @@ void glFramebufferTextureMultisampleMultiviewOVR(unsigned target, unsigned att, 
     (void)target; (void)att; (void)tex; (void)level;
     (void)samples; (void)baseViewIndex; (void)numViews;
 }
-/* Sync objects: return monotonic sentinels. ClientWaitSync always reports
- * "already signaled" so the game's wait-loop terminates. */
+/* JOURNAL Step 96.2 */
 void *glFenceSync(unsigned condition, unsigned flags) {
     static uintptr_t sync_seq = 0xfeed0000ull;
     (void)condition; (void)flags;
@@ -3193,22 +3157,23 @@ void *glFenceSync(unsigned condition, unsigned flags) {
 void glDeleteSync(void *sync) { (void)sync; }
 unsigned glClientWaitSync(void *sync, unsigned flags, uint64_t timeout) {
     (void)sync; (void)flags; (void)timeout;
-    return 0x911A;  /* GL_ALREADY_SIGNALED */
+    return 0x911A /* GL_ALREADY_SIGNALED, ES3 spec */;
 }
 void glWaitSync(void *sync, unsigned flags, uint64_t timeout) {
     (void)sync; (void)flags; (void)timeout;
 }
 void glGetSynciv(void *sync, unsigned pname, int bufSize, int *length, int *values) {
+    /* SYNC_STATUS/OBJECT_TYPE/SYNC_CONDITION enums per ES3 spec Table 4.4 */
     (void)sync;
     if (length) *length = 1;
     if (values && bufSize >= 1) {
-        if (pname == 0x9114 /* SYNC_STATUS */)        values[0] = 0x9117 /* SIGNALED */;
-        else if (pname == 0x9112 /* OBJECT_TYPE */)   values[0] = 0x9116 /* SYNC_FENCE */;
-        else if (pname == 0x9113 /* SYNC_CONDITION */) values[0] = 0x9117;
-        else                                           values[0] = 0;
+        if (pname == 0x9114)      values[0] = 0x9117;
+        else if (pname == 0x9112) values[0] = 0x9116;
+        else if (pname == 0x9113) values[0] = 0x9117;
+        else                      values[0] = 0;
     }
 }
-/* Program binary: report no formats; game falls back to source compile. */
+/* JOURNAL Step 97 — bypass-detection diagnostic */
 void glGetProgramBinary(unsigned program, int bufSize, int *length,
                         unsigned *binaryFormat, void *binary) {
     static int log_get = 0;
@@ -3224,7 +3189,7 @@ void glProgramBinary(unsigned program, unsigned binaryFormat,
                      const void *binary, int length) {
     static int log_set = 0;
     if (log_set < 32) {
-        SHIM_LOG("[program_binary] glProgramBinary(prog=%u, fmt=0x%x, len=%d) #%d -> NO-OP (this would bypass shader rewrite)",
+        SHIM_LOG("[program_binary] glProgramBinary(prog=%u, fmt=0x%x, len=%d) #%d",
                  program, binaryFormat, length, ++log_set);
     }
     (void)program; (void)binaryFormat; (void)binary; (void)length;

@@ -8755,3 +8755,143 @@ Three of the five Phase 3d open items landed without surfacing surprises. `spi_s
 - `_emulation/shim_bridges.c` — `#include "gl_proto.h"` added; `shim_frame_capture_at_page_flip` gains a daemon-mode branch at the top that marshals BIND_FRAMEBUFFER + sync READ_PIXELS + restore-BIND, with the response replacing local glReadPixels.
 - `_emulation/docs/JOURNAL.md` — this Step 96.2 entry appended.
 
+
+## Step 97: Atomic Horizon Phase 3d game-run iteration — daemon GL coverage closed; attract scene alpha-blend regression remains unresolved (2026-05-09)
+
+Continuation of Step 96.2. Multiple game runs under `GL_DAEMON=1` surfaced specific marshal-coverage gaps and regressions between `GL_DAEMON=0` (working baseline, per Step 95) and `GL_DAEMON=1`. Coverage gaps have been closed and verified. One user-visible behavior remains unresolved at end of session: **attract scene renders pure black with default settings under `GL_DAEMON=1`**.
+
+### Verified findings — daemon coverage gaps closed
+
+#### 97a — EGL setup hooks lacked daemon-mode early-returns
+
+In daemon mode the shim returns synthesised `FAKE_EGL_*` sentinels for `eglGetDisplay` / `eglInitialize` / `eglBindAPI` / `eglCreateContext` / `eglMakeCurrent` / `eglCreatePbufferSurface` / `eglChooseConfig` (Step 96.1). The remaining EGL hooks (`eglGetPlatformDisplay`, `eglGetPlatformDisplayEXT`, `eglGetConfigs`, `eglGetConfigAttrib`, `eglQueryString`, `eglTerminate`, `eglDestroyContext`, `eglDestroySurface`, `eglCreateWindowSurface`, `eglSwapBuffers`, `eglSwapInterval`, `eglSurfaceAttrib`, `eglQuerySurface`, `eglGetError`) unconditionally `FWD`'d to local Mesa — which has no real EGL initialisation in daemon mode (Mesa overlay's display state is uninitialised because eglInitialize was acked synthetically). Result: game received a real Mesa display from `eglGetPlatformDisplayEXT`, then fake-acked `eglInitialize`, then `eglGetConfigs` produced a garbage `num_config` and the game's `new T[N]` threw `std::bad_array_new_length`. Each affected hook now has `if (shim_gl_marshal_active())` returning the synthesised values directly.
+
+#### 97b — Query hooks lacked daemon-mode early-returns
+
+`glGetIntegerv`, `glGetFloatv`, `glGetBooleanv`, `glGetString`, `glGetStringi` had the same pattern as 97a. Game queried `GL_MAX_*_TEXTURE_IMAGE_UNITS` etc. and got garbage. Observed symptom: `glActiveTexture(0x84BB..0x84BF)` emitted by the game (i.e. `GL_TEXTURE0 - 5..GL_TEXTURE0 - 1`), invalid per spec. Each query hook now bypasses FWD when daemon active and returns the existing canned stub values.
+
+#### 97c — Daemon EGL_CONTEXT_CLIENT_VERSION bumped 2 → 3
+
+Daemon previously requested ES2.0 context. Game compiles `#version 300 es` shaders and uses `glBindBufferRange(GL_UNIFORM_BUFFER, ...)` / `glBufferData(GL_UNIFORM_BUFFER, ...)` (ES3-only). Bumped `EGL_CONTEXT_CLIENT_VERSION` to 3 in `gl_daemon.py::Renderer.__init__`. `gl_daemon.log` confirms `GL_VERSION=OpenGL ES 3.2 Mesa 25.0.7-2`.
+
+#### 97d — `glMapBufferRange` / `glUnmapBuffer` shadow buffer
+
+In daemon mode the prior implementations FWD'd to uninit Mesa, returning NULL. Game's pattern is `ptr = glMapBufferRange(...); memcpy(ptr + 0x40, src, n); glUnmapBuffer(...);` — produced `SIGSEGV` with `fault_addr=0x40` (NULL+0x40). Verified in run logs as the deterministic crash at game ELF VAs `0x11e2208` / `0x7b8c08`. Implemented per-target shadow table (`shim_gl_map_table[8]` in `shim_gl.c`): allocate scratch on `glMapBufferRange`, on `glUnmapBuffer` with `GL_MAP_WRITE_BIT` set, marshal contents via `OP_GL_BUFFER_SUB_DATA(target, offset, len, scratch)`. Crash gone.
+
+#### 97e — PyOpenGL `CompressedImageConverter` rejects raw bytes
+
+`gl_daemon.py::Renderer.compressed_tex_image_2d` initially called `self._GL.glCompressedTexImage2D(...)` with raw `bytes` payload. PyOpenGL's `CompressedImageConverter` raised `AttributeError: 'NumberHandler' object has no attribute 'arrayByteCount'` on every DXT5 (`internal_format=0x83F3`) upload — game.elf attract-mode video frames are 1360×768 / 512×512 DXT5. Bypassed via raw `libGLESv2.so.2` ctypes binding for both `glCompressedTexImage2D` and `glCompressedTexSubImage2D`; PyOpenGL's wrapper is no longer in the path for these.
+
+#### 97f — Game-vs-shim symbol audit closed all `gl*` / `egl*` exports
+
+`comm -23` of `strings game | grep '^gl[A-Z]\|^egl[A-Z]'` against `nm -D spi_shim.so` showed gaps. Two batches added new exports + marshal opcodes:
+- ES3 / extension functions previously not hooked: `glBindBufferBase`, `glBindBufferRange`, `glUniformBlockBinding`, `glGetUniformBlockIndex` (sync), `glBlitFramebuffer`, `glDrawBuffers`, `glReadBuffer`, `glClearBufferfv`, `glInvalidateFramebuffer`, `glVertexAttribIPointer`, `glDrawRangeElements`, `glCopyBufferSubData`, `glTexImage3D`, `glTexSubImage3D`, `glTexStorage2D`, `glTexStorage3D`, `glCompressedTexImage3D`, `glCompressedTexSubImage3D`, `glFramebufferTexture2DMultisampleEXT`, `glTexStorage3DMultisample`.
+- Direct exports of stubs that previously only existed in the `eglGetProcAddress` table: `eglCreateSyncKHR`, `eglDestroySyncKHR`, `eglWaitSyncKHR`, `eglClientWaitSyncKHR`, `eglReleaseThread`. Plus `glDebugMessageCallback` / `KHR`, `glBeginTransformFeedback` / `glEndTransformFeedback` / `glTransformFeedbackVaryings`, `glGenQueries` / `glDeleteQueries`, `glFramebufferTextureMultiviewOVR` / `glFramebufferTextureMultisampleMultiviewOVR`, `glGetInteger64v`, `glProgramBinary` / `glGetProgramBinary` as no-ops or sentinel-returning stubs.
+- Existing hooks that previously fell through to FWD (and thus to uninit Mesa under `GL_DAEMON=1`) gained daemon-mode early-returns with marshal: `glGenRenderbuffers`, `glDeleteRenderbuffers`, `glBindRenderbuffer`, `glCompressedTexImage2D`, `glCompressedTexSubImage2D`, `glTexParameterf`, `glGenerateMipmap`, `glBufferSubData`, `glDetachShader`, `glValidateProgram`, `glGetShaderInfoLog`, `glGetProgramInfoLog`, `glBindAttribLocation`, `glUniform2i` / `3i` / `4i`, `glUniform1f` / `2f` / `3f`, `glUniform1iv` / `1fv` / `2fv` / `3fv` / `4fv`, `glUniformMatrix3fv`, `glDisableVertexAttribArray`, `glFramebufferRenderbuffer`, `glRenderbufferStorage`, `glBlendFuncSeparate`, `glBlendEquation`, `glBlendEquationSeparate`, `glBlendColor`, `glDepthRangef`, `glFrontFace`, `glStencilFunc`, `glStencilMask`, `glStencilOp`, `glLineWidth`, `glPolygonOffset`, `glClearDepthf`, `glClearStencil`, `glDrawArraysInstanced`, `glDrawElementsInstanced`, `glVertexAttribDivisor`, `glFlush`. Plus three ES3 uniforms found in a separate audit pass: `glUniform1ui`, `glUniform1uiv`, `glUniform2iv`, and `glVertexAttrib4f`, `glVertexAttribI4ui`. The `glUniform1ui/1uiv/2iv` additions empirically fixed text rendering (text was previously rendered as solid white rectangles instead of character shapes).
+
+After this work, `comm -23` returns no rows — every gl/egl symbol referenced by `game.elf` is exported by `spi_shim.so` and has a marshal path.
+
+### Verified findings — runtime observations under `GL_DAEMON=1`
+
+#### 97g — Frame capture pipeline is correct
+
+`shim_frame_capture_at_page_flip` reads from `shim_last_draw_fbo` (last non-zero FB-target bind by the game). Verified by running with a daemon-side write-then-read self-check: daemon writes magenta at `(200, 200)` on fb=1, then immediately reads back via `glReadPixels` — return is `(0xff, 0x00, 0xff)` on every scan during the run. The user observed the magenta dot in the viewer, confirming the capture-→-viewer wire is intact end-to-end for the targeted FBO.
+
+#### 97h — Game uses fb=1/2/3 in triple-buffer rotation throughout the run
+
+Unthrottled bind logging in the daemon (one log line per `glBindFramebuffer`) shows the game cycles `glBindFramebuffer(GL_FRAMEBUFFER, 1) → 2 → 3 → 1 → 2 → 3 → ...` for both Service Menu and attract scenes. fb=4 is bound twice (FB target) at boot (`T+22-25s`), fb=5 is bound twice at boot also; both before Service Menu. fb=0 is bound only with `GL_READ_FRAMEBUFFER` target — those are our `shim_frame_capture` restore-binds. **Game never binds fb=0 with `GL_FRAMEBUFFER` or `GL_DRAW_FRAMEBUFFER` target during attract.**
+
+#### 97i — Per-frame uniform values arrive at daemon correctly
+
+`glUniform4fv` value logging shows the game sends `colorTransformMultiply = (1, 1, 1, 1)` and `colorTransformAdd = (0, 0, 0, 0)` for video draws — the GL identity for the Stern Radium color-transform path. The marshal layer is delivering these values correctly.
+
+#### 97j — All FBOs are `FRAMEBUFFER_COMPLETE`
+
+`glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER)` returns `0x8CD5` (`GL_FRAMEBUFFER_COMPLETE`) for fb=1/2/3; their color attachment 0 names match the daemon-allocated texture ids (`col0_tex=1/2/3` correspond to the `GL_TEXTURE_2D` ids). FBOs 4..20 raise `GLError` on bind (do not exist).
+
+### Static analysis (Ghidra)
+
+Source strings + xrefs for `colorTransformMultiply`:
+
+- `0x361b7f0` — string `"colorTransformMultiply"`
+- `0x361b820` — solid-fill fragment shader (no texture)
+- `0x361ba30` — textured sprite fragment shader (`sampler2D`): `clamp(colorTransformMultiply * frag, 0, 1); clamp(prev + colorTransformAdd * prev.a, 0, 1)`
+- `0x361bd08` — YUV→RGB video fragment shader (3 plane samplers): `vec4(r, g, b, 1.0)` initial alpha hardcoded
+- `0x361df50` — gradient fragment shader
+- `0x361e630` — font fragment shader
+- `0x3623d78` — EGLImage video fragment shader (`samplerExternalOES`, used for attract video frames via the EGLImage path)
+
+VideoPlayer setup function: `FUN_0091e570` at `0x91e570` — compiles the `samplerExternalOES` shader, links program, stores program id at `this+0x2d4`, viewprojMat loc at `+0x2d8`, modelMat at `+0x2dc`, `colorTransformMultiply` loc at `+0x2e0`, `colorTransformAdd` loc at `+0x2e4`.
+
+VideoPlayer uniform-set function: `FUN_0091e3b0` at `0x91e3b0` — calls `glUseProgram`, `glUniformMatrix4fv` (×2), `glUniform4fv(colorTransformMultiply_loc, 1, this+0x2b4)`, `glUniform4fv(colorTransformAdd_loc, 1, this+0x2c4)`. The vec4s at `this+0x2b4` and `this+0x2c4` are populated by `FUN_008c8e10` from the result of:
+
+- `FUN_008a3950` = `Radium::Stage::GetColorMultiplication()` — returns top of the `m_mColorTransformStack` (asserts on empty)
+- `FUN_008a3990` = `Radium::Stage::GetColorAddition()` — returns top of the same stack
+- `FUN_008a3a70` = `Radium::Stage::PushColorTransform(Color&)` — composes new mult against previous (`new.r * prev.r`, etc.) and clamps add to `[0, 1]`
+- `FUN_008a3a20` = `Radium::Stage::PopColorTransform()` — decrements end pointer by `0x20`
+
+`Video::draw` at `FUN_008b4c30` invokes the Push at offset `0x008b4ca0` with `param_1 + 0x84` (a 32-byte color transform on the Video element) before drawing, and the Pop after.
+
+### Unresolved at end of session — attract scene renders pure black under `GL_DAEMON=1` default settings
+
+Behavior matrix observed by running the same `game` binary under the same shim:
+
+| `GL_DAEMON` | `SPIKE3_DISABLE_BLEND` | Boot logo | Service Menu | Attract |
+|---|---|---|---|---|
+| `0` | `0` | shown ~T+10s, persists | shown ~T+60s | renders correctly |
+| `0` | `1` | same as above | same as above | renders correctly (env has no effect on local-Mesa path) |
+| `1` | `0` | shown ~T+7s, disappears within 1-2s | shown ~T+45s | **pure black** |
+| `1` | `1` | shown ~T+7s, disappears within 1-2s | shown ~T+45s | content visible but text appears as solid white rectangles and sprite "transparent" backgrounds appear as solid black |
+
+`SPIKE3_DISABLE_BLEND=1` is implemented in `gl_daemon.py::Renderer.enable` as: silently return without calling `glEnable` when `cap == GL_BLEND` and the env is set.
+
+#### Investigation results that did NOT identify the cause
+
+The following were confirmed and ruled out as the SOLE cause of the regression:
+
+- **Marshal of uniform values**: `glUniform4fv` logging confirmed daemon receives `(1, 1, 1, 1)` for `colorTransformMultiply` and `(0, 0, 0, 0)` for `colorTransformAdd` during attract draws (per 97i above). Wire is correct.
+- **Texture alpha = 0 in uploaded data**: tested env-gated `SPIKE3_FORCE_TEX_ALPHA_255=1` (since removed) which forced the alpha byte of every RGBA upload to 255. Attract remained pure black with blend on. Texture alpha is not the source of the alpha=0 fragment output.
+- **FBO target wrong / draws going elsewhere**: `FBO_SCAN` diagnostic samples 8 pixels of fb=0..20 on every Nth frame_cap. Throughout attract: fb=0 shows uniform `(0x24, 0x24, 0x24)` (set by 3 boot-time `FB-fb=0` binds, then unchanged); fb=1/2/3 are pure `(0x00, 0x00, 0x00, 0x00)`; fb=4..20 do not exist on daemon. With write-then-read self-check on fb=1 returning the magenta we wrote, the read pipeline is verified.
+- **Clear path bypass**: `SPIKE3_FORCE_MAGENTA_CLEAR=1` overrides `glClearColor` and `glClearBufferfv` (color-buffer variant) to `(1, 0, 1, 1)`. Service Menu shows magenta around the SM area in capture, confirming the override reaches Mesa for SM. Attract shows no magenta — game does not invoke `glClear` / `glClearColor` / `glClearBufferfv` between attract draws. `game.elf` does not reference `glClearBufferiv` / `glClearBufferuiv` / `glClearBufferfi` per `strings`.
+- **Blit-from-black**: `SPIKE3_FORCE_MAGENTA_CLEAR=1` also short-circuits `glBlitFramebuffer`. `glBlitFramebuffer` is referenced in `game.elf` strings but is called 0 times during the run per daemon's blit counter. Attract content is not produced via blit.
+- **Missing function hooks**: per 97f, full audit closed all gaps. After all hooks were added and SM text rendered correctly (the 97f `glUniform1ui/1uiv/2iv` fix), attract remained black with blend on.
+- **Defensive blend-state reset**: glBlendFunc logging shows boot draws alternate `(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)` ↔ `(GL_ZERO, GL_ZERO)`, but after boot the resets stop. Sampled glBlendFunc calls during attract are all `(0x302, 0x303)` = `(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)`, the standard alpha blend. Blend factors set during attract are not the source.
+- **Draws not happening**: daemon's draw counter confirms ~150-300 draws/sec sustained throughout attract; `glUseProgram`/`glDrawArrays`/`glDrawElements` are all marshalled and reach the daemon.
+- **Daemon errors**: the daemon log reports zero `GLError` exceptions and zero `unknown op` warnings during attract.
+- **`glProgramBinary` bypass of shader rewrite**: hypothesised that game might restore pre-compiled shaders bypassing `glShaderSource` (and our `samplerExternalOES → sampler2D` rewrite). Diagnostic logs added to `glProgramBinary` and `glGetProgramBinary`. **Not yet verified by a run with these logs in place.**
+
+#### Hypotheses still open
+
+These remain plausible but unverified at the end of the session:
+
+- The shader's *output alpha* on the daemon's host-Mesa context resolves to 0 even when its inputs (texture alpha, uniform alpha) are 1 — i.e. host-Mesa swrast computes the same shader differently than the in-process aarch64 Mesa overlay. Could be a Mesa version difference, a PyOpenGL wrapper artefact, a samplerExternalOES path subtlety, or a uniform we haven't yet discovered being read by the shader and silently defaulted to 0.
+- The game's faster execution under `GL_DAEMON=1` (Service Menu at ~T+45s vs ~T+60s under `GL_DAEMON=0`) may be advancing frame-counted animation timers faster — possibly relevant to "Pokemon logo disappears within 1-2s instead of persisting", though this could also be a separate symptom of the same underlying alpha issue.
+
+### Diagnostic infrastructure retained in code (env-gated, opt-in)
+
+These are present in `gl_daemon.py` and `shim_gl.c` / `shim_bridges.c` and have been useful enough during this session to keep available for future debugging:
+
+- `SPIKE3_DISABLE_BLEND=1` — daemon's `Renderer.enable` ignores `glEnable(GL_BLEND)`. **Working workaround for attract visibility.**
+- `SPIKE3_FORCE_MAGENTA_CLEAR=1` — daemon overrides `glClearColor` / `glClearBufferfv (COLOR)` to `(1, 0, 1, 1)`; also short-circuits `glBlitFramebuffer`.
+- `SPIKE3_VIDEO_TESTPATTERN=1` — daemon replaces RGBA uploads ≥256×256 with a hot-pink/green checkerboard.
+- `FBO_SCAN` log per Nth `glReadPixels` — samples 8 pixels of fb=0..20, reports `glCheckFramebufferStatus` and `COLOR_ATTACHMENT0` texture id.
+- Throttled per-call logs: `glBindFramebuffer` (unthrottled), `glDrawArrays`/`glDrawElements`, `glBlendFunc` / `Separate`, `glBlitFramebuffer`, `glUniform4f`, `glUniform4fv` (with values), `glProgramBinary` / `glGetProgramBinary`.
+- `near_black=N/256` in `[frame_cap]` — pixel-content sniff per frame send.
+- `shim_inject` `manual_press` `BEFORE`/`AFTER` `state` / `edge` / `delta` log — confirms switch-press write reached the polling region.
+
+### Operational improvements
+
+- `_emulation/scripts/reset_run_state.sh` now reaps stale `decode_daemon.py`, `gl_daemon.py`, `marker_button.py`, `audio_subscriber.py`, `frame_viewer.py`, and `ffplay` (audio bridge) processes before clearing NVRAM/cache, so re-running after a `SIGKILL` of a previous run no longer fails with `EADDRINUSE` on the abstract sockets.
+- `.claude/hooks/quirk_detector.py` gained an always-on invocation trace at `.claude/hooks/quirk_detector_invocation.log`. The hook itself only writes to its own audit log when drift is detected (silent on the fast-path clean exit), so the trace lets us distinguish "hook ran and saw nothing" from "hook never ran" in future investigations.
+
+### Touched
+
+- `_emulation/shim_gl.c` — daemon-mode early-returns added to all EGL setup/query/teardown hooks (97a) and all `glGet*` query hooks (97b); shadow-buffer table + scratch allocator for `glMapBufferRange` / `glUnmapBuffer` (97d); `glEGLImageTargetTexture2DOES` daemon path emits `OP_GL_TEX_IMAGE_2D` with the avforward RGBA payload; daemon-mode early-returns + marshal added to all previously-unmarshalled hooks per 97f; new exports for the ES3 / extension functions per 97f; logging counters added to several hooks.
+- `_emulation/shim_bridges.c` — `near_black=N/256` sampling added to `[frame_cap]` log; daemon-mode branch in `shim_frame_capture_at_page_flip` retained from Step 96.2.
+- `_emulation/spi_shim.h` — `extern int shim_gl_marshal_active(void);` etc. unchanged from Step 96.2.
+- `_emulation/gl_proto.h` / `gl_proto.py` — opcodes + payload structs / format strings added for the Phase 3d batch + the supplemental ES3 batch (uniform integer-variants, vertex-attrib, compressed-3D, multisample-3D, multisample-FB-attach).
+- `_emulation/gl_daemon.py` — `Renderer.__init__` now creates an ES3 context and reads three env vars (`SPIKE3_VIDEO_TESTPATTERN`, `SPIKE3_FORCE_MAGENTA_CLEAR`, `SPIKE3_DISABLE_BLEND`); `_libGLESv2` raw ctypes binding for compressed-tex bypass (97e); `Renderer` gained methods + dispatch for every new opcode in the Phase 3d batches; `execute_read_pixels` invokes `_scan_all_fbos_for_content` on a sampling cadence (FBO_SCAN diagnostic + write-then-read self-check); various per-call logging counters.
+- `_emulation/scripts/reset_run_state.sh` — stale-daemon reaper.
+- `.claude/hooks/quirk_detector.py` — `_trace_invocation` always-on invocation log.
+- `_emulation/docs/JOURNAL.md` — this Step 97 entry appended.
+

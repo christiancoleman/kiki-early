@@ -34,9 +34,7 @@ def _load_libegl():
 
 
 def _load_libgles_raw():
-    """Load libGLESv2 with raw ctypes bindings for functions where PyOpenGL's
-    Python-side converters misbehave (compressed textures: NumberHandler vs
-    ArrayHandler bug on the imageSize parameter)."""
+    """JOURNAL Step 97e."""
     lib = ctypes.CDLL(ctypes.util.find_library("GLESv2") or "libGLESv2.so.2",
                       mode=ctypes.RTLD_GLOBAL)
     lib.glCompressedTexImage2D.argtypes = [
@@ -183,6 +181,7 @@ class Renderer:
         self._GL.glClear(mask)
 
     def execute_clear_color(self, r: float, g: float, b: float, a: float) -> None:
+        # JOURNAL Step 97 — SPIKE3_FORCE_MAGENTA_CLEAR diagnostic
         if self._force_magenta:
             r, g, b, a = 1.0, 0.0, 1.0, 1.0
         self._GL.glClearColor(r, g, b, a)
@@ -198,19 +197,18 @@ class Renderer:
 
     def execute_read_pixels(self, x: int, y: int, w: int, h: int,
                             fmt: int, typ: int) -> bytes:
-        # Diagnostic: every Nth read, scan ALL known FBOs (0, 1, 2, 3, 4)
-        # and report which one(s) have non-black content. Tells us if we're
-        # reading from the right framebuffer.
+        # JOURNAL Step 97 — FBO_SCAN diagnostic
         self._read_count = getattr(self, "_read_count", 0) + 1
         if self._read_count <= 4 or (self._read_count & 63) == 0:
             self._scan_all_fbos_for_content(x, y, w, h)
         return bytes(self._GL.glReadPixels(x, y, w, h, fmt, typ))
 
     def _scan_all_fbos_for_content(self, x, y, w, h):
+        # JOURNAL Step 97g/97h/97j — FBO target/completeness/content probe
         GL = self._GL
-        prev_read = GL.glGetIntegerv(0x8CAA)  # GL_READ_FRAMEBUFFER_BINDING
-        prev_draw = GL.glGetIntegerv(0x8CA6)  # GL_DRAW_FRAMEBUFFER_BINDING
-        # Write-then-read sanity check on fb=1 + GL state probe.
+        # GL_READ_FRAMEBUFFER_BINDING=0x8CAA, GL_DRAW_FRAMEBUFFER_BINDING=0x8CA6 per ES3 spec Table 6.21
+        prev_read = GL.glGetIntegerv(0x8CAA)
+        prev_draw = GL.glGetIntegerv(0x8CA6)
         try:
             GL.glBindFramebuffer(0x8D40, 1)
             _ = GL.glGetError()
@@ -392,6 +390,7 @@ class Renderer:
         self._GL.glUniform1i(location, value)
 
     def uniform_4f(self, location: int, v0: float, v1: float, v2: float, v3: float) -> None:
+        # JOURNAL Step 97i — vec4 uniform value log
         self._u4f_count = getattr(self, "_u4f_count", 0) + 1
         if self._u4f_count <= 16 or (self._u4f_count & 63) == 0:
             self.log.info("u4f #%d loc=%d (%.2g, %.2g, %.2g, %.2g)",
@@ -418,7 +417,8 @@ class Renderer:
         self._GL.glDrawElements(mode, count, typ, ctypes.c_void_p(offset))
 
     def enable(self, cap: int) -> None:
-        if self._disable_blend and cap == 0x0BE2:  # GL_BLEND
+        # JOURNAL Step 97 — SPIKE3_DISABLE_BLEND attract-rendering workaround
+        if self._disable_blend and cap == 0x0BE2:
             return
         self._GL.glEnable(cap)
     def disable(self, cap: int) -> None:   self._GL.glDisable(cap)
@@ -444,8 +444,10 @@ class Renderer:
     def active_texture(self, unit: int) -> None:  self._GL.glActiveTexture(unit)
     def bind_texture(self, target: int, tex: int) -> None: self._GL.glBindTexture(target, tex)
     def tex_image_2d(self, target, level, internal_format, w, h, border, fmt, typ, data: bytes) -> None:
+        # JOURNAL Step 97 — SPIKE3_VIDEO_TESTPATTERN diagnostic; constants per ES2/3 spec Table 3.1
+        GL_RGBA, GL_UNSIGNED_BYTE = 0x1908, 0x1401
         if (data and w >= 256 and h >= 256
-                and fmt == 0x1908 and typ == 0x1401
+                and fmt == GL_RGBA and typ == GL_UNSIGNED_BYTE
                 and self._test_pattern):
             import numpy as np
             yy, xx = np.indices((h, w))
@@ -474,10 +476,7 @@ class Renderer:
         self._GL.glDeleteFramebuffers(len(ids), ids)
         for i in ids: self._tracked["framebuffers"].discard(int(i))
     def bind_framebuffer(self, target: int, fb: int) -> None:
-        # Temporary unthrottled trace — confirms ground-truth FBO sequence the
-        # daemon executes (vs the shim's throttled trace). Look for fb=0 binds
-        # during attract; their presence would prove the game switched to the
-        # default framebuffer and our frame_cap is reading the wrong target.
+        # JOURNAL Step 97h — unthrottled bind trace
         self._bind_fb_count = getattr(self, "_bind_fb_count", 0) + 1
         tname = {0x8D40: "FB", 0x8CA8: "READ", 0x8CA9: "DRAW"}.get(target, "?")
         self.log.info("bind_fb #%d: %s fb=%d", self._bind_fb_count, tname, fb)
@@ -534,8 +533,7 @@ class Renderer:
     def vertex_attrib_i_pointer(self, idx, size, typ, stride, offset) -> None:
         self._GL.glVertexAttribIPointer(idx, size, typ, stride, ctypes.c_void_p(offset))
     def clear_buffer_fv(self, buffer: int, drawbuffer: int, vals: list) -> None:
-        # GL_COLOR = 0x1800; only override colour-buffer clears, leave depth
-        # (GL_DEPTH=0x1801) / stencil (0x1802) values alone.
+        # JOURNAL Step 97 — SPIKE3_FORCE_MAGENTA_CLEAR; GL_COLOR=0x1800 per ES3 spec Table 4.5
         if self._force_magenta and buffer == 0x1800:
             vals = [1.0, 0.0, 1.0, 1.0]
         self._GL.glClearBufferfv(buffer, drawbuffer, vals)
@@ -556,10 +554,7 @@ class Renderer:
     def tex_storage_3d(self, target, levels, internal, w, h, d) -> None:
         self._GL.glTexStorage3D(target, levels, internal, w, h, d)
     def compressed_tex_image_2d(self, target, level, internal, w, h, border, data: bytes) -> None:
-        # Bypass PyOpenGL — its CompressedImageConverter resolves the
-        # imageSize argument to a NumberHandler that has no arrayByteCount
-        # method, raising AttributeError on every DXT5 upload. Call
-        # libGLESv2's symbol directly via ctypes.
+        # JOURNAL Step 97e
         if data:
             c_buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
             self._libGLESv2.glCompressedTexImage2D(
@@ -579,14 +574,12 @@ class Renderer:
                 target, level, x, y, w, h, fmt, 0, None)
 
     def blit_framebuffer(self, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filt) -> None:
+        # JOURNAL Step 97 — diagnostic count + force-magenta short-circuit
         self._blit_count = getattr(self, "_blit_count", 0) + 1
         if self._blit_count <= 8 or (self._blit_count & 1023) == 0:
             self.log.info("blit #%d: src=(%d,%d,%d,%d) dst=(%d,%d,%d,%d) mask=0x%x",
                           self._blit_count, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask)
         if self._force_magenta:
-            # Skip the actual blit so any magenta we cleared into the destination
-            # FBO survives. If attract was being blacked-out by a blit-from-black,
-            # this will let the magenta show through.
             return
         self._GL.glBlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filt)
     def draw_range_elements(self, mode, start, end, count, typ, offset) -> None:
@@ -611,9 +604,7 @@ class Renderer:
     def uniform_xfv(self, n_per_elem: int, fn, loc, count, data: bytes) -> None:
         import numpy as np
         floats = np.frombuffer(data, dtype=np.float32, count=count * n_per_elem)
-        # Log vec4 uniform sets so we can spot any "(_, _, _, 0)" patterns
-        # (alpha-killing) — Stern's colorTransformMultiply is a vec4. Sample
-        # first 8 + every 64th of vec4 sets for visibility without spam.
+        # JOURNAL Step 97i — vec4 uniform value log (alpha-channel inspection)
         if n_per_elem == 4:
             self._uxfv4_count = getattr(self, "_uxfv4_count", 0) + 1
             if self._uxfv4_count <= 16 or (self._uxfv4_count & 63) == 0:

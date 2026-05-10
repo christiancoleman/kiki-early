@@ -429,11 +429,7 @@ void shim_frame_capture_at_page_flip(void) {
         }
 
         if (verbose_d) {
-            /* Sniff the captured frame so the user-visible "black screen"
-             * symptom can be confirmed (or refuted) from logs alone. Sample
-             * 256 pixels at a stride; count near-black ones. ≥250/256 = the
-             * frame really is empty. <250 = there IS content reaching the
-             * viewer; the visual problem is downstream (viewer / format). */
+            /* JOURNAL Step 97 — near_black sniff */
             int near_black = 0;
             int sampled = 0;
             if (sent && shim_frame_buf) {
