@@ -8895,3 +8895,144 @@ These are present in `gl_daemon.py` and `shim_gl.c` / `shim_bridges.c` and have 
 - `.claude/hooks/quirk_detector.py` — `_trace_invocation` always-on invocation log.
 - `_emulation/docs/JOURNAL.md` — this Step 97 entry appended.
 
+
+## Step 98: Atomic Horizon blend-state fix — ignore bogus zero/zero blend factors, preserve alpha compositing (2026-05-10)
+
+Continuation of Step 97. Treat the Step 97 hypotheses as suspect historical context only: this session re-tested the rendering failure from the user-visible symptoms and from fresh daemon logs. The final fix was smaller than the earlier investigation implied: when the game/renderer sends `glBlendFunc(GL_ZERO, GL_ZERO)` under `GL_DAEMON=1`, the daemon should not apply that state literally, and should not disable blending either. It should preserve the last valid alpha blend factors.
+
+### 98a — Repro automation: host-side Service Back at T+60s
+
+The user's visual repro depends on a manual interaction: with `TIMER=ON`, wait until the Service Menu is visible, then press Service Back around T+60s so the game transitions into attract mode. To make this testable without the Tk TIMER UI, `run_game.sh` gained an opt-in host-side auto-press helper:
+
+```bash
+SHIM_AUTO_PRESS=1
+SHIM_AUTO_PRESS_DELAY_S=60
+SHIM_AUTO_PRESS_SW_ID=93
+SHIM_AUTO_PRESS_LABEL="Service Back"
+```
+
+The helper writes the same file that `marker_button.py` writes:
+
+```text
+_emulation/runs/latest/press_request.txt
+```
+
+The existing `shim_manual_press_thread` then consumes the request and drives the switch. Verified in automated 80s daemon runs:
+
+- `runs/2026-05-10T11.13.29_auto_service_back_zero_blend` — `SPIKE3_ZERO_BLEND_DISABLE=1`, old behavior at first.
+- `runs/2026-05-10T11.15.13_auto_service_back_blend_enabled` — no zero-blend workaround.
+- `runs/2026-05-10T11.21.52_auto_service_back_zero_blend_ignore` — experimental ignore-zero-blend behavior.
+- `runs/2026-05-10T11.23.55_auto_service_back_zero_blend` — compatibility run using the existing flag name after the fix.
+
+In each automated run, the game log showed:
+
+```text
+[auto_press] T+60s PRESS Service Back sw_id=93 -> .../runs/latest/press_request.txt
+[shim] [manual_press] sw_id=93 ch=0 byte=1 bit=3
+```
+
+The press landed roughly 70-120 ms after the file write. The attract-mode scene dump also appeared after the press, proving the automated path exercised the same transition the user had been testing by hand.
+
+### 98b — Symptom split clarified the real blend-state problem
+
+User-reported visual matrix after Step 97 work:
+
+| Mode | User-visible behavior |
+|---|---|
+| `GL_DAEMON=1`, normal blend | Text/service menu mostly correct, but after Service Back the attract mode renders black / nothing. |
+| `GL_DAEMON=1`, old `SPIKE3_ZERO_BLEND_DISABLE=1` behavior | Attract content becomes visible, but fonts/images show alpha artifacts: white text rectangles and black square backgrounds. Later text improved after uniform marshal fixes, but image alpha boxes remained. |
+
+Fresh daemon logs explain both sides of that matrix:
+
+- Normal blend run (`2026-05-10T11.15.13_auto_service_back_blend_enabled`) reached attract and then sampled draw calls like:
+
+```text
+draw #13312 ... blend=1 func=(0x0,0x0,0x0,0x0)
+```
+
+With blending enabled, `glBlendFunc(0,0)` computes `src * 0 + dst * 0`, so draws produce black/transparent output. This matches "attract displays nothing."
+
+- Old workaround run (`2026-05-10T11.13.29_auto_service_back_zero_blend`) changed those intervals to:
+
+```text
+draw #13312 ... blend=0 func=(0x0,0x0,0x0,0x0)
+```
+
+This prevented the black wipe, but disabling `GL_BLEND` makes alpha textures draw as opaque RGBA. That exactly matches the remaining artifacts: fonts and images draw, but their transparent pixels become visible rectangles or black backgrounds depending on the uploaded RGB under alpha-zero texels.
+
+Texture sampling supported this interpretation. Font/UI atlas uploads intentionally contain many texels like white RGB with alpha 0 (`rgb_when_a0 > 0`), so disabling blending is guaranteed to expose boxes. The texture data was not the primary bug; the daemon's handling of bad blend state was.
+
+### 98c — Fix: ignore `glBlendFunc(0,0)` and keep the previous valid blend factors
+
+The successful experimental mode was:
+
+```bash
+SPIKE3_ZERO_BLEND_IGNORE=1
+```
+
+Implementation in `gl_daemon.py`:
+
+- If `glBlendFunc(0,0)` arrives, return without calling host GL.
+- If `glBlendFuncSeparate(0,0,0,0)` arrives, return without calling host GL.
+- Leave `GL_BLEND` enabled.
+- Leave the previous valid blend factors active, normally:
+
+```text
+GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA
+```
+
+The final compatibility behavior maps the user's existing flag to this safer mode:
+
+```bash
+SPIKE3_ZERO_BLEND_DISABLE=1
+```
+
+now means "ignore zero/zero blend factors and preserve alpha compositing" by default. The old behavior remains available only for comparison:
+
+```bash
+SPIKE3_ZERO_BLEND_MODE=disable
+```
+
+The final compatibility run (`runs/2026-05-10T11.23.55_auto_service_back_zero_blend`) confirmed that after Service Back and attract startup, sampled draw calls stayed on the correct alpha blend state:
+
+```text
+draw #12288 ... blend=1 func=(0x302,0x303,0x302,0x303)
+draw #13312 ... blend=1 func=(0x302,0x303,0x302,0x303)
+draw #14336 ... blend=1 func=(0x302,0x303,0x302,0x303)
+...
+```
+
+`0x302` = `GL_SRC_ALPHA`; `0x303` = `GL_ONE_MINUS_SRC_ALPHA`. This is the expected compositing mode for sprites, font atlases, and RGBA video/UI textures.
+
+### 98d — Program-binary hypothesis closed as not causal
+
+During the search, `glProgramBinary` / `glGetProgramBinary` diagnostics were added because Step 97 left open the possibility that precompiled shader binaries bypassed the shader-source rewrite or linked a different program path. The observed diagnostics did not support that theory:
+
+- `glProgramBinary` calls were real.
+- Binary-touched programs reported `GL_LINK_STATUS=0`.
+- No real binary-touched program was later used for the problematic draw stream.
+
+This made program binaries a false lead for the alpha/attract regression.
+
+### 98e — Current operational command
+
+For GL-daemon runs with the fix:
+
+```bash
+GL_DAEMON=1 SPIKE3_ZERO_BLEND_DISABLE=1 ./run_game.sh
+```
+
+For deterministic test/repro without TIMER:
+
+```bash
+GL_DAEMON=1 SPIKE3_ZERO_BLEND_DISABLE=1 \
+SHIM_AUTO_PRESS=1 SHIM_AUTO_PRESS_DELAY_S=60 SHIM_AUTO_PRESS_SW_ID=93 \
+TIMEOUT=80 ./run_game.sh --debug --note visual_zero_blend_fix
+```
+
+### Touched
+
+- `_emulation/run_game.sh` — added `SHIM_AUTO_PRESS` helper, defaulting to Service Back (`sw_id=93`) at T+60s, and recorded its final values in `run_info.txt`.
+- `_emulation/gl_daemon.py` — added zero-blend modes. `SPIKE3_ZERO_BLEND_DISABLE=1` now defaults to preserving the last valid blend factors by ignoring `glBlendFunc(0,0)` / `glBlendFuncSeparate(0,0,0,0)`; `SPIKE3_ZERO_BLEND_MODE=disable` preserves the old "disable GL_BLEND" behavior for comparison.
+- `_emulation/shim_gl.c` / `_emulation/gl_daemon.py` — retained RGBA upload sampling and program-binary diagnostics used to close false leads during this investigation.
+- `_emulation/docs/JOURNAL.md` — this Step 98 entry appended.

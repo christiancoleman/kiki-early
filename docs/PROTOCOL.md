@@ -1435,7 +1435,7 @@ Each BO is registered in a side-table (32 slots, mutex-guarded) holding its `(wi
 |---|---|---|
 | Stub | `REAL_GL=0 GL_DAEMON=0 ./run_game.sh` | Every GLES/EGL/GBM call returns plausible defaults. Shaders "compile". Draws are no-op. Produces no real pixels |
 | Mesa-aarch64 overlay (default) | `./run_game.sh` (default) | `FWD_RET` / `FWD_VOID` macros tail-call `dlsym(RTLD_NEXT, ...)` into the Mesa overlay at `mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/`. Game's EGL/GLES calls run inside qemu-aarch64 against an in-process Mesa → llvmpipe → a real EGL pbuffer (1920×1080) |
-| Host-native daemon | `GL_DAEMON=1 ./run_game.sh` | Shim's GL/EGL hooks marshal opcodes over abstract AF_UNIX `@spike3_gl` to `gl_daemon.py` running natively on the host. Daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context and replays opcodes via PyOpenGL. EGL setup is synthesized in-shim (FAKE_EGL_* sentinels). See "Host-native GL daemon" subsection below |
+| Host-native daemon | `GL_DAEMON=1 SPIKE3_ZERO_BLEND_DISABLE=1 ./run_game.sh` | Shim's GL/EGL hooks marshal opcodes over abstract AF_UNIX `@spike3_gl` to `gl_daemon.py` running natively on the host. Daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context and replays opcodes via PyOpenGL. EGL setup is synthesized in-shim (FAKE_EGL_* sentinels). `SPIKE3_ZERO_BLEND_DISABLE=1` preserves alpha compositing when the game sends zero/zero blend factors. See "Host-native GL daemon" subsection below |
 
 #### Cross-backend translation glue
 
@@ -1457,9 +1457,15 @@ Tracks `libEGL` / `libGLES` / `libgbm` handles. Substitutes the shim's 3 EGLImag
 
 When `GL_DAEMON=1` is exported (forwarded to qemu env as `SPIKE3_GL_DAEMON=1`), the shim's GL/EGL hooks marshal opcodes to `gl_daemon.py` over abstract AF_UNIX `@spike3_gl` instead of forwarding to the in-process Mesa overlay. The daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context (config `0x31DD`) and replays opcodes via PyOpenGL; `glReadPixels` round-trips ship RGBA bytes back to the shim for the frame bridge. `run_game.sh` spawns `gl_daemon.py` alongside `decode_daemon.py`; logs at `runs/<TS>/gl_daemon.log`.
 
+Current verified Pokémon LE game-run command:
+
+```bash
+GL_DAEMON=1 SPIKE3_ZERO_BLEND_DISABLE=1 ./run_game.sh
+```
+
 #### Wire protocol
 
-Header is 8 bytes little-endian: `{u16 op, u16 flags, u32 payload_len}` + payload. Flags: bit 0 = SYNC, bit 1 = HAS_DATA. Sync ops carry typed replies (`REP_OK`, `REP_VALUE`, `REP_LOC`, `REP_IDS`, `REP_PIXELS`, `REP_ERR`). Async ops are fire-and-forget. ~50 opcodes cover EGL setup, GL state, object lifecycle, upload, draw + sync, uniforms, replies.
+Header is 8 bytes little-endian: `{u16 op, u16 flags, u32 payload_len}` + payload. Flags: bit 0 = SYNC, bit 1 = HAS_DATA. Sync ops carry typed replies (`REP_OK`, `REP_VALUE`, `REP_LOC`, `REP_IDS`, `REP_PIXELS`, `REP_ERR`). Async ops are fire-and-forget. The opcode set covers EGL setup, GL state, object lifecycle, upload, draw + sync, uniforms, replies, and readback.
 
 #### Shim-side EGL synthesis
 
@@ -1473,17 +1479,32 @@ Daemon's `Renderer` tracks every id it hands out (programs, shaders, buffers, va
 
 `glMapBufferRange` / `glUnmapBuffer` cannot round-trip a host pointer. The shim instead allocates per-target scratch buffers (`shim_gl_map_table[8]`), returns the scratch pointer to the game, and on `glUnmapBuffer` with `GL_MAP_WRITE_BIT` set marshals the scratch contents via `OP_GL_BUFFER_SUB_DATA(target, offset, len, scratch)`.
 
+#### Zero/zero blend-factor handling
+
+During GL-daemon game runs, the renderer receives repeated `glBlendFunc(GL_ZERO, GL_ZERO)` calls. Applying that state literally keeps `GL_BLEND` enabled but makes subsequent draws compute `src * 0 + dst * 0`, which renders the attract scene black. Disabling `GL_BLEND` instead makes the scene visible but draws RGBA textures opaquely, exposing alpha-zero texels as black/white rectangular backgrounds around images and fonts.
+
+The verified daemon behavior is to ignore zero/zero blend-factor updates and leave the previous valid alpha blend state active:
+
+```text
+GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA
+```
+
+`SPIKE3_ZERO_BLEND_DISABLE=1` selects this behavior by default. The name is historical; it no longer disables `GL_BLEND` unless `SPIKE3_ZERO_BLEND_MODE=disable` is also set. `SPIKE3_ZERO_BLEND_IGNORE=1` is an explicit synonym for the default fixed behavior.
+
 #### Diagnostic env vars (opt-in)
 
 | Env | Effect |
 |---|---|
-| `SPIKE3_DISABLE_BLEND=1` | Daemon's `Renderer.enable` ignores `glEnable(GL_BLEND)` |
+| `SPIKE3_ZERO_BLEND_DISABLE=1` | Ignore `glBlendFunc(0,0)` / `glBlendFuncSeparate(0,0,0,0)` and keep the previous valid alpha blend factors active. Current verified daemon game-run setting |
+| `SPIKE3_ZERO_BLEND_IGNORE=1` | Explicit synonym for the fixed zero-blend behavior |
+| `SPIKE3_ZERO_BLEND_MODE=disable` | Restore the older comparison behavior: apply zero/zero factors, then temporarily disable `GL_BLEND` until the next nonzero blend function |
+| `SPIKE3_DISABLE_BLEND=1` | Diagnostic only: daemon's `Renderer.enable` ignores `glEnable(GL_BLEND)` globally |
 | `SPIKE3_FORCE_MAGENTA_CLEAR=1` | Daemon overrides `glClearColor` / `glClearBufferfv` (color variant) to `(1, 0, 1, 1)`; short-circuits `glBlitFramebuffer` |
 | `SPIKE3_VIDEO_TESTPATTERN=1` | Daemon replaces RGBA uploads ≥256×256 with a hot-pink/green checkerboard |
 
 `gl_daemon.py` also emits opt-in throttled logging for `glBindFramebuffer`, `glDrawArrays`/`glDrawElements`, `glBlendFunc`/`Separate`, `glBlitFramebuffer`, `glUniform4f`, `glUniform4fv`, `glProgramBinary`/`glGetProgramBinary`, plus an `FBO_SCAN` diagnostic that samples 8 pixels of fb=0..20 on every Nth `glReadPixels` for content sniffing.
 
-*Verified by:* JOURNAL Step 96.1 (Phase 1–3c shim → daemon → Mesa pipeline + four self-contained probes `gles_probe3..6`), Step 96.2 (Phase 3d EGLImage marshal + frame-capture relay + `Renderer.reset`), Step 97 (Phase 3d game-run iteration: 97a EGL hook coverage, 97b query hook coverage, 97c ES3 context, 97d `glMapBufferRange` shadow buffer, 97e compressed-tex ctypes bypass, 97f full `comm -23` symbol audit closed).
+*Verified by:* JOURNAL Step 96.1 (Phase 1–3c shim → daemon → Mesa pipeline + four self-contained probes `gles_probe3..6`), Step 96.2 (Phase 3d EGLImage marshal + frame-capture relay + `Renderer.reset`), Step 97 (Phase 3d game-run iteration: 97a EGL hook coverage, 97b query hook coverage, 97c ES3 context, 97d `glMapBufferRange` shadow buffer, 97e compressed-tex ctypes bypass, 97f full `comm -23` symbol audit closed), Step 98 plus `runs/2026-05-10T11.23.55_auto_service_back_zero_blend/gl_daemon.log` (`draw #12288` onward remains `blend=1 func=(0x302,0x303,0x302,0x303)` after Service Back).
 
 ### Capture pipeline
 
@@ -2072,18 +2093,18 @@ When the daemon is unreachable, `avcodec_send_packet` / `avcodec_receive_frame` 
 
 ### Host-native GL daemon (host Mesa)
 
-The game's GL/EGL traffic can be routed to a host-native daemon over an abstract AF_UNIX socket. Active iff `GL_DAEMON=1` (forwarded as `SPIKE3_GL_DAEMON=1`); falls back to the in-process Mesa overlay path otherwise. See §10 "Host-native GL daemon" for full wire protocol + EGL synthesis + diagnostic env knobs.
+The game's GL/EGL traffic can be routed to a host-native daemon over an abstract AF_UNIX socket. Active iff `GL_DAEMON=1` (forwarded as `SPIKE3_GL_DAEMON=1`); falls back to the in-process Mesa overlay path otherwise. Current verified game-run command is `GL_DAEMON=1 SPIKE3_ZERO_BLEND_DISABLE=1 ./run_game.sh`. See §10 "Host-native GL daemon" for full wire protocol + EGL synthesis + zero-blend handling.
 
 | Component | File | Role |
 |---|---|---|
 | Shim marshaller | `_emulation/shim_gl_marshal.c` | `shim_gl_marshal_active()` (lazy connect with 3× retry + dlsym fallback), `_send_async()`, `_send_sync()` with mutex |
-| Wire format | `_emulation/gl_proto.h` (C) + `_emulation/gl_proto.py` (Python) | 8-byte LE header `{u16 op, u16 flags, u32 payload_len}` + payload, ~50 opcodes |
+| Wire format | `_emulation/gl_proto.h` (C) + `_emulation/gl_proto.py` (Python) | 8-byte LE header `{u16 op, u16 flags, u32 payload_len}` + payload; opcode set covers EGL setup, state, objects, uploads, uniforms, draws, sync replies, and readback |
 | Host daemon | `_emulation/gl_daemon.py` | `Renderer` binds `EGL_PLATFORM_SURFACELESS_MESA` ES3 context (config `0x31DD`) and replays opcodes via PyOpenGL; `Session` is single-client; `Renderer.reset()` runs on every bind after the first. Compressed-tex uploads bypass PyOpenGL's `CompressedImageConverter` and call `libGLESv2.so.2` via raw ctypes |
 | Launcher | `_emulation/run_game.sh` | When `GL_DAEMON=1`, spawns daemon before qemu and forwards `SPIKE3_GL_DAEMON=1` into game env |
 
-Coverage as of JOURNAL Step 97f: `comm -23` of every `gl*` / `egl*` symbol referenced in `game.elf` against `nm -D spi_shim.so` exports returns no rows — every gl/egl entry-point the game can call has a hook with a marshal path.
+Coverage as of JOURNAL Step 97f: `comm -23` of every `gl*` / `egl*` symbol referenced in `game.elf` against `nm -D spi_shim.so` exports returns no rows — every gl/egl entry-point the game can call has a hook with a marshal path. Step 98 verified Pokémon LE attract after Service Back with daemon-mode alpha compositing preserved by the zero-blend handler.
 
-*Verified by:* JOURNAL Step 96.1 (initial stack landing — shim → daemon → host Mesa pipeline), Step 96.2 (frame-capture relay + `Renderer.reset` + EGLImage marshal), Step 97f (full game-vs-shim symbol audit + closed coverage gaps).
+*Verified by:* JOURNAL Step 96.1 (initial stack landing — shim → daemon → host Mesa pipeline), Step 96.2 (frame-capture relay + `Renderer.reset` + EGLImage marshal), Step 97f (full game-vs-shim symbol audit + closed coverage gaps), Step 98 plus `runs/2026-05-10T11.23.55_auto_service_back_zero_blend`.
 
 ### Runtime binary patches (`shim_patches.c`)
 
@@ -2243,4 +2264,3 @@ The DisplayRenderer / SceneCache / RadiumScene / proc-system / node-bus / SPI / 
 Each Spike 3 game ships its own set of node firmware `.hex` files (the per-family files described in §11). Firmware versions vary across game releases — Pokémon LE 0.81 ships `1_31_0` for every node family; other Spike 3 titles will likely ship different versions. The shim's FE-probe synth reads version bytes from the loaded firmware records at runtime (`shim_nodebus.c::nodebus_version_for_slot()` walks `data_44df838`, mirrors `sub_8f88b0`'s simple/complex path logic), so the same shim source works across games without per-version updates as long as the loader's record format stays stable.
 
 *Verified by:* JOURNAL Step 92 — runtime version-byte probe of all 6 loaded records in PLE 0.81 producing `(V1, V2, V3, V0)` matching the shipped `1_31_0` filenames; shim implementation in `shim_nodebus.c::nodebus_version_for_slot()`.
-

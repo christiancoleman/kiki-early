@@ -73,6 +73,19 @@ class Renderer:
         self._disable_blend = os.environ.get("SPIKE3_DISABLE_BLEND", "0") == "1"
         if self._disable_blend:
             self.log.info("SPIKE3_DISABLE_BLEND=1 — glEnable(GL_BLEND) silently ignored")
+        zero_blend_requested = os.environ.get("SPIKE3_ZERO_BLEND_DISABLE", "0") == "1"
+        zero_blend_mode = os.environ.get("SPIKE3_ZERO_BLEND_MODE", "")
+        if os.environ.get("SPIKE3_ZERO_BLEND_IGNORE", "0") == "1":
+            zero_blend_mode = "ignore"
+        if zero_blend_requested and not zero_blend_mode:
+            zero_blend_mode = "ignore"
+        self._zero_blend_disables = zero_blend_mode == "disable"
+        self._zero_blend_ignores = zero_blend_mode == "ignore"
+        self._zero_blend_suppressed = False
+        if self._zero_blend_ignores:
+            self.log.info("SPIKE3_ZERO_BLEND_IGNORE=1 — glBlendFunc(0,0) leaves prior blend factors active")
+        if self._zero_blend_disables:
+            self.log.info("SPIKE3_ZERO_BLEND_DISABLE=1 — glBlendFunc(0,0) temporarily disables GL_BLEND")
         self._tracked = {k: set() for k in
                          ("programs", "shaders", "buffers", "vaos",
                           "textures", "framebuffers")}
@@ -405,27 +418,73 @@ class Renderer:
     def draw_arrays(self, mode: int, first: int, count: int) -> None:
         self._draw_count += 1
         if self._draw_count <= 16 or (self._draw_count & 1023) == 0:
-            self.log.info("draw #%d: glDrawArrays(mode=0x%x, count=%d)",
-                          self._draw_count, mode, count)
+            self.log.info("draw #%d: glDrawArrays(mode=0x%x, count=%d) %s",
+                          self._draw_count, mode, count, self._blend_state_summary())
         self._GL.glDrawArrays(mode, first, count)
 
     def draw_elements(self, mode: int, count: int, typ: int, offset: int) -> None:
         self._draw_count += 1
         if self._draw_count <= 16 or (self._draw_count & 1023) == 0:
-            self.log.info("draw #%d: glDrawElements(mode=0x%x, count=%d)",
-                          self._draw_count, mode, count)
+            self.log.info("draw #%d: glDrawElements(mode=0x%x, count=%d) %s",
+                          self._draw_count, mode, count, self._blend_state_summary())
         self._GL.glDrawElements(mode, count, typ, ctypes.c_void_p(offset))
+
+    def _blend_state_summary(self) -> str:
+        GL = self._GL
+        try:
+            enabled = int(bool(GL.glIsEnabled(0x0BE2)))   # GL_BLEND
+            src_rgb = int(GL.glGetIntegerv(0x80C9))       # GL_BLEND_SRC_RGB
+            dst_rgb = int(GL.glGetIntegerv(0x80C8))       # GL_BLEND_DST_RGB
+            src_a = int(GL.glGetIntegerv(0x80CB))         # GL_BLEND_SRC_ALPHA
+            dst_a = int(GL.glGetIntegerv(0x80CA))         # GL_BLEND_DST_ALPHA
+            eq_rgb = int(GL.glGetIntegerv(0x8009))        # GL_BLEND_EQUATION_RGB
+            eq_a = int(GL.glGetIntegerv(0x883D))          # GL_BLEND_EQUATION_ALPHA
+            return (f"blend={enabled} func=(0x{src_rgb:x},0x{dst_rgb:x},"
+                    f"0x{src_a:x},0x{dst_a:x}) eq=(0x{eq_rgb:x},0x{eq_a:x})")
+        except Exception as e:
+            return f"blend_state_error={type(e).__name__}:{e}"
 
     def enable(self, cap: int) -> None:
         # JOURNAL Step 97 — SPIKE3_DISABLE_BLEND attract-rendering workaround
         if self._disable_blend and cap == 0x0BE2:
             return
+        if cap == 0x0BE2:
+            self._blend_toggle_count = getattr(self, "_blend_toggle_count", 0) + 1
+            if self._blend_toggle_count <= 64 or (self._blend_toggle_count & 255) == 0:
+                self.log.info("blend_toggle #%d: glEnable(GL_BLEND) before %s",
+                              self._blend_toggle_count, self._blend_state_summary())
         self._GL.glEnable(cap)
-    def disable(self, cap: int) -> None:   self._GL.glDisable(cap)
+    def disable(self, cap: int) -> None:
+        if cap == 0x0BE2:
+            self._blend_toggle_count = getattr(self, "_blend_toggle_count", 0) + 1
+            if self._blend_toggle_count <= 64 or (self._blend_toggle_count & 255) == 0:
+                self.log.info("blend_toggle #%d: glDisable(GL_BLEND) before %s",
+                              self._blend_toggle_count, self._blend_state_summary())
+        self._GL.glDisable(cap)
     def blend_func(self, s: int, d: int) -> None:
         self._blend_count = getattr(self, "_blend_count", 0) + 1
         if self._blend_count <= 32 or (self._blend_count & 255) == 0:
             self.log.info("blend #%d: glBlendFunc(0x%x, 0x%x)", self._blend_count, s, d)
+        if self._zero_blend_ignores and s == 0 and d == 0:
+            if self._blend_count <= 128 or (self._blend_count & 255) == 0:
+                self.log.info("zero_blend_ignore: ignored glBlendFunc(0,0) at blend #%d", self._blend_count)
+            return
+        if self._zero_blend_disables:
+            if s == 0 and d == 0:
+                self._GL.glBlendFunc(s, d)
+                if self._GL.glIsEnabled(0x0BE2):
+                    if self._blend_count <= 128 or (self._blend_count & 255) == 0:
+                        self.log.info("zero_blend_disable: disabling GL_BLEND at blend #%d", self._blend_count)
+                    self._GL.glDisable(0x0BE2)
+                    self._zero_blend_suppressed = True
+                return
+            if self._zero_blend_suppressed:
+                self._GL.glBlendFunc(s, d)
+                if self._blend_count <= 128 or (self._blend_count & 255) == 0:
+                    self.log.info("zero_blend_disable: re-enabling GL_BLEND at blend #%d", self._blend_count)
+                self._GL.glEnable(0x0BE2)
+                self._zero_blend_suppressed = False
+                return
         self._GL.glBlendFunc(s, d)
     def depth_func(self, f: int) -> None:  self._GL.glDepthFunc(f)
     def depth_mask(self, m: int) -> None:  self._GL.glDepthMask(bool(m))
@@ -443,9 +502,52 @@ class Renderer:
         for i in ids: self._tracked["textures"].discard(int(i))
     def active_texture(self, unit: int) -> None:  self._GL.glActiveTexture(unit)
     def bind_texture(self, target: int, tex: int) -> None: self._GL.glBindTexture(target, tex)
+    def _log_rgba_sample(self, label: str, seq: int, w: int, h: int, data: bytes) -> None:
+        if not data or w <= 0 or h <= 0:
+            return
+        stride = w * 4
+        need = stride * h
+        if len(data) < need:
+            self.log.info(
+                "tex_alpha %s #%d %dx%d len=%d need=%d SHORT",
+                label, seq, w, h, len(data), need,
+            )
+            return
+        step_y = max(1, h // 64)
+        step_x = max(1, w // 64)
+        a0 = a255 = amid = rgb_when_a0 = samples = 0
+        for y in range(0, h, step_y):
+            row = y * stride
+            for x in range(0, w, step_x):
+                off = row + x * 4
+                r, g, b, a = data[off], data[off + 1], data[off + 2], data[off + 3]
+                if a == 0:
+                    a0 += 1
+                    if r or g or b:
+                        rgb_when_a0 += 1
+                elif a == 255:
+                    a255 += 1
+                else:
+                    amid += 1
+                samples += 1
+        def px(x: int, y: int):
+            off = y * stride + x * 4
+            return tuple(data[off:off + 4])
+        self.log.info(
+            "tex_alpha %s #%d %dx%d len=%d sample=%d a0=%d a255=%d amid=%d rgb_when_a0=%d "
+            "first=%s mid=%s last=%s",
+            label, seq, w, h, len(data), samples, a0, a255, amid, rgb_when_a0,
+            px(0, 0), px(w // 2, h // 2), px(w - 1, h - 1),
+        )
+
     def tex_image_2d(self, target, level, internal_format, w, h, border, fmt, typ, data: bytes) -> None:
         # JOURNAL Step 97 — SPIKE3_VIDEO_TESTPATTERN diagnostic; constants per ES2/3 spec Table 3.1
         GL_RGBA, GL_UNSIGNED_BYTE = 0x1908, 0x1401
+        if data and fmt == GL_RGBA and typ == GL_UNSIGNED_BYTE:
+            self._tex_image_sample_count = getattr(self, "_tex_image_sample_count", 0) + 1
+            n = self._tex_image_sample_count
+            if n <= 64 or (n & 255) == 0:
+                self._log_rgba_sample("tex_image_2d", n, w, h, data)
         if (data and w >= 256 and h >= 256
                 and fmt == GL_RGBA and typ == GL_UNSIGNED_BYTE
                 and self._test_pattern):
@@ -461,6 +563,11 @@ class Renderer:
         self._GL.glTexImage2D(target, level, internal_format, w, h, border, fmt, typ,
                               data if data else None)
     def tex_sub_image_2d(self, target, level, x, y, w, h, fmt, typ, data: bytes) -> None:
+        if data and fmt == 0x1908 and typ == 0x1401:
+            self._tex_sub_image_sample_count = getattr(self, "_tex_sub_image_sample_count", 0) + 1
+            n = self._tex_sub_image_sample_count
+            if n <= 64 or (n & 255) == 0:
+                self._log_rgba_sample("tex_sub_image_2d", n, w, h, data)
         self._GL.glTexSubImage2D(target, level, x, y, w, h, fmt, typ,
                                  data if data else None)
     def tex_parameter_i(self, target: int, pname: int, param: int) -> None:
@@ -493,6 +600,27 @@ class Renderer:
         if self._blend_count <= 32 or (self._blend_count & 255) == 0:
             self.log.info("blend #%d: glBlendFuncSeparate(0x%x, 0x%x, 0x%x, 0x%x)",
                           self._blend_count, srcRGB, dstRGB, srcA, dstA)
+        if self._zero_blend_ignores and srcRGB == 0 and dstRGB == 0 and srcA == 0 and dstA == 0:
+            if self._blend_count <= 128 or (self._blend_count & 255) == 0:
+                self.log.info("zero_blend_ignore: ignored glBlendFuncSeparate(0,0,0,0) at blend #%d",
+                              self._blend_count)
+            return
+        if self._zero_blend_disables:
+            if srcRGB == 0 and dstRGB == 0 and srcA == 0 and dstA == 0:
+                self._GL.glBlendFuncSeparate(srcRGB, dstRGB, srcA, dstA)
+                if self._GL.glIsEnabled(0x0BE2):
+                    if self._blend_count <= 128 or (self._blend_count & 255) == 0:
+                        self.log.info("zero_blend_disable: disabling GL_BLEND at blend #%d", self._blend_count)
+                    self._GL.glDisable(0x0BE2)
+                    self._zero_blend_suppressed = True
+                return
+            if self._zero_blend_suppressed:
+                self._GL.glBlendFuncSeparate(srcRGB, dstRGB, srcA, dstA)
+                if self._blend_count <= 128 or (self._blend_count & 255) == 0:
+                    self.log.info("zero_blend_disable: re-enabling GL_BLEND at blend #%d", self._blend_count)
+                self._GL.glEnable(0x0BE2)
+                self._zero_blend_suppressed = False
+                return
         self._GL.glBlendFuncSeparate(srcRGB, dstRGB, srcA, dstA)
     def blend_equation(self, mode: int) -> None: self._GL.glBlendEquation(mode)
     def blend_equation_separate(self, modeRGB, modeA) -> None: self._GL.glBlendEquationSeparate(modeRGB, modeA)

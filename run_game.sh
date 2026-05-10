@@ -17,6 +17,10 @@
 #                                   line to runs/latest/game.log on each press.
 #                                   Lets you correlate "I heard X" with the
 #                                   shim's interleaved log output.
+#   SHIM_AUTO_PRESS=<0|1>   [0]     schedule one host-side switch press request
+#                                   without the TIMER UI. Defaults to Service
+#                                   Back at T+60s when enabled; override with
+#                                   SHIM_AUTO_PRESS_DELAY_S / _SW_ID / _LABEL.
 #   BOOT_DISPLAY=<0|1>      [1]     run spike3/bin/boot_display for ~1.5 s
 #                                   pre-game, then kill it (mimics
 #                                   etc/init.d/game_monitor). Lets boot_display
@@ -175,6 +179,10 @@ export SHIM_SELECT_PRESS_ATTEMPTS="${SHIM_SELECT_PRESS_ATTEMPTS:-4}"
 export SHIM_SELECT_PRESS_MS="${SHIM_SELECT_PRESS_MS:-500}"
 export SHIM_SWITCH_TABLE_PROBE="${SHIM_SWITCH_TABLE_PROBE:-1}"
 export SHIM_SWITCH_TABLE_PROBE_DELAY_S="${SHIM_SWITCH_TABLE_PROBE_DELAY_S:-65}"
+export SHIM_AUTO_PRESS="${SHIM_AUTO_PRESS:-0}"
+export SHIM_AUTO_PRESS_DELAY_S="${SHIM_AUTO_PRESS_DELAY_S:-60}"
+export SHIM_AUTO_PRESS_SW_ID="${SHIM_AUTO_PRESS_SW_ID:-93}"
+export SHIM_AUTO_PRESS_LABEL="${SHIM_AUTO_PRESS_LABEL:-Service Back}"
 
 # ---- Derived ----
 SHIM="$SCRIPT_DIR/spi_shim.so"
@@ -420,9 +428,9 @@ if [[ "$GL_DAEMON" == "1" ]]; then
         python3 -u "$SCRIPT_DIR/gl_daemon.py" \
             >"$gl_daemon_log_target" 2>&1 &
         HELPER_PIDS+=("$!"); HELPER_LABELS+=("gl daemon")
-        printf '[run_game] spawned gl daemon (pid %d) — log %s\n' \
-            "$!" "$gl_daemon_log_target" >&2
-        sleep 0.3
+        #printf '[run_game] spawned gl daemon (pid %d) — log %s\n' \
+            #"$!" "$gl_daemon_log_target" >&2
+        #sleep 0.3
     else
         printf '[run_game] GL_DAEMON=1 but python3 not found; skipping\n' >&2
     fi
@@ -441,6 +449,25 @@ if [[ "$TIMER" == "ON" ]]; then
     else
         printf '[run_game] TIMER=ON but python3 not found; skipping marker button\n' >&2
     fi
+fi
+
+if [[ "$SHIM_AUTO_PRESS" == "1" ]]; then
+    (
+        sleep "$SHIM_AUTO_PRESS_DELAY_S"
+        request_path="$SCRIPT_DIR/runs/latest/press_request.txt"
+        printf '%s\n' "$SHIM_AUTO_PRESS_SW_ID" > "$request_path"
+        if [[ -f "$GAME_DBG_LOG" ]]; then
+            printf '%s - [auto_press] T+%ss PRESS %s sw_id=%s -> %s\n' \
+                "$(date '+%Y/%m/%d - %H:%M:%S.%3N')" \
+                "$SHIM_AUTO_PRESS_DELAY_S" \
+                "$SHIM_AUTO_PRESS_LABEL" \
+                "$SHIM_AUTO_PRESS_SW_ID" \
+                "$request_path" >> "$GAME_DBG_LOG"
+        fi
+    ) &
+    HELPER_PIDS+=("$!"); HELPER_LABELS+=("auto press")
+    printf '[run_game] scheduled auto press: %s sw_id=%s at T+%ss\n' \
+        "$SHIM_AUTO_PRESS_LABEL" "$SHIM_AUTO_PRESS_SW_ID" "$SHIM_AUTO_PRESS_DELAY_S" >&2
 fi
 
 
@@ -538,7 +565,9 @@ fi
     for v in TIMEOUT REAL_GL FRAME_BRIDGE AUDIO_BRIDGE FORWARD_DECODE GL_DAEMON \
              SPI_QUIET SPI_DELAY_US STATE_BRIDGE OFFLINE_MODE \
              VIEWER VIEWER_FULLSCREEN AUDIO_PLAYER TIMER  BOOT_DISPLAY \
-             BOOT_DISPLAY_DURATION STALE_KILL DEBUG LOGFILE; do
+             BOOT_DISPLAY_DURATION STALE_KILL SHIM_AUTO_PRESS \
+             SHIM_AUTO_PRESS_DELAY_S SHIM_AUTO_PRESS_SW_ID \
+             SHIM_AUTO_PRESS_LABEL DEBUG LOGFILE; do
         printf '  %-22s = %s\n' "$v" "${!v:-}"
     done
     printf '\n# qemu invocation\n'

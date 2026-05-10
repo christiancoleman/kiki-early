@@ -911,6 +911,44 @@ static inline unsigned shim_demote_external_oes(unsigned target) {
     return (target == 0x8D65) ? 0x0DE1 : target;
 }
 
+static void shim_log_rgba_sample(const char *tag, unsigned long seq,
+                                 int w, int h, int stride,
+                                 const uint8_t *data) {
+    if (!data || w <= 0 || h <= 0 || stride <= 0) return;
+    int tight = w * 4;
+    uint64_t a0 = 0, a255 = 0, amid = 0, rgb_when_a0 = 0;
+    uint64_t samples = 0;
+    int step_y = h > 64 ? h / 64 : 1;
+    int step_x = w > 64 ? w / 64 : 1;
+    for (int y = 0; y < h; y += step_y) {
+        const uint8_t *row = data + (size_t)y * (size_t)stride;
+        for (int x = 0; x < w; x += step_x) {
+            const uint8_t *p = row + (size_t)x * 4;
+            if (p[3] == 0) {
+                a0++;
+                if (p[0] || p[1] || p[2]) rgb_when_a0++;
+            } else if (p[3] == 255) {
+                a255++;
+            } else {
+                amid++;
+            }
+            samples++;
+        }
+    }
+    const uint8_t *first = data;
+    const uint8_t *mid = data + (size_t)(h / 2) * (size_t)stride + (size_t)(w / 2) * 4;
+    const uint8_t *last = data + (size_t)(h - 1) * (size_t)stride + (size_t)(w - 1) * 4;
+    SHIM_LOG("[tex_alpha] %s #%lu %dx%d stride=%d tight=%d sample=%lu "
+             "a0=%lu a255=%lu amid=%lu rgb_when_a0=%lu "
+             "first=(%02x,%02x,%02x,%02x) mid=(%02x,%02x,%02x,%02x) last=(%02x,%02x,%02x,%02x)",
+             tag, seq, w, h, stride, tight, (unsigned long)samples,
+             (unsigned long)a0, (unsigned long)a255, (unsigned long)amid,
+             (unsigned long)rgb_when_a0,
+             first[0], first[1], first[2], first[3],
+             mid[0], mid[1], mid[2], mid[3],
+             last[0], last[1], last[2], last[3]);
+}
+
 /* Counter-based EGLImage sentinel. Earlier versions used malloc(1) which
  * caused address reuse after eglDestroyImageKHR's free() — the game's
  * FUN_01df8b40 cache check (`if (cached == new) return;`) then false-hit
@@ -1049,8 +1087,9 @@ void glEGLImageTargetTexture2DOES(unsigned target, void *image) {
             ? __atomic_add_fetch(&n_video,    1, __ATOMIC_RELAXED)
             : __atomic_add_fetch(&n_nonvideo, 1, __ATOMIC_RELAXED);
         if (n <= 8 || (n & 255) == 0) {
-            SHIM_LOG("glEGLImageTargetTexture2DOES #%lu (%s) -> daemon: %dx%d dsz=%zu",
-                     n, rgba_ptr ? "VIDEO" : "non-video", w, h, dsz);
+            SHIM_LOG("glEGLImageTargetTexture2DOES #%lu (%s) -> daemon: %dx%d stride=%d tight=%d dsz=%zu",
+                     n, rgba_ptr ? "VIDEO" : "non-video", w, h, stride, w * 4, dsz);
+            if (rgba_ptr) shim_log_rgba_sample("egl_image_src", n, w, h, stride, rgba_ptr);
         }
         unsigned char *buf = (unsigned char*)malloc(plen);
         if (buf) {
@@ -1059,7 +1098,19 @@ void glEGLImageTargetTexture2DOES(unsigned target, void *image) {
             r->internal_format = 0x8058; r->width = w; r->height = h;
             r->border = 0; r->format = 0x1908; r->type = 0x1401;
             r->data_size = (uint32_t)dsz;
-            if (rgba_ptr && dsz) memcpy(buf + sizeof(*r), rgba_ptr, dsz);
+            if (rgba_ptr && dsz) {
+                unsigned char *dst = buf + sizeof(*r);
+                int src_stride = stride > 0 ? stride : w * 4;
+                if (src_stride == w * 4) {
+                    memcpy(dst, rgba_ptr, dsz);
+                } else {
+                    for (int y = 0; y < h; y++) {
+                        memcpy(dst + (size_t)y * (size_t)w * 4,
+                               rgba_ptr + (size_t)y * (size_t)src_stride,
+                               (size_t)w * 4);
+                    }
+                }
+            }
             shim_gl_marshal_send_async(GL_OP_GL_TEX_IMAGE_2D, buf, (uint32_t)plen);
             free(buf);
         }
@@ -1183,6 +1234,7 @@ static int stub_eglClientWaitSyncKHR(void *display, void *sync, int flags, uint6
 #define GL_INFO_LOG_LENGTH       0x8B84
 #define GL_ACTIVE_UNIFORMS       0x8B86
 #define GL_ACTIVE_ATTRIBUTES     0x8B89
+#define GL_PROGRAM_BINARY_LENGTH 0x8741
 #define GL_MAX_TEXTURE_SIZE      0x0D33
 #define GL_MAX_VIEWPORT_DIMS     0x0D3A
 #define GL_MAX_TEXTURE_IMAGE_UNITS 0x8872
@@ -1195,6 +1247,102 @@ static uint32_t gl_next_rb_id      = 1;
 static uint32_t gl_next_vao_id     = 1;
 static uint32_t gl_next_shader_id  = 1;
 static uint32_t gl_next_program_id = 1;
+
+#define SHIM_PROGRAM_BINARY_TRACK_MAX 64
+
+struct shim_program_binary_track {
+    unsigned program;
+    unsigned fmt;
+    int length;
+    int attempts;
+    int link_count;
+    int use_logged;
+    int last_link_status;
+    int last_binary_length;
+};
+
+static struct shim_program_binary_track shim_program_binary_track[SHIM_PROGRAM_BINARY_TRACK_MAX];
+static pthread_mutex_t shim_program_binary_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct shim_program_binary_track *shim_program_binary_find_locked(unsigned program) {
+    if (program == 0) return NULL;
+    for (int i = 0; i < SHIM_PROGRAM_BINARY_TRACK_MAX; i++) {
+        if (shim_program_binary_track[i].program == program) return &shim_program_binary_track[i];
+    }
+    return NULL;
+}
+
+static void shim_program_binary_note_attempt(unsigned program, unsigned fmt, int length) {
+    if (program == 0) return;
+    pthread_mutex_lock(&shim_program_binary_lock);
+    struct shim_program_binary_track *slot = shim_program_binary_find_locked(program);
+    if (!slot) {
+        for (int i = 0; i < SHIM_PROGRAM_BINARY_TRACK_MAX; i++) {
+            if (shim_program_binary_track[i].program == 0) {
+                slot = &shim_program_binary_track[i];
+                slot->program = program;
+                slot->last_link_status = -1;
+                slot->last_binary_length = -1;
+                break;
+            }
+        }
+    }
+    if (slot) {
+        slot->fmt = fmt;
+        slot->length = length;
+        slot->attempts++;
+        slot->use_logged = 0;
+    }
+    pthread_mutex_unlock(&shim_program_binary_lock);
+}
+
+static int shim_program_binary_note_link(unsigned program, int *attempts_out) {
+    int tracked = 0;
+    pthread_mutex_lock(&shim_program_binary_lock);
+    struct shim_program_binary_track *slot = shim_program_binary_find_locked(program);
+    if (slot) {
+        tracked = 1;
+        slot->link_count++;
+        if (attempts_out) *attempts_out = slot->attempts;
+    }
+    pthread_mutex_unlock(&shim_program_binary_lock);
+    return tracked;
+}
+
+static int shim_program_binary_note_use(unsigned program,
+                                        int *attempts_out, int *link_count_out,
+                                        int *last_link_status_out,
+                                        int *last_binary_length_out) {
+    int should_log = 0;
+    pthread_mutex_lock(&shim_program_binary_lock);
+    struct shim_program_binary_track *slot = shim_program_binary_find_locked(program);
+    if (slot && !slot->use_logged) {
+        slot->use_logged = 1;
+        should_log = 1;
+        if (attempts_out) *attempts_out = slot->attempts;
+        if (link_count_out) *link_count_out = slot->link_count;
+        if (last_link_status_out) *last_link_status_out = slot->last_link_status;
+        if (last_binary_length_out) *last_binary_length_out = slot->last_binary_length;
+    }
+    pthread_mutex_unlock(&shim_program_binary_lock);
+    return should_log;
+}
+
+static int shim_program_binary_note_programiv(unsigned program, unsigned pname, int value,
+                                              int *attempts_out, int *link_count_out) {
+    int tracked = 0;
+    pthread_mutex_lock(&shim_program_binary_lock);
+    struct shim_program_binary_track *slot = shim_program_binary_find_locked(program);
+    if (slot) {
+        tracked = 1;
+        if (pname == GL_LINK_STATUS) slot->last_link_status = value;
+        if (pname == GL_PROGRAM_BINARY_LENGTH) slot->last_binary_length = value;
+        if (attempts_out) *attempts_out = slot->attempts;
+        if (link_count_out) *link_count_out = slot->link_count;
+    }
+    pthread_mutex_unlock(&shim_program_binary_lock);
+    return tracked;
+}
 
 /* Logging is selective — GL calls can be extremely high-volume during
  * draw. Only the first N of each kind, and first-time calls for creation
@@ -1606,6 +1754,13 @@ void glTexImage2D(unsigned target, int level, int internalfmt,
             r->width = w; r->height = h; r->border = border;
             r->format = format; r->type = type; r->data_size = (uint32_t)dsz;
             if (data && dsz) memcpy(buf + sizeof(*r), data, dsz);
+            if (data && format == 0x1908 && type == 0x1401) {
+                static unsigned long n = 0;
+                unsigned long c = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
+                if (c <= 32 || (c & 255) == 0)
+                    shim_log_rgba_sample("tex_image_2d_arg", c, w, h, w * 4,
+                                         (const uint8_t *)data);
+            }
             shim_gl_marshal_send_async(GL_OP_GL_TEX_IMAGE_2D, buf, (uint32_t)plen);
             free(buf);
         }
@@ -1633,6 +1788,13 @@ void glTexSubImage2D(unsigned target, int level, int xoff, int yoff,
             r->width = w; r->height = h;
             r->format = format; r->type = type; r->data_size = (uint32_t)dsz;
             if (data && dsz) memcpy(buf + sizeof(*r), data, dsz);
+            if (data && format == 0x1908 && type == 0x1401) {
+                static unsigned long n = 0;
+                unsigned long c = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
+                if (c <= 32 || (c & 255) == 0)
+                    shim_log_rgba_sample("tex_sub_image_2d_arg", c, w, h, w * 4,
+                                         (const uint8_t *)data);
+            }
             shim_gl_marshal_send_async(GL_OP_GL_TEX_SUB_IMAGE_2D, buf, (uint32_t)plen);
             free(buf);
         }
@@ -1974,6 +2136,11 @@ void glDetachShader(unsigned program, unsigned shader) {
 }
 void glLinkProgram(unsigned program) {
     if (shim_gl_marshal_active()) {
+        int attempts = 0;
+        if (shim_program_binary_note_link(program, &attempts)) {
+            SHIM_LOG("[program_binary] glLinkProgram(prog=%u) after %d glProgramBinary attempt(s)",
+                     program, attempts);
+        }
         struct gl_payload_id_op req = { program };
         shim_gl_marshal_send_async(GL_OP_GL_LINK_PROGRAM, &req, sizeof(req));
         return;
@@ -1993,6 +2160,12 @@ void glValidateProgram(unsigned program) {
 void glUseProgram(unsigned program) {
     SHIM_GL_DBG_HOOK(glUseProgram);
     if (shim_gl_marshal_active()) {
+        int attempts = 0, link_count = 0, last_link_status = -1, last_binary_length = -1;
+        if (shim_program_binary_note_use(program, &attempts, &link_count,
+                                         &last_link_status, &last_binary_length)) {
+            SHIM_LOG("[program_binary] glUseProgram(prog=%u) uses binary-touched program: attempts=%d later_links=%d last_link_status=%d last_binary_len=%d",
+                     program, attempts, link_count, last_link_status, last_binary_length);
+        }
         struct gl_payload_id_op req = { program };
         shim_gl_marshal_send_async(GL_OP_GL_USE_PROGRAM, &req, sizeof(req));
         return;
@@ -2028,6 +2201,13 @@ void glGetProgramiv(unsigned program, unsigned pname, int *params) {
         int rep_op = shim_gl_marshal_send_sync(GL_OP_GL_GET_PROGRAM_IV, &req, sizeof(req),
                                                 &reply, sizeof(reply), &rl);
         *params = (rep_op == GL_OP_REP_VALUE) ? (int)reply.value : 0;
+        int attempts = 0, link_count = 0;
+        if (shim_program_binary_note_programiv(program, pname, *params,
+                                               &attempts, &link_count) &&
+            (pname == GL_LINK_STATUS || pname == GL_PROGRAM_BINARY_LENGTH || pname == GL_INFO_LOG_LENGTH)) {
+            SHIM_LOG("[program_binary] glGetProgramiv(prog=%u, pname=0x%x) -> %d (attempts=%d later_links=%d)",
+                     program, pname, *params, attempts, link_count);
+        }
         return;
     }
     FWD_VOID(glGetProgramiv, (unsigned, unsigned, int*), (program, pname, params));
@@ -3188,8 +3368,9 @@ void glGetProgramBinary(unsigned program, int bufSize, int *length,
 void glProgramBinary(unsigned program, unsigned binaryFormat,
                      const void *binary, int length) {
     static int log_set = 0;
+    shim_program_binary_note_attempt(program, binaryFormat, length);
     if (log_set < 32) {
-        SHIM_LOG("[program_binary] glProgramBinary(prog=%u, fmt=0x%x, len=%d) #%d",
+        SHIM_LOG("[program_binary] glProgramBinary(prog=%u, fmt=0x%x, len=%d) #%d (no-op; tracking future link/use)",
                  program, binaryFormat, length, ++log_set);
     }
     (void)program; (void)binaryFormat; (void)binary; (void)length;
@@ -3239,4 +3420,3 @@ void (*eglGetProcAddress(const char *name))(void) {
     SHIM_LOG("eglGetProcAddress(\"%s\") -> NULL (no stub)", name);
     return NULL;
 }
-
