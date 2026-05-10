@@ -1435,7 +1435,7 @@ Each BO is registered in a side-table (32 slots, mutex-guarded) holding its `(wi
 |---|---|---|
 | Stub | `REAL_GL=0 GL_DAEMON=0 ./run_game.sh` | Every GLES/EGL/GBM call returns plausible defaults. Shaders "compile". Draws are no-op. Produces no real pixels |
 | Mesa-aarch64 overlay (default) | `./run_game.sh` (default) | `FWD_RET` / `FWD_VOID` macros tail-call `dlsym(RTLD_NEXT, ...)` into the Mesa overlay at `mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/`. Game's EGL/GLES calls run inside qemu-aarch64 against an in-process Mesa → llvmpipe → a real EGL pbuffer (1920×1080) |
-| Host-native daemon | `GL_DAEMON=1 SPIKE3_ZERO_BLEND_DISABLE=1 ./run_game.sh` | Shim's GL/EGL hooks marshal opcodes over abstract AF_UNIX `@spike3_gl` to `gl_daemon.py` running natively on the host. Daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context and replays opcodes via PyOpenGL. EGL setup is synthesized in-shim (FAKE_EGL_* sentinels). `SPIKE3_ZERO_BLEND_DISABLE=1` preserves alpha compositing when the game sends zero/zero blend factors. See "Host-native GL daemon" subsection below |
+| Host-native daemon | `GL_DAEMON=1 ./run_game.sh` | Shim's GL/EGL hooks marshal opcodes over abstract AF_UNIX `@spike3_gl` to `gl_daemon.py` running natively on the host. Daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context and replays opcodes via PyOpenGL. EGL setup is synthesized in-shim (FAKE_EGL_* sentinels). `run_game.sh` auto-enables the alpha-preserving zero-blend behavior unless overridden. See "Host-native GL daemon" subsection below |
 
 #### Cross-backend translation glue
 
@@ -1460,7 +1460,7 @@ When `GL_DAEMON=1` is exported (forwarded to qemu env as `SPIKE3_GL_DAEMON=1`), 
 Current verified Pokémon LE game-run command:
 
 ```bash
-GL_DAEMON=1 SPIKE3_ZERO_BLEND_DISABLE=1 ./run_game.sh
+GL_DAEMON=1 ./run_game.sh
 ```
 
 #### Wire protocol
@@ -1489,13 +1489,13 @@ The verified daemon behavior is to ignore zero/zero blend-factor updates and lea
 GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA
 ```
 
-`SPIKE3_ZERO_BLEND_DISABLE=1` selects this behavior by default. The name is historical; it no longer disables `GL_BLEND` unless `SPIKE3_ZERO_BLEND_MODE=disable` is also set. `SPIKE3_ZERO_BLEND_IGNORE=1` is an explicit synonym for the default fixed behavior.
+`SPIKE3_ZERO_BLEND_DISABLE=1` selects this behavior by default. The name is historical; it no longer disables `GL_BLEND` unless `SPIKE3_ZERO_BLEND_MODE=disable` is also set. `run_game.sh` auto-exports `SPIKE3_ZERO_BLEND_DISABLE=1` when `GL_DAEMON=1`, unless `SPIKE3_ZERO_BLEND_DISABLE`, `SPIKE3_ZERO_BLEND_IGNORE`, or `SPIKE3_ZERO_BLEND_MODE` was already supplied by the caller. `SPIKE3_ZERO_BLEND_IGNORE=1` is an explicit synonym for the default fixed behavior.
 
 #### Diagnostic env vars (opt-in)
 
 | Env | Effect |
 |---|---|
-| `SPIKE3_ZERO_BLEND_DISABLE=1` | Ignore `glBlendFunc(0,0)` / `glBlendFuncSeparate(0,0,0,0)` and keep the previous valid alpha blend factors active. Current verified daemon game-run setting |
+| `SPIKE3_ZERO_BLEND_DISABLE=1` | Ignore `glBlendFunc(0,0)` / `glBlendFuncSeparate(0,0,0,0)` and keep the previous valid alpha blend factors active. Current verified daemon game-run setting; auto-enabled by `run_game.sh` for `GL_DAEMON=1` unless overridden |
 | `SPIKE3_ZERO_BLEND_IGNORE=1` | Explicit synonym for the fixed zero-blend behavior |
 | `SPIKE3_ZERO_BLEND_MODE=disable` | Restore the older comparison behavior: apply zero/zero factors, then temporarily disable `GL_BLEND` until the next nonzero blend function |
 | `SPIKE3_DISABLE_BLEND=1` | Diagnostic only: daemon's `Renderer.enable` ignores `glEnable(GL_BLEND)` globally |
@@ -2094,7 +2094,7 @@ When the daemon is unreachable, `avcodec_send_packet` / `avcodec_receive_frame` 
 
 ### Host-native GL daemon (host Mesa)
 
-The game's GL/EGL traffic can be routed to a host-native daemon over an abstract AF_UNIX socket. Active iff `GL_DAEMON=1` (forwarded as `SPIKE3_GL_DAEMON=1`); falls back to the in-process Mesa overlay path otherwise. Current verified game-run command is `GL_DAEMON=1 SPIKE3_ZERO_BLEND_DISABLE=1 ./run_game.sh`. See §10 "Host-native GL daemon" for full wire protocol + EGL synthesis + zero-blend handling.
+The game's GL/EGL traffic can be routed to a host-native daemon over an abstract AF_UNIX socket. Active iff `GL_DAEMON=1` (forwarded as `SPIKE3_GL_DAEMON=1`); falls back to the in-process Mesa overlay path otherwise. Current verified game-run command is `GL_DAEMON=1 ./run_game.sh`; `run_game.sh` auto-enables the zero-blend fix unless overridden. See §10 "Host-native GL daemon" for full wire protocol + EGL synthesis + zero-blend handling.
 
 | Component | File | Role |
 |---|---|---|

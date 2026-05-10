@@ -98,6 +98,7 @@ extern volatile uint8_t shim_spi_rx_extra[8];
  * SPIKE3_DECODER_PATCH=0 for debugging only. Called from shim_inject.c's
  * deferred-init thread (after game-base is resolvable). */
 void shim_patch_get_format_callback(void);
+void shim_patch_channel1_derived_switches(void);
 
 /* ---- Signal handlers (defined in shim_diagnostics.c; registered by
  *      shim_install_crash_handler in spi_shim.c) ---- */

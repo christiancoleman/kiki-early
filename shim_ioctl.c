@@ -169,6 +169,38 @@ static uint32_t drm_next_fb_id = 100;
 
 volatile uint8_t shim_spi_rx_extra[8] = {0};
 
+static int shim_spi_fill_channel0_idle_rx(uint8_t *rx, uint32_t len) {
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base || !rx || len == 0) return 0;
+
+    uint8_t idle[8];
+    memcpy(idle, (const void *)(uintptr_t)(game_base + 0x44804d0ULL), 8);
+    int nonzero = 0;
+    for (int i = 0; i < 8; i++) nonzero |= idle[i];
+    if (!nonzero) return 0;
+
+    /* sub_8fa820 stores DAT_0450d9b0 byte N from SPI rx[N-1].
+     * DAT byte 0 is a separate zero-initialized stack byte, so rx[7] is
+     * ignored for channel-0 switch translation. */
+    for (uint32_t dat_i = 1; dat_i < 8 && dat_i - 1 < len; dat_i++)
+        rx[dat_i - 1] = idle[dat_i];
+
+    static uint8_t last_logged[8];
+    static int logged = 0;
+    if (!logged || memcmp(last_logged, idle, sizeof(idle)) != 0) {
+        memcpy(last_logged, idle, sizeof(idle));
+        logged = 1;
+        SHIM_LOG("[spi] channel0 idle RX source DAT=%02x %02x %02x %02x %02x %02x %02x %02x -> rx=%02x %02x %02x %02x %02x %02x %02x %02x",
+                 idle[0], idle[1], idle[2], idle[3],
+                 idle[4], idle[5], idle[6], idle[7],
+                 len > 0 ? rx[0] : 0, len > 1 ? rx[1] : 0,
+                 len > 2 ? rx[2] : 0, len > 3 ? rx[3] : 0,
+                 len > 4 ? rx[4] : 0, len > 5 ? rx[5] : 0,
+                 len > 6 ? rx[6] : 0, len > 7 ? rx[7] : 0);
+    }
+    return 1;
+}
+
 /* Synthesize a page-flip completion event on the shim side of the DRM
  * socketpair. Format matches `struct drm_event_vblank` from <drm/drm.h>
  * (32 bytes; libdrm reads the length field to know how much to consume,
@@ -359,7 +391,8 @@ int ioctl(int fd, unsigned long request, ...) {
                         const char *q = getenv("SPIKE3_SPI_QUIET");
                         quiet_cached = (q && q[0] == '1') ? 1 : 0;
                     }
-                    rx[2] = quiet_cached ? 0x00 : 0x04;
+                    if (!quiet_cached && !shim_spi_fill_channel0_idle_rx(rx, len))
+                        rx[2] = 0x04;
                 }
                 for (uint32_t i = 0; i < len && i < 8; i++)
                     rx[i] |= shim_spi_rx_extra[i];
@@ -808,4 +841,3 @@ int ioctl(int fd, unsigned long request, ...) {
 
     return 0;
 }
-

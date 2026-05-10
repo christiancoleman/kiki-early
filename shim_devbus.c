@@ -290,6 +290,14 @@ static void *devbus_writer_thread(void *arg) {
     devbus_client_t *cli = arg;
     SHIM_LOG("[devbus] client connected fd=%d", cli->fd);
 
+    while (!atomic_load_explicit(&g_shadow_seeded, memory_order_acquire) &&
+           atomic_load_explicit(&cli->active, memory_order_acquire)) {
+        struct timespec ts = {0, 50 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+    if (!atomic_load_explicit(&cli->active, memory_order_acquire))
+        goto disconnect;
+
     if (devbus_send_hello(cli) < 0)    goto disconnect;
     if (devbus_send_snapshot(cli) < 0) goto disconnect;
 
@@ -407,6 +415,12 @@ static int devbus_create_listener(const char *abstract_name) {
 }
 
 void shim_devbus_init(void) {
+    const char *gate = getenv("SPIKE3_DEVBUS");
+    if (gate && gate[0] == '0') {
+        SHIM_LOG("[devbus] SPIKE3_DEVBUS=0 — bridge disabled");
+        return;
+    }
+
     g_listen_fd = devbus_create_listener(DEVBUS_SOCKET_NAME);
     if (g_listen_fd < 0) return;
 

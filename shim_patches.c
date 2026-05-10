@@ -131,6 +131,7 @@ void *memcpy(void *dst, const void *src, size_t n) {
  */
 #define GET_FORMAT_BNE_VA   0x920cf0
 #define AARCH64_NOP         0xd503201fu
+#define CHANNEL1_DERIVED_TRANSLATE_VA 0x674cb4
 
 static int shim_decoder_patch_enabled(void) {
     static int cached = -1;
@@ -171,6 +172,38 @@ void shim_patch_get_format_callback(void) {
     *instr = AARCH64_NOP;
     __builtin___clear_cache((char *)instr, (char *)instr + 4);
     SHIM_LOG("[decoder_patch] patched get_format b.ne @ %p: 0x%08x -> 0x%08x (NOP)",
+             (void *)instr, old, (unsigned)AARCH64_NOP);
+}
+
+void shim_patch_channel1_derived_switches(void) {
+    const char *s = getenv("SPIKE3_CHANNEL1_DERIVED");
+    if (s && s[0] == '1') return;
+
+    uintptr_t game_base = shim_resolve_game_base();
+    if (!game_base) {
+        SHIM_LOG("[channel1_patch] game_base unresolved; patch aborted");
+        return;
+    }
+
+    uint32_t *instr = (uint32_t *)(game_base + CHANNEL1_DERIVED_TRANSLATE_VA);
+    uintptr_t page = (uintptr_t)instr & ~(uintptr_t)4095;
+    if (mprotect((void *)page, 8192,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        SHIM_LOG("[channel1_patch] mprotect RWX @ %p failed: %s",
+                 (void *)page, strerror(errno));
+        return;
+    }
+
+    uint32_t old = *instr;
+    if (old != 0x97ff7257u) {
+        SHIM_LOG("[channel1_patch] REFUSED to patch @ %p: expected 0x97ff7257 (bl sub_651610), got 0x%08x",
+                 (void *)instr, old);
+        return;
+    }
+
+    *instr = AARCH64_NOP;
+    __builtin___clear_cache((char *)instr, (char *)instr + 4);
+    SHIM_LOG("[channel1_patch] patched derived channel-1 translate @ %p: 0x%08x -> 0x%08x (NOP)",
              (void *)instr, old, (unsigned)AARCH64_NOP);
 }
 
@@ -369,4 +402,3 @@ void avcodec_flush_buffers(void *avctx) {
     SHIM_LOG("avcodec_flush_buffers (ctx=%p) [forward]", avctx);
     shim_avforward_flush(avctx);
 }
-

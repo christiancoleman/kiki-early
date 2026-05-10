@@ -108,6 +108,9 @@ _HELPER_PATTERNS = (
     r"qemu-aarch64.*LD_PRELOAD",
     r"python3.*frame_viewer\.py",
     r"python3.*audio_subscriber\.py",
+    r"python3.*devbus_subscriber\.py",
+    r"python3.*decode_daemon\.py",
+    r"python3.*gl_daemon\.py",
     r"ffplay.*spike3_audio",
 )
 
@@ -127,13 +130,11 @@ def kill_game(root, status_var):
 
 def _kill_followup(root, status_var):
     try:
-        subprocess.run(["pkill", "-KILL", "-f", r"run_game\.sh"],
-                       capture_output=True, timeout=1)
         for pat in _HELPER_PATTERNS:
             subprocess.run(["pkill", "-KILL", "-f", pat],
                            capture_output=True, timeout=1)
-        status_var.set("SIGKILL'd parent + helpers. Marker closing in 1 s.")
-        append_to_game_log(f"{now_timestamp()} - [marker] KILL: SIGKILL fallback fired\n")
+        status_var.set("SIGKILL'd game/helpers. Parent script will finish diagnostics.")
+        append_to_game_log(f"{now_timestamp()} - [marker] KILL: SIGKILL helpers fallback fired\n")
         root.after(1000, lambda: os._exit(0))
     except Exception as e:
         status_var.set(f"KILL KILL failed: {e}")

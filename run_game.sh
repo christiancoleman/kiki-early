@@ -46,6 +46,17 @@
 #   STATE_BRIDGE=<0|1>      [0]     emit cmode JSON on abstract AF_UNIX socket
 #   LOGFILE=<path>          []      redirect game stdout+stderr to a file
 #                                   (separate from --debug; only affects game)
+#   SWITCH_NOISE_TEST=<auto|0|1> [auto]
+#                                   after the run, analyze devbus.log for
+#                                   same-timestamp watched switch clusters.
+#                                   auto enables when TIMER=ON and DEVBUS_TAIL=1.
+#   SWITCH_NOISE_WATCH=<ids> [77-98]
+#                                   comma/range list passed to
+#                                   switch_noise_test.py --watch.
+#   SWITCH_NOISE_TEST_STRICT=<0|1> [0]
+#                                   if 1, a failed switch-noise test becomes
+#                                   the script exit status when the game itself
+#                                   exited cleanly.
 #   QEMU=<bin>              [qemu-aarch64]     override qemu binary
 #
 # RUN ARCHIVING:
@@ -136,9 +147,19 @@ AUDIO_BRIDGE="${AUDIO_BRIDGE:-1}"
 # propagated to the game.
 FORWARD_DECODE="${FORWARD_DECODE:-1}"
 # GL_DAEMON=1: launch gl_daemon.py and route shim GL/EGL calls to host-native
-# Mesa via abstract AF_UNIX @spike3_gl. Atomic Horizon Phase 1 = log-only;
-# real GL still runs through Mesa overlay via dlsym. Default off until Phase 4.
+# Mesa via abstract AF_UNIX @spike3_gl. Default off; when enabled, default the
+# daemon's zero/zero blend handling to the verified alpha-preserving mode unless
+# the caller explicitly supplied a zero-blend env override.
 GL_DAEMON="${GL_DAEMON:-0}"
+if [[ "$GL_DAEMON" == "1" \
+      && -z "${SPIKE3_ZERO_BLEND_DISABLE+x}" \
+      && -z "${SPIKE3_ZERO_BLEND_IGNORE+x}" \
+      && -z "${SPIKE3_ZERO_BLEND_MODE+x}" ]]; then
+    export SPIKE3_ZERO_BLEND_DISABLE=1
+fi
+export SPIKE3_ZERO_BLEND_DISABLE="${SPIKE3_ZERO_BLEND_DISABLE:-}"
+export SPIKE3_ZERO_BLEND_IGNORE="${SPIKE3_ZERO_BLEND_IGNORE:-}"
+export SPIKE3_ZERO_BLEND_MODE="${SPIKE3_ZERO_BLEND_MODE:-}"
 # SPI_QUIET=1: stop replying byte-2=0x04 ("ack/data-available") to every SPI
 # transfer; instead reply all-zeros. Per-cmd overrides via SPIKE3_SPI_RX_<HEX>=
 # still take precedence.
@@ -154,6 +175,25 @@ VIEWER="${VIEWER:-1}"
 VIEWER_FULLSCREEN="${VIEWER_FULLSCREEN:-0}"
 AUDIO_PLAYER="${AUDIO_PLAYER:-1}"
 TIMER="${TIMER:-OFF}"
+DEVBUS="${DEVBUS:-1}"
+DEVBUS_TAIL="${DEVBUS_TAIL:-auto}"
+if [[ "$DEVBUS_TAIL" == "auto" ]]; then
+    if [[ "$TIMER" == "ON" && "$DEVBUS" == "1" ]]; then
+        DEVBUS_TAIL=1
+    else
+        DEVBUS_TAIL=0
+    fi
+fi
+SWITCH_NOISE_TEST="${SWITCH_NOISE_TEST:-auto}"
+SWITCH_NOISE_WATCH="${SWITCH_NOISE_WATCH:-77-98}"
+SWITCH_NOISE_TEST_STRICT="${SWITCH_NOISE_TEST_STRICT:-0}"
+if [[ "$SWITCH_NOISE_TEST" == "auto" ]]; then
+    if [[ "$TIMER" == "ON" && "$DEVBUS_TAIL" == "1" && "$DEVBUS" == "1" ]]; then
+        SWITCH_NOISE_TEST=1
+    else
+        SWITCH_NOISE_TEST=0
+    fi
+fi
 BOOT_DISPLAY="${BOOT_DISPLAY:-1}"
 BOOT_DISPLAY_DURATION="${BOOT_DISPLAY_DURATION:-3}"
 STALE_KILL="${STALE_KILL:-1}"
@@ -258,7 +298,7 @@ fi
 
 if [[ "$STALE_KILL" == "1" ]]; then
     stale_qemu=$(pgrep -f "qemu-aarch64.*LD_PRELOAD=$SHIM" 2>/dev/null || true)
-    stale_help=$(pgrep -f "$SCRIPT_DIR/(frame_viewer|audio_subscriber|marker_button)\.py" 2>/dev/null || true)
+    stale_help=$(pgrep -f "$SCRIPT_DIR/(frame_viewer|audio_subscriber|marker_button|devbus_subscriber)\.py" 2>/dev/null || true)
     stale_fplay=$(pgrep -f "ffplay.*s16le.*44100" 2>/dev/null || true)
     stale_all="$stale_qemu $stale_help $stale_fplay"
     if [[ -n "${stale_all// }" ]]; then
@@ -451,6 +491,22 @@ if [[ "$TIMER" == "ON" ]]; then
     fi
 fi
 
+if [[ "$DEVBUS_TAIL" == "1" ]]; then
+    if [[ "$DEVBUS" != "1" ]]; then
+        printf '[run_game] DEVBUS_TAIL=1 ignored — DEVBUS=0\n' >&2
+    elif command -v python3 >/dev/null; then
+        devbus_log_target=/dev/null
+        [[ "$DEBUG" == "1" ]] && devbus_log_target="$LATEST_DIR/devbus.log"
+        python3 -u "$SCRIPT_DIR/devbus_subscriber.py" --retry \
+            >"$devbus_log_target" 2>&1 &
+        HELPER_PIDS+=("$!"); HELPER_LABELS+=("devbus tail")
+        printf '[run_game] spawned devbus tail (pid %d) — log %s\n' \
+            "$!" "$devbus_log_target" >&2
+    else
+        printf '[run_game] DEVBUS_TAIL=1 but python3 not found; skipping\n' >&2
+    fi
+fi
+
 if [[ "$SHIM_AUTO_PRESS" == "1" ]]; then
     (
         sleep "$SHIM_AUTO_PRESS_DELAY_S"
@@ -499,6 +555,8 @@ fi
 [[ "$AUDIO_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_AUDIO_BRIDGE=1")
 [[ "$FORWARD_DECODE"   == "1" ]] && args+=(-E "SPIKE3_FORWARD_DECODE=1")
 [[ "$GL_DAEMON"        == "1" ]] && args+=(-E "SPIKE3_GL_DAEMON=1")
+[[ "$DEVBUS"           == "1" ]] && args+=(-E "SPIKE3_DEVBUS=1")
+[[ "$DEVBUS"           == "0" ]] && args+=(-E "SPIKE3_DEVBUS=0")
 [[ "$SPI_QUIET"        == "1" ]] && args+=(-E "SPIKE3_SPI_QUIET=1")
 [[ "$SPI_DELAY_US"     != "0" ]] && args+=(-E "SPIKE3_SPI_DELAY_US=$SPI_DELAY_US")
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")
@@ -563,7 +621,10 @@ fi
     printf '$ %s %s\n' "$0" "$*"
     printf '\n# env-toggle settings (final values)\n'
     for v in TIMEOUT REAL_GL FRAME_BRIDGE AUDIO_BRIDGE FORWARD_DECODE GL_DAEMON \
+             SPIKE3_ZERO_BLEND_DISABLE SPIKE3_ZERO_BLEND_IGNORE SPIKE3_ZERO_BLEND_MODE \
+             DEVBUS DEVBUS_TAIL \
              SPI_QUIET SPI_DELAY_US STATE_BRIDGE OFFLINE_MODE \
+             SWITCH_NOISE_TEST SWITCH_NOISE_WATCH SWITCH_NOISE_TEST_STRICT \
              VIEWER VIEWER_FULLSCREEN AUDIO_PLAYER TIMER  BOOT_DISPLAY \
              BOOT_DISPLAY_DURATION STALE_KILL SHIM_AUTO_PRESS \
              SHIM_AUTO_PRESS_DELAY_S SHIM_AUTO_PRESS_SW_ID \
@@ -632,6 +693,37 @@ case "$GAME_EXIT" in
         ;;
 esac
 printf '[run_game] game exited (status %d — %s)\n' "$GAME_EXIT" "$exit_reason" >&2
-# cleanup_all runs via the EXIT trap; exit with the game's status so
-# callers can still detect timeout (124) or crash.
+
+# Stop helper processes now so post-run analyzers read stable log files.
+cleanup_all
+trap - EXIT INT TERM
+
+SWITCH_NOISE_EXIT=0
+if [[ "$SWITCH_NOISE_TEST" == "1" ]]; then
+    noise_log="$RUN_DIR/switch_noise_test.log"
+    if [[ "$DEVBUS" != "1" || "$DEVBUS_TAIL" != "1" ]]; then
+        printf '[run_game] switch-noise test skipped — requires DEVBUS=1 and DEVBUS_TAIL=1\n' >&2
+        printf '[switch_noise_test] skipped: requires DEVBUS=1 and DEVBUS_TAIL=1\n' >"$noise_log"
+    elif ! command -v python3 >/dev/null; then
+        printf '[run_game] switch-noise test skipped — python3 not found\n' >&2
+        printf '[switch_noise_test] skipped: python3 not found\n' >"$noise_log"
+    else
+        printf '[run_game] running switch-noise test — log %s\n' "$noise_log" >&2
+        if python3 "$SCRIPT_DIR/switch_noise_test.py" \
+                --run-dir "$RUN_DIR" \
+                --watch "$SWITCH_NOISE_WATCH" \
+                >"$noise_log" 2>&1; then
+            printf '[run_game] switch-noise test PASS\n' >&2
+        else
+            SWITCH_NOISE_EXIT=$?
+            printf '[run_game] switch-noise test FAIL — see %s\n' "$noise_log" >&2
+        fi
+    fi
+fi
+
+# Preserve the game's status by default so callers can still detect timeout
+# (124) or crash. Strict mode promotes diagnostic failures on clean game exits.
+if [[ "$SWITCH_NOISE_TEST_STRICT" == "1" && "$GAME_EXIT" == "0" && "$SWITCH_NOISE_EXIT" != "0" ]]; then
+    exit "$SWITCH_NOISE_EXIT"
+fi
 exit "$GAME_EXIT"

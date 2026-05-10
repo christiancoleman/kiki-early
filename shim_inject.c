@@ -49,6 +49,12 @@ sigjmp_buf shim_event_sweep_jmp;
 volatile sig_atomic_t shim_event_fire_in_progress = 0;
 volatile int shim_current_sweep_event_id = -1;
 
+static void shim_copy_channel_state_buffer(uintptr_t game_base,
+                                           uint8_t channel_id,
+                                           uint8_t out[8]);
+static void shim_log_channel_buf(const char *tag, uint8_t channel_id,
+                                 const uint8_t buf[8]);
+
 static uint64_t shim_fire_event(int32_t event_id, int64_t event_data) {
     uintptr_t game_base = shim_resolve_game_base();
     if (!game_base) return (uint64_t)-1;
@@ -170,26 +176,39 @@ void shim_event_sweep(void) {
 
 
 /* Wait until channel-1's saved-state buffer at game_base + 0x44804d0 + 0xb0
- * is non-zero (i.e., FUN_00650f00 has populated it), then write that buffer
- * to DAT_0436b020 so FUN_00674b90's channel-0 path reads back idle bytes
- * instead of zero. Polls every 100 ms with a 30 s timeout. */
+ * is non-zero (i.e., FUN_00650f00 has populated it), then mirror changes to
+ * DAT_0436b020 while the CPU-SPI/channel-1 state machine settles during boot. */
 static void shim_install_channel1_idle(uintptr_t game_base) {
     uint8_t *channel_1_saved = (uint8_t *)(uintptr_t)
         (game_base + 0x44804d0ULL + 0xb0ULL);
     volatile uint64_t *dat_0436b020 = (volatile uint64_t *)(uintptr_t)
         (game_base + 0x436b020ULL);
+    uint64_t last_written = 0;
+    int first_ms = -1;
     for (int i = 0; i < 300; i++) {
-        uint64_t idle_u64;
+        uint64_t idle_u64 = 0;
         memcpy(&idle_u64, channel_1_saved, 8);
         if (idle_u64 != 0) {
-            *dat_0436b020 = idle_u64;
-            SHIM_LOG("[channel1_idle] wrote 0x%016lx to DAT_0436b020 after %dms (FUN_00674b90 spam fix)",
-                     (unsigned long)idle_u64, i * 100);
-            return;
+            if (first_ms < 0) first_ms = i * 100;
+            if (idle_u64 != last_written) {
+                *dat_0436b020 = idle_u64;
+                last_written = idle_u64;
+                SHIM_LOG("[channel1_idle] wrote 0x%016lx to DAT_0436b020 after %dms (FUN_00674b90 spam fix)",
+                         (unsigned long)idle_u64, i * 100);
+            }
+            if (i * 100 >= first_ms + 15000) {
+                SHIM_LOG("[channel1_idle] settled at 0x%016lx after %dms",
+                         (unsigned long)last_written, i * 100);
+                return;
+            }
         }
         usleep(100000);
     }
-    SHIM_LOG("[channel1_idle] gave up after 30s — channel 1 saved state stayed zero");
+    if (last_written)
+        SHIM_LOG("[channel1_idle] stopped monitoring at 0x%016lx after 30s",
+                 (unsigned long)last_written);
+    else
+        SHIM_LOG("[channel1_idle] gave up after 30s — channel 1 saved state stayed zero");
 }
 
 static void *shim_discovery_init_thread(void *arg) {
@@ -203,6 +222,7 @@ static void *shim_discovery_init_thread(void *arg) {
      * — the 2 s sleep above already handles that timing. Default-on; gate
      * via SPIKE3_DECODER_PATCH=0. */
     shim_patch_get_format_callback();
+    shim_patch_channel1_derived_switches();
 
     uintptr_t game_base = shim_resolve_game_base();
     if (game_base) shim_install_channel1_idle(game_base);
@@ -699,53 +719,42 @@ static void *shim_switch_table_probe_thread(void *arg) {
                      round + 1, attempts, sw_id, channel_id, byte_off,
                      (unsigned)(bit_idx & 7), state_before, edge_before);
 
-            if (channel_id == 0 && byte_off >= 1 && byte_off < 8) {
-                /* SPI thread builds DAT_0450d9b0 via
-                 *   CONCAT44(uStack_54, CONCAT13(bStack_55, CONCAT21(uStack_57, local_58)))
-                 * with local_58 zero-init at DAT byte 0:
-                 *   DAT byte 0 = 0 (always)
-                 *   DAT byte N = rx[N-1] for N=1..7   (rx[7] dropped)
-                 *
-                 * Setting rx_extra alone DOES NOT WORK — sub_8fa820 stores
-                 * to DAT_0450d9b0 but never calls translate. The translate
-                 * path (FUN_00674b90 → FUN_008fab80 → FUN_00651610) is only
-                 * invoked from sub_675a10 (one-shot, init-gated) and from
-                 * nodebus init/enum loops. Post-init, no periodic caller.
-                 *
-                 * So we BOTH set rx_extra (in case some path reads
-                 * DAT_0450d9b0) AND call FUN_00674b90(0) directly to force
-                 * a translate(0, ...) cycle that picks up the bit. */
-                int rx_off = byte_off - 1;
-                typedef void (*poll_ch0_fn)(int);
-                poll_ch0_fn poll_ch0 = (poll_ch0_fn)(uintptr_t)
-                    (game_base + 0x674b90ULL);
-
-                SHIM_LOG("[select_press]   PRESS via SPI+poll  (channel-byte=%d → rx[%d] |= 0x%02x; calling FUN_00674b90(0))",
-                         byte_off, rx_off, bit_mask);
-                shim_spi_rx_extra[rx_off] |= bit_mask;
-                usleep(5000);  /* let SPI thread cycle once with new rx */
-                poll_ch0(0);   /* force translate(0, ...) with current DAT_0450d9b0 */
-                usleep((useconds_t)press_ms * 1000);
-                uint16_t edge_during = *(uint16_t *)(e + 0x26);
-                uint8_t  state_during = *(uint8_t *)(e + 0x28);
-                SHIM_LOG("[select_press]   RELEASE  (DURING-press: state=%u edge_cnt=%u)",
-                         state_during, edge_during);
-                shim_spi_rx_extra[rx_off] &= (uint8_t)~bit_mask;
-                usleep(5000);
-                poll_ch0(0);   /* force translate(0, ...) with bit cleared (release edge) */
-            } else if (channel_id != 0) {
+            if (channel_id == 0 && byte_off < 8) {
                 uint8_t buf[8];
-                SHIM_LOG("[select_press]   PRESS via translate(ch=%u, buf[%d]=0x%02x)",
-                         channel_id, byte_off, bit_mask);
-                memset(buf, 0, sizeof(buf));
-                buf[byte_off] = bit_mask;
+                shim_copy_channel_state_buffer(game_base, channel_id, buf);
+                shim_log_channel_buf("[select_press]   ch0 base", channel_id, buf);
+                buf[byte_off] &= (uint8_t)~bit_mask;
+                shim_log_channel_buf("[select_press]   ch0 press", channel_id, buf);
                 translate(channel_id, buf);
                 usleep((useconds_t)press_ms * 1000);
                 uint16_t edge_during = *(uint16_t *)(e + 0x26);
                 uint8_t  state_during = *(uint8_t *)(e + 0x28);
                 SHIM_LOG("[select_press]   RELEASE  (DURING-press: state=%u edge_cnt=%u)",
                          state_during, edge_during);
-                memset(buf, 0, sizeof(buf));
+                shim_copy_channel_state_buffer(game_base, channel_id, buf);
+                buf[byte_off] |= bit_mask;
+                shim_log_channel_buf("[select_press]   ch0 release", channel_id, buf);
+                translate(channel_id, buf);
+            } else if (channel_id != 0) {
+                uint8_t buf[8];
+                if (byte_off >= 8) {
+                    SHIM_LOG("[select_press]   bit_idx=%u out of remote buffer range; skip",
+                             bit_idx);
+                    continue;
+                }
+                shim_copy_channel_state_buffer(game_base, channel_id, buf);
+                shim_log_channel_buf("[select_press]   remote base", channel_id, buf);
+                buf[byte_off] |= bit_mask;
+                shim_log_channel_buf("[select_press]   remote press", channel_id, buf);
+                translate(channel_id, buf);
+                usleep((useconds_t)press_ms * 1000);
+                uint16_t edge_during = *(uint16_t *)(e + 0x26);
+                uint8_t  state_during = *(uint8_t *)(e + 0x28);
+                SHIM_LOG("[select_press]   RELEASE  (DURING-press: state=%u edge_cnt=%u)",
+                         state_during, edge_during);
+                shim_copy_channel_state_buffer(game_base, channel_id, buf);
+                buf[byte_off] &= (uint8_t)~bit_mask;
+                shim_log_channel_buf("[select_press]   remote release", channel_id, buf);
                 translate(channel_id, buf);
             }
 
@@ -1154,6 +1163,22 @@ static void *shim_dispatch_watchdog_thread(void *arg) {
     }
 }
 
+static void shim_copy_channel_state_buffer(uintptr_t game_base,
+                                           uint8_t channel_id,
+                                           uint8_t out[8]) {
+    uintptr_t channel_state = game_base + 0x44804b8ULL
+                            + (uintptr_t)channel_id * 0xb0ULL + 0x20ULL;
+    memcpy(out, (const void *)channel_state, 8);
+}
+
+static void shim_log_channel_buf(const char *tag, uint8_t channel_id,
+                                 const uint8_t buf[8]) {
+    SHIM_LOG("%s ch=%u buf=%02x %02x %02x %02x %02x %02x %02x %02x",
+             tag, channel_id,
+             buf[0], buf[1], buf[2], buf[3],
+             buf[4], buf[5], buf[6], buf[7]);
+}
+
 /* SHIM_MANUAL_PRESS=1 — poll runs/latest/press_request.txt every 200 ms;
  * when the file appears, parse its first int as a runtime sw_id, delete the
  * file, and drive ONE press/release through the same code path that
@@ -1168,8 +1193,6 @@ static void *shim_dispatch_watchdog_thread(void *arg) {
 static void shim_press_one_sw_id(uintptr_t game_base, uint8_t *arr, int sw_id, int press_ms) {
     typedef int64_t (*translate_fn)(uint8_t channel_id, const uint8_t *buffer);
     translate_fn translate = (translate_fn)(game_base + 0x651610);
-    typedef void (*poll_ch0_fn)(int);
-    poll_ch0_fn poll_ch0 = (poll_ch0_fn)(uintptr_t)(game_base + 0x674b90ULL);
 
     uint8_t *e = arr + (size_t)sw_id * 0x30u;
     uint16_t recorded = *(uint16_t *)(e + 0x20);
@@ -1188,21 +1211,33 @@ static void shim_press_one_sw_id(uintptr_t game_base, uint8_t *arr, int sw_id, i
              sw_id, channel_id, byte_off, (unsigned)(bit_idx & 7),
              state_before, edge_before);
 
-    if (channel_id == 0 && byte_off >= 1 && byte_off < 8) {
-        int rx_off = byte_off - 1;
-        shim_spi_rx_extra[rx_off] |= bit_mask;
-        usleep(5000);
-        poll_ch0(0);
-        usleep((useconds_t)press_ms * 1000);
-        shim_spi_rx_extra[rx_off] &= (uint8_t)~bit_mask;
-        usleep(5000);
-        poll_ch0(0);
-    } else if (channel_id != 0) {
-        uint8_t buf[8] = {0};
-        buf[byte_off] = bit_mask;
+    if (channel_id == 0 && byte_off < 8) {
+        uint8_t buf[8];
+        shim_copy_channel_state_buffer(game_base, channel_id, buf);
+        shim_log_channel_buf("[manual_press] ch0 base", channel_id, buf);
+        buf[byte_off] &= (uint8_t)~bit_mask;
+        shim_log_channel_buf("[manual_press] ch0 press", channel_id, buf);
         translate(channel_id, buf);
         usleep((useconds_t)press_ms * 1000);
-        memset(buf, 0, sizeof(buf));
+        shim_copy_channel_state_buffer(game_base, channel_id, buf);
+        buf[byte_off] |= bit_mask;
+        shim_log_channel_buf("[manual_press] ch0 release", channel_id, buf);
+        translate(channel_id, buf);
+    } else if (channel_id != 0) {
+        uint8_t buf[8];
+        if (byte_off >= 8) {
+            SHIM_LOG("[manual_press] bit_idx=%u out of remote buffer range; skip", bit_idx);
+            return;
+        }
+        shim_copy_channel_state_buffer(game_base, channel_id, buf);
+        shim_log_channel_buf("[manual_press] remote base", channel_id, buf);
+        buf[byte_off] |= bit_mask;
+        shim_log_channel_buf("[manual_press] remote press", channel_id, buf);
+        translate(channel_id, buf);
+        usleep((useconds_t)press_ms * 1000);
+        shim_copy_channel_state_buffer(game_base, channel_id, buf);
+        buf[byte_off] &= (uint8_t)~bit_mask;
+        shim_log_channel_buf("[manual_press] remote release", channel_id, buf);
         translate(channel_id, buf);
     }
     usleep(200000);
