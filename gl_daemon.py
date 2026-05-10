@@ -392,6 +392,10 @@ class Renderer:
         self._GL.glUniform1i(location, value)
 
     def uniform_4f(self, location: int, v0: float, v1: float, v2: float, v3: float) -> None:
+        self._u4f_count = getattr(self, "_u4f_count", 0) + 1
+        if self._u4f_count <= 16 or (self._u4f_count & 63) == 0:
+            self.log.info("u4f #%d loc=%d (%.2g, %.2g, %.2g, %.2g)",
+                          self._u4f_count, location, v0, v1, v2, v3)
         self._GL.glUniform4f(location, v0, v1, v2, v3)
 
     def uniform_matrix4fv(self, location: int, count: int, transpose: int, data: bytes) -> None:
@@ -607,11 +611,58 @@ class Renderer:
     def uniform_xfv(self, n_per_elem: int, fn, loc, count, data: bytes) -> None:
         import numpy as np
         floats = np.frombuffer(data, dtype=np.float32, count=count * n_per_elem)
+        # Log vec4 uniform sets so we can spot any "(_, _, _, 0)" patterns
+        # (alpha-killing) — Stern's colorTransformMultiply is a vec4. Sample
+        # first 8 + every 64th of vec4 sets for visibility without spam.
+        if n_per_elem == 4:
+            self._uxfv4_count = getattr(self, "_uxfv4_count", 0) + 1
+            if self._uxfv4_count <= 16 or (self._uxfv4_count & 63) == 0:
+                vals_str = ",".join(f"{floats[i*4]:.2g}/{floats[i*4+1]:.2g}/{floats[i*4+2]:.2g}/{floats[i*4+3]:.2g}"
+                                    for i in range(min(count, 4)))
+                self.log.info("u4fv #%d loc=%d count=%d: [%s]",
+                              self._uxfv4_count, loc, count, vals_str)
         fn(loc, count, floats)
     def uniform_matrix_3fv(self, loc, count, transpose, data: bytes) -> None:
         import numpy as np
         floats = np.frombuffer(data, dtype=np.float32, count=count * 9).reshape(count, 3, 3)
         self._GL.glUniformMatrix3fv(loc, count, bool(transpose), floats)
+
+    def uniform_1ui(self, loc, v0) -> None: self._GL.glUniform1ui(loc, v0)
+    def uniform_1uiv(self, loc, count, data: bytes) -> None:
+        import numpy as np
+        uints = np.frombuffer(data, dtype=np.uint32, count=count)
+        self._GL.glUniform1uiv(loc, count, uints)
+    def uniform_2iv(self, loc, count, data: bytes) -> None:
+        import numpy as np
+        ints = np.frombuffer(data, dtype=np.int32, count=count * 2)
+        self._GL.glUniform2iv(loc, count, ints)
+
+    def vertex_attrib_4f(self, idx, x, y, z, w) -> None:
+        self._GL.glVertexAttrib4f(idx, x, y, z, w)
+    def vertex_attrib_i4ui(self, idx, x, y, z, w) -> None:
+        self._GL.glVertexAttribI4ui(idx, x, y, z, w)
+    def fb_tex_2d_ms(self, target, attachment, textarget, tex, level, samples) -> None:
+        # GL_EXT_multisampled_render_to_texture entry point. Mesa exports it
+        # via eglGetProcAddress; PyOpenGL may not have a pre-bound symbol.
+        # Resolve through ctypes if needed.
+        try:
+            self._GL.glFramebufferTexture2DMultisampleEXT(target, attachment, textarget, tex, level, samples)
+        except Exception:
+            # Fallback to non-multisample version if EXT not available
+            self._GL.glFramebufferTexture2D(target, attachment, textarget, tex, level)
+    def compressed_tex_image_3d(self, target, level, internal, w, h, d, border, data: bytes) -> None:
+        import numpy as np
+        arr = np.frombuffer(data, dtype=np.uint8) if data else None
+        self._GL.glCompressedTexImage3D(target, level, internal, w, h, d, border, len(data), arr)
+    def compressed_tex_sub_image_3d(self, target, level, x, y, z, w, h, d, fmt, data: bytes) -> None:
+        import numpy as np
+        arr = np.frombuffer(data, dtype=np.uint8) if data else None
+        self._GL.glCompressedTexSubImage3D(target, level, x, y, z, w, h, d, fmt, len(data), arr)
+    def tex_storage_3d_ms(self, target, samples, internal, w, h, d, fixed) -> None:
+        try:
+            self._GL.glTexStorage3DMultisample(target, samples, internal, w, h, d, bool(fixed))
+        except Exception:
+            self._GL.glTexStorage3D(target, 1, internal, w, h, d)
 
 
 def read_all(sock: socket.socket, n: int) -> bytes:
@@ -1138,6 +1189,44 @@ class Session:
         elif op == P.GL_OP_GL_UNIFORM_MATRIX_3FV:
             l, ct, tr = struct.unpack(P.UNIFORM_MAT3_FMT, payload[:12])
             self.renderer.uniform_matrix_3fv(l, ct, tr, payload[12:])
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_1UI:
+            l, v0 = struct.unpack(P.UNIFORM_1UI_FMT, payload)
+            self.renderer.uniform_1ui(l, v0)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_1UIV:
+            l, ct = struct.unpack(P.UNIFORM_XIV_FMT, payload[:8])
+            self.renderer.uniform_1uiv(l, ct, payload[8:])
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_UNIFORM_2IV:
+            l, ct = struct.unpack(P.UNIFORM_XIV_FMT, payload[:8])
+            self.renderer.uniform_2iv(l, ct, payload[8:])
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_VERTEX_ATTRIB_4F:
+            i, x, y, z, w = struct.unpack(P.VERTEX_ATTRIB_4F_FMT, payload)
+            self.renderer.vertex_attrib_4f(i, x, y, z, w)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_VERTEX_ATTRIB_I_4UI:
+            i, x, y, z, w = struct.unpack(P.VERTEX_ATTRIB_I4UI_FMT, payload)
+            self.renderer.vertex_attrib_i4ui(i, x, y, z, w)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_FB_TEX_2D_MS_EXT:
+            t, a, tt, tx, lv, sm = struct.unpack(P.FB_TEX_2D_MS_FMT, payload)
+            self.renderer.fb_tex_2d_ms(t, a, tt, tx, lv, sm)
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_COMPRESSED_TEX_IMAGE_3D:
+            hsz = struct.calcsize(P.COMPRESSED_TEX_IMAGE_3D_FMT)
+            t, lv, ifmt, w, h, d, b, isz = struct.unpack(P.COMPRESSED_TEX_IMAGE_3D_FMT, payload[:hsz])
+            self.renderer.compressed_tex_image_3d(t, lv, ifmt, w, h, d, b, payload[hsz:hsz+isz] if isz else b'')
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_COMPRESSED_TEX_SUB_IMAGE_3D:
+            hsz = struct.calcsize(P.COMPRESSED_TEX_SUB_IMAGE_3D_FMT)
+            t, lv, x, y, z, w, h, d, fmt, isz = struct.unpack(P.COMPRESSED_TEX_SUB_IMAGE_3D_FMT, payload[:hsz])
+            self.renderer.compressed_tex_sub_image_3d(t, lv, x, y, z, w, h, d, fmt, payload[hsz:hsz+isz] if isz else b'')
+            if sync: send_reply(self.sock, P.GL_OP_REP_OK)
+        elif op == P.GL_OP_GL_TEX_STORAGE_3D_MS:
+            t, sm, ifmt, w, h, d, fx = struct.unpack(P.TEX_STORAGE_3D_MS_FMT, payload)
+            self.renderer.tex_storage_3d_ms(t, sm, ifmt, w, h, d, fx)
             if sync: send_reply(self.sock, P.GL_OP_REP_OK)
 
         else:

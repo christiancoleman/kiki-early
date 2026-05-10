@@ -139,6 +139,16 @@
 #define GL_OP_GL_UNIFORM_3FV           0x0159
 #define GL_OP_GL_UNIFORM_4FV           0x015A
 #define GL_OP_GL_UNIFORM_MATRIX_3FV    0x015B
+#define GL_OP_GL_UNIFORM_1UI           0x015C
+#define GL_OP_GL_UNIFORM_1UIV          0x015D
+#define GL_OP_GL_UNIFORM_2IV           0x015E
+#define GL_OP_GL_VERTEX_ATTRIB_4F      0x015F
+#define GL_OP_GL_VERTEX_ATTRIB_I_4UI   0x0160
+#define GL_OP_GL_FB_TEX_2D_MS_EXT      0x0161
+
+#define GL_OP_GL_COMPRESSED_TEX_IMAGE_3D    0x030C
+#define GL_OP_GL_COMPRESSED_TEX_SUB_IMAGE_3D 0x030D
+#define GL_OP_GL_TEX_STORAGE_3D_MS     0x030E
 
 #define GL_OP_REP_OK          0x0F01
 #define GL_OP_REP_VALUE       0x0F02
@@ -545,6 +555,49 @@ struct gl_payload_uniform_matrix_3fv {
     uint8_t  transpose;
     uint8_t  pad[3];
     /* followed by `count * 9 * 4` bytes of float data */
+};
+struct gl_payload_uniform_1ui {
+    int32_t  location;
+    uint32_t v0;
+};
+struct gl_payload_vertex_attrib_4f {
+    uint32_t index;
+    float    x, y, z, w;
+};
+struct gl_payload_vertex_attrib_i4ui {
+    uint32_t index;
+    uint32_t x, y, z, w;
+};
+struct gl_payload_fb_tex_2d_ms {
+    uint32_t target;
+    uint32_t attachment;
+    uint32_t textarget;
+    uint32_t texture;
+    int32_t  level;
+    int32_t  samples;
+};
+struct gl_payload_compressed_tex_image_3d {
+    uint32_t target;
+    int32_t  level;
+    uint32_t internal_format;
+    int32_t  width, height, depth, border;
+    uint32_t image_size;
+};
+struct gl_payload_compressed_tex_sub_image_3d {
+    uint32_t target;
+    int32_t  level;
+    int32_t  xoffset, yoffset, zoffset;
+    int32_t  width, height, depth;
+    uint32_t format;
+    uint32_t image_size;
+};
+struct gl_payload_tex_storage_3d_ms {
+    uint32_t target;
+    int32_t  samples;
+    uint32_t internal_format;
+    int32_t  width, height, depth;
+    uint8_t  fixed_sample_locations;
+    uint8_t  pad[3];
 };
 struct gl_payload_clear_buffer_fv {
     uint32_t buffer;

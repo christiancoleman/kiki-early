@@ -2273,6 +2273,177 @@ void glUniformMatrix3fv(int loc, int count, unsigned char trans, const float *v)
              (loc, count, trans, v));
     (void)loc; (void)count; (void)trans; (void)v;
 }
+
+/* ES3 uniform variants game uses but shim previously didn't hook. Without
+ * marshal, these fall through to local Mesa with no context → silently
+ * dropped → daemon's uniform stays at default 0 → shaders that depend on
+ * these for alpha/mode produce wrong fragment alpha → blend equation kills
+ * everything. */
+void glUniform1ui(int loc, unsigned v0) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_uniform_1ui req = { loc, v0 };
+        shim_gl_marshal_send_async(GL_OP_GL_UNIFORM_1UI, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glUniform1ui, (int, unsigned), (loc, v0));
+    (void)loc; (void)v0;
+}
+void glUniform1uiv(int loc, int count, const unsigned *v) {
+    if (shim_gl_marshal_active()) {
+        gl_marshal_uniform_xv(GL_OP_GL_UNIFORM_1UIV, loc, count, v, sizeof(unsigned));
+        return;
+    }
+    FWD_VOID(glUniform1uiv, (int, int, const unsigned*), (loc, count, v));
+    (void)loc; (void)count; (void)v;
+}
+void glUniform2iv(int loc, int count, const int *v) {
+    if (shim_gl_marshal_active()) {
+        gl_marshal_uniform_xv(GL_OP_GL_UNIFORM_2IV, loc, count, v, 2 * sizeof(int));
+        return;
+    }
+    FWD_VOID(glUniform2iv, (int, int, const int*), (loc, count, v));
+    (void)loc; (void)count; (void)v;
+}
+
+/* glVertexAttrib4f: sets a CONSTANT default value for a vertex attribute when
+ * no per-vertex array is bound for that attribute. Game uses this for per-draw
+ * tints/colors. If we don't marshal it, the daemon's attribute stays at the
+ * GL default (0,0,0,1) — which means RGB=0 — and shaders that multiply by
+ * this attribute produce final.rgb=0 → with blend on, FBO writes are killed
+ * → exactly the "attract is black" symptom. */
+void glVertexAttrib4f(unsigned idx, float x, float y, float z, float w) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_vertex_attrib_4f req = { idx, x, y, z, w };
+        shim_gl_marshal_send_async(GL_OP_GL_VERTEX_ATTRIB_4F, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glVertexAttrib4f, (unsigned, float, float, float, float),
+             (idx, x, y, z, w));
+    (void)idx; (void)x; (void)y; (void)z; (void)w;
+}
+void glVertexAttribI4ui(unsigned idx, unsigned x, unsigned y, unsigned z, unsigned w) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_vertex_attrib_i4ui req = { idx, x, y, z, w };
+        shim_gl_marshal_send_async(GL_OP_GL_VERTEX_ATTRIB_I_4UI, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glVertexAttribI4ui, (unsigned, unsigned, unsigned, unsigned, unsigned),
+             (idx, x, y, z, w));
+    (void)idx; (void)x; (void)y; (void)z; (void)w;
+}
+void glFramebufferTexture2DMultisampleEXT(unsigned target, unsigned att, unsigned ttarget,
+                                           unsigned tex, int level, int samples) {
+    if (ttarget == 0x8D65) ttarget = 0x0DE1;  /* EXTERNAL_OES → 2D */
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_fb_tex_2d_ms req = { target, att, ttarget, tex, level, samples };
+        shim_gl_marshal_send_async(GL_OP_GL_FB_TEX_2D_MS_EXT, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glFramebufferTexture2DMultisampleEXT,
+             (unsigned, unsigned, unsigned, unsigned, int, int),
+             (target, att, ttarget, tex, level, samples));
+    (void)target; (void)att; (void)ttarget; (void)tex; (void)level; (void)samples;
+}
+void glCompressedTexImage3D(unsigned target, int level, unsigned internal,
+                             int w, int h, int d, int border, int size, const void *data) {
+    target = shim_demote_external_oes(target);
+    if (shim_gl_marshal_active()) {
+        size_t isz = (data && size > 0) ? (size_t)size : 0;
+        size_t plen = sizeof(struct gl_payload_compressed_tex_image_3d) + isz;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        if (buf) {
+            struct gl_payload_compressed_tex_image_3d *r =
+                (struct gl_payload_compressed_tex_image_3d*)buf;
+            r->target = target; r->level = level; r->internal_format = internal;
+            r->width = w; r->height = h; r->depth = d; r->border = border;
+            r->image_size = (uint32_t)isz;
+            if (isz) memcpy(buf + sizeof(*r), data, isz);
+            shim_gl_marshal_send_async(GL_OP_GL_COMPRESSED_TEX_IMAGE_3D, buf, (uint32_t)plen);
+            free(buf);
+        }
+        return;
+    }
+    FWD_VOID(glCompressedTexImage3D,
+             (unsigned, int, unsigned, int, int, int, int, int, const void*),
+             (target, level, internal, w, h, d, border, size, data));
+    (void)target; (void)level; (void)internal;
+    (void)w; (void)h; (void)d; (void)border; (void)size; (void)data;
+}
+void glCompressedTexSubImage3D(unsigned target, int level, int xo, int yo, int zo,
+                                int w, int h, int d, unsigned format, int size,
+                                const void *data) {
+    target = shim_demote_external_oes(target);
+    if (shim_gl_marshal_active()) {
+        size_t isz = (data && size > 0) ? (size_t)size : 0;
+        size_t plen = sizeof(struct gl_payload_compressed_tex_sub_image_3d) + isz;
+        unsigned char *buf = (unsigned char*)malloc(plen);
+        if (buf) {
+            struct gl_payload_compressed_tex_sub_image_3d *r =
+                (struct gl_payload_compressed_tex_sub_image_3d*)buf;
+            r->target = target; r->level = level;
+            r->xoffset = xo; r->yoffset = yo; r->zoffset = zo;
+            r->width = w; r->height = h; r->depth = d;
+            r->format = format; r->image_size = (uint32_t)isz;
+            if (isz) memcpy(buf + sizeof(*r), data, isz);
+            shim_gl_marshal_send_async(GL_OP_GL_COMPRESSED_TEX_SUB_IMAGE_3D, buf, (uint32_t)plen);
+            free(buf);
+        }
+        return;
+    }
+    FWD_VOID(glCompressedTexSubImage3D,
+             (unsigned, int, int, int, int, int, int, int, unsigned, int, const void*),
+             (target, level, xo, yo, zo, w, h, d, format, size, data));
+    (void)target; (void)level; (void)xo; (void)yo; (void)zo;
+    (void)w; (void)h; (void)d; (void)format; (void)size; (void)data;
+}
+void glTexStorage3DMultisample(unsigned target, int samples, unsigned internal,
+                                int w, int h, int d, unsigned char fixed) {
+    if (shim_gl_marshal_active()) {
+        struct gl_payload_tex_storage_3d_ms req = {
+            target, samples, internal, w, h, d, fixed, {0,0,0} };
+        shim_gl_marshal_send_async(GL_OP_GL_TEX_STORAGE_3D_MS, &req, sizeof(req));
+        return;
+    }
+    FWD_VOID(glTexStorage3DMultisample,
+             (unsigned, int, unsigned, int, int, int, unsigned char),
+             (target, samples, internal, w, h, d, fixed));
+    (void)target; (void)samples; (void)internal;
+    (void)w; (void)h; (void)d; (void)fixed;
+}
+/* Reuse our existing glGetIntegerv stub-body for the 64-bit variant. Our
+ * stub returns canned plausible values for known caps and 0 for unknowns,
+ * which satisfies callers without needing daemon round-trip. */
+void glGetInteger64v(unsigned pname, int64_t *params) {
+    if (!shim_gl_marshal_active() && is_real_gl()) {
+        static void (*real_fn)(unsigned, int64_t*) = NULL;
+        if (!real_fn) real_fn = (void(*)(unsigned, int64_t*))
+                                dlsym(RTLD_NEXT, "glGetInteger64v");
+        if (real_fn) { real_fn(pname, params); return; }
+    }
+    if (params) *params = 0;
+    (void)pname;
+}
+/* EGL sync: top-level exports that delegate to existing stubs from the
+ * eglGetProcAddress table (game uses both PLT and procaddr resolution). */
+extern void *eglCreateImageKHR(void *display, void *ctx, unsigned target,
+                                void *buffer, const int *attrib_list);
+void *eglCreateSyncKHR(void *display, unsigned type, const intptr_t *attrib_list) {
+    static uintptr_t sync_seq = 0xfee70000ull;
+    (void)display; (void)type; (void)attrib_list;
+    return (void *)__atomic_add_fetch(&sync_seq, 1, __ATOMIC_RELAXED);
+}
+unsigned eglDestroySyncKHR(void *display, void *sync) {
+    (void)display; (void)sync; return EGL_TRUE;
+}
+int eglWaitSyncKHR(void *display, void *sync, int flags) {
+    (void)display; (void)sync; (void)flags; return EGL_TRUE;
+}
+int eglClientWaitSyncKHR(void *display, void *sync, int flags, uint64_t timeout) {
+    (void)display; (void)sync; (void)flags; (void)timeout;
+    return 0x30F6;  /* EGL_CONDITION_SATISFIED_KHR */
+}
+unsigned eglReleaseThread(void) { return EGL_TRUE; }
+
 void glUniformMatrix4fv(int loc, int count, unsigned char trans, const float *v) {
     if (shim_gl_marshal_active() && count > 0 && v) {
         size_t data_bytes = (size_t)count * 16 * sizeof(float);
@@ -3040,12 +3211,22 @@ void glGetSynciv(void *sync, unsigned pname, int bufSize, int *length, int *valu
 /* Program binary: report no formats; game falls back to source compile. */
 void glGetProgramBinary(unsigned program, int bufSize, int *length,
                         unsigned *binaryFormat, void *binary) {
-    (void)program; (void)bufSize; (void)binary;
+    static int log_get = 0;
+    if (log_get < 8) {
+        SHIM_LOG("[program_binary] glGetProgramBinary(prog=%u, bufSize=%d) #%d -> length=0 fmt=0",
+                 program, bufSize, ++log_get);
+    }
+    (void)bufSize; (void)binary;
     if (length) *length = 0;
     if (binaryFormat) *binaryFormat = 0;
 }
 void glProgramBinary(unsigned program, unsigned binaryFormat,
                      const void *binary, int length) {
+    static int log_set = 0;
+    if (log_set < 32) {
+        SHIM_LOG("[program_binary] glProgramBinary(prog=%u, fmt=0x%x, len=%d) #%d -> NO-OP (this would bypass shader rewrite)",
+                 program, binaryFormat, length, ++log_set);
+    }
     (void)program; (void)binaryFormat; (void)binary; (void)length;
 }
 

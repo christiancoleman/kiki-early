@@ -71,4 +71,24 @@ printf '[reset_run_state] mode=%s\n' "$MODE"
 clear_dir "$NVRAM_DIR"
 clear_dir "$MESA_CACHE"
 clear_dir "$SHADER_CACHE"
+
+# Reap stale daemons that hold abstract AF_UNIX sockets across runs. If a
+# prior run was killed mid-flight (SIGKILL / Ctrl+C in the wrong window),
+# these survive and the next run's daemon launches fail with EADDRINUSE.
+for proc in decode_daemon.py gl_daemon.py marker_button.py audio_subscriber.py frame_viewer.py; do
+    pids=$(pgrep -f "_emulation/$proc" 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        # shellcheck disable=SC2086
+        kill -9 $pids 2>/dev/null || true
+        printf '[reset_run_state] killed stale %-26s (pids: %s)\n' "$proc" "$pids"
+    fi
+done
+# Stale ffplay from prior audio bridge runs.
+ffplay_pids=$(pgrep -f 'ffplay.*s16le.*44100' 2>/dev/null || true)
+if [[ -n "$ffplay_pids" ]]; then
+    # shellcheck disable=SC2086
+    kill -9 $ffplay_pids 2>/dev/null || true
+    printf '[reset_run_state] killed stale %-26s (pids: %s)\n' "ffplay (audio bridge)" "$ffplay_pids"
+fi
+
 printf '[reset_run_state] done — next run will see fresh state.\n'
