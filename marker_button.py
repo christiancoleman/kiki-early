@@ -160,6 +160,7 @@ _PRESSES = [
     ("PRESS Service Plus  (sw_id 91)",  91, "#0288d1"),
     ("PRESS Service Minus (sw_id 92)",  92, "#039be5"),
     ("PRESS Service Back  (sw_id 93)",  93, "#0097a7"),
+    ("PRESS Left Coin     (sw_id 80)",  80, "#2e7d32"),
     ("PRESS Start Button  (sw_id 78)",  78, "#00838f"),
     ("PRESS Action Button (sw_id 77)",  77, "#006064"),
 ]

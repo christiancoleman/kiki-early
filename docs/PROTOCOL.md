@@ -1631,6 +1631,10 @@ Total = 99 entries. Manual lists "over 100" because some manual entries are rese
 
 `bit_idx` (stored at `+0x22` of each entry) is `byte * 8 + bit` ∈ [0..63]. The Pokémon manual's `N-SW-K` notation maps to `(channel=N, bit_idx=K)` — i.e. `0-SW-8` (Service Select) = channel 0, bit_idx 8 = byte 1 bit 0.
 
+`0-SW-23` maps to runtime `sw_id=98`, channel 0, bit 23. This is the Coin Door Power Interlock. In emulation the shim defaults this bit to the restored/closed state before the channel-0 SPI buffer reaches `sub_651610`; otherwise the attract overlay displays `48V DISABLED / CLOSE COIN DOOR / OR PULL INTERLOCK SWITCH / TO RESTORE POWER` and the game will not start. Set `SPIKE3_COIN_DOOR_INTERLOCK=open` to reproduce the warning state.
+
+`1-SW-16` maps to runtime `sw_id=80`, channel 1, bit 16. This is the Left Coin switch. Use this for credit insertion; Service Back (`sw_id=93`) only exits service/operator screens and is not a coin input.
+
 **Per-switch handler config** at `g_switch_state_array[sw_id] + 0x10` (the `config_ptr`). On a press-or-release transition, `sub_6511c0` (the queue drain — see "Switch → event dispatch is two-stage" below) calls `sub_729c10(event_id, handler_fn, priority)`:
 
 | Config offset | Field | Notes |
@@ -2219,7 +2223,7 @@ Status LED (D2) blink codes (real-hardware debug only):
 - Runtime mode: 1 Hz slow blink, 75% duty
 - Error: pattern of blinks with long pauses
 
-**Emulation:** the shim returns synthetic pwrdist responses for cmds 0x10/0x15/0x16/0x18/0x1c/0x1d (see §4). Sending all-zeros for status bytes has worked through init. If the game starts gating later features on specific rail/door state, we may need to send "all rails OK, door closed" bits.
+**Emulation:** the shim returns synthetic pwrdist responses for cmds 0x10/0x15/0x16/0x18/0x1c/0x1d (see §4). The visible 48V gameplay gate is currently satisfied by the CPU switch-matrix interlock (`0-SW-23` / `sw_id=98`) rather than by the `0x1d` four-byte payload alone; `0x1d=ff ff ff ff` still shows the warning if `sw_id=98` remains open.
 
 ## 13. Comparison binaries (SW LE 0.85)
 

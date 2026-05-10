@@ -204,13 +204,14 @@ QEMU="${QEMU:-qemu-aarch64}"
 # the marker GUI, which has explicit "PRESS Service Select / Plus / Minus /
 # Back / Start / Action" buttons that write runs/latest/press_request.txt;
 # the shim's shim_manual_press_thread polls for the file and drives the
-# requested switch. Default delay 30s for the manual watcher (well before
-# SM at ~+65s).
+# requested switch. The manual watcher starts immediately and drops requests
+# made before the game exposes the switch table, so early clicks cannot replay
+# later on a different screen.
 #
 # To restore the older auto-press behaviour, set SHIM_SELECT_PRESS=1 (off
 # by default now) along with SHIM_SELECT_PRESS_SW_ID/INTERVAL_S/ATTEMPTS/MS.
 export SHIM_MANUAL_PRESS="${SHIM_MANUAL_PRESS:-1}"
-export SHIM_MANUAL_PRESS_DELAY_S="${SHIM_MANUAL_PRESS_DELAY_S:-30}"
+export SHIM_MANUAL_PRESS_DELAY_S="${SHIM_MANUAL_PRESS_DELAY_S:-0}"
 export SHIM_MANUAL_PRESS_MS="${SHIM_MANUAL_PRESS_MS:-500}"
 export SHIM_SELECT_PRESS="${SHIM_SELECT_PRESS:-0}"
 export SHIM_SELECT_PRESS_SW_ID="${SHIM_SELECT_PRESS_SW_ID:-90}"
@@ -557,6 +558,7 @@ fi
 [[ "$GL_DAEMON"        == "1" ]] && args+=(-E "SPIKE3_GL_DAEMON=1")
 [[ "$DEVBUS"           == "1" ]] && args+=(-E "SPIKE3_DEVBUS=1")
 [[ "$DEVBUS"           == "0" ]] && args+=(-E "SPIKE3_DEVBUS=0")
+[[ -n "${SPIKE3_COIN_DOOR_INTERLOCK:-}" ]] && args+=(-E "SPIKE3_COIN_DOOR_INTERLOCK=$SPIKE3_COIN_DOOR_INTERLOCK")
 [[ "$SPI_QUIET"        == "1" ]] && args+=(-E "SPIKE3_SPI_QUIET=1")
 [[ "$SPI_DELAY_US"     != "0" ]] && args+=(-E "SPIKE3_SPI_DELAY_US=$SPI_DELAY_US")
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")
@@ -622,6 +624,7 @@ fi
     printf '\n# env-toggle settings (final values)\n'
     for v in TIMEOUT REAL_GL FRAME_BRIDGE AUDIO_BRIDGE FORWARD_DECODE GL_DAEMON \
              SPIKE3_ZERO_BLEND_DISABLE SPIKE3_ZERO_BLEND_IGNORE SPIKE3_ZERO_BLEND_MODE \
+             SPIKE3_COIN_DOOR_INTERLOCK \
              DEVBUS DEVBUS_TAIL \
              SPI_QUIET SPI_DELAY_US STATE_BRIDGE OFFLINE_MODE \
              SWITCH_NOISE_TEST SWITCH_NOISE_WATCH SWITCH_NOISE_TEST_STRICT \

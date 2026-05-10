@@ -9036,3 +9036,65 @@ TIMEOUT=80 ./run_game.sh --debug --note visual_zero_blend_fix
 - `_emulation/gl_daemon.py` — added zero-blend modes. `SPIKE3_ZERO_BLEND_DISABLE=1` now defaults to preserving the last valid blend factors by ignoring `glBlendFunc(0,0)` / `glBlendFuncSeparate(0,0,0,0)`; `SPIKE3_ZERO_BLEND_MODE=disable` preserves the old "disable GL_BLEND" behavior for comparison.
 - `_emulation/shim_gl.c` / `_emulation/gl_daemon.py` — retained RGBA upload sampling and program-binary diagnostics used to close false leads during this investigation.
 - `_emulation/docs/JOURNAL.md` — this Step 98 entry appended.
+
+## Step 99 — 48V warning traced to Coin Door Power Interlock (`0-SW-23` / `sw_id=98`)
+
+After the channel-1 derived-switch fix, the game reached the real attract path and displayed the blocking warning:
+
+```text
+48V DISABLED
+CLOSE COIN DOOR
+OR PULL INTERLOCK SWITCH
+TO RESTORE POWER
+```
+
+First hypothesis was the power-distribution board `0x1d` status response. Disassembly confirmed cmd `0x1d`'s game-side handler at `0x916028` accepts exactly four payload bytes and copies them into the per-id receive buffer. A probe changed the shim from 0-byte ACK to a configurable 4-byte payload (`SPIKE3_PWRDIST_1D`, default `ff ff ff ff`), and the game log confirmed receipt:
+
+```text
+bridge RESP to cmd=0x1d id=0x01 ... 02 1d 01 ff ff ff ff e6 03
+```
+
+But a frame capture from that run still showed the 48V warning. So `0x1d` alone was not the visible gate.
+
+The decisive clue was the switch inventory: the Pokémon manual maps `0-SW-23` to **Coin Door Power Interlock**, and the runtime switch table maps that to `sw_id=98`, channel 0, bit 23. In the failing run, devbus snapshot reported `sw_id=98 state=1`. The shim now forces channel-0 bit 23 to the restored/closed state before the normal SPI channel-0 translation path sees it.
+
+Verification run:
+
+```text
+runs/2026-05-10T14.31.59
+```
+
+Observed evidence:
+
+- `game.log`: channel-0 idle buffer changed from `ff ff ff ...` to `ff ff 7f ...`, clearing bit 23.
+- `devbus.log`: `sw_id=98` emitted `switch_change ... state=0`.
+- `switch_noise_test.log`: PASS.
+- Frame capture `/tmp/interlock_closed_snap_live/frame_000360.png`: warning overlay gone; attract screen shows `TRAINER 1`.
+
+Operational behavior:
+
+- Default: emulate coin door/interlock restored (`SPIKE3_COIN_DOOR_INTERLOCK` unset).
+- Repro warning: `SPIKE3_COIN_DOOR_INTERLOCK=open ./run_game.sh`.
+
+Touched:
+
+- `_emulation/shim_ioctl.c` — defaults channel-0 bit 23 (`0-SW-23`, `sw_id=98`) to restored/closed before SPI RX is handed to the game's switch translator; supports `SPIKE3_COIN_DOOR_INTERLOCK=open|0` for A/B testing.
+- `_emulation/run_game.sh` — forwards `SPIKE3_COIN_DOOR_INTERLOCK` into qemu when set and records it in `run_info.txt`.
+- `_emulation/docs/PROTOCOL.md` — documents the env knob and the `0-SW-23`/`sw_id=98` mapping.
+
+### 99a — Left Coin added to TIMER press panel (`1-SW-16` / `sw_id=80`)
+
+After the channel-0 SPI quieting bug was fixed, rendering improved and the remaining start-game blocker looked more likely to be credit/precondition related than display related. Service Back had been used informally as "add credit" during service-menu navigation, but the machine inventory shows real coin inputs on channel 1:
+
+```text
+1-SW-16  Left Coin    -> runtime sw_id=80
+1-SW-17  Center Coin
+1-SW-18  Right Coin
+```
+
+The TIMER UI now exposes `PRESS Left Coin (sw_id 80)` so credit insertion can be tested separately from Service Back (`sw_id=93`), which should only exit service/operator screens.
+
+Touched:
+
+- `_emulation/marker_button.py` — added a Left Coin/Add Credit press button using the existing `press_request.txt` API path.
+- `_emulation/docs/PROTOCOL.md` — documented `1-SW-16` -> `sw_id=80` and clarified that Service Back is not the coin input.

@@ -175,9 +175,24 @@ static int shim_spi_fill_channel0_idle_rx(uint8_t *rx, uint32_t len) {
 
     uint8_t idle[8];
     memcpy(idle, (const void *)(uintptr_t)(game_base + 0x44804d0ULL), 8);
+
     int nonzero = 0;
     for (int i = 0; i < 8; i++) nonzero |= idle[i];
-    if (!nonzero) return 0;
+    if (!nonzero) {
+        static const uint8_t synthetic_idle[8] =
+            { 0x00, 0xff, 0xff, 0xf8, 0xff, 0xff, 0xff, 0xff };
+        memcpy(idle, synthetic_idle, sizeof(idle));
+    }
+
+    const char *coin_door = getenv("SPIKE3_COIN_DOOR_INTERLOCK");
+    if (!coin_door || !coin_door[0] ||
+        strcmp(coin_door, "closed") == 0 ||
+        strcmp(coin_door, "restored") == 0 ||
+        strcmp(coin_door, "1") == 0) {
+        idle[2] &= (uint8_t)~0x80u;
+    } else if (strcmp(coin_door, "open") == 0 || strcmp(coin_door, "0") == 0) {
+        idle[2] |= 0x80u;
+    }
 
     /* sub_8fa820 stores DAT_0450d9b0 byte N from SPI rx[N-1].
      * DAT byte 0 is a separate zero-initialized stack byte, so rx[7] is
@@ -386,12 +401,7 @@ int ioctl(int fd, unsigned long request, ...) {
                     if (n > len) n = len;
                     memcpy(rx, spi_rx_override[cmd], n);
                 } else if (len > 2) {
-                    static int quiet_cached = -1;
-                    if (__builtin_expect(quiet_cached < 0, 0)) {
-                        const char *q = getenv("SPIKE3_SPI_QUIET");
-                        quiet_cached = (q && q[0] == '1') ? 1 : 0;
-                    }
-                    if (!quiet_cached && !shim_spi_fill_channel0_idle_rx(rx, len))
+                    if (!shim_spi_fill_channel0_idle_rx(rx, len))
                         rx[2] = 0x04;
                 }
                 for (uint32_t i = 0; i < len && i < 8; i++)

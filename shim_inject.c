@@ -52,6 +52,7 @@ volatile int shim_current_sweep_event_id = -1;
 static void shim_copy_channel_state_buffer(uintptr_t game_base,
                                            uint8_t channel_id,
                                            uint8_t out[8]);
+static void shim_make_channel0_idle_buffer(uint8_t out[8]);
 static void shim_log_channel_buf(const char *tag, uint8_t channel_id,
                                  const uint8_t buf[8]);
 
@@ -721,7 +722,7 @@ static void *shim_switch_table_probe_thread(void *arg) {
 
             if (channel_id == 0 && byte_off < 8) {
                 uint8_t buf[8];
-                shim_copy_channel_state_buffer(game_base, channel_id, buf);
+                shim_make_channel0_idle_buffer(buf);
                 shim_log_channel_buf("[select_press]   ch0 base", channel_id, buf);
                 buf[byte_off] &= (uint8_t)~bit_mask;
                 shim_log_channel_buf("[select_press]   ch0 press", channel_id, buf);
@@ -731,8 +732,7 @@ static void *shim_switch_table_probe_thread(void *arg) {
                 uint8_t  state_during = *(uint8_t *)(e + 0x28);
                 SHIM_LOG("[select_press]   RELEASE  (DURING-press: state=%u edge_cnt=%u)",
                          state_during, edge_during);
-                shim_copy_channel_state_buffer(game_base, channel_id, buf);
-                buf[byte_off] |= bit_mask;
+                shim_make_channel0_idle_buffer(buf);
                 shim_log_channel_buf("[select_press]   ch0 release", channel_id, buf);
                 translate(channel_id, buf);
             } else if (channel_id != 0) {
@@ -744,7 +744,8 @@ static void *shim_switch_table_probe_thread(void *arg) {
                 }
                 shim_copy_channel_state_buffer(game_base, channel_id, buf);
                 shim_log_channel_buf("[select_press]   remote base", channel_id, buf);
-                buf[byte_off] |= bit_mask;
+                uint8_t saved_byte = buf[byte_off];
+                buf[byte_off] ^= bit_mask;
                 shim_log_channel_buf("[select_press]   remote press", channel_id, buf);
                 translate(channel_id, buf);
                 usleep((useconds_t)press_ms * 1000);
@@ -753,7 +754,7 @@ static void *shim_switch_table_probe_thread(void *arg) {
                 SHIM_LOG("[select_press]   RELEASE  (DURING-press: state=%u edge_cnt=%u)",
                          state_during, edge_during);
                 shim_copy_channel_state_buffer(game_base, channel_id, buf);
-                buf[byte_off] &= (uint8_t)~bit_mask;
+                buf[byte_off] = saved_byte;
                 shim_log_channel_buf("[select_press]   remote release", channel_id, buf);
                 translate(channel_id, buf);
             }
@@ -1171,6 +1172,22 @@ static void shim_copy_channel_state_buffer(uintptr_t game_base,
     memcpy(out, (const void *)channel_state, 8);
 }
 
+static void shim_make_channel0_idle_buffer(uint8_t out[8]) {
+    static const uint8_t idle[8] =
+        { 0x00, 0xff, 0xff, 0xf8, 0xff, 0xff, 0xff, 0xff };
+    memcpy(out, idle, sizeof(idle));
+
+    const char *coin_door = getenv("SPIKE3_COIN_DOOR_INTERLOCK");
+    if (!coin_door || !coin_door[0] ||
+        strcmp(coin_door, "closed") == 0 ||
+        strcmp(coin_door, "restored") == 0 ||
+        strcmp(coin_door, "1") == 0) {
+        out[2] &= (uint8_t)~0x80u;
+    } else if (strcmp(coin_door, "open") == 0 || strcmp(coin_door, "0") == 0) {
+        out[2] |= 0x80u;
+    }
+}
+
 static void shim_log_channel_buf(const char *tag, uint8_t channel_id,
                                  const uint8_t buf[8]) {
     SHIM_LOG("%s ch=%u buf=%02x %02x %02x %02x %02x %02x %02x %02x",
@@ -1188,7 +1205,7 @@ static void shim_log_channel_buf(const char *tag, uint8_t channel_id,
  *
  * Env knobs:
  *   SHIM_MANUAL_PRESS=1               — enable
- *   SHIM_MANUAL_PRESS_DELAY_S=N       — wait N s before first poll (default 30)
+ *   SHIM_MANUAL_PRESS_DELAY_S=N       — wait N s before first poll (default 0)
  *   SHIM_MANUAL_PRESS_MS=N            — press hold ms (default 500) */
 static void shim_press_one_sw_id(uintptr_t game_base, uint8_t *arr, int sw_id, int press_ms) {
     typedef int64_t (*translate_fn)(uint8_t channel_id, const uint8_t *buffer);
@@ -1213,14 +1230,13 @@ static void shim_press_one_sw_id(uintptr_t game_base, uint8_t *arr, int sw_id, i
 
     if (channel_id == 0 && byte_off < 8) {
         uint8_t buf[8];
-        shim_copy_channel_state_buffer(game_base, channel_id, buf);
+        shim_make_channel0_idle_buffer(buf);
         shim_log_channel_buf("[manual_press] ch0 base", channel_id, buf);
         buf[byte_off] &= (uint8_t)~bit_mask;
         shim_log_channel_buf("[manual_press] ch0 press", channel_id, buf);
         translate(channel_id, buf);
         usleep((useconds_t)press_ms * 1000);
-        shim_copy_channel_state_buffer(game_base, channel_id, buf);
-        buf[byte_off] |= bit_mask;
+        shim_make_channel0_idle_buffer(buf);
         shim_log_channel_buf("[manual_press] ch0 release", channel_id, buf);
         translate(channel_id, buf);
     } else if (channel_id != 0) {
@@ -1231,12 +1247,13 @@ static void shim_press_one_sw_id(uintptr_t game_base, uint8_t *arr, int sw_id, i
         }
         shim_copy_channel_state_buffer(game_base, channel_id, buf);
         shim_log_channel_buf("[manual_press] remote base", channel_id, buf);
-        buf[byte_off] |= bit_mask;
+        uint8_t saved_byte = buf[byte_off];
+        buf[byte_off] ^= bit_mask;
         shim_log_channel_buf("[manual_press] remote press", channel_id, buf);
         translate(channel_id, buf);
         usleep((useconds_t)press_ms * 1000);
         shim_copy_channel_state_buffer(game_base, channel_id, buf);
-        buf[byte_off] &= (uint8_t)~bit_mask;
+        buf[byte_off] = saved_byte;
         shim_log_channel_buf("[manual_press] remote release", channel_id, buf);
         translate(channel_id, buf);
     }
@@ -1252,18 +1269,10 @@ static void *shim_manual_press_thread(void *arg) {
     const char *v = getenv("SHIM_MANUAL_PRESS");
     if (!v || !v[0] || v[0] == '0') return NULL;
 
-    int delay_s = 30;
+    int delay_s = 0;
     int press_ms = 500;
     if ((v = getenv("SHIM_MANUAL_PRESS_DELAY_S")) != NULL && v[0]) delay_s = atoi(v);
     if ((v = getenv("SHIM_MANUAL_PRESS_MS")) != NULL && v[0]) press_ms = atoi(v);
-
-    if (delay_s > 0) sleep((unsigned)delay_s);
-
-    uintptr_t game_base = shim_resolve_game_base();
-    if (!game_base) {
-        SHIM_LOG("[manual_press] game_base unresolved; abort");
-        return NULL;
-    }
 
     /* Resolve the press_request.txt path relative to the run dir. The shim
      * runs with cwd = $GAME_DIR (per run_game.sh's `cd "$GAME_DIR"` before
@@ -1271,9 +1280,13 @@ static void *shim_manual_press_thread(void *arg) {
     const char *req_path = "/mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le/"
                            "_emulation/runs/latest/press_request.txt";
 
+    if (delay_s > 0) sleep((unsigned)delay_s);
+    unlink(req_path);
+
     SHIM_LOG("[manual_press] === START === press_ms=%d req_path=%s",
              press_ms, req_path);
 
+    uintptr_t game_base = 0;
     while (1) {
         usleep(200000);  /* 200 ms poll */
         int fd = open(req_path, O_RDONLY);
@@ -1289,10 +1302,16 @@ static void *shim_manual_press_thread(void *arg) {
             continue;
         }
 
+        game_base = shim_resolve_game_base();
+        if (!game_base) {
+            SHIM_LOG("[manual_press] game_base unresolved; drop sw_id=%d", sw_id);
+            continue;
+        }
+
         uint8_t **arr_pp = (uint8_t **)(uintptr_t)(game_base + 0x4480220ULL);
         uint8_t *arr = *arr_pp;
         if (!arr) {
-            SHIM_LOG("[manual_press] g_switch_state_array NULL; skip");
+            SHIM_LOG("[manual_press] g_switch_state_array NULL; drop sw_id=%d", sw_id);
             continue;
         }
         shim_press_one_sw_id(game_base, arr, sw_id, press_ms);

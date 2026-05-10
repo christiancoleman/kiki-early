@@ -208,6 +208,29 @@ static uint8_t bridge_checksum(const uint8_t *bytes, size_t len) {
     return (uint8_t)(-(int32_t)sum);
 }
 
+static void pwrdist_1d_payload(uint8_t out[4]) {
+    out[0] = 0xff;
+    out[1] = 0xff;
+    out[2] = 0xff;
+    out[3] = 0xff;
+
+    const char *s = getenv("SPIKE3_PWRDIST_1D");
+    if (!s || !s[0]) return;
+
+    unsigned b0, b1, b2, b3;
+    if (sscanf(s, "%x:%x:%x:%x", &b0, &b1, &b2, &b3) == 4 ||
+        sscanf(s, "%x,%x,%x,%x", &b0, &b1, &b2, &b3) == 4 ||
+        sscanf(s, "%2x%2x%2x%2x", &b0, &b1, &b2, &b3) == 4) {
+        out[0] = (uint8_t)b0;
+        out[1] = (uint8_t)b1;
+        out[2] = (uint8_t)b2;
+        out[3] = (uint8_t)b3;
+    } else {
+        SHIM_LOG("bridge: invalid SPIKE3_PWRDIST_1D='%s' (expected ff:ff:ff:ff, ff,ff,ff,ff, or ffffffff)",
+                 s);
+    }
+}
+
 /* Bridge frame escape encoding. The Spike 3 bridge protocol reserves three
  * byte values for framing:
  *   0x02 = STX (start of frame)
@@ -521,16 +544,24 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
         /* Dedicated handler at 0x916028: `cmp w27,#4 / b.eq 0x915e88`. If
          * payload_len == 4 it memcpys into the per-id buffer at
          * data_490e5b0+0xa0+id*8; otherwise it falls through to the silent-
-         * ACK fallback at 0x915d28. Sending 0-byte payload takes the else
-         * path — unblocks the waiting channel without writing stale data
-         * into a buffer whose semantics we haven't yet verified (plausibly
-         * pwrdist status bits + rail state + ADC reading, per FotE §4.16). */
+         * ACK fallback at 0x915d28. This carries pwrdist rail/interlock
+         * status; default to all-bits-set until the exact bitfield is mapped.
+         * Override with SPIKE3_PWRDIST_1D=ff:ff:ff:ff / ff,ff,ff,ff /
+         * ffffffff for bit-probe runs. */
+        uint8_t pd[4];
+        pwrdist_1d_payload(pd);
         resp[0] = 0x02;
         resp[1] = 0x1d;
         resp[2] = id;
-        resp[3] = bridge_checksum(resp + 1, 2);
-        resp[4] = 0x03;
-        bridge_send_response(resp, 5, cmd, id);
+        resp[3] = pd[0];
+        resp[4] = pd[1];
+        resp[5] = pd[2];
+        resp[6] = pd[3];
+        resp[7] = bridge_checksum(resp + 1, 6);
+        resp[8] = 0x03;
+        bridge_send_response(resp, 9, cmd, id);
+        SHIM_LOG("bridge: cmd 0x1d pwrdist payload id=0x%02x [%02x %02x %02x %02x]",
+                 id, pd[0], pd[1], pd[2], pd[3]);
         return;
     }
     case 0x27: {
@@ -1012,4 +1043,3 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
         return;
     }
 }
-
