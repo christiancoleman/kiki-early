@@ -1049,6 +1049,17 @@ void glEGLImageTargetTexture2DOES(unsigned target, void *image) {
          * gate on size match. */
         size_t dsz = rgba_ptr ? (size_t)w * (size_t)h * 4 : 0;
         size_t plen = sizeof(struct gl_payload_tex_image_2d) + dsz;
+        /* Diagnostic: log first 8 calls + every 256th so we can verify the
+         * video upload path is firing at the expected ~30 Hz. Reset on
+         * non-video so FBO storage allocations don't drown out the count. */
+        static unsigned long n_video = 0, n_nonvideo = 0;
+        unsigned long n = rgba_ptr
+            ? __atomic_add_fetch(&n_video,    1, __ATOMIC_RELAXED)
+            : __atomic_add_fetch(&n_nonvideo, 1, __ATOMIC_RELAXED);
+        if (n <= 8 || (n & 255) == 0) {
+            SHIM_LOG("glEGLImageTargetTexture2DOES #%lu (%s) -> daemon: %dx%d dsz=%zu",
+                     n, rgba_ptr ? "VIDEO" : "non-video", w, h, dsz);
+        }
         unsigned char *buf = (unsigned char*)malloc(plen);
         if (buf) {
             struct gl_payload_tex_image_2d *r = (struct gl_payload_tex_image_2d*)buf;
@@ -1507,6 +1518,22 @@ void glBindFramebuffer(unsigned target, unsigned fb) {
         shim_gl_marshal_send_async(GL_OP_GL_BIND_FRAMEBUFFER, &req, sizeof(req));
         if ((target == 0x8D40 || target == 0x8CA9) && fb != 0 && fb != shim_capture_fbo)
             __atomic_store_n(&shim_last_draw_fbo, fb, __ATOMIC_RELAXED);
+        /* Diagnostic to surface the FBO sequence used during attract — first
+         * 32 calls + every 256th of subsequent. Knowing the actual draw-FBO
+         * pattern tells us whether shim_last_draw_fbo (= last non-zero DRAW
+         * bind) is the right read source for frame_capture, or whether the
+         * game composites to fb=0 via a path we're not capturing. */
+        static unsigned long n = 0;
+        unsigned long c = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
+        if (c <= 32 || (c & 255) == 0) {
+            const char *tname = "?";
+            switch (target) {
+                case 0x8D40: tname = "FRAMEBUFFER"; break;
+                case 0x8CA8: tname = "READ"; break;
+                case 0x8CA9: tname = "DRAW"; break;
+            }
+            SHIM_LOG("[fbo_trace] #%lu glBindFramebuffer(%s, fb=%u)", c, tname, fb);
+        }
         return;
     }
     if (__builtin_expect(is_real_gl(), 0)) {

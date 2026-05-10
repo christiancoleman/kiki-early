@@ -428,9 +428,28 @@ void shim_frame_capture_at_page_flip(void) {
             shim_gl_marshal_send_async(GL_OP_GL_BIND_FRAMEBUFFER, &bind_back, sizeof(bind_back));
         }
 
-        if (verbose_d)
-            SHIM_LOG("[frame_cap] %s %dx%d (flip #%u, daemon, from_fbo=%u)",
-                     sent ? "sent" : "FAILED", w, h, shim_capture_flip_counter, game_fbo);
+        if (verbose_d) {
+            /* Sniff the captured frame so the user-visible "black screen"
+             * symptom can be confirmed (or refuted) from logs alone. Sample
+             * 256 pixels at a stride; count near-black ones. ≥250/256 = the
+             * frame really is empty. <250 = there IS content reaching the
+             * viewer; the visual problem is downstream (viewer / format). */
+            int near_black = 0;
+            int sampled = 0;
+            if (sent && shim_frame_buf) {
+                size_t stride = ((size_t)w * h) / 256;
+                if (stride < 1) stride = 1;
+                for (size_t i = 0; i < (size_t)w * h && sampled < 256; i += stride, sampled++) {
+                    uint8_t r = shim_frame_buf[i*4 + 0];
+                    uint8_t g = shim_frame_buf[i*4 + 1];
+                    uint8_t b = shim_frame_buf[i*4 + 2];
+                    if (r < 8 && g < 8 && b < 8) near_black++;
+                }
+            }
+            SHIM_LOG("[frame_cap] %s %dx%d (flip #%u, daemon, from_fbo=%u, near_black=%d/%d)",
+                     sent ? "sent" : "FAILED", w, h, shim_capture_flip_counter, game_fbo,
+                     near_black, sampled);
+        }
         return;
     }
 

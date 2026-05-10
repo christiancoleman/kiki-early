@@ -33,20 +33,53 @@ def _load_libegl():
     return lib
 
 
+def _load_libgles_raw():
+    """Load libGLESv2 with raw ctypes bindings for functions where PyOpenGL's
+    Python-side converters misbehave (compressed textures: NumberHandler vs
+    ArrayHandler bug on the imageSize parameter)."""
+    lib = ctypes.CDLL(ctypes.util.find_library("GLESv2") or "libGLESv2.so.2",
+                      mode=ctypes.RTLD_GLOBAL)
+    lib.glCompressedTexImage2D.argtypes = [
+        ctypes.c_uint, ctypes.c_int, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_void_p,
+    ]
+    lib.glCompressedTexImage2D.restype = None
+    lib.glCompressedTexSubImage2D.argtypes = [
+        ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+        ctypes.c_int, ctypes.c_void_p,
+    ]
+    lib.glCompressedTexSubImage2D.restype = None
+    return lib
+
+
 class Renderer:
     """Native EGL + GLES context. Created in the main thread; eglMakeCurrent
     is deferred to bind() so the Session thread that calls it owns the
     context. Single-Session lifecycle for now."""
 
     def __init__(self, width: int = 1920, height: int = 1080):
+        import os
         self.log = logging.getLogger("renderer")
         self.width = width
         self.height = height
         self._first_bind = True
+        self._draw_count = 0
+        self._test_pattern = os.environ.get("SPIKE3_VIDEO_TESTPATTERN", "0") == "1"
+        if self._test_pattern:
+            self.log.info("SPIKE3_VIDEO_TESTPATTERN=1 — RGBA uploads >=256x256 will be replaced with checkerboard")
+        self._force_magenta = os.environ.get("SPIKE3_FORCE_MAGENTA_CLEAR", "0") == "1"
+        if self._force_magenta:
+            self.log.info("SPIKE3_FORCE_MAGENTA_CLEAR=1 — glClearColor overridden to (1,0,1,1) magenta")
+        self._disable_blend = os.environ.get("SPIKE3_DISABLE_BLEND", "0") == "1"
+        if self._disable_blend:
+            self.log.info("SPIKE3_DISABLE_BLEND=1 — glEnable(GL_BLEND) silently ignored")
         self._tracked = {k: set() for k in
                          ("programs", "shaders", "buffers", "vaos",
                           "textures", "framebuffers")}
         self._libEGL = _load_libegl()
+        self._libGLESv2 = _load_libgles_raw()
         from OpenGL import EGL as E
         self._E = E
 
@@ -150,6 +183,8 @@ class Renderer:
         self._GL.glClear(mask)
 
     def execute_clear_color(self, r: float, g: float, b: float, a: float) -> None:
+        if self._force_magenta:
+            r, g, b, a = 1.0, 0.0, 1.0, 1.0
         self._GL.glClearColor(r, g, b, a)
 
     def execute_viewport(self, x: int, y: int, w: int, h: int) -> None:
@@ -163,7 +198,108 @@ class Renderer:
 
     def execute_read_pixels(self, x: int, y: int, w: int, h: int,
                             fmt: int, typ: int) -> bytes:
+        # Diagnostic: every Nth read, scan ALL known FBOs (0, 1, 2, 3, 4)
+        # and report which one(s) have non-black content. Tells us if we're
+        # reading from the right framebuffer.
+        self._read_count = getattr(self, "_read_count", 0) + 1
+        if self._read_count <= 4 or (self._read_count & 63) == 0:
+            self._scan_all_fbos_for_content(x, y, w, h)
         return bytes(self._GL.glReadPixels(x, y, w, h, fmt, typ))
+
+    def _scan_all_fbos_for_content(self, x, y, w, h):
+        GL = self._GL
+        prev_read = GL.glGetIntegerv(0x8CAA)  # GL_READ_FRAMEBUFFER_BINDING
+        prev_draw = GL.glGetIntegerv(0x8CA6)  # GL_DRAW_FRAMEBUFFER_BINDING
+        # Write-then-read sanity check on fb=1 + GL state probe.
+        try:
+            GL.glBindFramebuffer(0x8D40, 1)
+            _ = GL.glGetError()
+            GL.glClearColor(1.0, 0.0, 1.0, 1.0)
+            GL.glEnable(0x0C11)
+            GL.glScissor(200, 200, 4, 4)
+            GL.glClear(0x4000)
+            GL.glDisable(0x0C11)
+            _ = GL.glGetError()
+            GL.glBindFramebuffer(0x8CA8, 1)
+            pix = GL.glReadPixels(202, 202, 1, 1, 0x1908, 0x1401)
+            arr = bytes(pix)
+            wrr_check = f"fb=1 wrote_magenta_at_200 read_back=({arr[0]:02x},{arr[1]:02x},{arr[2]:02x})"
+        except Exception as e:
+            wrr_check = f"wrr_check EXC {type(e).__name__}: {e}"
+        # Probe game-side GL state observed by the daemon RIGHT NOW. Each
+        # query individually try/except'd so one bad enum doesn't kill the rest.
+        def safe(fn, *a, default="?"):
+            try:
+                _ = GL.glGetError()  # drain
+                v = fn(*a)
+                err = GL.glGetError()
+                if err: return f"err{hex(err)}"
+                return v
+            except Exception as e:
+                return f"EXC{type(e).__name__}"
+        vp = safe(GL.glGetIntegerv, 0x0BA2)              # GL_VIEWPORT
+        sc = safe(GL.glGetIntegerv, 0x0C10)              # GL_SCISSOR_BOX
+        stest = safe(GL.glIsEnabled, 0x0C11)             # GL_SCISSOR_TEST
+        dtest = safe(GL.glIsEnabled, 0x0B71)             # GL_DEPTH_TEST
+        blend = safe(GL.glIsEnabled, 0x0BE2)             # GL_BLEND
+        cull  = safe(GL.glIsEnabled, 0x0B44)             # GL_CULL_FACE
+        bsrc  = safe(GL.glGetIntegerv, 0x80C9)           # GL_BLEND_SRC_RGB (ES)
+        bdst  = safe(GL.glGetIntegerv, 0x80C8)           # GL_BLEND_DST_RGB (ES)
+        bsrcA = safe(GL.glGetIntegerv, 0x80CB)           # GL_BLEND_SRC_ALPHA
+        bdstA = safe(GL.glGetIntegerv, 0x80CA)           # GL_BLEND_DST_ALPHA
+        prog  = safe(GL.glGetIntegerv, 0x8B8D)           # GL_CURRENT_PROGRAM
+        dfbo  = safe(GL.glGetIntegerv, 0x8CA6)           # GL_DRAW_FRAMEBUFFER_BINDING
+        cmask = safe(GL.glGetBooleanv, 0x0C23)           # GL_COLOR_WRITEMASK
+        dmask = safe(GL.glGetBooleanv, 0x0B72)           # GL_DEPTH_WRITEMASK
+        state_str = (
+            f"vp={vp} scis={sc} stest={stest} dtest={dtest} dmask={dmask} "
+            f"blend={blend}(rgb={bsrc}/{bdst},a={bsrcA}/{bdstA}) "
+            f"cull={cull} prog={prog} draw_fbo={dfbo} colmask={cmask}"
+        )
+        report = [wrr_check, "STATE: " + state_str]
+        for fb_id in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 20):
+            try:
+                # Bind as DRAW first to query completeness as a draw target
+                GL.glBindFramebuffer(0x8CA9, fb_id)  # GL_DRAW_FRAMEBUFFER
+                _ = GL.glGetError()
+                draw_status = GL.glCheckFramebufferStatus(0x8CA9)
+                attach = GL.glGetFramebufferAttachmentParameteriv(
+                    0x8CA9, 0x8CE0, 0x8CD1)  # COLOR_ATTACHMENT0, OBJECT_NAME
+                _ = GL.glGetError()
+
+                GL.glBindFramebuffer(0x8CA8, fb_id)  # GL_READ_FRAMEBUFFER
+                _ = GL.glGetError()
+                # Sample 8 corners + center
+                samples = [
+                    (0, 0), (w-1, 0), (0, h-1), (w-1, h-1),
+                    (w//2, h//2), (w//4, h//4), (3*w//4, 3*h//4), (w//2, 0),
+                ]
+                non_black = 0
+                px_summary = []
+                for sx, sy in samples:
+                    pix = GL.glReadPixels(sx, sy, 1, 1, 0x1908, 0x1401)
+                    err2 = GL.glGetError()
+                    if err2:
+                        px_summary.append(f"err=0x{err2:x}")
+                        continue
+                    arr = bytes(pix)
+                    r, g, b = arr[0], arr[1], arr[2]
+                    if r > 8 or g > 8 or b > 8:
+                        non_black += 1
+                    px_summary.append(f"({r:02x},{g:02x},{b:02x})")
+                report.append(
+                    f"fb={fb_id}: stat=0x{int(draw_status):x} "
+                    f"col0_tex={int(attach)} nonblack={non_black}/8 "
+                    f"[{' '.join(px_summary)}]")
+            except Exception as e:
+                report.append(f"fb={fb_id}: EXC {type(e).__name__}")
+        try:
+            GL.glBindFramebuffer(0x8CA8, int(prev_read) if prev_read is not None else 0)
+            GL.glBindFramebuffer(0x8CA9, int(prev_draw) if prev_draw is not None else 0)
+        except Exception:
+            pass
+        self.log.info("FBO_SCAN #%d (read %dx%d): %s",
+                      self._read_count, w, h, " | ".join(report))
 
     def gen_buffers(self, n: int) -> list:
         ids = [int(i) for i in self._GL.glGenBuffers(n)] if n != 1 else [int(self._GL.glGenBuffers(1))]
@@ -264,14 +400,29 @@ class Renderer:
         self._GL.glUniformMatrix4fv(location, count, bool(transpose), floats)
 
     def draw_arrays(self, mode: int, first: int, count: int) -> None:
+        self._draw_count += 1
+        if self._draw_count <= 16 or (self._draw_count & 1023) == 0:
+            self.log.info("draw #%d: glDrawArrays(mode=0x%x, count=%d)",
+                          self._draw_count, mode, count)
         self._GL.glDrawArrays(mode, first, count)
 
     def draw_elements(self, mode: int, count: int, typ: int, offset: int) -> None:
+        self._draw_count += 1
+        if self._draw_count <= 16 or (self._draw_count & 1023) == 0:
+            self.log.info("draw #%d: glDrawElements(mode=0x%x, count=%d)",
+                          self._draw_count, mode, count)
         self._GL.glDrawElements(mode, count, typ, ctypes.c_void_p(offset))
 
-    def enable(self, cap: int) -> None:    self._GL.glEnable(cap)
+    def enable(self, cap: int) -> None:
+        if self._disable_blend and cap == 0x0BE2:  # GL_BLEND
+            return
+        self._GL.glEnable(cap)
     def disable(self, cap: int) -> None:   self._GL.glDisable(cap)
-    def blend_func(self, s: int, d: int) -> None: self._GL.glBlendFunc(s, d)
+    def blend_func(self, s: int, d: int) -> None:
+        self._blend_count = getattr(self, "_blend_count", 0) + 1
+        if self._blend_count <= 32 or (self._blend_count & 255) == 0:
+            self.log.info("blend #%d: glBlendFunc(0x%x, 0x%x)", self._blend_count, s, d)
+        self._GL.glBlendFunc(s, d)
     def depth_func(self, f: int) -> None:  self._GL.glDepthFunc(f)
     def depth_mask(self, m: int) -> None:  self._GL.glDepthMask(bool(m))
     def cull_face(self, m: int) -> None:   self._GL.glCullFace(m)
@@ -289,6 +440,18 @@ class Renderer:
     def active_texture(self, unit: int) -> None:  self._GL.glActiveTexture(unit)
     def bind_texture(self, target: int, tex: int) -> None: self._GL.glBindTexture(target, tex)
     def tex_image_2d(self, target, level, internal_format, w, h, border, fmt, typ, data: bytes) -> None:
+        if (data and w >= 256 and h >= 256
+                and fmt == 0x1908 and typ == 0x1401
+                and self._test_pattern):
+            import numpy as np
+            yy, xx = np.indices((h, w))
+            checker = ((xx // 32) + (yy // 32)) & 1
+            buf = np.empty((h, w, 4), dtype=np.uint8)
+            buf[..., 3] = 255
+            buf[..., 0] = np.where(checker, 255, 0)
+            buf[..., 1] = np.where(checker, 0, 255)
+            buf[..., 2] = np.where(checker, 255, 0)
+            data = buf.tobytes()
         self._GL.glTexImage2D(target, level, internal_format, w, h, border, fmt, typ,
                               data if data else None)
     def tex_sub_image_2d(self, target, level, x, y, w, h, fmt, typ, data: bytes) -> None:
@@ -306,7 +469,15 @@ class Renderer:
     def delete_framebuffers(self, ids: list) -> None:
         self._GL.glDeleteFramebuffers(len(ids), ids)
         for i in ids: self._tracked["framebuffers"].discard(int(i))
-    def bind_framebuffer(self, target: int, fb: int) -> None: self._GL.glBindFramebuffer(target, fb)
+    def bind_framebuffer(self, target: int, fb: int) -> None:
+        # Temporary unthrottled trace — confirms ground-truth FBO sequence the
+        # daemon executes (vs the shim's throttled trace). Look for fb=0 binds
+        # during attract; their presence would prove the game switched to the
+        # default framebuffer and our frame_cap is reading the wrong target.
+        self._bind_fb_count = getattr(self, "_bind_fb_count", 0) + 1
+        tname = {0x8D40: "FB", 0x8CA8: "READ", 0x8CA9: "DRAW"}.get(target, "?")
+        self.log.info("bind_fb #%d: %s fb=%d", self._bind_fb_count, tname, fb)
+        self._GL.glBindFramebuffer(target, fb)
     def framebuffer_texture_2d(self, target, attachment, textarget, tex, level) -> None:
         self._GL.glFramebufferTexture2D(target, attachment, textarget, tex, level)
     def check_framebuffer_status(self, target: int) -> int:
@@ -314,7 +485,12 @@ class Renderer:
 
     # --- Phase 3d additions ---
     def disable_vertex_attrib_array(self, idx: int) -> None: self._GL.glDisableVertexAttribArray(idx)
-    def blend_func_separate(self, srcRGB, dstRGB, srcA, dstA) -> None: self._GL.glBlendFuncSeparate(srcRGB, dstRGB, srcA, dstA)
+    def blend_func_separate(self, srcRGB, dstRGB, srcA, dstA) -> None:
+        self._blend_count = getattr(self, "_blend_count", 0) + 1
+        if self._blend_count <= 32 or (self._blend_count & 255) == 0:
+            self.log.info("blend #%d: glBlendFuncSeparate(0x%x, 0x%x, 0x%x, 0x%x)",
+                          self._blend_count, srcRGB, dstRGB, srcA, dstA)
+        self._GL.glBlendFuncSeparate(srcRGB, dstRGB, srcA, dstA)
     def blend_equation(self, mode: int) -> None: self._GL.glBlendEquation(mode)
     def blend_equation_separate(self, modeRGB, modeA) -> None: self._GL.glBlendEquationSeparate(modeRGB, modeA)
     def blend_color(self, r, g, b, a) -> None: self._GL.glBlendColor(r, g, b, a)
@@ -354,6 +530,10 @@ class Renderer:
     def vertex_attrib_i_pointer(self, idx, size, typ, stride, offset) -> None:
         self._GL.glVertexAttribIPointer(idx, size, typ, stride, ctypes.c_void_p(offset))
     def clear_buffer_fv(self, buffer: int, drawbuffer: int, vals: list) -> None:
+        # GL_COLOR = 0x1800; only override colour-buffer clears, leave depth
+        # (GL_DEPTH=0x1801) / stencil (0x1802) values alone.
+        if self._force_magenta and buffer == 0x1800:
+            vals = [1.0, 0.0, 1.0, 1.0]
         self._GL.glClearBufferfv(buffer, drawbuffer, vals)
     def detach_shader(self, prog, shader) -> None: self._GL.glDetachShader(prog, shader)
     def bind_attrib_location(self, prog, idx, name: bytes) -> None:
@@ -372,11 +552,38 @@ class Renderer:
     def tex_storage_3d(self, target, levels, internal, w, h, d) -> None:
         self._GL.glTexStorage3D(target, levels, internal, w, h, d)
     def compressed_tex_image_2d(self, target, level, internal, w, h, border, data: bytes) -> None:
-        self._GL.glCompressedTexImage2D(target, level, internal, w, h, border, len(data), data if data else None)
+        # Bypass PyOpenGL — its CompressedImageConverter resolves the
+        # imageSize argument to a NumberHandler that has no arrayByteCount
+        # method, raising AttributeError on every DXT5 upload. Call
+        # libGLESv2's symbol directly via ctypes.
+        if data:
+            c_buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+            self._libGLESv2.glCompressedTexImage2D(
+                target, level, internal, w, h, border, len(data),
+                ctypes.cast(c_buf, ctypes.c_void_p))
+        else:
+            self._libGLESv2.glCompressedTexImage2D(
+                target, level, internal, w, h, border, 0, None)
     def compressed_tex_sub_image_2d(self, target, level, x, y, w, h, fmt, data: bytes) -> None:
-        self._GL.glCompressedTexSubImage2D(target, level, x, y, w, h, fmt, len(data), data if data else None)
+        if data:
+            c_buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+            self._libGLESv2.glCompressedTexSubImage2D(
+                target, level, x, y, w, h, fmt, len(data),
+                ctypes.cast(c_buf, ctypes.c_void_p))
+        else:
+            self._libGLESv2.glCompressedTexSubImage2D(
+                target, level, x, y, w, h, fmt, 0, None)
 
     def blit_framebuffer(self, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filt) -> None:
+        self._blit_count = getattr(self, "_blit_count", 0) + 1
+        if self._blit_count <= 8 or (self._blit_count & 1023) == 0:
+            self.log.info("blit #%d: src=(%d,%d,%d,%d) dst=(%d,%d,%d,%d) mask=0x%x",
+                          self._blit_count, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask)
+        if self._force_magenta:
+            # Skip the actual blit so any magenta we cleared into the destination
+            # FBO survives. If attract was being blacked-out by a blit-from-black,
+            # this will let the magenta show through.
+            return
         self._GL.glBlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filt)
     def draw_range_elements(self, mode, start, end, count, typ, offset) -> None:
         self._GL.glDrawRangeElements(mode, start, end, count, typ, ctypes.c_void_p(offset))
