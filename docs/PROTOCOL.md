@@ -1363,7 +1363,7 @@ No `uint32_t token_to_asset[]` array exists in the binary; token constants never
 
 ## 10. Display pipeline (DRM / GBM / EGL / GLES)
 
-**Data flow at a glance.** The game does its own real GLES rendering — no synthesized frames are fed to it. We intercept the hardware-specific framebuffer presentation parts (DRM/KMS ioctls + GBM allocation calls) and replace them with stand-ins, but every `glClear` / `glDraw*` / shader / texture upload the game issues is forwarded through to **real Mesa with the llvmpipe CPU rasterizer**, which writes real pixels into a real off-screen EGL pbuffer (returned by Mesa's `eglCreatePbufferSurface(1920×1080)` after we redirect the game's `eglCreateWindowSurface` call). At each fake page-flip the shim does `glReadPixels` on that pbuffer and routes the bytes to one or more sinks (frame bridge over abstract AF_UNIX, periodic on-disk capture). GBM in this flow is a handle stand-in — its BOs are `calloc(256)` scratch pointers used as opaque tokens passed between layers; the only GBM BOs that actually carry pixel data are the special 1024×256 DMD path (`gbm_bo_map` returns `calloc(stride*height)` storage and `gbm_bo_unmap` captures it).
+**Data flow at a glance.** The game does its own real GLES rendering — no synthesized frames are fed to it. We intercept the hardware-specific framebuffer presentation parts (DRM/KMS ioctls + GBM allocation calls) and replace them with stand-ins, but every `glClear` / `glDraw*` / shader / texture upload the game issues is forwarded through to a **real GL backend** that writes real pixels into a real framebuffer. The shim supports two real-GL backends — an in-process Mesa-aarch64 overlay (`SPIKE3_REAL_GL=1`, default) or a host-native daemon (`GL_DAEMON=1`, see "Host-native GL daemon" below) — and at each fake page-flip does `glReadPixels` on the active backend's framebuffer and routes the bytes to one or more sinks (frame bridge over abstract AF_UNIX, periodic on-disk capture). GBM in this flow is a handle stand-in — its BOs are `calloc(256)` scratch pointers used as opaque tokens passed between layers; the only GBM BOs that actually carry pixel data are the special 1024×256 DMD path (`gbm_bo_map` returns `calloc(stride*height)` storage and `gbm_bo_unmap` captures it).
 
 The game presents frames via Linux's KMS/DRM stack with EGL on top of GBM. Three layers in the shim:
 
@@ -1429,14 +1429,17 @@ Each BO is registered in a side-table (32 slots, mutex-guarded) holding its `(wi
 | Draw | `glDrawArrays`, `glDrawElements` | no-op in stub mode; forward in real-GL |
 | Read | `glReadPixels` | the frame-bridge capture path uses this |
 
-### `SPIKE3_REAL_GL` modes
+### GL execution modes
 
 | Mode | Set via | Behavior |
 |---|---|---|
-| Stub (default off) | `REAL_GL=0 ./run_game.sh` | Every GLES/EGL/GBM call returns plausible defaults. Shaders "compile". Draws are no-op. Produces no real pixels |
-| Real-GL (default on, `REAL_GL=1`) | `./run_game.sh` (default) | `FWD_RET` / `FWD_VOID` macros tail-call `dlsym(RTLD_NEXT, ...)` into the Mesa overlay at `mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/`. Game's EGL/GLES calls now go to real Mesa → llvmpipe → a real framebuffer |
+| Stub | `REAL_GL=0 GL_DAEMON=0 ./run_game.sh` | Every GLES/EGL/GBM call returns plausible defaults. Shaders "compile". Draws are no-op. Produces no real pixels |
+| Mesa-aarch64 overlay (default) | `./run_game.sh` (default) | `FWD_RET` / `FWD_VOID` macros tail-call `dlsym(RTLD_NEXT, ...)` into the Mesa overlay at `mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/`. Game's EGL/GLES calls run inside qemu-aarch64 against an in-process Mesa → llvmpipe → a real EGL pbuffer (1920×1080) |
+| Host-native daemon | `GL_DAEMON=1 ./run_game.sh` | Shim's GL/EGL hooks marshal opcodes over abstract AF_UNIX `@spike3_gl` to `gl_daemon.py` running natively on the host. Daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context and replays opcodes via PyOpenGL. EGL setup is synthesized in-shim (FAKE_EGL_* sentinels). See "Host-native GL daemon" subsection below |
 
-#### Real-GL translation glue
+#### Cross-backend translation glue
+
+The shim normalizes EGL/GLES traffic before forwarding to whichever backend is active. The first five bullets (EGL setup) apply only to the Mesa-overlay backend; the daemon path synthesizes EGL state in-shim. The texture-target demotion and shader rewrite apply to both real-GL backends.
 
 - `eglGetDisplay` / `PlatformDisplay[EXT]` → drops game's GBM_KHR query, asks Mesa for `EGL_PLATFORM_SURFACELESS_MESA`
 - `eglChooseConfig` → patches `EGL_SURFACE_TYPE: WINDOW_BIT → PBUFFER_BIT`
@@ -1450,6 +1453,38 @@ Each BO is registered in a side-table (32 slots, mutex-guarded) holding its `(wi
 
 Tracks `libEGL` / `libGLES` / `libgbm` handles. Substitutes the shim's 3 EGLImage overrides on `dlsym(handle, "eglCreateImageKHR" / "eglDestroyImageKHR" / "glEGLImageTargetTexture2DOES")`. `eglGetProcAddress` returns the shim's stubs (never forwards).
 
+### Host-native GL daemon (`GL_DAEMON=1`)
+
+When `GL_DAEMON=1` is exported (forwarded to qemu env as `SPIKE3_GL_DAEMON=1`), the shim's GL/EGL hooks marshal opcodes to `gl_daemon.py` over abstract AF_UNIX `@spike3_gl` instead of forwarding to the in-process Mesa overlay. The daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context (config `0x31DD`) and replays opcodes via PyOpenGL; `glReadPixels` round-trips ship RGBA bytes back to the shim for the frame bridge. `run_game.sh` spawns `gl_daemon.py` alongside `decode_daemon.py`; logs at `runs/<TS>/gl_daemon.log`.
+
+#### Wire protocol
+
+Header is 8 bytes little-endian: `{u16 op, u16 flags, u32 payload_len}` + payload. Flags: bit 0 = SYNC, bit 1 = HAS_DATA. Sync ops carry typed replies (`REP_OK`, `REP_VALUE`, `REP_LOC`, `REP_IDS`, `REP_PIXELS`, `REP_ERR`). Async ops are fire-and-forget. ~50 opcodes cover EGL setup, GL state, object lifecycle, upload, draw + sync, uniforms, replies.
+
+#### Shim-side EGL synthesis
+
+The daemon owns the real EGL state. The shim returns FAKE_EGL_* sentinel handles for every EGL setup/query/teardown call (`eglGetDisplay`, `eglGetPlatformDisplay[EXT]`, `eglInitialize`, `eglBindAPI`, `eglChooseConfig`, `eglGetConfigs`, `eglGetConfigAttrib`, `eglQueryString`, `eglCreateContext`, `eglCreatePbufferSurface`, `eglCreateWindowSurface`, `eglMakeCurrent`, `eglSwapBuffers`, `eglSwapInterval`, `eglSurfaceAttrib`, `eglQuerySurface`, `eglGetError`, `eglTerminate`, `eglDestroyContext`, `eglDestroySurface`) so the qemu-side game/probe never sees the real EGL state on host. `glGet*` query hooks (`glGetIntegerv`, `glGetFloatv`, `glGetBooleanv`, `glGetString`, `glGetStringi`) return canned stub values in daemon mode — forwarding to uninit Mesa overlay returns garbage.
+
+#### Renderer state
+
+Daemon's `Renderer` tracks every id it hands out (programs, shaders, buffers, vaos, textures, framebuffers). On every `Session.bind()` after the first, `Renderer.reset()` deletes them all so each new client connection starts with a fresh GL state. Single-connection assumption: `Session.serve()` is called inline from accept loop, so two clients can't connect simultaneously, but state across sequential connections is reset.
+
+#### Buffer mapping (shadow path)
+
+`glMapBufferRange` / `glUnmapBuffer` cannot round-trip a host pointer. The shim instead allocates per-target scratch buffers (`shim_gl_map_table[8]`), returns the scratch pointer to the game, and on `glUnmapBuffer` with `GL_MAP_WRITE_BIT` set marshals the scratch contents via `OP_GL_BUFFER_SUB_DATA(target, offset, len, scratch)`.
+
+#### Diagnostic env vars (opt-in)
+
+| Env | Effect |
+|---|---|
+| `SPIKE3_DISABLE_BLEND=1` | Daemon's `Renderer.enable` ignores `glEnable(GL_BLEND)` |
+| `SPIKE3_FORCE_MAGENTA_CLEAR=1` | Daemon overrides `glClearColor` / `glClearBufferfv` (color variant) to `(1, 0, 1, 1)`; short-circuits `glBlitFramebuffer` |
+| `SPIKE3_VIDEO_TESTPATTERN=1` | Daemon replaces RGBA uploads ≥256×256 with a hot-pink/green checkerboard |
+
+`gl_daemon.py` also emits opt-in throttled logging for `glBindFramebuffer`, `glDrawArrays`/`glDrawElements`, `glBlendFunc`/`Separate`, `glBlitFramebuffer`, `glUniform4f`, `glUniform4fv`, `glProgramBinary`/`glGetProgramBinary`, plus an `FBO_SCAN` diagnostic that samples 8 pixels of fb=0..20 on every Nth `glReadPixels` for content sniffing.
+
+*Verified by:* JOURNAL Step 96.1 (Phase 1–3c shim → daemon → Mesa pipeline + four self-contained probes `gles_probe3..6`), Step 96.2 (Phase 3d EGLImage marshal + frame-capture relay + `Renderer.reset`), Step 97 (Phase 3d game-run iteration: 97a EGL hook coverage, 97b query hook coverage, 97c ES3 context, 97d `glMapBufferRange` shadow buffer, 97e compressed-tex ctypes bypass, 97f full `comm -23` symbol audit closed).
+
 ### Capture pipeline
 
 | Asset | Hook | Output |
@@ -1461,7 +1496,7 @@ Tracks `libEGL` / `libGLES` / `libgbm` handles. Substitutes the shim's 3 EGLImag
 
 ### Frame bridge wire format
 
-When `FRAME_BRIDGE=1`, every 2nd `MODE_PAGE_FLIP` triggers `glReadPixels(0, 0, 1920, 1080)` from `shim_last_draw_fbo` (or current `READ_FRAMEBUFFER`) and writes one frame to `@pokemon_spike3_frame` (AF_UNIX abstract namespace):
+When `FRAME_BRIDGE=1`, every 2nd `MODE_PAGE_FLIP` triggers `glReadPixels(0, 0, 1920, 1080)` from `shim_last_draw_fbo` (or current `READ_FRAMEBUFFER`) and writes one frame to `@pokemon_spike3_frame` (AF_UNIX abstract namespace). Under `GL_DAEMON=1`, the readback is marshalled over `@spike3_gl` as a sync `OP_GL_READ_PIXELS`; the daemon executes it on its host-native ES3 context and ships the RGBA bytes back, which the shim then forwards to the frame bridge unchanged. Wire format:
 
 ```
 +0x00  uint32 LE  magic = 0xF00FBABA
@@ -2034,6 +2069,21 @@ Each message is `[u32 type][u32 length][payload]` little-endian. Length is paylo
 When the daemon is unreachable, `avcodec_send_packet` / `avcodec_receive_frame` return `-EIO` and the game raises `SIGABRT` from `SpiVideoStreamDecoderBase`.
 
 *Verified by:* JOURNAL Step 87 — daemon round-trip 49 fps NVDEC against `Lake_01_22_26_h265.mp4` (1940×1100, extradata=2490B); real game run `runs/2026-05-06T12.45.39_hw_refactor` shows 449/551 frame/EAGAIN ratio across 1000 `avcodec_receive_frame` calls. RGBA single-plane wire format + host-side `frame.reformat('rgba')` introduced in JOURNAL Step 95 (alongside the `samplerExternalOES` shader-source rewrite that unblocks Mesa swrast sampling — see PROTOCOL §10 "Real-GL translation glue"); H.264 attract clips at 1360×768 and HEVC in-game clips at 1940×1100 / 1920×1080 confirmed flowing through the pipeline.
+
+### Host-native GL daemon (host Mesa)
+
+The game's GL/EGL traffic can be routed to a host-native daemon over an abstract AF_UNIX socket. Active iff `GL_DAEMON=1` (forwarded as `SPIKE3_GL_DAEMON=1`); falls back to the in-process Mesa overlay path otherwise. See §10 "Host-native GL daemon" for full wire protocol + EGL synthesis + diagnostic env knobs.
+
+| Component | File | Role |
+|---|---|---|
+| Shim marshaller | `_emulation/shim_gl_marshal.c` | `shim_gl_marshal_active()` (lazy connect with 3× retry + dlsym fallback), `_send_async()`, `_send_sync()` with mutex |
+| Wire format | `_emulation/gl_proto.h` (C) + `_emulation/gl_proto.py` (Python) | 8-byte LE header `{u16 op, u16 flags, u32 payload_len}` + payload, ~50 opcodes |
+| Host daemon | `_emulation/gl_daemon.py` | `Renderer` binds `EGL_PLATFORM_SURFACELESS_MESA` ES3 context (config `0x31DD`) and replays opcodes via PyOpenGL; `Session` is single-client; `Renderer.reset()` runs on every bind after the first. Compressed-tex uploads bypass PyOpenGL's `CompressedImageConverter` and call `libGLESv2.so.2` via raw ctypes |
+| Launcher | `_emulation/run_game.sh` | When `GL_DAEMON=1`, spawns daemon before qemu and forwards `SPIKE3_GL_DAEMON=1` into game env |
+
+Coverage as of JOURNAL Step 97f: `comm -23` of every `gl*` / `egl*` symbol referenced in `game.elf` against `nm -D spi_shim.so` exports returns no rows — every gl/egl entry-point the game can call has a hook with a marshal path.
+
+*Verified by:* JOURNAL Step 96.1 (initial stack landing — shim → daemon → host Mesa pipeline), Step 96.2 (frame-capture relay + `Renderer.reset` + EGLImage marshal), Step 97f (full game-vs-shim symbol audit + closed coverage gaps).
 
 ### Runtime binary patches (`shim_patches.c`)
 

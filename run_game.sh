@@ -98,6 +98,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # canonical PLE one); SCRIPT_DIR resolves to whichever game we're launching.
 GAME_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SYSROOT="$(cd "$GAME_DIR/../.." && pwd)"
+
+if ! "$SCRIPT_DIR/scripts/setup_bind_mounts.sh" --check >/dev/null 2>&1; then
+    cat <<EOF >&2
+[run_game] ERROR: bind mounts not active (/games, /connectivity, or /data missing).
+
+  Restore (one-time per WSL session, requires sudo):
+    sudo $SCRIPT_DIR/scripts/setup_bind_mounts.sh
+
+  Persist across WSL reboots — append to /etc/fstab:
+    $SYSROOT/games        /games        none bind 0 0
+    $SYSROOT/connectivity /connectivity none bind 0 0
+    $SYSROOT/data         /data         none bind 0 0
+EOF
+    exit 2
+fi
 RUN_TS="$(date +%Y-%m-%dT%H.%M.%S)"
 RUN_DIRNAME="$RUN_TS${NOTE_SLUG:+_$NOTE_SLUG}"
 RUN_DIR="$SCRIPT_DIR/runs/$RUN_DIRNAME"
