@@ -9279,4 +9279,16 @@ The user emphasized that `PROTOCOL.md` is the most important document and should
 - devbus coverage now documents current read-only behavior instead of future write plans;
 - persistence notes now keep only inspected file behavior and avoid a cause hypothesis.
 
+### Devbus future-work notes migrated from scratchpad
+
+`docs/devbus_design.md` was demoted from active reference to historical scratchpad. The current verified devbus behavior is in `PROTOCOL.md`; the useful future-work constraints from the scratchpad are preserved here:
+
+- Keep the consumer-facing model subscriber-based: clients connect, receive a snapshot, then receive deltas. Avoid requiring consumer-side polling.
+- If devbus switch writes are added, route every write through one canonical switch helper so edge/state semantics stay in one place. At the time of this step, the active public write path is still file-backed TIMER/external switch commands, not JSON devbus commands.
+- If a TCP transport is added for Windows/COM clients, bind to `127.0.0.1`, not `0.0.0.0`. WSL2 mirrored networking should forward localhost; legacy NAT mode may require connecting to the WSL VM IP from Windows.
+- A plausible future phase order remains: real-time panel, JSON switch commands, TCP transport, then drivers/lamps read-only observation. Treat this as planning, not verified implementation.
+- Keep JSON unless event rates prove it is inadequate. The old scratchpad rejected binary protocol, shared mmap, and vsock as premature for the current WSL/Windows/COM constraints.
+- The 1 ms watcher remains acceptable for the observed switch workload. Hooking `sub_651610` could still be revisited if sub-ms transition capture becomes a real requirement, but it carries higher crash/reentrancy risk.
+- Slow clients should not block the watcher. The current ring/drop-oldest/sequence-gap shape is the right direction for future transports too.
+
 After this cleanup, reassess before touching code again.
