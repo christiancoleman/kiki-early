@@ -27,13 +27,13 @@ import sys
 import time
 import tkinter as tk
 
-# Derive paths from the script's location so the marker button works no matter
-# where the repo is cloned. Layout: <SYSROOT>/games/pokemon_le/_emulation/marker_button.py
-_HERE = pathlib.Path(__file__).resolve().parent  # _emulation/
-_SYSROOT = _HERE.parent.parent.parent  # 3 up from _emulation = project sysroot
+# run_game.sh passes explicit paths so a symlinked _emulation directory can
+# drive multiple sysroots without pathlib resolving back to the canonical tree.
+_HERE = pathlib.Path(os.environ.get("SPIKE3_EMULATION_DIR", pathlib.Path(__file__).parent)).absolute()
+_SYSROOT = pathlib.Path(os.environ.get("SPIKE3_SYSROOT", _HERE.parent.parent.parent)).absolute()
 
-GAME_LOG_PATH = str(_HERE / "runs" / "latest" / "game.log")
-PRESS_REQUEST_PATH = str(_HERE / "runs" / "latest" / "press_request.txt")
+GAME_LOG_PATH = os.environ.get("SPIKE3_GAME_LOG_PATH", str(_HERE / "runs" / "latest" / "game.log"))
+PRESS_REQUEST_PATH = os.environ.get("SHIM_PRESS_REQUEST_PATH", str(_HERE / "runs" / "latest" / "press_request.txt"))
 ERROR_LOG_PATH = str(_SYSROOT / "tmp" / "marker_button_errors.log")
 
 

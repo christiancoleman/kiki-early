@@ -1631,6 +1631,100 @@ Total = 99 entries. Manual lists "over 100" because some manual entries are rese
 
 `bit_idx` (stored at `+0x22` of each entry) is `byte * 8 + bit` ∈ [0..63]. The Pokémon manual's `N-SW-K` notation maps to `(channel=N, bit_idx=K)` — i.e. `0-SW-8` (Service Select) = channel 0, bit_idx 8 = byte 1 bit 0.
 
+#### Manual switch inventory (Pokémon LE/Premium manual §3.3)
+
+Source: `Pokemon_LE_Pre_web.pdf`, section 3.3 "Switch Reference", PDF pages 17-19. The manual ID is the cabinet/playfield callout number; the runtime `sw_id` is separate and must be resolved through the game's switch table. Address `N-SW-K` maps to channel/node `N`, bit index `K`.
+
+| Address | Manual ID | Name | Node | Conn/pin | Location | Type |
+|---|---:|---|---:|---|---|---|
+| `0-SW-8` | C9 | Service Select | 0 | CN25/1 | Coin Door | Switch |
+| `0-SW-9` | C10 | Service Plus | 0 | CN25/2 | Coin Door | Switch |
+| `0-SW-10` | C11 | Service Minus | 0 | CN25/3 | Coin Door | Switch |
+| `0-SW-11` | C12 | Service Back | 0 | CN25/4 | Coin Door | Switch |
+| `0-SW-16` | C17 | Headphone Detect | 0 | - | Coin Door | Detect |
+| `0-SW-17` | C18 | Headphone Kit Cable Detect | 0 | CN3/5 | Coin Door | Detect |
+| `0-SW-18` | C19 | Volume Encoder 1 | 0 | CN3/6 | Coin Door | Encoder |
+| `0-SW-19` | C20 | Volume Encoder 2 | 0 | CN3/7 | Coin Door | Encoder |
+| `0-SW-20` | C21 | Jumper LVDS Resolution 1 | 0 | - | CPU Node | Jumper |
+| `0-SW-21` | C22 | Jumper LVDS Resolution 2 | 0 | - | CPU Node | Jumper |
+| `0-SW-22` | C23 | Jumper Unused | 0 | - | CPU Node | Jumper |
+| `0-SW-23` | C24 | Coin Door Power Interlock | 0 | CN4/1 | Cabinet | Interlock |
+| `1-SW-2` | 90 | Action Button | 1 | CN7/10 | Cabinet | Leaf |
+| `1-SW-7` | 105 | Ticket Low | 1 | CN2/2 | Cabinet | - |
+| `1-SW-8` | 103 | Ticket Notch | 1 | CN11/5 | Cabinet | - |
+| `1-SW-11` | 93 | Start Button | 1 | CN6/11 | Cabinet | Micro |
+| `1-SW-12` | 94 | Tournament Start Button | 1 | CN6/9 | Cabinet | Micro |
+| `1-SW-14` | 101 | Tilt Pendulum | 1 | CN6/7 | Cabinet | Plumb bob |
+| `1-SW-16` | 96 | Left Coin | 1 | CN5/9 | Coin Door | Micro |
+| `1-SW-17` | 98 | Center Coin | 1 | CN5/8 | Coin Door | Micro |
+| `1-SW-18` | 97 | Right Coin | 1 | CN5/7 | Coin Door | Micro |
+| `1-SW-19` | 99 | Fourth Coin | 1 | CN5/6 | Coin Door | - |
+| `1-SW-20` | 100 | Fifth Coin | 1 | CN5/5 | Coin Door | - |
+| `1-SW-21` | 102 | Sixth Coin | 1 | CN9/5 | Cabinet | - |
+| `1-SW-22` | 104 | Slam Tilt | 1 | CN5/4 | Cabinet | - |
+| `8-SW-0` | 33 | Lower Left Target-Top | 8 | CN13/2 | Playfield | Leaf target |
+| `8-SW-1` | 34 | Lower Left Target-Mid | 8 | CN13/3 | Playfield | Leaf target |
+| `8-SW-2` | 35 | Lower Left Target-Bot | 8 | CN13/4 | Playfield | Leaf target |
+| `8-SW-3` | 36 | Lower Right Target-Top | 8 | CN13/5 | Playfield | Leaf target |
+| `8-SW-4` | 37 | Lower Right Target-Bot | 8 | CN13/6 | Playfield | Leaf target |
+| `8-SW-5` | 40 | Left Eject Opto | 8 | CN13/7 | Playfield | Opto |
+| `8-SW-8` | 31 | Subway Enter | 8 | CN12/2 | Playfield | Opto |
+| `8-SW-9` | 27 | Berry Target Left | 8 | CN12/3 | Playfield | Leaf target |
+| `8-SW-10` | 28 | Berry Target Center | 8 | CN12/4 | Playfield | Leaf target |
+| `8-SW-11` | 29 | Left Ramp Enter Opto | 8 | CN12/5 | Playfield | Opto |
+| `8-SW-12` | 30 | Left Ramp Made 2 Gate | 8 | CN12/6 | Playfield | Micro |
+| `8-SW-16` | 11 | Left Flipper EOS | 8 | CN10/6 | Playfield | Leaf |
+| `8-SW-17` | 1 | Left Outlane | 8 | CN11/4 | Playfield | Rollover |
+| `8-SW-18` | 2 | Left Return Lane | 8 | CN11/5 | Playfield | Rollover |
+| `8-SW-19` | 5 | Right Return Lane | 8 | CN11/6 | Playfield | Rollover |
+| `8-SW-20` | 6 | Right Outlane | 8 | CN11/7 | Playfield | Rollover |
+| `8-SW-24` | 10 | Right Flipper Button | 8 | CN9/3 | Cabinet | Leaf |
+| `8-SW-25` | 9 | Left Flipper Button | 8 | CN9/4 | Cabinet | Leaf |
+| `8-SW-27` | 25 | Bowl Opto | 8 | CN11/3 | Playfield | Opto |
+| `8-SW-28` | 22 | Shooter Lane | 8 | CN10/2 | Playfield | Micro |
+| `8-SW-29` | 8 | Right Slingshot | 8 | CN10/3 | Playfield | Leaf |
+| `8-SW-30` | 7 | Left Slingshot | 8 | CN10/4 | Playfield | Leaf |
+| `8-SW-31` | 12 | Right Flipper EOS | 8 | CN10/5 | Playfield | Leaf |
+| `8-SW-32` | 15 | Trough 6 | 8 | 8a/CN14 | Playfield | Opto |
+| `8-SW-33` | 16 | Trough 5 | 8 | 8a/CN14 | Playfield | Opto |
+| `8-SW-34` | 17 | Trough 4 | 8 | 8a/CN14 | Playfield | Opto |
+| `8-SW-35` | 18 | Trough 3 | 8 | 8a/CN14 | Playfield | Opto |
+| `8-SW-36` | 19 | Trough 2 | 8 | 8a/CN14 | Playfield | Opto |
+| `8-SW-37` | 20 | Trough 1 | 8 | 8a/CN14 | Playfield | Opto |
+| `8-SW-38` | 21 | Trough Jam | 8 | 8a/CN14 | Playfield | Opto |
+| `9-SW-0` | 70 | Berry Target Right | 9 | CN13/2 | Playfield | Leaf target |
+| `9-SW-1` | 41 | Right Eject | 9 | CN13/3 | Playfield | Micro |
+| `9-SW-2` | 79 | Team Rocket Enter | 9 | CN13/4 | Playfield | Rollover |
+| `9-SW-3` | 80 | Right Orbit | 9 | CN13/5 | Playfield | Rollover |
+| `9-SW-4` | 71 | Captive Ball-Lower | 9 | CN13/6 | Playfield | Rollover |
+| `9-SW-5` | 72 | Captive Ball-Upper | 9 | CN13/7 | Playfield | Rollover |
+| `9-SW-6` | 73 | Captive Ball-Target | 9 | CN13/8 | Playfield | Leaf target |
+| `9-SW-7` | 78 | Spinner Opto | 9 | CN13/9 | Playfield | Opto |
+| `9-SW-8` | 44 | Left Orbit | 9 | CN12/2 | Playfield | Rollover |
+| `9-SW-9` | 45 | Left Ramp Made 1 Opto | 9 | CN12/3 | Playfield | Opto |
+| `9-SW-10` | 66 | Top Lane Left | 9 | CN12/4 | Playfield | Rollover |
+| `9-SW-11` | 67 | Top Lane Right | 9 | CN12/5 | Playfield | Rollover |
+| `9-SW-13` | 49 | Arena Left 10 Pt Sw | 9 | CN12/7 | Playfield | Leaf |
+| `9-SW-14` | 50 | Arena Right 10 Pt Switch | 9 | CN12/8 | Playfield | Leaf |
+| `9-SW-15` | 74 | Right Ramp Hold | 9 | CN12/9 | Playfield | Micro |
+| `9-SW-17` | 53 | BA(T)TLE Target | 9 | CN11/4 | Playfield | Leaf target |
+| `9-SW-18` | 54 | BAT(T)LE Target | 9 | CN11/5 | Playfield | Leaf target |
+| `9-SW-19` | 55 | BATT(L)E Target | 9 | CN11/6 | Playfield | Leaf target |
+| `9-SW-20` | 56 | BATTL(E) Target | 9 | CN11/7 | Playfield | Leaf target |
+| `9-SW-21` | 57 | Team Rocket Target Left | 9 | CN11/8 | Playfield | Leaf target |
+| `9-SW-22` | 58 | Team Rocket Target Right | 9 | CN11/9 | Playfield | Leaf target |
+| `9-SW-23` | 59 | Meowth Hit Opto | 9 | CN11/10 | Playfield | Opto |
+| `9-SW-24` | 60 | Meowth Up | 9 | CN9/3 | Playfield | Magnet switch |
+| `9-SW-25` | 61 | Meowth Down | 9 | CN9/4 | Playfield | Magnet switch |
+| `9-SW-26` | 51 | (B)ATTLE Target | 9 | CN11/2 | Playfield | Leaf target |
+| `9-SW-27` | 52 | B(A)TTLE Target | 9 | CN11/3 | Playfield | Leaf target |
+| `9-SW-28` | 63 | Top Pop Bumper | 9 | CN10/2 | Playfield | Leaf |
+| `9-SW-29` | 46 | Rear Ramp Made | 9 | CN10/3 | Playfield | Micro |
+| `9-SW-30` | 64 | Bot Pop Bumper | 9 | CN10/4 | Playfield | Leaf |
+| `9-SW-31` | 76 | Right Ramp Made Opto | 9 | CN10/5 | Playfield | Opto |
+
+Resting-state work should treat the manual's `Type` as a hardware clue, not as the final logical polarity. The game applies the per-switch config invert flag in `sub_a50850`; raw channel bytes must match the board/firmware electrical state. Known example: `0-SW-23`/`sw_id=98` is physically a restored coin-door interlock in normal play, but our channel-0 idle buffer must clear raw bit 23 (`ff ff 7f ...`) so the translated/logical state becomes restored and the 48V warning clears.
+
 `0-SW-23` maps to runtime `sw_id=98`, channel 0, bit 23. This is the Coin Door Power Interlock. In emulation the shim defaults this bit to the restored/closed state before the channel-0 SPI buffer reaches `sub_651610`; otherwise the attract overlay displays `48V DISABLED / CLOSE COIN DOOR / OR PULL INTERLOCK SWITCH / TO RESTORE POWER` and the game will not start. Set `SPIKE3_COIN_DOOR_INTERLOCK=open` to reproduce the warning state.
 
 `1-SW-16` maps to runtime `sw_id=80`, channel 1, bit 16. This is the Left Coin switch. Use this for credit insertion; Service Back (`sw_id=93`) only exits service/operator screens and is not a coin input.
@@ -2043,6 +2137,33 @@ Status alone doesn't hide a row — `sub_7da460`'s "Not Responding/Not Registere
 ## 12. Hardware shim coverage reference
 
 The shim (`spi_shim.so`) intercepts every device the game expects and emulates it in software. The bulk of FS-level path remapping has been moved out of the shim entirely (see PROTOCOL §2 "One-time setup: bind-mount the sysroot") — the kernel resolves `/games`, `/connectivity`, `/data` via the mount table, and the shim now focuses on hardware emulation.
+
+### Game profile roadmap
+
+`_emulation/games/` is the start of the per-game abstraction layer. Today it contains `pokemon_le_machine.c/.h`, which acts as the Pokémon LE machine profile for cabinet inventory: switch IDs, driver IDs, lamp IDs, channel/bit mappings, manual IDs, and human-readable names.
+
+Long-term, this should evolve into the shim's explicit profile boundary rather than creating a second `profiles/` tree:
+
+```text
+_emulation/games/
+  machine_profile.h
+  pokemon_le.c
+  pokemon_le.h
+  starwars_le.c
+  starwars_le.h
+```
+
+The public shim-facing API should expose one selected runtime profile, for example:
+
+```c
+const machine_profile_t *shim_machine_profile_current(void);
+```
+
+That profile should contain both stable cabinet inventory data and per-binary runtime anchors: switch-array pointer VA, switch translator VA, boot-state mask VA, output-state VA, Start/coin/interlock helpers, and any other game-version-specific addresses currently hardcoded in the shim.
+
+Pattern scanning fits behind this boundary. Startup should identify the loaded game binary/version, select the best exact profile by hash/build/version, then resolve or verify runtime anchors with known byte/code patterns. If a required anchor cannot be resolved, the shim should fail closed with a clear log rather than silently applying a Pokémon LE 0.81 address to another binary.
+
+Current status: pathing and launch tooling are sysroot-generic; runtime anchors are still Pokémon LE 0.81-specific unless explicitly documented otherwise.
 
 ### Per-device coverage
 

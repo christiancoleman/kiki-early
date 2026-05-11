@@ -9137,3 +9137,14 @@ Touched:
 - `games/pokemon_le/.gitignore` — excludes generated analysis/runtime artifacts.
 - `games/pokemon_le/_emulation/.gitignore` — excludes run folders, pycache, and rebuilt binaries.
 - `games/pokemon_le/_emulation/docs/PROTOCOL.md` — documents source-control hygiene and `.bndb` locality.
+
+## Step 100 — Manual switch inventory folded into PROTOCOL (2026-05-11)
+
+Used the PDF reader MCP against `Pokemon_LE_Pre_web.pdf` and extracted manual section 3.3 "Switch Reference" from PDF pages 17-19. The dedicated switch section lists the Pokémon LE/Premium switch address, manual callout ID, node, connector/pin, location, and switch type for Node 0, Node 1, Node 8, and Node 9.
+
+Added the complete manual-derived switch inventory to `PROTOCOL.md` under §11 "Runtime switch table" so switch resting-state work has the manual address/name/type map adjacent to the runtime channel/bit model. Also documented the key polarity caution: the manual's switch type is only a hardware clue; the shim must synthesize raw channel bytes, while the game applies per-switch logical inversion later in `sub_a50850`. The known example remains `0-SW-23` / `sw_id=98`, where the emulated raw idle bit must be cleared (`ff ff 7f ...`) for the translated/restored coin-door interlock state to clear the 48V warning.
+
+Touched:
+
+- `_emulation/docs/PROTOCOL.md` — added the full manual switch inventory and resting-state caution.
+- `_emulation/docs/JOURNAL.md` — this Step 100 entry.

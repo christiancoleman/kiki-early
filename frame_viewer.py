@@ -38,9 +38,10 @@ import sys
 import threading
 import time
 
-# Self-resolve project paths from script location (sysroot/games/pokemon_le/_emulation/frame_viewer.py).
-_HERE = pathlib.Path(__file__).resolve().parent
-_SYSROOT = _HERE.parent.parent.parent
+# run_game.sh supplies explicit paths so symlinked _emulation dirs can drive
+# different sysroots without resolving back to the canonical tree.
+_HERE = pathlib.Path(os.environ.get("SPIKE3_EMULATION_DIR", pathlib.Path(__file__).parent)).absolute()
+_SYSROOT = pathlib.Path(os.environ.get("SPIKE3_SYSROOT", _HERE.parent.parent.parent)).absolute()
 # Default to abstract AF_UNIX namespace (leading null) — matches the shim
 # bridge's bind. Avoids 9P/WSL bind-on-/mnt/c failures, zero filesystem
 # touch, no cleanup. Override --socket with a filesystem path if you want

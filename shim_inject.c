@@ -1196,6 +1196,48 @@ static void shim_log_channel_buf(const char *tag, uint8_t channel_id,
              buf[4], buf[5], buf[6], buf[7]);
 }
 
+static void shim_log_start_gate_snapshot(uintptr_t game_base, const char *phase,
+                                         uint8_t *switch_entry) {
+    typedef int (*switch_read_fn)(int);
+    typedef int (*mode_gate_fn)(int);
+
+    switch_read_fn switch_read = (switch_read_fn)(uintptr_t)(game_base + 0x650850ULL);
+    mode_gate_fn mode_gate = (mode_gate_fn)(uintptr_t)(game_base + 0x7a8de0ULL);
+
+    uint8_t raw_state = switch_entry ? *(uint8_t *)(switch_entry + 0x28) : 0xff;
+    uint16_t edge = switch_entry ? *(uint16_t *)(switch_entry + 0x26) : 0xffff;
+    int logical_state = switch_read ? switch_read(78) : -1;
+    int gate2 = mode_gate ? mode_gate(2) : -1;
+    int gate3 = mode_gate ? mode_gate(3) : -1;
+    int gate4 = mode_gate ? mode_gate(4) : -1;
+
+    uint16_t mode_flags = 0xffff;
+    uintptr_t mode_flags_ptr = 0;
+    uintptr_t mode_flags_pp = game_base + 0x4353468ULL;
+    memcpy(&mode_flags_ptr, (const void *)mode_flags_pp, sizeof(mode_flags_ptr));
+    if (mode_flags_ptr) {
+        memcpy(&mode_flags, (const void *)mode_flags_ptr, sizeof(mode_flags));
+    }
+
+    uint16_t start_arg = 0xffff;
+    uintptr_t player_outer = 0;
+    uintptr_t player_inner = 0;
+    uintptr_t player_outer_p = game_base + 0x43500c0ULL;
+    memcpy(&player_outer, (const void *)player_outer_p, sizeof(player_outer));
+    if (player_outer) {
+        memcpy(&player_inner, (const void *)player_outer, sizeof(player_inner));
+        if (player_inner) {
+            memcpy(&start_arg, (const void *)(player_inner + 0x108ULL),
+                   sizeof(start_arg));
+        }
+    }
+
+    SHIM_LOG("[start_probe] %s raw_state=%u logical=%d edge=%u "
+             "gate2=%d gate3=%d gate4=%d mode_flags=0x%04x start_arg=%u",
+             phase, raw_state, logical_state, edge,
+             gate2, gate3, gate4, mode_flags, start_arg);
+}
+
 /* SHIM_MANUAL_PRESS=1 — poll runs/latest/press_request.txt every 200 ms;
  * when the file appears, parse its first int as a runtime sw_id, delete the
  * file, and drive ONE press/release through the same code path that
@@ -1228,6 +1270,10 @@ static void shim_press_one_sw_id(uintptr_t game_base, uint8_t *arr, int sw_id, i
              sw_id, channel_id, byte_off, (unsigned)(bit_idx & 7),
              state_before, edge_before);
 
+    if (sw_id == 78) {
+        shim_log_start_gate_snapshot(game_base, "before", e);
+    }
+
     if (channel_id == 0 && byte_off < 8) {
         uint8_t buf[8];
         shim_make_channel0_idle_buffer(buf);
@@ -1235,10 +1281,19 @@ static void shim_press_one_sw_id(uintptr_t game_base, uint8_t *arr, int sw_id, i
         buf[byte_off] &= (uint8_t)~bit_mask;
         shim_log_channel_buf("[manual_press] ch0 press", channel_id, buf);
         translate(channel_id, buf);
+        if (sw_id == 78) {
+            shim_log_start_gate_snapshot(game_base, "pressed", e);
+        }
         usleep((useconds_t)press_ms * 1000);
+        if (sw_id == 78) {
+            shim_log_start_gate_snapshot(game_base, "held", e);
+        }
         shim_make_channel0_idle_buffer(buf);
         shim_log_channel_buf("[manual_press] ch0 release", channel_id, buf);
         translate(channel_id, buf);
+        if (sw_id == 78) {
+            shim_log_start_gate_snapshot(game_base, "released", e);
+        }
     } else if (channel_id != 0) {
         uint8_t buf[8];
         if (byte_off >= 8) {
@@ -1251,11 +1306,20 @@ static void shim_press_one_sw_id(uintptr_t game_base, uint8_t *arr, int sw_id, i
         buf[byte_off] ^= bit_mask;
         shim_log_channel_buf("[manual_press] remote press", channel_id, buf);
         translate(channel_id, buf);
+        if (sw_id == 78) {
+            shim_log_start_gate_snapshot(game_base, "pressed", e);
+        }
         usleep((useconds_t)press_ms * 1000);
+        if (sw_id == 78) {
+            shim_log_start_gate_snapshot(game_base, "held", e);
+        }
         shim_copy_channel_state_buffer(game_base, channel_id, buf);
         buf[byte_off] = saved_byte;
         shim_log_channel_buf("[manual_press] remote release", channel_id, buf);
         translate(channel_id, buf);
+        if (sw_id == 78) {
+            shim_log_start_gate_snapshot(game_base, "released", e);
+        }
     }
     usleep(200000);
     uint16_t edge_after = *(uint16_t *)(e + 0x26);
@@ -1274,11 +1338,9 @@ static void *shim_manual_press_thread(void *arg) {
     if ((v = getenv("SHIM_MANUAL_PRESS_DELAY_S")) != NULL && v[0]) delay_s = atoi(v);
     if ((v = getenv("SHIM_MANUAL_PRESS_MS")) != NULL && v[0]) press_ms = atoi(v);
 
-    /* Resolve the press_request.txt path relative to the run dir. The shim
-     * runs with cwd = $GAME_DIR (per run_game.sh's `cd "$GAME_DIR"` before
-     * exec qemu), so we use the absolute path through _emulation/runs/latest. */
-    const char *req_path = "/mnt/c/Workspace/pokemon-le-0.81.0/games/pokemon_le/"
-                           "_emulation/runs/latest/press_request.txt";
+    const char *req_path = getenv("SHIM_PRESS_REQUEST_PATH");
+    if (!req_path || !req_path[0])
+        req_path = "_emulation/runs/latest/press_request.txt";
 
     if (delay_s > 0) sleep((unsigned)delay_s);
     unlink(req_path);

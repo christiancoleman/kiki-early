@@ -57,6 +57,10 @@
 #                                   if 1, a failed switch-noise test becomes
 #                                   the script exit status when the game itself
 #                                   exited cleanly.
+#   AUTO_BIND_MOUNTS=<0|1>  [1]     if /games, /connectivity, /data are
+#                                   missing or mounted to a different sysroot,
+#                                   run setup_bind_mounts.sh --switch "$SYSROOT"
+#                                   via sudo before launching.
 #   QEMU=<bin>              [qemu-aarch64]     override qemu binary
 #
 # RUN ARCHIVING:
@@ -113,13 +117,34 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # canonical PLE one); SCRIPT_DIR resolves to whichever game we're launching.
 GAME_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SYSROOT="$(cd "$GAME_DIR/../.." && pwd)"
+AUTO_BIND_MOUNTS="${AUTO_BIND_MOUNTS:-1}"
 
-if ! "$SCRIPT_DIR/scripts/setup_bind_mounts.sh" --check >/dev/null 2>&1; then
+if ! "$SCRIPT_DIR/scripts/setup_bind_mounts.sh" --check "$SYSROOT" >/dev/null 2>&1; then
+    if [[ "$AUTO_BIND_MOUNTS" == "1" ]]; then
+        printf '[run_game] bind mounts do not match SYSROOT=%s; switching via sudo\n' "$SYSROOT" >&2
+        if sudo "$SCRIPT_DIR/scripts/setup_bind_mounts.sh" --switch "$SYSROOT"; then
+            printf '[run_game] bind mounts switched to %s\n' "$SYSROOT" >&2
+        else
+            cat <<EOF >&2
+[run_game] ERROR: failed to switch bind mounts for this sysroot.
+
+  Manual repair:
+    sudo $SCRIPT_DIR/scripts/setup_bind_mounts.sh --switch "$SYSROOT"
+
+  Disable automatic switching:
+    AUTO_BIND_MOUNTS=0 ./run_game.sh
+EOF
+            exit 2
+        fi
+    fi
+fi
+
+if ! "$SCRIPT_DIR/scripts/setup_bind_mounts.sh" --check "$SYSROOT" >/dev/null 2>&1; then
     cat <<EOF >&2
-[run_game] ERROR: bind mounts not active (/games, /connectivity, or /data missing).
+[run_game] ERROR: bind mounts are not active for this sysroot.
 
   Restore (one-time per WSL session, requires sudo):
-    sudo $SCRIPT_DIR/scripts/setup_bind_mounts.sh
+    sudo $SCRIPT_DIR/scripts/setup_bind_mounts.sh --switch "$SYSROOT"
 
   Persist across WSL reboots — append to /etc/fstab:
     $SYSROOT/games        /games        none bind 0 0
@@ -134,6 +159,13 @@ RUN_DIR="$SCRIPT_DIR/runs/$RUN_DIRNAME"
 LATEST_DIR="$RUN_DIR"
 mkdir -p "$RUN_DIR"
 ln -sfn "$RUN_DIRNAME" "$SCRIPT_DIR/runs/latest"
+
+export SPIKE3_SYSROOT="$SYSROOT"
+export SPIKE3_GAME_DIR="$GAME_DIR"
+export SPIKE3_EMULATION_DIR="$SCRIPT_DIR"
+export SPIKE3_RUN_DIR="$RUN_DIR"
+export SPIKE3_GAME_LOG_PATH="$LATEST_DIR/game.log"
+export SHIM_PRESS_REQUEST_PATH="$SCRIPT_DIR/runs/latest/press_request.txt"
 
 # ---- Defaults (override via env) ----
 TIMEOUT="${TIMEOUT:-0}"
@@ -374,6 +406,12 @@ if [[ "$BOOT_DISPLAY" == "1" ]]; then
         "$QEMU" -L "$SYSROOT" \
             -E "LD_PRELOAD=$SHIM" \
             -E "LD_LIBRARY_PATH=$OVERLAY:$SYSROOT/usr/lib64:$SYSROOT/usr/lib:$SYSROOT/lib64:$SYSROOT/lib" \
+            -E "SPIKE3_SYSROOT=$SYSROOT" \
+            -E "SPIKE3_GAME_DIR=$GAME_DIR" \
+            -E "SPIKE3_EMULATION_DIR=$SCRIPT_DIR" \
+            -E "SPIKE3_RUN_DIR=$RUN_DIR" \
+            -E "SPIKE3_GAME_LOG_PATH=$GAME_DBG_LOG" \
+            -E "SHIM_PRESS_REQUEST_PATH=$SHIM_PRESS_REQUEST_PATH" \
             -E "SPIKE3_REAL_GL=$REAL_GL" \
             -E "LIBGL_DRIVERS_PATH=$DRIVERS" \
             -E "MESA_LOADER_DRIVER_OVERRIDE=swrast" \
@@ -533,6 +571,12 @@ args=(
     "$QEMU" -L "$SYSROOT"
     -E "LD_PRELOAD=$SHIM"
     -E "LD_LIBRARY_PATH=$OVERLAY:$SYSROOT/usr/lib64:$SYSROOT/usr/lib:$SYSROOT/lib64:$SYSROOT/lib"
+    -E "SPIKE3_SYSROOT=$SYSROOT"
+    -E "SPIKE3_GAME_DIR=$GAME_DIR"
+    -E "SPIKE3_EMULATION_DIR=$SCRIPT_DIR"
+    -E "SPIKE3_RUN_DIR=$RUN_DIR"
+    -E "SPIKE3_GAME_LOG_PATH=$GAME_DBG_LOG"
+    -E "SHIM_PRESS_REQUEST_PATH=$SHIM_PRESS_REQUEST_PATH"
 )
 # Inherit /etc/init.d/shared env (GAMES_PATH, BOOT_DISPLAY, GAME, etc.)
 if (( ${#INIT_SHARED_ENV[@]} > 0 )); then

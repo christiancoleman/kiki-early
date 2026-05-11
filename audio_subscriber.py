@@ -29,13 +29,14 @@ second evicts the first.
 """
 
 import argparse
+import os
 import pathlib
 import socket
 import sys
 import time
 
-_HERE = pathlib.Path(__file__).resolve().parent
-_SYSROOT = _HERE.parent.parent.parent
+_HERE = pathlib.Path(os.environ.get("SPIKE3_EMULATION_DIR", pathlib.Path(__file__).parent)).absolute()
+_SYSROOT = pathlib.Path(os.environ.get("SPIKE3_SYSROOT", _HERE.parent.parent.parent)).absolute()
 # Abstract AF_UNIX namespace — matches the shim bridge's bind.
 DEFAULT_SOCKET = "\0pokemon_spike3_audio"
 
