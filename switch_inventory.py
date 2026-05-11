@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import re
+
 
 # manual_id, address, runtime_sw_id, name, connector/input, location, type
 MANUAL_SWITCHES = [
@@ -100,6 +102,15 @@ SWITCH_BY_RUNTIME_ID = {
     for row in MANUAL_SWITCHES
     if row[2] is not None
 }
+
+_ADDRESS_RE = re.compile(r"^(\d+)-SW-(\d+)$", re.IGNORECASE)
+
+
+def parse_switch_address(address: str):
+    match = _ADDRESS_RE.match(address)
+    if match is None:
+        return None
+    return int(match.group(1), 10), int(match.group(2), 10)
 
 
 def resolve_switch(token: str, runtime: bool = False):
