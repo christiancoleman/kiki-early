@@ -907,6 +907,30 @@ static void shim_translate_held_switch_state(uintptr_t game_base,
     translate(channel_id, buf);
 }
 
+static void shim_reconcile_service_back_release(uintptr_t game_base,
+                                                uint8_t *e,
+                                                uint8_t channel_id,
+                                                int held) {
+    if (held) {
+        return;
+    }
+
+    uint8_t state = *(uint8_t *)(e + SHIM_SWITCH_ENTRY_STATE_OFF);
+    if (state != 0) {
+        return;
+    }
+
+    SHIM_LOG("[manual_press] service-back release still active; re-translating channel 0 idle");
+    usleep(50000);
+    shim_translate_held_switch_state(game_base, channel_id);
+    usleep(50000);
+
+    uint16_t edge_after = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_EDGE_OFF);
+    uint8_t state_after = *(uint8_t *)(e + SHIM_SWITCH_ENTRY_STATE_OFF);
+    SHIM_LOG("[manual_press] service-back release reconcile AFTER: state=%u edge=%u",
+             state_after, edge_after);
+}
+
 static int shim_handle_coin_door_request(uintptr_t game_base, char *line) {
     char *p = line;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
@@ -990,6 +1014,9 @@ static int shim_set_switch_held_by_sw_id(uintptr_t game_base, uint8_t *arr,
     SHIM_LOG("[manual_press] %s sw_id=%d AFTER: state=%u edge=%u (delta=%d)",
              action_tag, sw_id, state_after, edge_after,
              edge_after - edge_before);
+    if (sw_id == 93) {
+        shim_reconcile_service_back_release(game_base, e, channel_id, held);
+    }
     return 1;
 }
 
