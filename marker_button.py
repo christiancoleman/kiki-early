@@ -65,7 +65,8 @@ def log_error(detail: str):
 
 
 def write_switch_command(action: str, sw_id: int, name: str,
-                         elapsed_var, status_var, count_ref):
+                         elapsed_var, status_var, count_ref,
+                         switch_test_var=None, observed_var=None):
     """Append a switch command to press_request.txt.
 
     The shim accepts explicit "down N" / "up N" / "tap N" commands. O_APPEND
@@ -88,6 +89,14 @@ def write_switch_command(action: str, sw_id: int, name: str,
         log_action = action.upper()
         line = f"{now_timestamp()} - [marker] {elapsed} event #{count_ref[0]} ({log_action} {name} sw_id={sw_id})\n"
         append_to_game_log(line)
+        if switch_test_var is not None and switch_test_var.get():
+            observed = ""
+            if observed_var is not None:
+                observed = observed_var.get().strip()
+            test_line = (f"{now_timestamp()} - [switch_test] {elapsed} "
+                         f"event #{count_ref[0]} command={log_action} "
+                         f"sw_id={sw_id} name=\"{name}\" observed=\"{observed}\"\n")
+            append_to_game_log(test_line)
         log_error(f"{log_action} request written: sw_id={sw_id} ({name})")
         try: status_var.set(f"#{count_ref[0]} {elapsed} -> {log_action} {name} (sw_id={sw_id})")
         except Exception: pass
@@ -177,19 +186,22 @@ def _button_detail(manual_id: str, address: str, runtime_sw_id, name: str,
 
 
 def _bind_hold_button(button, sw_id: int, name: str, held_set: set[int],
-                      elapsed_var, status_var, count_ref):
+                      elapsed_var, status_var, count_ref,
+                      switch_test_var, observed_var):
     def on_down(_event, s=sw_id, n=name):
         if s in held_set:
             return "break"
         held_set.add(s)
-        write_switch_command("down", s, n, elapsed_var, status_var, count_ref)
+        write_switch_command("down", s, n, elapsed_var, status_var, count_ref,
+                             switch_test_var, observed_var)
         return "break"
 
     def on_up(_event, s=sw_id, n=name):
         if s not in held_set:
             return "break"
         held_set.discard(s)
-        write_switch_command("up", s, n, elapsed_var, status_var, count_ref)
+        write_switch_command("up", s, n, elapsed_var, status_var, count_ref,
+                             switch_test_var, observed_var)
         return "break"
 
     button.bind("<ButtonPress-1>", on_down)
@@ -259,6 +271,31 @@ def _tick_timer(root, start_time, elapsed_var):
     root.after(100, lambda: _tick_timer(root, start_time, elapsed_var))
 
 
+def _log_switch_test_mode(enabled: bool, elapsed_var, status_var, observed_var):
+    elapsed = elapsed_var.get()
+    state = "START" if enabled else "STOP"
+    observed = observed_var.get().strip()
+    line = f"{now_timestamp()} - [switch_test] {elapsed} {state} observed=\"{observed}\"\n"
+    append_to_game_log(line)
+    try:
+        status_var.set(f"Switch test {state.lower()} at {elapsed}")
+    except Exception:
+        pass
+
+
+def _log_observed_switches(elapsed_var, status_var, observed_var):
+    elapsed = elapsed_var.get()
+    observed = observed_var.get().strip()
+    if not observed:
+        observed = "-"
+    line = f"{now_timestamp()} - [switch_test] {elapsed} OBSERVED toggles=\"{observed}\"\n"
+    append_to_game_log(line)
+    try:
+        status_var.set(f"{elapsed} observed toggles: {observed}")
+    except Exception:
+        pass
+
+
 def main():
     log_error(f"STARTED pid={os.getpid()} GAME_LOG_PATH={GAME_LOG_PATH} "
               f"PRESS_REQUEST_PATH={PRESS_REQUEST_PATH} "
@@ -271,6 +308,8 @@ def main():
 
     elapsed_var = tk.StringVar(value="T+0:00.0")
     status_var = tk.StringVar(value="Hold a switch button.")
+    switch_test_var = tk.BooleanVar(value=False)
+    observed_var = tk.StringVar(value="")
     count_ref = [0]
     held_switches: set[int] = set()
 
@@ -300,10 +339,47 @@ def main():
         )
         if sw_id is not None:
             _bind_hold_button(button, sw_id, name, held_switches,
-                              elapsed_var, status_var, count_ref)
+                              elapsed_var, status_var, count_ref,
+                              switch_test_var, observed_var)
         _ToolTip(button, _button_detail(manual_id, address, sw_id, name,
                                         conn, loc, typ))
         button.grid(row=0, column=col, padx=5, pady=2, sticky="nsew")
+
+    test_frame = tk.Frame(service_frame)
+    test_frame.grid(row=1, column=0, columnspan=len(_SERVICE_BUTTONS),
+                    padx=5, pady=(6, 2), sticky="ew")
+    test_frame.columnconfigure(1, weight=1)
+    tk.Checkbutton(
+        test_frame,
+        text="Switch Test Menu",
+        variable=switch_test_var,
+        command=lambda: _log_switch_test_mode(
+            switch_test_var.get(), elapsed_var, status_var, observed_var
+        ),
+        font=("monospace", 11, "bold"),
+    ).grid(row=0, column=0, padx=(0, 8), sticky="w")
+    observed_entry = tk.Entry(
+        test_frame,
+        textvariable=observed_var,
+        font=("monospace", 11),
+    )
+    observed_entry.grid(row=0, column=1, padx=(0, 8), sticky="ew")
+    observed_entry.insert(0, "")
+    observed_entry.bind(
+        "<Return>",
+        lambda _event: (_log_observed_switches(elapsed_var, status_var, observed_var), "break")[1],
+    )
+    tk.Button(
+        test_frame,
+        text="Log Observed",
+        command=lambda: _log_observed_switches(elapsed_var, status_var, observed_var),
+        font=("monospace", 10, "bold"),
+    ).grid(row=0, column=2, sticky="e")
+    _ToolTip(
+        observed_entry,
+        "Comma-separated switches the game UI showed as toggled after the press.\n"
+        "Example: 90, 93, 8-SW-25, left flipper"
+    )
 
     notebook = ttk.Notebook(root)
     notebook.pack(padx=12, pady=(4, 8), fill=tk.BOTH, expand=True)
@@ -328,7 +404,8 @@ def main():
             )
             if not disabled:
                 _bind_hold_button(button, sw_id, name, held_switches,
-                                  elapsed_var, status_var, count_ref)
+                                  elapsed_var, status_var, count_ref,
+                                  switch_test_var, observed_var)
             _ToolTip(button, _button_detail(manual_id, address, sw_id, name,
                                             conn, loc, typ))
             button.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
@@ -345,10 +422,14 @@ def main():
              font=("monospace", 9)).pack(pady=4, padx=10)
 
     def on_close():
+        if switch_test_var.get():
+            _log_switch_test_mode(False, elapsed_var, status_var, observed_var)
+            switch_test_var.set(False)
         for sw_id in list(held_switches):
             held_switches.discard(sw_id)
             write_switch_command("up", sw_id, f"Switch {sw_id}",
-                                 elapsed_var, status_var, count_ref)
+                                 elapsed_var, status_var, count_ref,
+                                 switch_test_var, observed_var)
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
