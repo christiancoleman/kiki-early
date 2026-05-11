@@ -17,6 +17,8 @@ import datetime as _dt
 import os
 from pathlib import Path
 
+from switch_inventory import resolve_switch
+
 try:
     import fcntl
 except ImportError:  # Windows
@@ -65,97 +67,6 @@ def _resolve_latest_path(path: Path) -> Path:
     return path
 
 
-# manual_id, address, runtime_sw_id, name
-_SWITCHES = [
-    ("1", "8-SW-17", 17, "Left Outlane"),
-    ("2", "8-SW-18", 18, "Left Return Lane"),
-    ("5", "8-SW-19", 19, "Right Return Lane"),
-    ("6", "8-SW-20", 20, "Right Outlane"),
-    ("7", "8-SW-30", 21, "Left Slingshot"),
-    ("8", "8-SW-29", 22, "Right Slingshot"),
-    ("9", "8-SW-25", 23, "Left Flipper Button"),
-    ("10", "8-SW-24", 24, "Right Flipper Button"),
-    ("11", "8-SW-16", 25, "Left Flipper EOS"),
-    ("12", "8-SW-31", 26, "Right Flipper EOS"),
-    ("15", "8-SW-32", 27, "Trough 6"),
-    ("16", "8-SW-33", 28, "Trough 5"),
-    ("17", "8-SW-34", 29, "Trough 4"),
-    ("18", "8-SW-35", 30, "Trough 3"),
-    ("19", "8-SW-36", 31, "Trough 2"),
-    ("20", "8-SW-37", 32, "Trough 1"),
-    ("21", "8-SW-38", 33, "Trough Jam"),
-    ("22", "8-SW-28", 34, "Shooter Lane"),
-    ("25", "8-SW-27", 35, "Bowl Opto"),
-    ("27", "8-SW-9", 36, "Berry Target Left"),
-    ("28", "8-SW-10", 37, "Berry Target Center"),
-    ("29", "8-SW-11", 38, "Left Ramp Enter Opto"),
-    ("30", "8-SW-12", 39, "Left Ramp Made 2 Gate"),
-    ("31", "8-SW-8", 40, "Subway Enter"),
-    ("33", "8-SW-0", 41, "Lower Left Target-Top"),
-    ("34", "8-SW-1", 42, "Lower Left Target-Mid"),
-    ("35", "8-SW-2", 43, "Lower Left Target-Bot"),
-    ("36", "8-SW-3", 44, "Lower Right Target-Top"),
-    ("37", "8-SW-4", 45, "Lower Right Target-Bot"),
-    ("40", "8-SW-5", 46, "Left Eject Opto"),
-    ("41", "9-SW-1", 47, "Right Eject"),
-    ("44", "9-SW-8", 48, "Left Orbit"),
-    ("45", "9-SW-9", 49, "Left Ramp Made 1 Opto"),
-    ("46", "9-SW-29", 50, "Rear Ramp Made"),
-    ("49", "9-SW-13", 51, "Arena Left 10 Pt Sw"),
-    ("50", "9-SW-14", 52, "Arena Right 10 Pt Switch"),
-    ("51", "9-SW-26", 53, "(B)ATTLE Target"),
-    ("52", "9-SW-27", 54, "B(A)TTLE Target"),
-    ("53", "9-SW-17", 55, "BA(T)TLE Target"),
-    ("54", "9-SW-18", 56, "BAT(T)LE Target"),
-    ("55", "9-SW-19", 57, "BATT(L)E Target"),
-    ("56", "9-SW-20", 58, "BATTL(E) Target"),
-    ("57", "9-SW-21", 59, "Team Rocket Target Left"),
-    ("58", "9-SW-22", 60, "Team Rocket Target Right"),
-    ("59", "9-SW-23", 61, "Meowth Hit Opto"),
-    ("60", "9-SW-24", 62, "Meowth Up"),
-    ("61", "9-SW-25", 63, "Meowth Down"),
-    ("63", "9-SW-28", 64, "Top Pop Bumper"),
-    ("64", "9-SW-30", 65, "Bot Pop Bumper"),
-    ("66", "9-SW-10", 66, "Top Lane Left"),
-    ("67", "9-SW-11", 67, "Top Lane Right"),
-    ("70", "9-SW-0", 68, "Berry Target Right"),
-    ("71", "9-SW-4", 69, "Captive Ball-Lower"),
-    ("72", "9-SW-5", 70, "Captive Ball-Upper"),
-    ("73", "9-SW-6", 71, "Captive Ball-Target"),
-    ("74", "9-SW-15", 72, "Right Ramp Hold"),
-    ("76", "9-SW-31", 73, "Right Ramp Made Opto"),
-    ("78", "9-SW-7", 74, "Spinner Opto"),
-    ("79", "9-SW-2", 75, "Team Rocket Enter"),
-    ("80", "9-SW-3", 76, "Right Orbit"),
-    ("90", "1-SW-2", 77, "Action Button"),
-    ("93", "1-SW-11", 78, "Start Button"),
-    ("94", "1-SW-12", 79, "Tournament Start Button"),
-    ("96", "1-SW-16", 80, "Left Coin"),
-    ("97", "1-SW-18", 81, "Right Coin"),
-    ("98", "1-SW-17", 82, "Center Coin"),
-    ("99", "1-SW-19", 83, "Fourth Coin"),
-    ("100", "1-SW-20", 84, "Fifth Coin"),
-    ("101", "1-SW-14", 85, "Tilt Pendulum"),
-    ("102", "1-SW-21", 86, "Sixth Coin"),
-    ("103", "1-SW-8", 87, "Ticket Notch"),
-    ("104", "1-SW-22", 88, "Slam Tilt"),
-    ("105", "1-SW-7", 89, "Ticket Low"),
-    ("C9", "0-SW-8", 90, "Service Select"),
-    ("C10", "0-SW-9", 91, "Service Plus"),
-    ("C11", "0-SW-10", 92, "Service Minus"),
-    ("C12", "0-SW-11", 93, "Service Back"),
-    ("C17", "0-SW-16", 94, "Headphone Detect"),
-    ("C18", "0-SW-17", 95, "Headphone Kit Cable Detect"),
-    ("C19", "0-SW-18", 96, "Volume Encoder 1"),
-    ("C20", "0-SW-19", 97, "Volume Encoder 2"),
-    ("C24", "0-SW-23", 98, "Coin Door Power Interlock"),
-]
-
-_BY_MANUAL = {manual.upper(): row for row in _SWITCHES for manual in [row[0]]}
-_BY_ADDRESS = {addr.upper(): row for row in _SWITCHES for addr in [row[1]]}
-_BY_RUNTIME = {runtime: row for row in _SWITCHES for runtime in [row[2]]}
-
-
 def _lock_file(f):
     if fcntl is not None:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -173,24 +84,6 @@ def _unlock_file(f):
             msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
         except OSError:
             pass
-
-
-def resolve_switch(token: str, runtime: bool):
-    if runtime:
-        sw_id = int(token, 10)
-        return _BY_RUNTIME.get(sw_id, (str(sw_id), "runtime", sw_id, f"Switch {sw_id}"))
-    key = token.upper()
-    if key in _BY_MANUAL:
-        return _BY_MANUAL[key]
-    if key in _BY_ADDRESS:
-        return _BY_ADDRESS[key]
-    if token.isdigit():
-        # Bare numbers mean manual/service IDs by default. Use --runtime for
-        # the shim array index.
-        if token in _BY_MANUAL:
-            return _BY_MANUAL[token]
-        raise SystemExit(f"unknown manual switch ID {token!r}; use --runtime for runtime sw_id {token}")
-    raise SystemExit(f"unknown switch {token!r}; use manual ID, N-SW-K address, or --runtime")
 
 
 def now_timestamp() -> str:
@@ -226,7 +119,9 @@ def main() -> int:
     ap.add_argument("--no-log", action="store_true")
     args = ap.parse_args()
 
-    manual_id, address, sw_id, name = resolve_switch(args.switch, args.runtime)
+    manual_id, address, sw_id, name, _conn, _location, _switch_type = resolve_switch(
+        args.switch, args.runtime
+    )
     if args.action == "tap":
         command = f"tap {sw_id} {args.ms}\n"
     else:
