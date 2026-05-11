@@ -83,12 +83,18 @@ int shim_gl_marshal_send_sync(uint16_t op,
                               uint32_t *out_reply_len);
 
 /* Runtime SPI RX override (defined in shim_ioctl.c).
- * Lets shim_inject.c inject CPU-local switch presses by OR-ing bits into
- * the 8-byte SPI MESSAGE_1 RX buffer. Each byte is OR'd in after the env
- * override (or default rx[2]=0x04) is applied. Zero entries are no-ops.
- * The SPI thread polls at ~480 Hz; a bit stays asserted across many cycles
- * until the inject thread clears it, so FUN_00674b90(0) sees a clean edge. */
+ * Legacy one-shot CPU-local overlay. New held switch input should use the
+ * channel/bit mixer below so presses can clear/toggle raw channel bytes and
+ * multiple buttons can be held simultaneously. */
 extern volatile uint8_t shim_spi_rx_extra[8];
+
+/* Held switch overlay (defined in shim_inject.c).
+ * Host-side input APIs set/clear held channel bits. Channel 0 raw presses
+ * clear bits in the CPU SPI idle buffer; node-bus channels toggle bits
+ * relative to their saved idle bytes, matching the existing manual press
+ * behavior. */
+void shim_switch_hold_set(uint8_t channel_id, uint16_t bit_idx, int held);
+void shim_switch_hold_apply(uint8_t channel_id, uint8_t buf[8]);
 
 /* Decoder compatibility patch (defined in shim_patches.c).
  * Patches the b.ne at game VA 0x920cf0 in the game's get_format callback

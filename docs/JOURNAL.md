@@ -9148,3 +9148,66 @@ Touched:
 
 - `_emulation/docs/PROTOCOL.md` — added the full manual switch inventory and resting-state caution.
 - `_emulation/docs/JOURNAL.md` — this Step 100 entry.
+
+## Step 101 — TIMER switches converted to held down/up inputs (2026-05-11)
+
+Changed the manual switch path from one-shot-only pulses to a held-state overlay:
+
+- `marker_button.py` now appends explicit `down <sw_id>` / `up <sw_id>` commands on button press/release under an advisory file lock. The old numeric request format remains valid as a tap for `SHIM_AUTO_PRESS` and existing ad-hoc tools.
+- `shim_manual_press_thread` parses multi-line request files and handles `down`, `up`, and `tap`. It consumes requests under the same advisory file lock, truncating the file instead of unlinking it, then sets/clears a shared per-channel held-bit mask and still calls `sub_651610(channel, buf)` immediately so the edge is visible without waiting for the next poll.
+- `shim_ioctl.c` applies the held overlay to channel 0's synthesized CPU-SPI idle buffer. `shim_nodebus.c` applies the same overlay to synthesized remote node `switch_poll` responses. This lets multiple TIMER buttons stay held at the same time.
+- Polarity is intentionally raw-channel based: channel 0 held bits clear the idle bit; remote node held bits XOR against saved idle bytes. This matches the prior pulse behavior while making the state persistent.
+
+Validated with:
+
+```text
+python3 -m py_compile games/pokemon_le/_emulation/marker_button.py
+cd games/pokemon_le/_emulation && ./build.sh
+```
+
+### 101a — Runtime env cleanup and GL daemon default
+
+Cleaned out old environment-variable scaffolding from the launcher and shim so the current baseline is easier to reason about:
+
+- `GL_DAEMON=1` is now the launcher default. `GL_DAEMON=0` remains the explicit Mesa-aarch64 overlay fallback.
+- `DEVBUS=0` is now default; devbus remains opt-in for switch-state/noise work.
+- `DEVBUS_TAIL=auto` currently resolves to off instead of silently tailing every run.
+- `SWITCH_NOISE_TEST=0` and `SHIM_SWITCH_TABLE_PROBE=0` are default-off diagnostics.
+- `SHIM_MANUAL_PRESS` now auto-enables only for `TIMER=ON`, `TIMER=EXTERNAL`, or `SHIM_AUTO_PRESS=1`.
+- `SHIM_MANUAL_PRESS_MS` default was reduced to `120` for legacy tap requests.
+- Removed stale CH5/select/switch-probe/node-probe env scaffolding from `shim_inject.c`.
+- Removed the temporary `SPIKE3_PWRDIST_1D` override; powerdist `0x1d` now always reports `ff ff ff ff`.
+
+The TIMER UI was also reorganized into tabs: service controls stay fixed at the top, and other switch buttons are grouped into small 2x2 tabs by function.
+
+Validated with:
+
+```text
+bash -n games/pokemon_le/_emulation/run_game.sh
+cd games/pokemon_le/_emulation && ./build.sh
+git diff --check -- run_game.sh shim_inject.c shim_nodebus.c docs/PROTOCOL.md
+```
+
+### 101b — Codex knowledge tools imported without stale Claude memory
+
+Imported the useful local mechanics from the old Claude tooling into repo-local Codex paths, without copying Claude memories, generated indexes, hook logs, hook state, or settings:
+
+- `.codex/tools/knowledge/protocol/` — `freshness.py`, `audit_section.py`, `journal_writer.py`
+- `.codex/tools/knowledge/lore/` — `journal_index.py`, `corpus_search.py`
+- `.codex/tools/knowledge/log/` — `find_runs.py`, `scan_log.py`
+- `.codex/agents/lore-keeper.md` — rewritten as a read-only prior-art workflow that regenerates the current index before searching.
+- `.codex/agents/log-reader.md` — rewritten as a read-only run-log triage workflow.
+- `.codex/tools/knowledge/cache/.gitignore` — keeps regenerated `journal_index.json` out of source control.
+
+Patched the imported scripts so project-root discovery no longer depends on `.claude`, and the generated index now lives under `.codex/tools/knowledge/cache/`.
+
+Validated with:
+
+```text
+python3 .codex/tools/knowledge/lore/journal_index.py
+python3 .codex/tools/knowledge/protocol/freshness.py
+python3 .codex/tools/knowledge/protocol/audit_section.py 10
+python3 .codex/tools/knowledge/lore/corpus_search.py "GL_DAEMON" --no-bn
+python3 .codex/tools/knowledge/log/find_runs.py --limit 3
+python3 .codex/tools/knowledge/log/scan_log.py --tail 5
+```

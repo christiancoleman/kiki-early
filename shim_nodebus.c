@@ -67,6 +67,8 @@ static int nodebus_enum_idx = 0;
  * with those keys instead.
  */
 static uint8_t nodebus_cipher_keys[32][16] = {{0}};
+static uint8_t nodebus_switch_idle_baseline[32][8];
+static uint8_t nodebus_switch_idle_baseline_valid[32];
 
 /* Per-response delay before sending a synthetic cipher reply. Without it the
  * game races past Godot/Radium init (Step 43 "timeout is progress" — the path
@@ -213,22 +215,6 @@ static void pwrdist_1d_payload(uint8_t out[4]) {
     out[1] = 0xff;
     out[2] = 0xff;
     out[3] = 0xff;
-
-    const char *s = getenv("SPIKE3_PWRDIST_1D");
-    if (!s || !s[0]) return;
-
-    unsigned b0, b1, b2, b3;
-    if (sscanf(s, "%x:%x:%x:%x", &b0, &b1, &b2, &b3) == 4 ||
-        sscanf(s, "%x,%x,%x,%x", &b0, &b1, &b2, &b3) == 4 ||
-        sscanf(s, "%2x%2x%2x%2x", &b0, &b1, &b2, &b3) == 4) {
-        out[0] = (uint8_t)b0;
-        out[1] = (uint8_t)b1;
-        out[2] = (uint8_t)b2;
-        out[3] = (uint8_t)b3;
-    } else {
-        SHIM_LOG("bridge: invalid SPIKE3_PWRDIST_1D='%s' (expected ff:ff:ff:ff, ff,ff,ff,ff, or ffffffff)",
-                 s);
-    }
 }
 
 /* Bridge frame escape encoding. The Spike 3 bridge protocol reserves three
@@ -545,9 +531,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
          * payload_len == 4 it memcpys into the per-id buffer at
          * data_490e5b0+0xa0+id*8; otherwise it falls through to the silent-
          * ACK fallback at 0x915d28. This carries pwrdist rail/interlock
-         * status; default to all-bits-set until the exact bitfield is mapped.
-         * Override with SPIKE3_PWRDIST_1D=ff:ff:ff:ff / ff,ff,ff,ff /
-         * ffffffff for bit-probe runs. */
+         * status; default to all-bits-set until the exact bitfield is mapped. */
         uint8_t pd[4];
         pwrdist_1d_payload(pd);
         resp[0] = 0x02;
@@ -976,11 +960,24 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             uint8_t idle[8] = {0};
             uintptr_t game_base = shim_resolve_game_base();
             if (game_base) {
-                memcpy(idle,
-                       (void *)(uintptr_t)(game_base + 0x44804d0ULL +
-                                           0xb0ULL * (uint64_t)slot),
-                       8);
+                if (slot < 32 && nodebus_switch_idle_baseline_valid[slot]) {
+                    memcpy(idle, nodebus_switch_idle_baseline[slot], 8);
+                } else {
+                    memcpy(idle,
+                           (void *)(uintptr_t)(game_base + 0x44804d0ULL +
+                                               0xb0ULL * (uint64_t)slot),
+                           8);
+                    if (slot < 32) {
+                        int nonzero = 0;
+                        for (int i = 0; i < 8; i++) nonzero |= idle[i];
+                        if (nonzero) {
+                            memcpy(nodebus_switch_idle_baseline[slot], idle, 8);
+                            nodebus_switch_idle_baseline_valid[slot] = 1;
+                        }
+                    }
+                }
             }
+            shim_switch_hold_apply(slot, idle);
             uint8_t resp[64];
             int o = 0;
             resp[o++] = 0x02;

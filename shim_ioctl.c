@@ -173,16 +173,10 @@ static int shim_spi_fill_channel0_idle_rx(uint8_t *rx, uint32_t len) {
     uintptr_t game_base = shim_resolve_game_base();
     if (!game_base || !rx || len == 0) return 0;
 
+    static const uint8_t synthetic_idle[8] =
+        { 0x00, 0xff, 0xff, 0xf8, 0xff, 0xff, 0xff, 0xff };
     uint8_t idle[8];
-    memcpy(idle, (const void *)(uintptr_t)(game_base + 0x44804d0ULL), 8);
-
-    int nonzero = 0;
-    for (int i = 0; i < 8; i++) nonzero |= idle[i];
-    if (!nonzero) {
-        static const uint8_t synthetic_idle[8] =
-            { 0x00, 0xff, 0xff, 0xf8, 0xff, 0xff, 0xff, 0xff };
-        memcpy(idle, synthetic_idle, sizeof(idle));
-    }
+    memcpy(idle, synthetic_idle, sizeof(idle));
 
     const char *coin_door = getenv("SPIKE3_COIN_DOOR_INTERLOCK");
     if (!coin_door || !coin_door[0] ||
@@ -193,6 +187,8 @@ static int shim_spi_fill_channel0_idle_rx(uint8_t *rx, uint32_t len) {
     } else if (strcmp(coin_door, "open") == 0 || strcmp(coin_door, "0") == 0) {
         idle[2] |= 0x80u;
     }
+
+    shim_switch_hold_apply(0, idle);
 
     /* sub_8fa820 stores DAT_0450d9b0 byte N from SPI rx[N-1].
      * DAT byte 0 is a separate zero-initialized stack byte, so rx[7] is

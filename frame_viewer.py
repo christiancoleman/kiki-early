@@ -145,6 +145,16 @@ def run_display(args, sock):
     # scale it by args.scale for the window. Fullscreen overrides both.
     if args.fullscreen:
         root.attributes("-fullscreen", True)
+    elif args.maximized:
+        try:
+            root.state("zoomed")
+        except tk.TclError:
+            try:
+                root.attributes("-zoomed", True)
+            except tk.TclError:
+                init_w = max(1, int(1920 * args.scale))
+                init_h = max(1, int(1080 * args.scale))
+                root.geometry(f"{init_w}x{init_h}")
     else:
         init_w = max(1, int(1920 * args.scale))
         init_h = max(1, int(1080 * args.scale))
@@ -244,6 +254,8 @@ def main():
     ap.add_argument("--fullscreen", action="store_true",
                     help="open the viewer window fullscreen "
                          "(otherwise sized 1920×1080 × --scale at start)")
+    ap.add_argument("--maximized", action="store_true",
+                    help="ask the window manager to open the viewer maximized")
     ap.add_argument("--orient",
                     default="none",
                     choices=["none", "rot90", "rot180", "rot270", "flip-h", "flip-v"],

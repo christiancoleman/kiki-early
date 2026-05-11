@@ -8,15 +8,15 @@
 # TUNABLE ENV OVERRIDES (defaults in []):
 #   TIMEOUT=<sec>           [0]     cap run duration; 0 = no limit (default play)
 #   VIEWER=<0|1>            [1]     auto-launch python3 frame_viewer.py
+#   VIEWER_MAXIMIZED=<0|1>  [1]     open the viewer maximized
 #   VIEWER_FULLSCREEN=<0|1> [0]     open the viewer fullscreen rather than
-#                                   in a 1920×1080 window
+#                                   maximized/in a 1920×1080 window
 #   AUDIO_PLAYER=<0|1>      [1]     auto-launch audio_subscriber.py | ffplay
-#   TIMER=<ON|OFF>          [OFF]   auto-launch marker_button.py — a small Tk
-#                                   window with one button that appends a
-#                                   timestamped "[marker] click #N (label)"
-#                                   line to runs/latest/game.log on each press.
-#                                   Lets you correlate "I heard X" with the
-#                                   shim's interleaved log output.
+#   TIMER=<OFF|ON|EXTERNAL> [OFF]   ON auto-launches marker_button.py — a Tk
+#                                   switch panel that writes switch commands to
+#                                   runs/latest/press_request.txt. EXTERNAL
+#                                   keeps the same shim command path active
+#                                   without launching the WSL Tk panel.
 #   SHIM_AUTO_PRESS=<0|1>   [0]     schedule one host-side switch press request
 #                                   without the TIMER UI. Defaults to Service
 #                                   Back at T+60s when enabled; override with
@@ -26,7 +26,7 @@
 #                                   etc/init.d/game_monitor). Lets boot_display
 #                                   write /games/data/boot_display_cmd which the
 #                                   game reads at startup.
-#   BOOT_DISPLAY_DURATION=<s> [1.5]  how long to leave boot_display alive.
+#   BOOT_DISPLAY_DURATION=<s> [3]    how long to leave boot_display alive.
 #   STALE_KILL=<0|1>        [1]     reap leftover qemu/helpers from prior runs
 #                                   before starting.
 #   REAL_GL=<0|1>           [1]     forward EGL/GLES to Mesa vs return stubs
@@ -46,10 +46,10 @@
 #   STATE_BRIDGE=<0|1>      [0]     emit cmode JSON on abstract AF_UNIX socket
 #   LOGFILE=<path>          []      redirect game stdout+stderr to a file
 #                                   (separate from --debug; only affects game)
-#   SWITCH_NOISE_TEST=<auto|0|1> [auto]
+#   SWITCH_NOISE_TEST=<auto|0|1> [0]
 #                                   after the run, analyze devbus.log for
 #                                   same-timestamp watched switch clusters.
-#                                   auto enables when TIMER=ON and DEVBUS_TAIL=1.
+#                                   auto enables only when DEVBUS_TAIL=1.
 #   SWITCH_NOISE_WATCH=<ids> [77-98]
 #                                   comma/range list passed to
 #                                   switch_noise_test.py --watch.
@@ -159,13 +159,14 @@ RUN_DIR="$SCRIPT_DIR/runs/$RUN_DIRNAME"
 LATEST_DIR="$RUN_DIR"
 mkdir -p "$RUN_DIR"
 ln -sfn "$RUN_DIRNAME" "$SCRIPT_DIR/runs/latest"
+printf '%s\n' "$RUN_DIRNAME" > "$SCRIPT_DIR/runs/latest_path.txt"
 
 export SPIKE3_SYSROOT="$SYSROOT"
 export SPIKE3_GAME_DIR="$GAME_DIR"
 export SPIKE3_EMULATION_DIR="$SCRIPT_DIR"
 export SPIKE3_RUN_DIR="$RUN_DIR"
 export SPIKE3_GAME_LOG_PATH="$LATEST_DIR/game.log"
-export SHIM_PRESS_REQUEST_PATH="$SCRIPT_DIR/runs/latest/press_request.txt"
+export SHIM_PRESS_REQUEST_PATH="$RUN_DIR/press_request.txt"
 
 # ---- Defaults (override via env) ----
 TIMEOUT="${TIMEOUT:-0}"
@@ -179,10 +180,10 @@ AUDIO_BRIDGE="${AUDIO_BRIDGE:-1}"
 # propagated to the game.
 FORWARD_DECODE="${FORWARD_DECODE:-1}"
 # GL_DAEMON=1: launch gl_daemon.py and route shim GL/EGL calls to host-native
-# Mesa via abstract AF_UNIX @spike3_gl. Default off; when enabled, default the
+# Mesa via abstract AF_UNIX @spike3_gl. Default on; when enabled, default the
 # daemon's zero/zero blend handling to the verified alpha-preserving mode unless
 # the caller explicitly supplied a zero-blend env override.
-GL_DAEMON="${GL_DAEMON:-0}"
+GL_DAEMON="${GL_DAEMON:-1}"
 if [[ "$GL_DAEMON" == "1" \
       && -z "${SPIKE3_ZERO_BLEND_DISABLE+x}" \
       && -z "${SPIKE3_ZERO_BLEND_IGNORE+x}" \
@@ -204,23 +205,40 @@ SPI_DELAY_US="${SPI_DELAY_US:-0}"
 STATE_BRIDGE="${STATE_BRIDGE:-0}"
 OFFLINE_MODE="${OFFLINE_MODE:-1}"
 VIEWER="${VIEWER:-1}"
+VIEWER_MAXIMIZED="${VIEWER_MAXIMIZED:-1}"
 VIEWER_FULLSCREEN="${VIEWER_FULLSCREEN:-0}"
 AUDIO_PLAYER="${AUDIO_PLAYER:-1}"
 TIMER="${TIMER:-OFF}"
-DEVBUS="${DEVBUS:-1}"
+case "$TIMER" in
+    ON)
+        TIMER_ACTIVE=1
+        TIMER_GUI=1
+        ;;
+    EXTERNAL|REMOTE)
+        TIMER=EXTERNAL
+        TIMER_ACTIVE=1
+        TIMER_GUI=0
+        ;;
+    OFF|0)
+        TIMER=OFF
+        TIMER_ACTIVE=0
+        TIMER_GUI=0
+        ;;
+    *)
+        printf '[run_game] unknown TIMER=%s; expected OFF, ON, or EXTERNAL\n' "$TIMER" >&2
+        exit 2
+        ;;
+esac
+DEVBUS="${DEVBUS:-0}"
 DEVBUS_TAIL="${DEVBUS_TAIL:-auto}"
 if [[ "$DEVBUS_TAIL" == "auto" ]]; then
-    if [[ "$TIMER" == "ON" && "$DEVBUS" == "1" ]]; then
-        DEVBUS_TAIL=1
-    else
-        DEVBUS_TAIL=0
-    fi
+    DEVBUS_TAIL=0
 fi
-SWITCH_NOISE_TEST="${SWITCH_NOISE_TEST:-auto}"
+SWITCH_NOISE_TEST="${SWITCH_NOISE_TEST:-0}"
 SWITCH_NOISE_WATCH="${SWITCH_NOISE_WATCH:-77-98}"
 SWITCH_NOISE_TEST_STRICT="${SWITCH_NOISE_TEST_STRICT:-0}"
 if [[ "$SWITCH_NOISE_TEST" == "auto" ]]; then
-    if [[ "$TIMER" == "ON" && "$DEVBUS_TAIL" == "1" && "$DEVBUS" == "1" ]]; then
+    if [[ "$DEVBUS_TAIL" == "1" && "$DEVBUS" == "1" ]]; then
         SWITCH_NOISE_TEST=1
     else
         SWITCH_NOISE_TEST=0
@@ -232,30 +250,29 @@ STALE_KILL="${STALE_KILL:-1}"
 LOGFILE="${LOGFILE:-}"
 QEMU="${QEMU:-qemu-aarch64}"
 
-# Default mode is MANUAL press control via marker_button.py: TIMER=ON spawns
-# the marker GUI, which has explicit "PRESS Service Select / Plus / Minus /
-# Back / Start / Action" buttons that write runs/latest/press_request.txt;
-# the shim's shim_manual_press_thread polls for the file and drives the
-# requested switch. The manual watcher starts immediately and drops requests
-# made before the game exposes the switch table, so early clicks cannot replay
-# later on a different screen.
+# Manual press control uses runs/latest/press_request.txt. TIMER=ON spawns the
+# marker GUI; TIMER=EXTERNAL leaves GUI ownership to an external process such
+# as switch_command.py or a future Windows/COM client. The shim watcher is
+# enabled only when an input producer is expected, unless SHIM_MANUAL_PRESS is
+# explicitly set by the caller.
 #
-# To restore the older auto-press behaviour, set SHIM_SELECT_PRESS=1 (off
-# by default now) along with SHIM_SELECT_PRESS_SW_ID/INTERVAL_S/ATTEMPTS/MS.
-export SHIM_MANUAL_PRESS="${SHIM_MANUAL_PRESS:-1}"
-export SHIM_MANUAL_PRESS_DELAY_S="${SHIM_MANUAL_PRESS_DELAY_S:-0}"
-export SHIM_MANUAL_PRESS_MS="${SHIM_MANUAL_PRESS_MS:-500}"
-export SHIM_SELECT_PRESS="${SHIM_SELECT_PRESS:-0}"
-export SHIM_SELECT_PRESS_SW_ID="${SHIM_SELECT_PRESS_SW_ID:-90}"
-export SHIM_SELECT_PRESS_INTERVAL_S="${SHIM_SELECT_PRESS_INTERVAL_S:-4}"
-export SHIM_SELECT_PRESS_ATTEMPTS="${SHIM_SELECT_PRESS_ATTEMPTS:-4}"
-export SHIM_SELECT_PRESS_MS="${SHIM_SELECT_PRESS_MS:-500}"
-export SHIM_SWITCH_TABLE_PROBE="${SHIM_SWITCH_TABLE_PROBE:-1}"
-export SHIM_SWITCH_TABLE_PROBE_DELAY_S="${SHIM_SWITCH_TABLE_PROBE_DELAY_S:-65}"
 export SHIM_AUTO_PRESS="${SHIM_AUTO_PRESS:-0}"
 export SHIM_AUTO_PRESS_DELAY_S="${SHIM_AUTO_PRESS_DELAY_S:-60}"
 export SHIM_AUTO_PRESS_SW_ID="${SHIM_AUTO_PRESS_SW_ID:-93}"
 export SHIM_AUTO_PRESS_LABEL="${SHIM_AUTO_PRESS_LABEL:-Service Back}"
+if [[ -z "${SHIM_MANUAL_PRESS+x}" ]]; then
+    if [[ "$TIMER_ACTIVE" == "1" || "$SHIM_AUTO_PRESS" == "1" ]]; then
+        export SHIM_MANUAL_PRESS=1
+    else
+        export SHIM_MANUAL_PRESS=0
+    fi
+else
+    export SHIM_MANUAL_PRESS
+fi
+export SHIM_MANUAL_PRESS_DELAY_S="${SHIM_MANUAL_PRESS_DELAY_S:-0}"
+export SHIM_MANUAL_PRESS_MS="${SHIM_MANUAL_PRESS_MS:-120}"
+export SHIM_SWITCH_TABLE_PROBE="${SHIM_SWITCH_TABLE_PROBE:-0}"
+export SHIM_SWITCH_TABLE_PROBE_DELAY_S="${SHIM_SWITCH_TABLE_PROBE_DELAY_S:-65}"
 
 # ---- Derived ----
 SHIM="$SCRIPT_DIR/spi_shim.so"
@@ -454,7 +471,11 @@ if [[ "$VIEWER" == "1" && "$FRAME_BRIDGE" == "1" ]]; then
         # Helpers self-resolve their socket path from __file__ (== $SYSROOT/tmp/spike3_*.sock).
         # No --socket arg needed.
         viewer_args=()
-        [[ "$VIEWER_FULLSCREEN" == "1" ]] && viewer_args+=("--fullscreen")
+        if [[ "$VIEWER_FULLSCREEN" == "1" ]]; then
+            viewer_args+=("--fullscreen")
+        elif [[ "$VIEWER_MAXIMIZED" == "1" ]]; then
+            viewer_args+=("--maximized")
+        fi
         python3 "$SCRIPT_DIR/frame_viewer.py" "${viewer_args[@]+"${viewer_args[@]}"}" \
             >"$viewer_log_target" 2>&1 &
         HELPER_PIDS+=("$!"); HELPER_LABELS+=("frame viewer")
@@ -515,7 +536,7 @@ if [[ "$GL_DAEMON" == "1" ]]; then
     fi
 fi
 
-if [[ "$TIMER" == "ON" ]]; then
+if [[ "$TIMER_GUI" == "1" ]]; then
     if command -v python3 >/dev/null; then
         # Marker writes go directly to runs/latest/game.log (raw O_APPEND in
         # marker_button.py) — no separate timer.log needed. BUT: route
@@ -528,6 +549,8 @@ if [[ "$TIMER" == "ON" ]]; then
     else
         printf '[run_game] TIMER=ON but python3 not found; skipping marker button\n' >&2
     fi
+elif [[ "$TIMER_ACTIVE" == "1" ]]; then
+    printf '[run_game] TIMER=EXTERNAL — switch commands accepted at %s\n' "$SHIM_PRESS_REQUEST_PATH" >&2
 fi
 
 if [[ "$DEVBUS_TAIL" == "1" ]]; then
@@ -672,8 +695,9 @@ fi
              DEVBUS DEVBUS_TAIL \
              SPI_QUIET SPI_DELAY_US STATE_BRIDGE OFFLINE_MODE \
              SWITCH_NOISE_TEST SWITCH_NOISE_WATCH SWITCH_NOISE_TEST_STRICT \
-             VIEWER VIEWER_FULLSCREEN AUDIO_PLAYER TIMER  BOOT_DISPLAY \
-             BOOT_DISPLAY_DURATION STALE_KILL SHIM_AUTO_PRESS \
+             VIEWER VIEWER_MAXIMIZED VIEWER_FULLSCREEN AUDIO_PLAYER TIMER  BOOT_DISPLAY \
+             BOOT_DISPLAY_DURATION STALE_KILL SHIM_MANUAL_PRESS SHIM_MANUAL_PRESS_MS \
+             SHIM_SWITCH_TABLE_PROBE SHIM_AUTO_PRESS \
              SHIM_AUTO_PRESS_DELAY_S SHIM_AUTO_PRESS_SW_ID \
              SHIM_AUTO_PRESS_LABEL DEBUG LOGFILE; do
         printf '  %-22s = %s\n' "$v" "${!v:-}"
@@ -692,9 +716,9 @@ cd /games
 # SIGINT handler doesn't always terminate — see cleanup_all's SIGKILL path).
 #
 # IMPORTANT: use `>>` (O_APPEND) for the game.log redirect, with explicit
-# pre-truncation. Reason: when TIMER=ON, marker_button.py also appends to
-# game.log via O_APPEND. With `>` (no O_APPEND), qemu's fd has a fixed
-# position counter; marker's appends advance EOF past qemu's position, then
+# pre-truncation. Reason: TIMER=ON marker_button.py and external clients can
+# also append to game.log via O_APPEND. With `>` (no O_APPEND), qemu's fd has a
+# fixed position counter; helper appends advance EOF past qemu's position, then
 # qemu's next write OVERWRITES the marker line. With both writers in
 # O_APPEND mode, every write goes atomically to current EOF — no
 # trampling. Pre-truncate so each run starts fresh.

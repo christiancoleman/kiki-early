@@ -1363,7 +1363,7 @@ No `uint32_t token_to_asset[]` array exists in the binary; token constants never
 
 ## 10. Display pipeline (DRM / GBM / EGL / GLES)
 
-**Data flow at a glance.** The game does its own real GLES rendering — no synthesized frames are fed to it. We intercept the hardware-specific framebuffer presentation parts (DRM/KMS ioctls + GBM allocation calls) and replace them with stand-ins, but every `glClear` / `glDraw*` / shader / texture upload the game issues is forwarded through to a **real GL backend** that writes real pixels into a real framebuffer. The shim supports two real-GL backends — an in-process Mesa-aarch64 overlay (`SPIKE3_REAL_GL=1`, default) or a host-native daemon (`GL_DAEMON=1`, see "Host-native GL daemon" below) — and at each fake page-flip does `glReadPixels` on the active backend's framebuffer and routes the bytes to one or more sinks (frame bridge over abstract AF_UNIX, periodic on-disk capture). GBM in this flow is a handle stand-in — its BOs are `calloc(256)` scratch pointers used as opaque tokens passed between layers; the only GBM BOs that actually carry pixel data are the special 1024×256 DMD path (`gbm_bo_map` returns `calloc(stride*height)` storage and `gbm_bo_unmap` captures it).
+**Data flow at a glance.** The game does its own real GLES rendering — no synthesized frames are fed to it. We intercept the hardware-specific framebuffer presentation parts (DRM/KMS ioctls + GBM allocation calls) and replace them with stand-ins, but every `glClear` / `glDraw*` / shader / texture upload the game issues is forwarded through to a **real GL backend** that writes real pixels into a real framebuffer. The shim supports two real-GL backends — the default host-native daemon (`GL_DAEMON=1`, see "Host-native GL daemon" below) or an in-process Mesa-aarch64 overlay (`GL_DAEMON=0`, `SPIKE3_REAL_GL=1`) — and at each fake page-flip does `glReadPixels` on the active backend's framebuffer and routes the bytes to one or more sinks (frame bridge over abstract AF_UNIX, periodic on-disk capture). GBM in this flow is a handle stand-in — its BOs are `calloc(256)` scratch pointers used as opaque tokens passed between layers; the only GBM BOs that actually carry pixel data are the special 1024×256 DMD path (`gbm_bo_map` returns `calloc(stride*height)` storage and `gbm_bo_unmap` captures it).
 
 The game presents frames via Linux's KMS/DRM stack with EGL on top of GBM. Three layers in the shim:
 
@@ -1434,8 +1434,8 @@ Each BO is registered in a side-table (32 slots, mutex-guarded) holding its `(wi
 | Mode | Set via | Behavior |
 |---|---|---|
 | Stub | `REAL_GL=0 GL_DAEMON=0 ./run_game.sh` | Every GLES/EGL/GBM call returns plausible defaults. Shaders "compile". Draws are no-op. Produces no real pixels |
-| Mesa-aarch64 overlay (default) | `./run_game.sh` (default) | `FWD_RET` / `FWD_VOID` macros tail-call `dlsym(RTLD_NEXT, ...)` into the Mesa overlay at `mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/`. Game's EGL/GLES calls run inside qemu-aarch64 against an in-process Mesa → llvmpipe → a real EGL pbuffer (1920×1080) |
-| Host-native daemon | `GL_DAEMON=1 ./run_game.sh` | Shim's GL/EGL hooks marshal opcodes over abstract AF_UNIX `@spike3_gl` to `gl_daemon.py` running natively on the host. Daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context and replays opcodes via PyOpenGL. EGL setup is synthesized in-shim (FAKE_EGL_* sentinels). `run_game.sh` auto-enables the alpha-preserving zero-blend behavior unless overridden. See "Host-native GL daemon" subsection below |
+| Mesa-aarch64 overlay | `GL_DAEMON=0 ./run_game.sh` | `FWD_RET` / `FWD_VOID` macros tail-call `dlsym(RTLD_NEXT, ...)` into the Mesa overlay at `mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/`. Game's EGL/GLES calls run inside qemu-aarch64 against an in-process Mesa → llvmpipe → a real EGL pbuffer (1920×1080) |
+| Host-native daemon (default) | `./run_game.sh` | Shim's GL/EGL hooks marshal opcodes over abstract AF_UNIX `@spike3_gl` to `gl_daemon.py` running natively on the host. Daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context and replays opcodes via PyOpenGL. EGL setup is synthesized in-shim (FAKE_EGL_* sentinels). `run_game.sh` auto-enables the alpha-preserving zero-blend behavior unless overridden. See "Host-native GL daemon" subsection below |
 
 #### Cross-backend translation glue
 
@@ -1460,7 +1460,7 @@ When `GL_DAEMON=1` is exported (forwarded to qemu env as `SPIKE3_GL_DAEMON=1`), 
 Current verified Pokémon LE game-run command:
 
 ```bash
-GL_DAEMON=1 ./run_game.sh
+./run_game.sh
 ```
 
 #### Wire protocol
@@ -1741,9 +1741,9 @@ Resting-state work should treat the manual's `Type` as a hardware clue, not as t
 | `+0x34` | `event_id` (u16) | tag passed to `sub_729c10` (mostly `0x0005` = generic switch-event tag) |
 
 Shim probes:
-- `SHIM_SWITCH_TABLE_PROBE=1` — dumps the (sw_id → channel, byte, bit, state, handler_fn, event_id, flags) table once at +80s.
+- `SHIM_SWITCH_TABLE_PROBE=1` — diagnostic only; dumps the (sw_id → channel, byte, bit, state, handler_fn, event_id, flags) table once after `SHIM_SWITCH_TABLE_PROBE_DELAY_S` (default 65s).
 - `SHIM_EDGE_SNAPSHOT=1` (with `SHIM_EDGE_SNAPSHOT_DELAY_S` / `_INTERVAL_S` / `_CYCLES`) — periodic snapshot of each switch's `edge_counter` (`+0x26`); logs only switches whose counter changed. Identifies which switches are firing edges continuously.
-- **Press injection (host → shim).** `run_game.sh`'s `SHIM_AUTO_PRESS=1` schedules a single timed switch press (default `sw_id=93` Service Back at T+60s; override with `SHIM_AUTO_PRESS_DELAY_S` / `SHIM_AUTO_PRESS_SW_ID` / `SHIM_AUTO_PRESS_LABEL`). `marker_button.py` (`TIMER=ON`) provides interactive presses via the same path. Both write the chosen sw_id as ASCII to `runs/latest/press_request.txt`; `shim_manual_press_thread` (env-gated by `SHIM_MANUAL_PRESS=1`, default on) polls that file and drives the press through the corrected-deref'd switch state byte described above. `SHIM_SELECT_PRESS=1` is the older auto-retry variant for service-button presses. See §2 for full env-knob defaults.
+- **Press injection (host → shim).** The canonical switch-control path is file-backed and intentionally simple. `run_game.sh`'s `SHIM_AUTO_PRESS=1` schedules a single timed switch press (default `sw_id=93` Service Back at T+60s; override with `SHIM_AUTO_PRESS_DELAY_S` / `SHIM_AUTO_PRESS_SW_ID` / `SHIM_AUTO_PRESS_LABEL`). `marker_button.py` (`TIMER=ON`) provides interactive holdable switches through `runs/latest/press_request.txt`. The request file accepts legacy numeric `sw_id` lines as taps plus explicit `down <sw_id>`, `up <sw_id>`, and `tap <sw_id> [hold_ms]` lines; writers append under advisory lock, and the shim consumes by truncating rather than unlinking. `shim_manual_press_thread` is auto-enabled only when `TIMER=ON`, `TIMER=EXTERNAL`, or `SHIM_AUTO_PRESS=1` unless `SHIM_MANUAL_PRESS` is explicitly set. It updates a held-switch overlay mask and immediately calls `sub_651610(channel, buf)` so the runtime switch array sees the edge; the SPI and nodebus poll synth paths also apply the overlay, so multiple buttons can remain held simultaneously until matching `up` commands arrive. Channel 0 held bits clear raw CPU-SPI idle bits; remote node channels XOR held bits relative to the saved idle bytes, matching the prior one-shot press behavior. See §2 for full env-knob defaults.
 
 *Verified by:* JOURNAL Step 93 — runtime probe output captured 2026-05-08 with all 99 entries enumerated; per-channel summary cross-checked against the Pokémon LE Lite manual's switch matrix.
 
@@ -2219,7 +2219,7 @@ When the daemon is unreachable, `avcodec_send_packet` / `avcodec_receive_frame` 
 
 ### Host-native GL daemon (host Mesa)
 
-The game's GL/EGL traffic can be routed to a host-native daemon over an abstract AF_UNIX socket. Active iff `GL_DAEMON=1` (forwarded as `SPIKE3_GL_DAEMON=1`); falls back to the in-process Mesa overlay path otherwise. Current verified game-run command is `GL_DAEMON=1 ./run_game.sh`; `run_game.sh` auto-enables the zero-blend fix unless overridden. See §10 "Host-native GL daemon" for full wire protocol + EGL synthesis + zero-blend handling.
+The game's GL/EGL traffic routes to a host-native daemon over an abstract AF_UNIX socket by default (`GL_DAEMON=1`, forwarded as `SPIKE3_GL_DAEMON=1`). Set `GL_DAEMON=0` to fall back to the in-process Mesa overlay path. `run_game.sh` auto-enables the zero-blend fix unless overridden. See §10 "Host-native GL daemon" for full wire protocol + EGL synthesis + zero-blend handling.
 
 | Component | File | Role |
 |---|---|---|
