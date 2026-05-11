@@ -37,6 +37,8 @@
 
 typedef struct {
     uint8_t  state;
+    uint8_t  logical_state;
+    uint8_t  invert_flag;
     uint16_t edge_counter;
     uint8_t  channel;
     uint16_t bit_idx;
@@ -49,9 +51,10 @@ typedef struct {
 typedef struct {
     uint8_t  sw_id;
     uint8_t  state;
+    uint8_t  logical_state;
+    uint8_t  invert_flag;
     uint16_t edge_counter;
     uint16_t flap_count;
-    uint8_t  pad[2];
     uint64_t timestamp_ns;
 } sw_event_t;
 
@@ -132,11 +135,20 @@ static int devbus_scan_once(uintptr_t game_base, int seeding) {
         uint8_t  channel  = *(uint8_t  *)(e + SHIM_SWITCH_ENTRY_CHANNEL_OFF);
         uint16_t edge     = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_EDGE_OFF);
         uint8_t  state    = *(uint8_t  *)(e + SHIM_SWITCH_ENTRY_STATE_OFF);
+        uint16_t flags    = 0;
+        long config_ptr   = *(long *)(e + SHIM_SWITCH_ENTRY_CONFIG_OFF);
+        if (config_ptr) {
+            flags = *(uint16_t *)(config_ptr + 0x30);
+        }
+        uint8_t invert = (flags & 0x04) ? 1 : 0;
+        uint8_t logical = invert ? state : (uint8_t)(state ^ 1);
 
         sw_shadow_t *sh = &g_shadow[sw_id];
 
         if (!sh->valid) {
             sh->state = state;
+            sh->logical_state = logical;
+            sh->invert_flag = invert;
             sh->edge_counter = edge;
             sh->channel = channel;
             sh->bit_idx = bit_idx;
@@ -155,15 +167,20 @@ static int devbus_scan_once(uintptr_t game_base, int seeding) {
             sh->flap_window_start_ns = now_ns;
         }
 
-        if (sh->state != state || sh->edge_counter != edge) {
+        if (sh->state != state || sh->logical_state != logical ||
+            sh->invert_flag != invert || sh->edge_counter != edge) {
             sh->flap_count_this_window++;
             sh->state = state;
+            sh->logical_state = logical;
+            sh->invert_flag = invert;
             sh->edge_counter = edge;
 
             if (!seeding) {
                 sw_event_t evt = {
                     .sw_id        = (uint8_t)sw_id,
                     .state        = state,
+                    .logical_state = logical,
+                    .invert_flag  = invert,
                     .edge_counter = edge,
                     .flap_count   = sh->flap_count_last_window,
                     .timestamp_ns = now_ns,
@@ -279,10 +296,12 @@ static int devbus_send_snapshot(devbus_client_t *cli) {
             raw_bit = (channel_bytes[sh->channel][byte_off] & bit_mask) ? 1 : 0;
         }
         n = snprintf(entry, sizeof(entry),
-                     "%s{\"sw_id\":%d,\"state\":%u,\"edge\":%u,"
+                     "%s{\"sw_id\":%d,\"state\":%u,\"logical\":%u,"
+                     "\"invert\":%u,\"edge\":%u,"
                      "\"channel\":%u,\"bit_idx\":%u,\"raw\":%u,\"flap\":%u}",
                      first ? "" : ",",
-                     sw_id, sh->state, sh->edge_counter,
+                     sw_id, sh->state, sh->logical_state, sh->invert_flag,
+                     sh->edge_counter,
                      sh->channel, sh->bit_idx, raw_bit,
                      sh->flap_count_last_window);
         if (n < 0 || n >= (int)sizeof(entry)) return -1;
@@ -297,11 +316,13 @@ static int devbus_send_change(devbus_client_t *cli, const sw_event_t *evt) {
     int n = snprintf(buf, sizeof(buf),
                      "{\"v\":%d,\"seq\":%llu,\"event\":\"switch_change\","
                      "\"ts_ns\":%llu,\"sw_id\":%d,\"state\":%u,"
+                     "\"logical\":%u,\"invert\":%u,"
                      "\"edge\":%u,\"flap\":%u}\n",
                      DEVBUS_PROTO_VERSION,
                      (unsigned long long)atomic_fetch_add(&cli->seq, 1),
                      (unsigned long long)evt->timestamp_ns,
                      evt->sw_id, evt->state,
+                     evt->logical_state, evt->invert_flag,
                      evt->edge_counter, evt->flap_count);
     if (n < 0 || n >= (int)sizeof(buf)) return -1;
     return devbus_write_all(cli->fd, buf, (size_t)n);

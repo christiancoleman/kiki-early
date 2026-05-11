@@ -157,7 +157,7 @@ After setup, `/games`, `/connectivity`, `/data` are kernel-resolved into the sys
 
 `_emulation/run_game.sh` is the source of truth for launcher toggles, defaults, and helper process selection. This document intentionally does not mirror that table to avoid drift.
 
-`devbus_snapshot.py` is the one-shot switch-state client. Run it while the game is active to print raw channel buffers joined with decoded switch state, edge/flap counters, raw/state relation, manual address, and switch name. Use `--from-file runs/latest/devbus.log` to analyze a saved debug log, or `--mismatches` to show only rows where the manual `N-SW-K` address disagrees with runtime channel/bit.
+`devbus_snapshot.py` is the one-shot switch-state client. Run it while the game is active to print raw channel buffers joined with decoded switch state, edge/flap counters, raw/state relation, manual address, and switch name. Use `--from-file runs/latest/devbus.log` to analyze a saved debug log; saved-log mode folds later `switch_change` lines over the snapshot before printing. Use `--mismatches` to show only rows where the manual `N-SW-K` address disagrees with runtime channel/bit.
 
 The `--debug` flag splits stdout/stderr per subsystem into the run dir (default behavior is to inherit the terminal). The `--note "describe"` flag adds a slug to the run-dir name and a note line to `run_info.txt`.
 
@@ -1586,7 +1586,7 @@ uintptr_t sw_struct = arr + sw_id * 0x30;     // live heap struct
 | `+0x10` | `config_ptr` | pointer to a config struct whose `+0x30` byte encodes flags |
 | `+0x10 → +0x30` | config flags | bit 2 (`0x04`) = invert, bits 5+6 (`0x60`) = broken/stuck masks |
 | `+0x26` | u16 `edge_counter` | incremented per closure/release; `sub_651610` pushes only when old counter == 0 |
-| `+0x28` | u8 `state` | current state byte — 1 closed, 0 open. Inverted before return if invert flag set |
+| `+0x28` | u8 `state` | current raw state byte. The reader returns `state` when the invert flag is set, otherwise `state ^ 1` |
 | `+0x2a` | u8 `disable_flag` | bit 0 = "ignore this switch" |
 
 #### Companion arrays (also pointers, parallel to the main one)
@@ -1599,7 +1599,7 @@ uintptr_t sw_struct = arr + sw_id * 0x30;     // live heap struct
 
 | Function | Behavior |
 |---|---|
-| `sub_a50850(sw_num) @ 0xa50850` | Returns the state byte with the invert flag applied. Short-circuits to 0 on `sw_num == 0` or `sw_num >= data_48cbaa0` |
+| `sub_650850(sw_num) @ 0x650850` | Returns the logical state byte: `state` when config flag `0x04` is set, otherwise `state ^ 1`. Short-circuits to 0 on `sw_num == 0` or `sw_num >= data_48cbaa0` |
 | `sub_a50350(sw_num) @ 0xa50350` | Returns 1 if the switch is "OK" (not broken, not stuck, alert count clear); 0 otherwise. Gates event firing |
 
 `data_48cbaa0` holds the runtime-determined live switch count (PLE has ~105 manual-listed switch IDs but only installed+valid switches count).
@@ -1716,7 +1716,7 @@ Source: `Pokemon_LE_Pre_web.pdf`, section 3.3 "Switch Reference", PDF pages 17-1
 | `9-SW-30` | 64 | Bot Pop Bumper | 9 | CN10/4 | Playfield | Leaf |
 | `9-SW-31` | 76 | Right Ramp Made Opto | 9 | CN10/5 | Playfield | Opto |
 
-Resting-state work should treat the manual's `Type` as a hardware clue, not as the final logical polarity. The game applies the per-switch config invert flag in `sub_a50850`; raw channel bytes must match the board/firmware electrical state. Known example: `0-SW-23`/`sw_id=98` is physically a restored coin-door interlock in normal play, but our channel-0 idle buffer must clear raw bit 23 (`ff ff 7f ...`) so the translated/logical state becomes restored and the 48V warning clears.
+Resting-state work should treat the manual's `Type` as a hardware clue, not as the final logical polarity. The game applies the per-switch config invert flag in `sub_650850`; raw channel bytes must match the board/firmware electrical state. Known example: `0-SW-23`/`sw_id=98` is physically a restored coin-door interlock in normal play, but our channel-0 idle buffer must clear raw bit 23 (`ff ff 7f ...`) so the translated/logical state becomes restored and the 48V warning clears.
 
 `0-SW-23` maps to runtime `sw_id=98`, channel 0, bit 23. This is the Coin Door Power Interlock. The launcher exposes coin-door state control for reproducing either the playable restored state or the `48V DISABLED / CLOSE COIN DOOR / OR PULL INTERLOCK SWITCH / TO RESTORE POWER` warning state.
 

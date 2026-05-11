@@ -70,14 +70,6 @@ static void shim_switch_apply_expected_idle(uint8_t channel_id,
         for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]); i++) {
             switch_set_bit(buf, bits[i], 0);
         }
-        switch_set_bit(buf, 16, 1); /* 11 Left Flipper EOS */
-        switch_set_bit(buf, 31, 1); /* 12 Right Flipper EOS */
-        switch_set_bit(buf, 32, 1); /* 15 Trough 6 */
-        switch_set_bit(buf, 33, 1); /* 16 Trough 5 */
-        switch_set_bit(buf, 34, 1); /* 17 Trough 4 */
-        switch_set_bit(buf, 35, 1); /* 18 Trough 3 */
-        switch_set_bit(buf, 36, 1); /* 19 Trough 2 */
-        switch_set_bit(buf, 37, 1); /* 20 Trough 1 */
     } else if (channel_id == 9) {
         static const uint8_t bits[] = {
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 17,
@@ -86,10 +78,6 @@ static void shim_switch_apply_expected_idle(uint8_t channel_id,
         for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]); i++) {
             switch_set_bit(buf, bits[i], 0);
         }
-        switch_set_bit(buf, 4, 1);  /* 71 Captive Ball-Lower */
-        switch_set_bit(buf, 5, 1);  /* 72 Captive Ball-Upper */
-        switch_set_bit(buf, 7, 1);  /* 78 Spinner Opto */
-        switch_set_bit(buf, 25, 1); /* 61 Meowth Down */
     }
 }
 
@@ -106,6 +94,33 @@ static void shim_switch_apply_default_idle_corrections(uint8_t channel_id,
         static const uint8_t coin_bits[] = {16, 17, 18, 19, 20, 21};
         for (size_t i = 0; i < sizeof(coin_bits) / sizeof(coin_bits[0]); i++) {
             switch_set_bit(buf, coin_bits[i], 1);
+        }
+    } else if (channel_id == 8) {
+        /* These normally-resting closed switches appear active in the
+         * cabinet's Switch Test. In this game build their config is not
+         * inverted, so raw/state low is the UI-active value. */
+        static const uint8_t active_low_bits[] = {
+            16, /* 11 Left Flipper EOS */
+            31, /* 12 Right Flipper EOS */
+            32, /* 15 Trough 6 */
+            33, /* 16 Trough 5 */
+            34, /* 17 Trough 4 */
+            35, /* 18 Trough 3 */
+            36, /* 19 Trough 2 */
+            37, /* 20 Trough 1 */
+        };
+        for (size_t i = 0; i < sizeof(active_low_bits) / sizeof(active_low_bits[0]); i++) {
+            switch_set_bit(buf, active_low_bits[i], 0);
+        }
+    } else if (channel_id == 9) {
+        static const uint8_t active_low_bits[] = {
+            4,  /* 71 Captive Ball-Lower */
+            5,  /* 72 Captive Ball-Upper */
+            7,  /* 78 Spinner Opto */
+            25, /* 61 Meowth Down */
+        };
+        for (size_t i = 0; i < sizeof(active_low_bits) / sizeof(active_low_bits[0]); i++) {
+            switch_set_bit(buf, active_low_bits[i], 0);
         }
     }
 }

@@ -215,6 +215,32 @@ static void shim_install_channel1_idle(uintptr_t game_base) {
         SHIM_LOG("[channel1_idle] gave up after 30s — channel 1 saved state stayed zero");
 }
 
+static void shim_translate_startup_idle(uintptr_t game_base,
+                                        uint8_t channel_id,
+                                        const char *label) {
+    typedef int64_t (*translate_fn)(uint8_t channel_id, const uint8_t *buffer);
+    translate_fn translate = (translate_fn)(game_base + 0x651610);
+
+    for (int i = 0; i < 300; i++) {
+        uint8_t idle[SHIM_SWITCH_CHANNEL_BYTES];
+        shim_switch_copy_channel_idle(game_base, channel_id, idle);
+
+        int nonzero = 0;
+        for (int j = 0; j < SHIM_SWITCH_CHANNEL_BYTES; j++) {
+            nonzero |= idle[j];
+        }
+        if (nonzero) {
+            shim_switch_hold_apply(channel_id, idle);
+            shim_log_channel_buf(label, channel_id, idle);
+            translate(channel_id, idle);
+            return;
+        }
+        usleep(100000);
+    }
+
+    SHIM_LOG("[startup_idle] ch=%u gave up waiting for nonzero idle", channel_id);
+}
+
 static void *shim_discovery_init_thread(void *arg) {
     (void)arg;
     sleep(2);
@@ -229,7 +255,11 @@ static void *shim_discovery_init_thread(void *arg) {
     shim_patch_channel1_derived_switches();
 
     uintptr_t game_base = shim_resolve_game_base();
-    if (game_base) shim_install_channel1_idle(game_base);
+    if (game_base) {
+        shim_translate_startup_idle(game_base, 8, "[startup_idle] translate");
+        shim_translate_startup_idle(game_base, 9, "[startup_idle] translate");
+        shim_install_channel1_idle(game_base);
+    }
     return NULL;
 }
 

@@ -63,6 +63,10 @@ def switch_name(sw_id: int):
 
 
 def load_snapshot_from_file(path: Path):
+    snapshot = None
+    by_sw_id = {}
+    folded = 0
+
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -73,8 +77,28 @@ def load_snapshot_from_file(path: Path):
             except json.JSONDecodeError:
                 continue
             if msg.get("event") == "snapshot":
-                return msg
-    raise SystemExit("no snapshot event found in {}".format(path))
+                snapshot = msg
+                by_sw_id = {
+                    int(sw["sw_id"]): sw
+                    for sw in snapshot.get("switches", [])
+                    if "sw_id" in sw
+                }
+                continue
+            if snapshot is None or msg.get("event") != "switch_change":
+                continue
+
+            sw = by_sw_id.get(int(msg.get("sw_id", 0)))
+            if sw is None:
+                continue
+            for key in ("state", "logical", "invert", "edge", "flap"):
+                if key in msg:
+                    sw[key] = msg[key]
+            folded += 1
+
+    if snapshot is None:
+        raise SystemExit("no snapshot event found in {}".format(path))
+    snapshot["_folded_switch_changes"] = folded
+    return snapshot
 
 
 def polarity_hint(raw, state):
@@ -83,6 +107,12 @@ def polarity_hint(raw, state):
     if int(raw) == int(state):
         return "raw=state"
     return "raw!=state"
+
+
+def ui_hint(logical):
+    if logical == "-":
+        return "-"
+    return "on" if int(logical) != 0 else "off"
 
 
 def mapping_status(address_bits, channel, bit_idx):
@@ -97,16 +127,19 @@ def mapping_status(address_bits, channel, bit_idx):
 
 
 def print_snapshot(snapshot, mismatches_only=False):
+    if "_folded_switch_changes" in snapshot:
+        print("folded switch_changes: {}".format(snapshot["_folded_switch_changes"]))
+
     print("channels:")
     for channel in snapshot.get("channels", []):
         print("  {:>2}: {}".format(channel.get("channel"), channel.get("bytes")))
 
     print()
-    print("{:>5} {:>3} {:>3} {:>5} {:>3} {:>5} {:>5} {:>5} {:>10} {:>12}  {:>8}  {}".format(
-        "sw_id", "ch", "bit", "byte", "raw", "state", "edge", "flap",
+    print("{:>5} {:>3} {:>3} {:>5} {:>3} {:>5} {:>7} {:>3} {:>5} {:>5} {:>10} {:>12}  {:>8}  {}".format(
+        "sw_id", "ch", "bit", "byte", "raw", "state", "logical", "ui", "edge", "flap",
         "relation", "map", "address", "name"
     ))
-    print("-" * 110)
+    print("-" * 124)
     for sw in snapshot.get("switches", []):
         sw_id = int(sw["sw_id"])
         _manual_id, address, name, address_bits = switch_name(sw_id)
@@ -114,6 +147,7 @@ def print_snapshot(snapshot, mismatches_only=False):
         bit_idx = sw.get("bit_idx", "-")
         raw = sw.get("raw", "-")
         state = sw.get("state", "-")
+        logical = sw.get("logical", "-")
         if bit_idx == "-":
             byte_bit = "-"
         else:
@@ -122,13 +156,15 @@ def print_snapshot(snapshot, mismatches_only=False):
         map_status = mapping_status(address_bits, channel, bit_idx)
         if mismatches_only and map_status == "ok":
             continue
-        print("{:>5} {:>3} {:>3} {:>5} {:>3} {:>5} {:>5} {:>5} {:>10} {:>12}  {:>8}  {}".format(
+        print("{:>5} {:>3} {:>3} {:>5} {:>3} {:>5} {:>7} {:>3} {:>5} {:>5} {:>10} {:>12}  {:>8}  {}".format(
             sw_id,
             channel,
             bit_idx,
             byte_bit,
             raw,
             state,
+            logical,
+            ui_hint(logical),
             sw.get("edge", "-"),
             sw.get("flap", "-"),
             relation,
