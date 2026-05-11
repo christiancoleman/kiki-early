@@ -31,17 +31,8 @@
 #define DEVBUS_TICK_US        1000
 #define DEVBUS_RING_SIZE      1024
 #define DEVBUS_MAX_CLIENTS    4
-#define DEVBUS_MAX_SWITCH_ID  255
 #define DEVBUS_FLAP_WINDOW_NS 1000000000ULL
 #define DEVBUS_BOOT_DELAY_S   5
-
-#define SWITCH_ARRAY_VA       0x4480220ULL
-#define SW_STRUCT_STRIDE      0x30u
-#define SW_OFF_RECORDED_ID    0x20
-#define SW_OFF_BIT_IDX        0x22
-#define SW_OFF_CHANNEL        0x24
-#define SW_OFF_EDGE           0x26
-#define SW_OFF_STATE          0x28
 
 typedef struct {
     uint8_t  state;
@@ -83,7 +74,7 @@ typedef struct devbus_client {
 static pthread_mutex_t  g_clients_lock   = PTHREAD_MUTEX_INITIALIZER;
 static devbus_client_t *g_clients_head   = NULL;
 static int              g_listen_fd      = -1;
-static sw_shadow_t      g_shadow[DEVBUS_MAX_SWITCH_ID + 1];
+static sw_shadow_t      g_shadow[SHIM_SWITCH_MAX_RUNTIME_ID + 1];
 static _Atomic int      g_switch_count   = 0;
 static _Atomic int      g_shadow_seeded  = 0;
 
@@ -125,22 +116,21 @@ static void devbus_emit(const sw_event_t *evt) {
 }
 
 static int devbus_scan_once(uintptr_t game_base, int seeding) {
-    uint8_t **arr_pp = (uint8_t **)(uintptr_t)(game_base + SWITCH_ARRAY_VA);
-    uint8_t  *arr    = *arr_pp;
+    uint8_t *arr = shim_switch_array(game_base);
     if (!arr) return 0;
 
     uint64_t now_ns = devbus_now_ns();
     int discovered = 0;
 
-    for (int sw_id = 1; sw_id <= DEVBUS_MAX_SWITCH_ID; sw_id++) {
-        uint8_t *e = arr + (size_t)sw_id * SW_STRUCT_STRIDE;
-        uint16_t recorded = *(uint16_t *)(e + SW_OFF_RECORDED_ID);
+    for (int sw_id = 1; sw_id <= SHIM_SWITCH_MAX_RUNTIME_ID; sw_id++) {
+        uint8_t *e = shim_switch_entry(arr, sw_id);
+        uint16_t recorded = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_ID_OFF);
         if (recorded != (uint16_t)sw_id) continue;
 
-        uint16_t bit_idx  = *(uint16_t *)(e + SW_OFF_BIT_IDX);
-        uint8_t  channel  = *(uint8_t  *)(e + SW_OFF_CHANNEL);
-        uint16_t edge     = *(uint16_t *)(e + SW_OFF_EDGE);
-        uint8_t  state    = *(uint8_t  *)(e + SW_OFF_STATE);
+        uint16_t bit_idx  = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_BIT_IDX_OFF);
+        uint8_t  channel  = *(uint8_t  *)(e + SHIM_SWITCH_ENTRY_CHANNEL_OFF);
+        uint16_t edge     = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_EDGE_OFF);
+        uint8_t  state    = *(uint8_t  *)(e + SHIM_SWITCH_ENTRY_STATE_OFF);
 
         sw_shadow_t *sh = &g_shadow[sw_id];
 
@@ -234,10 +224,24 @@ static int devbus_send_hello(devbus_client_t *cli) {
 }
 
 static int devbus_send_snapshot(devbus_client_t *cli) {
+    uintptr_t game_base = shim_resolve_game_base();
+    uint8_t channel_bytes[SHIM_SWITCH_CHANNEL_COUNT][SHIM_SWITCH_CHANNEL_BYTES];
+    memset(channel_bytes, 0, sizeof(channel_bytes));
+    if (game_base) {
+        for (uint8_t channel = 0; channel < SHIM_SWITCH_CHANNEL_COUNT; channel++) {
+            if (channel == 0) {
+                shim_switch_make_channel0_idle(channel_bytes[channel]);
+            } else {
+                shim_switch_copy_channel_idle(game_base, channel, channel_bytes[channel]);
+            }
+            shim_switch_hold_apply(channel, channel_bytes[channel]);
+        }
+    }
+
     char head[128];
     int n = snprintf(head, sizeof(head),
                      "{\"v\":%d,\"seq\":%llu,\"event\":\"snapshot\","
-                     "\"ts_ns\":%llu,\"switches\":[",
+                     "\"ts_ns\":%llu,\"channels\":[",
                      DEVBUS_PROTO_VERSION,
                      (unsigned long long)atomic_fetch_add(&cli->seq, 1),
                      (unsigned long long)devbus_now_ns());
@@ -245,15 +249,41 @@ static int devbus_send_snapshot(devbus_client_t *cli) {
 
     int first = 1;
     char entry[256];
-    for (int sw_id = 1; sw_id <= DEVBUS_MAX_SWITCH_ID; sw_id++) {
+    for (int channel = 0; channel < SHIM_SWITCH_CHANNEL_COUNT; channel++) {
+        n = snprintf(entry, sizeof(entry),
+                     "%s{\"channel\":%d,\"bytes\":\""
+                     "%02x %02x %02x %02x %02x %02x %02x %02x\"}",
+                     first ? "" : ",",
+                     channel,
+                     channel_bytes[channel][0], channel_bytes[channel][1],
+                     channel_bytes[channel][2], channel_bytes[channel][3],
+                     channel_bytes[channel][4], channel_bytes[channel][5],
+                     channel_bytes[channel][6], channel_bytes[channel][7]);
+        if (n < 0 || n >= (int)sizeof(entry)) return -1;
+        if (devbus_write_all(cli->fd, entry, (size_t)n) < 0) return -1;
+        first = 0;
+    }
+
+    if (devbus_write_all(cli->fd, "],\"switches\":[", 14) < 0) return -1;
+
+    first = 1;
+    for (int sw_id = 1; sw_id <= SHIM_SWITCH_MAX_RUNTIME_ID; sw_id++) {
         sw_shadow_t *sh = &g_shadow[sw_id];
         if (!sh->valid) continue;
+        uint8_t raw_bit = 0;
+        if (sh->channel < SHIM_SWITCH_CHANNEL_COUNT &&
+            sh->bit_idx < SHIM_SWITCH_BITS_PER_CHANNEL) {
+            uint8_t byte_off = (uint8_t)(sh->bit_idx >> 3);
+            uint8_t bit_mask = (uint8_t)(1u << (sh->bit_idx & 7));
+            raw_bit = (channel_bytes[sh->channel][byte_off] & bit_mask) ? 1 : 0;
+        }
         n = snprintf(entry, sizeof(entry),
                      "%s{\"sw_id\":%d,\"state\":%u,\"edge\":%u,"
-                     "\"channel\":%u,\"bit_idx\":%u,\"flap\":%u}",
+                     "\"channel\":%u,\"bit_idx\":%u,\"raw\":%u,\"flap\":%u}",
                      first ? "" : ",",
                      sw_id, sh->state, sh->edge_counter,
-                     sh->channel, sh->bit_idx, sh->flap_count_last_window);
+                     sh->channel, sh->bit_idx, raw_bit,
+                     sh->flap_count_last_window);
         if (n < 0 || n >= (int)sizeof(entry)) return -1;
         if (devbus_write_all(cli->fd, entry, (size_t)n) < 0) return -1;
         first = 0;
