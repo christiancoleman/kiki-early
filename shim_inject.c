@@ -181,6 +181,8 @@ void shim_event_sweep(void) {
 static void shim_install_channel1_idle(uintptr_t game_base) {
     volatile uint64_t *dat_0436b020 = (volatile uint64_t *)(uintptr_t)
         (game_base + 0x436b020ULL);
+    typedef int64_t (*translate_fn)(uint8_t channel_id, const uint8_t *buffer);
+    translate_fn translate = (translate_fn)(game_base + 0x651610);
     uint64_t last_written = 0;
     int first_ms = -1;
     for (int i = 0; i < 300; i++) {
@@ -193,8 +195,9 @@ static void shim_install_channel1_idle(uintptr_t game_base) {
             if (first_ms < 0) first_ms = now_ms;
             if (idle_u64 != last_written) {
                 *dat_0436b020 = idle_u64;
+                translate(1, idle);
                 last_written = idle_u64;
-                SHIM_LOG("[channel1_idle] wrote 0x%016lx to DAT_0436b020 after %dms (FUN_00674b90 spam fix)",
+                SHIM_LOG("[channel1_idle] wrote+translated 0x%016lx to DAT_0436b020 after %dms (FUN_00674b90 spam fix)",
                          (unsigned long)idle_u64, now_ms);
             }
             if (now_ms >= first_ms + 15000) {
@@ -868,11 +871,7 @@ static void shim_translate_held_switch_state(uintptr_t game_base,
     translate_fn translate = (translate_fn)(game_base + 0x651610);
 
     uint8_t buf[SHIM_SWITCH_CHANNEL_BYTES];
-    if (channel_id == 0) {
-        shim_switch_make_channel0_idle(buf);
-    } else {
-        shim_switch_copy_channel_idle(game_base, channel_id, buf);
-    }
+    shim_switch_copy_channel_stable_idle(game_base, channel_id, buf);
     shim_switch_hold_apply(channel_id, buf);
     shim_log_channel_buf("[manual_press] translate held", channel_id, buf);
     translate(channel_id, buf);

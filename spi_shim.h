@@ -120,6 +120,9 @@ void shim_switch_make_channel0_idle(uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]);
 void shim_switch_copy_channel_idle(uintptr_t game_base,
                                    uint8_t channel_id,
                                    uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]);
+void shim_switch_copy_channel_stable_idle(uintptr_t game_base,
+                                          uint8_t channel_id,
+                                          uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]);
 uint8_t *shim_switch_array(uintptr_t game_base);
 uint8_t *shim_switch_entry(uint8_t *switch_array, int sw_id);
 

@@ -12,6 +12,8 @@
 
 static pthread_mutex_t shim_switch_hold_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t shim_switch_hold_mask[SHIM_SWITCH_CHANNEL_COUNT][SHIM_SWITCH_CHANNEL_BYTES];
+static uint8_t shim_switch_stable_idle[SHIM_SWITCH_CHANNEL_COUNT][SHIM_SWITCH_CHANNEL_BYTES];
+static uint8_t shim_switch_stable_idle_valid[SHIM_SWITCH_CHANNEL_COUNT];
 static int shim_coin_door_open_override = -1;
 
 static int env_enabled(const char *name, int default_value) {
@@ -91,13 +93,71 @@ static void shim_switch_apply_expected_idle(uint8_t channel_id,
     }
 }
 
+static void shim_switch_apply_default_idle_corrections(uint8_t channel_id,
+                                                       uint8_t buf[SHIM_SWITCH_CHANNEL_BYTES]) {
+    if (!buf) {
+        return;
+    }
+
+    if (channel_id == 1) {
+        /* Coin inputs rest high. The game-derived channel-1 image can settle
+         * with 1-SW-16..21 low, which makes the switch test show manual
+         * switches 96, 97, 98, 99, 100, and 102 as already active. */
+        static const uint8_t coin_bits[] = {16, 17, 18, 19, 20, 21};
+        for (size_t i = 0; i < sizeof(coin_bits) / sizeof(coin_bits[0]); i++) {
+            switch_set_bit(buf, coin_bits[i], 1);
+        }
+    }
+}
+
 void shim_switch_copy_channel_idle(uintptr_t game_base,
                                    uint8_t channel_id,
                                    uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]) {
     uintptr_t channel_idle = game_base + SHIM_GAME_VA_CHANNEL_IDLE_BASE
                            + (uintptr_t)channel_id * SHIM_GAME_CHANNEL_IDLE_STRIDE;
     memcpy(out, (const void *)channel_idle, SHIM_SWITCH_CHANNEL_BYTES);
+    shim_switch_apply_default_idle_corrections(channel_id, out);
     shim_switch_apply_expected_idle(channel_id, out);
+}
+
+void shim_switch_copy_channel_stable_idle(uintptr_t game_base,
+                                          uint8_t channel_id,
+                                          uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]) {
+    if (!out || channel_id >= SHIM_SWITCH_CHANNEL_COUNT) {
+        return;
+    }
+    if (channel_id == 0) {
+        shim_switch_make_channel0_idle(out);
+        return;
+    }
+
+    pthread_mutex_lock(&shim_switch_hold_mutex);
+    if (shim_switch_stable_idle_valid[channel_id]) {
+        memcpy(out, shim_switch_stable_idle[channel_id], SHIM_SWITCH_CHANNEL_BYTES);
+        pthread_mutex_unlock(&shim_switch_hold_mutex);
+        return;
+    }
+    pthread_mutex_unlock(&shim_switch_hold_mutex);
+
+    uint8_t candidate[SHIM_SWITCH_CHANNEL_BYTES] = {0};
+    shim_switch_copy_channel_idle(game_base, channel_id, candidate);
+
+    int nonzero = 0;
+    for (int i = 0; i < SHIM_SWITCH_CHANNEL_BYTES; i++) {
+        nonzero |= candidate[i];
+    }
+
+    pthread_mutex_lock(&shim_switch_hold_mutex);
+    if (!shim_switch_stable_idle_valid[channel_id] && nonzero) {
+        memcpy(shim_switch_stable_idle[channel_id], candidate, SHIM_SWITCH_CHANNEL_BYTES);
+        shim_switch_stable_idle_valid[channel_id] = 1;
+    }
+    if (shim_switch_stable_idle_valid[channel_id]) {
+        memcpy(out, shim_switch_stable_idle[channel_id], SHIM_SWITCH_CHANNEL_BYTES);
+    } else {
+        memcpy(out, candidate, SHIM_SWITCH_CHANNEL_BYTES);
+    }
+    pthread_mutex_unlock(&shim_switch_hold_mutex);
 }
 
 void shim_switch_make_channel0_idle(uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]) {
