@@ -887,7 +887,7 @@ Each downstream node on the RS-485 bus reports a 32-bit chip ID via the cmd `0xf
 | 0  | 4 | chip ID (NXP `Part identification number` register for LPC parts; ARM CPUID register for Cortex-M33 parts like RP2350) |
 | 4  | 4 | padding (zero across all 28 entries) |
 | 8  | 8 | pointer to chip-name string in `.rodata` |
-| 16 | 4 | config word (unverified meaning) |
+| 16 | 4 | config word; semantic decoding not recorded |
 | 20 | 4 | flash size — entry 0: `0x2000` = 8 KB, matches LPC1111/101 |
 | 24 | 4 | RAM size — entry 0: `0x800` = 2 KB, matches LPC1111/101 |
 | 28 | 4 | RAM start / sector address (entry 0: `0x02dc6c00`) |
@@ -990,16 +990,16 @@ The runtime hashmap `g_asset_registry @ 0x48ca4d0` (a libstdc++ `std::unordered_
 
 | Hdr idx | File offset | Size hint | Verified content | Status |
 |--:|--:|--:|---|---|
-| 0 | `0x0001b800` | — | EULA + version manifest. First 8 bytes: `40 00 00 00` (length 0x40?) + `8e 70 f3 42` (uint32 — possibly checksum). Then ASCII: `"STERN PINBALL\nEND USER LICENSE AGREEMENT\n\nThis limite…"` | partial — header bytes uncharacterized |
+| 0 | `0x0001b800` | — | EULA + version manifest. First 8 bytes: `40 00 00 00` and `8e 70 f3 42`. Then ASCII: `"STERN PINBALL\nEND USER LICENSE AGREEMENT\n\nThis limite…"` | partial — header bytes uncharacterized |
 | 1 | `0x0001b7e0` | — | Audio/asset config header. uint32 LE @ +0 = `44100` (audio sample rate). **Byte +7 = `0x05` is the per-asset variant stride** used by `get_asset_ptr_by_packed_id` to index section 5 | partial — beyond byte +7, fields uncharacterized |
-| 2 | `0x000189b8` | 0x2E28 (11,816 B) | Playfield/mode grid records. 1,477 uint64 pointers into section 0 (and adjacent regions). Most records are 408-byte `{record_id:u32, flag:u32, w:u16=17, h:u16=23, pad[5], cells[391]}` grids; later records (delta != 408) likely have different dimensions | verified — see "Section 2: playfield grid records" below |
-| 3 | `0x00018658` | — | Aliases section 8 (same offset). Likely a parallel/duplicate header pointer — both registers resolve to the same data | aliased to §8 |
-| 4 | `0x000000f8` | — | Aliases section 5 (same offset). Likely parallel/duplicate header pointer | aliased to §5 |
+| 2 | `0x000189b8` | 0x2E28 (11,816 B) | Playfield/mode grid records. 1,477 uint64 pointers into section 0 (and adjacent regions). Most records are 408-byte `{record_id:u32, flag:u32, w:u16=17, h:u16=23, pad[5], cells[391]}` grids; records with non-408-byte deltas are not decoded here | verified — see "Section 2: playfield grid records" below |
+| 3 | `0x00018658` | — | Aliases section 8 (same offset); both registers resolve to the same data | aliased to §8 |
+| 4 | `0x000000f8` | — | Aliases section 5 (same offset) | aliased to §5 |
 | 5 | `0x000000f8` | 12,568 × 8 B = 100,544 B | **Per-asset bytecode descriptor table.** uint64 file offsets to bytecode in the bulk region, grouped in 5-tuples (one per language variant). 2,492 unique offsets in `[0x42EEEB3C, 0x42F23E06)` | verified — see "Section 5: per-asset descriptor table" below |
-| 6 | `0x42f323ea` | 4 B | File trailer. Last 4 bytes of the file (`96 19 d0 f5` here) — likely a CRC32 trailer | partial — bytes confirmed; semantic unverified |
+| 6 | `0x42f323ea` | 4 B | File trailer. Last 4 bytes of the file are `96 19 d0 f5` in Pokémon LE 0.81 | partial — bytes confirmed; semantic decoding not recorded |
 | 7 | `0x42f23e06` | 2,452 × 24 B = 58,848 B | **Asset directory** (audio in PLE 0.81). 2,452 fixed-size records per `spike_extract`. Verified 100% intersection with runtime `g_asset_registry` hashmap | verified — see "Section 7: asset directory" below |
 | 8 | `0x00018658` | — | **Scene metadata table** consumed by `load_scene_assets`. Records are 24-byte stride per the decompile's `i = &i[0x18]` and `mulu.dp.d(x0, 0x18)`. Fields per record (offsets within record): `+0 = uint64` (some pointer/value), `+8 = encoded packed_id field` (masked with `0xfffc0003ffffffff`), `+0x10 = uint32 size`. Per-record count from `get_image_meta_field(arg1, 4)`. The same offset as section 3 — they alias | partial — record format observed but not all fields decoded |
-| 9 | `0x000005c50000001b` | — | **Not a file offset.** Packed value: `count_hi:32 = 0x000005c5 = 1477`, `type_lo:32 = 0x0000001b = 27`. Likely a count + type tag for one of the other sections (1477 matches section 2's pointer count exactly) | partial — interpretation inferred but consistent |
+| 9 | `0x000005c50000001b` | — | **Not a file offset.** Packed value: `count_hi:32 = 0x000005c5 = 1477`, `type_lo:32 = 0x0000001b = 27`. The high half matches section 2's pointer count exactly | partial — semantic decoding not recorded |
 
 The file body (`~0x1c000` to `0x42f23e06`) is the bulk asset data — section 5's offsets and section 7's `file_offset` fields point into it. Section 7 (audio directory) lives at the very end of the file just before the 4-byte trailer.
 
@@ -2074,7 +2074,7 @@ PTR_PTR_04350200 → 0x436b680 (.data, 12 entries × 0x20-byte stride, compile-t
 
 At startup, iterates 7 chip-type indices (1..7), for each runs `glob64("./<family>-<sub_8ede20(idx)>-<major>_<minor>_[0-9]*.hex")` (with fallback `./<family>-<chip>-[0-9]*_[0-9]*_[0-9]*.hex`). Per match, allocates an 88-byte record and links to `data_44df838` head with key1=hash(family), key2=idx, filename=ptr.
 
-Pokémon LE ships 17 `.hex` files in `games/pokemon_le/`: `coil4_lednode-LPC1313`, `coil4node-{LPC1112_101,LPC1112_201,LPC1313}`, `hdminode-LPC1313`, `hdmi_ws2812node-LPC1313`, `lcdnode-LPC1113_302`, `magsensornode-LPC812`, `node4-{LPC1124_303,LPC812}`, `pinnode-{LPC1112_101,LPC1112_201,LPC1313}`, `tmc2590node-LPC1313`, `tmc5041node-LPC1313`, `ws2812node-LPC1313`, `ws2812pinnode-LPC1313`. Files are Intel HEX line format with encrypted data bytes; decryption format unverified.
+Pokémon LE ships 17 `.hex` files in `games/pokemon_le/`: `coil4_lednode-LPC1313`, `coil4node-{LPC1112_101,LPC1112_201,LPC1313}`, `hdminode-LPC1313`, `hdmi_ws2812node-LPC1313`, `lcdnode-LPC1113_302`, `magsensornode-LPC812`, `node4-{LPC1124_303,LPC812}`, `pinnode-{LPC1112_101,LPC1112_201,LPC1313}`, `tmc2590node-LPC1313`, `tmc5041node-LPC1313`, `ws2812node-LPC1313`, `ws2812pinnode-LPC1313`. Files are Intel HEX line format; firmware payload decryption is outside this document's verified scope.
 
 **chip-type-index ↔ chip-name map** (from `sub_8ede20`, observed via runtime probe):
 
@@ -2172,7 +2172,7 @@ Current status: pathing and launch tooling are sysroot-generic; runtime anchors 
 | `/dev/spidev4.0` | fake fd `1023` | CPU-board 8-byte SPI polling (local switches, not node bus) | `MESSAGE_1` ioctl: default `rx[2] = 0x04` advances state machine. Per-cmd override via `SPIKE3_SPI_RX_<HEX>=hexbytes` env. TX currently all-zeros (gated on bridge) |
 | `/dev/i2c-10` | fake fd `1022` | EEPROM at slave 0x57 | Read/write-back works; no real state maintained. **Persistence gap: writes vanish, no SIGTERM flush** |
 | `/dev/ttyAMA5` | real `socketpair(AF_UNIX, SOCK_STREAM)` | UART to netbridge (game gets sv[0], shim holds sv[1]) | Reads block naturally on the socketpair. Writes are intercepted by `shim_io.c::write` and routed to `synthesize_bridge_response` (see §4) |
-| `/dev/ttyAMA2` | real `socketpair(AF_UNIX, SOCK_STREAM)` | secondary UART (purpose unverified) | Pass-through |
+| `/dev/ttyAMA2` | real `socketpair(AF_UNIX, SOCK_STREAM)` | secondary UART path; no decoded protocol coverage in this document | Pass-through |
 | `/dev/dri/card1` | real `socketpair(AF_UNIX, SOCK_STREAM)` | DRM KMS display | DRM ioctls intercepted before they'd reach the socketpair. See §10 for the full DRM/GBM/EGL/GLES coverage |
 | `/dev/shim-v4l2-*` | fake fds `FAKE_FD_V4L2_MEDIA=1021` / `FAKE_FD_V4L2_VIDEO=1020` | V4L2 video device probes (Step 44) | All ioctls return `ENOTTY` |
 | `/dev/boot_display` | fake fd `FAKE_FD_BOOT_DISPLAY=1019` | boot_display ioctl surface | ioctls return 0; writes swallowed |
@@ -2346,6 +2346,23 @@ Status LED (D2) blink codes (real-hardware debug only):
 
 **Emulation:** the shim returns synthetic pwrdist responses for cmds 0x10/0x15/0x16/0x18/0x1c/0x1d (see §4). The visible 48V gameplay gate is currently satisfied by the CPU switch-matrix interlock (`0-SW-23` / `sw_id=98`) rather than by the `0x1d` four-byte payload alone; `0x1d=ff ff ff ff` still shows the warning if `sw_id=98` remains open.
 
+### Persistence gap
+
+Partial. Verified 2026-05-02:
+
+- **PIN_NVRAM tier — works.** Each run writes a new sequential file (`PIN_NVRAM/00000065`, `66`, `67`, …) with a `.crc32` sidecar, 588 bytes each, NFI2-structured (magic + NSEC timestamp section + multiple NDAT records). The mtime of the latest file matches the run start time.
+- **SYS_NVRAM / NVRAM / FRRAM / PTRAM / LKRAM / NVM tier — content exists but stale.** Files (e.g. `SYS_NVRAM/00000000` 2068 B, `NVRAM/00000000` 740 B) are populated with NFI2-structured data but mtimes are stuck at the initial seed date in the inspected runs.
+- **EEPROM tier (i2c slave 0x57)** — no completed verification pass is recorded here.
+- **SIGTERM flush** — no completed verification pass is recorded here.
+
+The shim's NV writeback machinery is at least partially working because PIN_NVRAM advances across runs. Settings-tier files did not advance in the inspected runs.
+
+Persistence follow-up experiments belong in `JOURNAL.md` until verified.
+
+*Verified by:* PIN_NVRAM file inspection + `xxd` (NFI2 magic + records) on 2026-05-02; `stat` showing PIN_NVRAM mtimes track run starts while SYS_NVRAM/NVRAM mtimes don't.
+
+---
+
 ## 13. Comparison binaries (SW LE 0.85)
 
 The emulator's correctness target is "boot ANY Spike 3 game to attract." Every claim about Stern-shared code (proc system, IScene base class, DisplayRenderer, SceneCache, RadiumScene, node-bus, SPI, audio) should reproduce in **Star Wars LE 0.85.0** because both games run the same Stern stack. SW LE has **zero Godot** in its binary (vs Pokémon LE's 457 "godot" string hits) — making it the cleanest A/B target for "what is Pokémon-port glue vs. shared Stern?"
@@ -2387,6 +2404,6 @@ The DisplayRenderer / SceneCache / RadiumScene / proc-system / node-bus / SPI / 
 
 ### Per-game firmware versions
 
-Each Spike 3 game ships its own set of node firmware `.hex` files (the per-family files described in §11). Firmware versions vary across game releases — Pokémon LE 0.81 ships `1_31_0` for every node family; other Spike 3 titles will likely ship different versions. The shim's FE-probe synth reads version bytes from the loaded firmware records at runtime (`shim_nodebus.c::nodebus_version_for_slot()` walks `data_44df838`, mirrors `sub_8f88b0`'s simple/complex path logic), so the same shim source works across games without per-version updates as long as the loader's record format stays stable.
+Each Spike 3 game ships its own set of node firmware `.hex` files (the per-family files described in §11). Pokémon LE 0.81 ships `1_31_0` for every node family. The shim's FE-probe synth reads version bytes from the loaded firmware records at runtime (`shim_nodebus.c::nodebus_version_for_slot()` walks `data_44df838`, mirrors `sub_8f88b0`'s simple/complex path logic), so the version response is sourced from the running game's loaded firmware records instead of a Pokémon-specific version constant.
 
 *Verified by:* JOURNAL Step 92 — runtime version-byte probe of all 6 loaded records in PLE 0.81 producing `(V1, V2, V3, V0)` matching the shipped `1_31_0` filenames; shim implementation in `shim_nodebus.c::nodebus_version_for_slot()`.

@@ -9211,3 +9211,72 @@ python3 .codex/tools/knowledge/lore/corpus_search.py "GL_DAEMON" --no-bn
 python3 .codex/tools/knowledge/log/find_runs.py --limit 3
 python3 .codex/tools/knowledge/log/scan_log.py --tail 5
 ```
+
+## Step 102 — Switch-path readability refactor, devbus snapshots, and PROTOCOL cleanup plan (2026-05-11)
+
+This session started as a focused switch-path readability refactor and then grew into the tooling needed to make the next switch-mapping pass less ambiguous. The naming of "phases" drifted during the session because devbus/UI work was mixed into the original refactor plan; this entry normalizes what actually happened.
+
+### Original five-phase cleanup status
+
+The original plan was:
+
+1. Add named constants and small helpers for switch-entry access.
+2. Deduplicate channel-0 idle synthesis so interlock behavior exists in one place.
+3. Clean stale comments/defaults around manual press.
+4. Replace readability-hostile ternaries in touched switch code.
+5. Leave larger modular splitting for a second pass after build/test.
+
+What landed:
+
+- `spi_shim.h` gained shared switch constants: channel count/bytes, switch-entry offsets, switch-array VA, channel idle base/stride, and coin-door interlock byte/mask.
+- `shim_switches.c` was introduced as the shared switch helper module. It owns `shim_switch_array`, `shim_switch_entry`, channel-0 idle synthesis, channel idle copying, and the held-switch overlay.
+- `shim_ioctl.c`, `shim_nodebus.c`, `shim_inject.c`, and `shim_devbus.c` now consume those helpers/constants instead of duplicating the low-level switch memory arithmetic.
+- The old manual-press comments/defaults were brought in line with the current `120 ms` tap default and the current held down/up command model.
+- The touched switch path is mostly free of the readability-hostile ternaries that motivated the cleanup. Some ternaries remain elsewhere, especially logging/default-value expressions and larger GL/nodebus code; those were not all part of the original switch path.
+
+What remains from the original phase 5:
+
+- `shim_inject.c` is still too broad. A reasonable second pass would split switch-control and runtime-probe code out of it, leaving `shim_inject.c` as startup/orchestration.
+- `shim_gl.c` and `gl_daemon.py` are the biggest readability debt in the project, but they should be treated as a separate display-pipeline cleanup session rather than mixed into switch mapping.
+
+### Switch/devbus tooling added while refactoring
+
+While clarifying switch memory, we added tooling that should make the next mapping run more deterministic:
+
+- `switch_inventory.py` became the shared Python source for the manual switch inventory used by TIMER and external switch commands.
+- `devbus_snapshot.py` was added as a one-shot devbus client. It can connect live or read a saved `devbus.log`, prints raw channel bytes, joins decoded switch state, and reports `raw=state` / `raw!=state` plus manual-address mapping status.
+- `shim_devbus.c` snapshots now include raw 8-byte channel buffers and a per-switch `raw` bit alongside decoded state.
+- `marker_button.py` now has a `Switch Test Menu` toggle and an observed-toggle text field. While enabled, it brackets logs with `[switch_test] START/STOP`, logs each switch command, and lets the tester record a comma-separated list of switches the game's service UI reported as toggled.
+
+Validated during the session:
+
+```text
+./build.sh
+git diff --check
+PYTHONDONTWRITEBYTECODE=1 python3 -c 'import ast, pathlib; ...'
+python3 _emulation/devbus_snapshot.py --help
+```
+
+### Maintainability audit result
+
+Top-level scan covered active C/Python/shell sources plus `PROTOCOL.md`. Current assessment:
+
+- The switch path is now healthy enough for continued feature work.
+- The next switch-adjacent cleanup should be small and behavior-preserving: remove remaining ternaries/magic values in `shim_devbus.c`, `shim_ioctl.c`, and `shim_nodebus.c` where they affect switch logic.
+- The next modular split should target `shim_inject.c`:
+  - `shim_switch_control.c` for manual press parsing, held switch state, and press-request consumption.
+  - `shim_runtime_probes.c` for switch-table probe, edge snapshot, machine dump, output probe, and watchdog-style diagnostics.
+  - `shim_inject.c` keeps startup orchestration.
+- `shim_gl.c` / `gl_daemon.py` need a later dedicated readability pass: named GL constants, less step-history commentary in code, and helper functions for repeated marshal patterns. That should not block switch mapping.
+
+### PROTOCOL cleanup performed
+
+The user emphasized that `PROTOCOL.md` is the most important document and should be true above all else. The first cleanup pass rewrote speculative or plan-like language in PROTOCOL so verified observations stay there and open questions remain in JOURNAL:
+
+- boot-sequence localization caveat now only claims the verified `Startup In Progress` localization path;
+- image.bin table rows now record bytes/aliases/counts without guessing semantic meaning;
+- firmware payload decryption and `/dev/ttyAMA2` are explicitly outside the current verified scope;
+- devbus coverage now documents current read-only behavior instead of future write plans;
+- persistence notes now keep only inspected file behavior and avoid a cause hypothesis.
+
+After this cleanup, reassess before touching code again.
