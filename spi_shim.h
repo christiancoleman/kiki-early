@@ -115,6 +115,7 @@ extern volatile uint8_t shim_spi_rx_extra[8];
 
 void shim_switch_hold_set(uint8_t channel_id, uint16_t bit_idx, int held);
 void shim_switch_hold_apply(uint8_t channel_id, uint8_t buf[SHIM_SWITCH_CHANNEL_BYTES]);
+void shim_switch_set_coin_door_open(int open);
 void shim_switch_make_channel0_idle(uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]);
 void shim_switch_copy_channel_idle(uintptr_t game_base,
                                    uint8_t channel_id,

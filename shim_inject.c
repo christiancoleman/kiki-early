@@ -52,6 +52,8 @@ volatile int shim_current_sweep_event_id = -1;
 
 static void shim_log_channel_buf(const char *tag, uint8_t channel_id,
                                  const uint8_t buf[SHIM_SWITCH_CHANNEL_BYTES]);
+static void shim_translate_held_switch_state(uintptr_t game_base,
+                                             uint8_t channel_id);
 
 static uint64_t shim_fire_event(int32_t event_id, int64_t event_data) {
     uintptr_t game_base = shim_resolve_game_base();
@@ -177,26 +179,27 @@ void shim_event_sweep(void) {
  * has populated it), then mirror changes to
  * DAT_0436b020 while the CPU-SPI/channel-1 state machine settles during boot. */
 static void shim_install_channel1_idle(uintptr_t game_base) {
-    uint8_t *channel_1_saved = (uint8_t *)(uintptr_t)
-        (game_base + SHIM_GAME_VA_CHANNEL_IDLE_BASE + SHIM_GAME_CHANNEL_IDLE_STRIDE);
     volatile uint64_t *dat_0436b020 = (volatile uint64_t *)(uintptr_t)
         (game_base + 0x436b020ULL);
     uint64_t last_written = 0;
     int first_ms = -1;
     for (int i = 0; i < 300; i++) {
+        uint8_t idle[SHIM_SWITCH_CHANNEL_BYTES];
         uint64_t idle_u64 = 0;
-        memcpy(&idle_u64, channel_1_saved, 8);
+        shim_switch_copy_channel_idle(game_base, 1, idle);
+        memcpy(&idle_u64, idle, 8);
         if (idle_u64 != 0) {
-            if (first_ms < 0) first_ms = i * 100;
+            int now_ms = i * 100;
+            if (first_ms < 0) first_ms = now_ms;
             if (idle_u64 != last_written) {
                 *dat_0436b020 = idle_u64;
                 last_written = idle_u64;
                 SHIM_LOG("[channel1_idle] wrote 0x%016lx to DAT_0436b020 after %dms (FUN_00674b90 spam fix)",
-                         (unsigned long)idle_u64, i * 100);
+                         (unsigned long)idle_u64, now_ms);
             }
-            if (i * 100 >= first_ms + 15000) {
+            if (now_ms >= first_ms + 15000) {
                 SHIM_LOG("[channel1_idle] settled at 0x%016lx after %dms",
-                         (unsigned long)last_written, i * 100);
+                         (unsigned long)last_written, now_ms);
                 return;
             }
         }
@@ -875,6 +878,40 @@ static void shim_translate_held_switch_state(uintptr_t game_base,
     translate(channel_id, buf);
 }
 
+static int shim_handle_coin_door_request(uintptr_t game_base, char *line) {
+    char *p = line;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    char op[16] = {0};
+    char state[16] = {0};
+    if (sscanf(p, "%15s %15s", op, state) != 2) {
+        return 0;
+    }
+    if (strcmp(op, "coin_door") != 0 &&
+        strcmp(op, "door") != 0 &&
+        strcmp(op, "interlock") != 0) {
+        return 0;
+    }
+
+    int open = 0;
+    if (strcmp(state, "open") == 0 || strcmp(state, "1") == 0) {
+        open = 1;
+    } else if (strcmp(state, "closed") == 0 ||
+               strcmp(state, "close") == 0 ||
+               strcmp(state, "restored") == 0 ||
+               strcmp(state, "0") == 0) {
+        open = 0;
+    } else {
+        SHIM_LOG("[manual_press] bogus coin-door request '%.64s'; skip", line);
+        return 1;
+    }
+
+    shim_switch_set_coin_door_open(open);
+    shim_translate_held_switch_state(game_base, 0);
+    SHIM_LOG("[manual_press] coin door %s (C24 / 0-SW-23 / sw_id=98)",
+             open ? "open" : "closed");
+    return 1;
+}
+
 static int shim_set_switch_held_by_sw_id(uintptr_t game_base, uint8_t *arr,
                                          int sw_id, int held,
                                          const char *action_tag) {
@@ -1025,6 +1062,10 @@ static void *shim_manual_press_thread(void *arg) {
         for (char *line = strtok_r(buf, "\n", &save);
              line;
              line = strtok_r(NULL, "\n", &save)) {
+            if (shim_handle_coin_door_request(game_base, line)) {
+                continue;
+            }
+
             char action[8] = {0};
             int sw_id = 0;
             int press_ms_override = -1;

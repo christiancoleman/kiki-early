@@ -9292,3 +9292,151 @@ The user emphasized that `PROTOCOL.md` is the most important document and should
 - Slow clients should not block the watcher. The current ring/drop-oldest/sequence-gap shape is the right direction for future transports too.
 
 After this cleanup, reassess before touching code again.
+
+## Step 103 — Door-open switch idle baseline made explicit and validated (2026-05-11)
+
+The known switch state supplied by the cabinet is specifically a coin-door-open / interlock-active state, not the normal restored-door state. That matters because `C24` (`0-SW-23`, runtime `sw_id=98`) should be controllable, not hardcoded as permanently restored.
+
+Changes made:
+
+- Added `SKIP_BIND_MOUNT_CHECK=1` to `run_game.sh` as a debug-only bypass for the sudo-backed `/games`, `/connectivity`, and `/data` bind-mount validation.
+- Normalized the emulated idle switch buffers for channels 0, 1, 8, and 9 so the door-open baseline raw bytes match the known cabinet state.
+- Added a runtime coin-door override through the same request file used by TIMER/manual switch input: `coin_door open` and `coin_door closed`.
+- Added matching TIMER UI controls: `Coin Door Open / C24 active` and `Coin Door Closed / C24 restored`.
+- Added a boot-time switch-idle reseed that feeds the corrected channel buffers back through the game's own translator (`sub_651610`) for channels 0, 1, 8, and 9. Without this, raw channel bytes were corrected, but the game/runtime devbus snapshot still showed stale decoded `state=1` values for many playfield, service, ticket, and cabinet switches.
+
+Validation run:
+
+```bash
+cd games/pokemon_le/_emulation
+env SKIP_BIND_MOUNT_CHECK=1 GL_DAEMON=1 SPIKE3_COIN_DOOR_INTERLOCK=open \
+    TIMEOUT=95 VIEWER=0 AUDIO_PLAYER=0 BOOT_DISPLAY=0 service_s_worker=0 \
+    DEVBUS=1 DEVBUS_TAIL=1 \
+    ./run_game.sh --debug --note switch_idle_exact_door_open_reseed
+```
+
+Run directory:
+
+```text
+runs/2026-05-11T17.09.32_switch_idle_exact_door_open_reseed
+```
+
+The first devbus snapshot captured the corrected raw channel bytes:
+
+```text
+channel 0: 00 f0 80 f8 ff ff ff ff
+channel 1: 7b a6 80 ff ff ff ff ff
+channel 8: c0 e0 e1 84 bf ff ff ff
+channel 9: b0 10 01 02 ff ff ff ff
+```
+
+After folding subsequent `switch_change` events over that snapshot, the active runtime IDs were exactly:
+
+```text
+25, 26, 27, 28, 29, 30, 31, 32, 63, 69, 70, 74, 98
+```
+
+Mapped back to manual IDs, that is exactly the supplied door-open baseline:
+
+```text
+11, 12, 15, 16, 17, 18, 19, 20, 61, 71, 72, 78, C24
+```
+
+No expected IDs were missing and there were no extra active IDs. The prior false-positive coin switches (`1-SW-16`, `1-SW-17`, `1-SW-18`, `1-SW-19`, `1-SW-20`, `1-SW-21`) were inactive after the reseed.
+
+Validated with:
+
+```text
+bash -n run_game.sh
+./build.sh
+git diff --check -- run_game.sh shim_switches.c shim_inject.c marker_button.py spi_shim.h docs/PROTOCOL.md docs/JOURNAL.md
+```
+
+### 103a — Ghidra pass on switch translation after TIMER noise (2026-05-11)
+
+The first attempted TIMER/manual switch-test pass was unusable: the Tk panel rendered poorly and button events were noisy enough that the observations could not be trusted. Pivoted to Ghidra before collecting more manual examples.
+
+Ghidra findings:
+
+- `sub_651610(channel, buf)` compares each byte of the supplied raw channel buffer against the previous raw byte stored under `DAT_044804b8 + channel * 0xb0`, maps changed bits through the channel/bit-to-`sw_id` table at `DAT_044804e0`, and increments the runtime switch entry's edge counter at `g_switch_state_array[sw_id] + 0x26`.
+- `sub_651610` does not apply a high-level manual-ID translation or per-switch UI mapping. It consumes raw channel bytes.
+- `sub_6511c0` drains queued switch edges. For each queued switch it reads the current raw bit from the channel byte mirror, writes the decoded state byte at `g_switch_state_array[sw_id] + 0x28`, and schedules the configured press/release handler according to the switch config flags.
+- `sub_674b90(0)` is the special channel-0 path: it reads CPU-SPI bytes, calls `sub_651610(0, ...)`, derives/saves channel-1 state through `DAT_0436b020`, then calls `sub_651610(1, ...)`.
+
+Consequence for the shim: the held-switch overlay should generate a raw transition relative to the corrected idle buffer, not force an active value. For inactive-at-idle switches that is `0 -> 1 -> 0`; for active-at-idle switches it is `1 -> 0 -> 1`. Changed `shim_switch_hold_apply()` from OR to XOR so one held bit inverts exactly one raw bit relative to the current idle image.
+
+Validated the XOR model without the Tk TIMER by using the file-backed auto-press path:
+
+```bash
+cd games/pokemon_le/_emulation
+env SKIP_BIND_MOUNT_CHECK=1 GL_DAEMON=1 SPIKE3_COIN_DOOR_INTERLOCK=open \
+    SHIM_AUTO_PRESS=1 SHIM_AUTO_PRESS_DELAY_S=45 \
+    SHIM_AUTO_PRESS_SW_ID=90 SHIM_AUTO_PRESS_LABEL=Service_Select \
+    TIMEOUT=65 VIEWER=0 AUDIO_PLAYER=0 BOOT_DISPLAY=0 service_s_worker=0 \
+    DEVBUS=1 DEVBUS_TAIL=1 \
+    ./run_game.sh --debug --note switch_xor_autopress_service_select
+```
+
+Run directory:
+
+```text
+runs/2026-05-11T17.26.38_switch_xor_autopress_service_select
+```
+
+The manual-press log showed exactly one channel-0 bit transition for `sw_id=90`:
+
+```text
+translate held ch=0 buf=00 f1 80 f8 ff ff ff ff
+translate held ch=0 buf=00 f0 80 f8 ff ff ff ff
+```
+
+After the baseline reseed finished, devbus reported only `sw_id=90` around the auto-press window. The watcher emitted both queued-edge and drained-state observations for that one switch, but no unrelated switch IDs fired.
+
+Follow-up: updated `marker_button.py` so TIMER uses `switch_command.append_locked()` for request-file and game-log writes instead of carrying a separate `os.open`/`fcntl` append implementation. TIMER switch presses still emit its `[marker]` and optional `[switch_test]` annotations, but they now also emit the same `[external_switch]` log shape as `switch_command.py`.
+
+### 103b — Removed boot reseed; kept expected-idle normalization as the only comparison knob
+
+The repeated boot-time idle reseed is too invasive: it can produce a correct final devbus state while still injecting early artificial transitions that the game may react to. Removed the reseed mechanism instead of leaving it as a dormant env flag.
+
+Kept one narrower diagnostic knob:
+
+```text
+SHIM_EXPECTED_SWITCH_IDLE=1
+```
+
+When unset, the shim uses the game's saved/raw channel idle image plus explicit coin-door override and held-input overlay. When set, the synthesized channel buffers also apply the manual expected idle bits before the game sees them. This lets us compare "raw/default startup" against "manual expected cabinet idle" without forcibly writing the game runtime switch table.
+
+Comparison run without expected idle and without reseed:
+
+```bash
+env SKIP_BIND_MOUNT_CHECK=1 GL_DAEMON=1 SPIKE3_COIN_DOOR_INTERLOCK=open \
+    TIMEOUT=45 VIEWER=0 AUDIO_PLAYER=0 BOOT_DISPLAY=0 service_s_worker=0 \
+    DEVBUS=1 DEVBUS_TAIL=1 \
+    ./run_game.sh --debug --note no_expected_idle_no_seed
+```
+
+Run directory:
+
+```text
+runs/2026-05-11T17.37.05_no_expected_idle_no_seed
+```
+
+The default/raw startup state avoids the reseed churn, but the devbus snapshot shows most runtime playfield/service switches active because channels 8 and 9 remain `ff ff ff ff ff ff ff ff` and channel 0 remains `00 ff ff f8 ff ff ff ff`. That is not a gameplay-correct idle target; it is useful only as a control for render/timing behavior.
+
+Adjusted `run_game.sh` defaults so the next user-facing comparison can be run as:
+
+```bash
+./run_game.sh --debug --note default_visual_check
+```
+
+Current defaults for this pass:
+
+- coin door open (`SPIKE3_COIN_DOOR_INTERLOCK=open`);
+- no expected-idle normalization unless `SHIM_EXPECTED_SWITCH_IDLE=1`;
+- no boot idle reseed code remains;
+- `DEVBUS=1`, and `DEVBUS_TAIL=auto` writes `devbus.log` for `--debug` runs;
+- `BOOT_DISPLAY=0`;
+- `AUDIO_PLAYER=0`;
+- `TIMER=OFF`.
+
+The goal is to keep the active experiment as the default test state instead of stacking env knobs. If this default loses, remove or revise it rather than accumulating another permanent option.

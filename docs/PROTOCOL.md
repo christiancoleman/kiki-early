@@ -153,9 +153,19 @@ After setup, `/games`, `/connectivity`, `/data` are kernel-resolved into the sys
 
 *Verified by:* `_emulation/scripts/setup_bind_mounts.sh` source; `findmnt /games /connectivity /data` against a live setup; JOURNAL Step 82 POC validation.
 
-### `/etc/init.d/shared` env propagation
+### Launcher configuration
 
-The script sources `$SYSROOT/etc/init.d/shared` and propagates every var via qemu's `-E` flag, exactly as real hardware would inherit them through init. The kernel-level bind mounts (above) resolve absolute paths like `/games/pokemon_le/...` to the sysroot natively. One override applied: `BOOT_DISPLAY` is forced to `$GAMES_PATH/spike3/bin/boot_display` because the shared script's `[ -x ]` check runs on the host filesystem and would otherwise fall back to the wrong path.
+`_emulation/run_game.sh` is the source of truth for launcher toggles, defaults, and helper process selection. This document intentionally does not mirror that table to avoid drift.
+
+`devbus_snapshot.py` is the one-shot switch-state client. Run it while the game is active to print raw channel buffers joined with decoded switch state, edge/flap counters, raw/state relation, manual address, and switch name. Use `--from-file runs/latest/devbus.log` to analyze a saved debug log, or `--mismatches` to show only rows where the manual `N-SW-K` address disagrees with runtime channel/bit.
+
+The `--debug` flag splits stdout/stderr per subsystem into the run dir (default behavior is to inherit the terminal). The `--note "describe"` flag adds a slug to the run-dir name and a note line to `run_info.txt`.
+
+*Verified by:* `_emulation/run_game.sh` source.
+
+### `/etc/init.d/shared` propagation
+
+The launcher sources `$SYSROOT/etc/init.d/shared` and passes the resulting game environment through qemu, matching how the real init scripts launch cabinet binaries. The kernel-level bind mounts above resolve absolute paths like `/games/pokemon_le/...` to the sysroot natively.
 
 *Verified by:* `_emulation/run_game.sh` source.
 
@@ -1363,13 +1373,13 @@ No `uint32_t token_to_asset[]` array exists in the binary; token constants never
 
 ## 10. Display pipeline (DRM / GBM / EGL / GLES)
 
-**Data flow at a glance.** The game does its own real GLES rendering — no synthesized frames are fed to it. We intercept the hardware-specific framebuffer presentation parts (DRM/KMS ioctls + GBM allocation calls) and replace them with stand-ins, but every `glClear` / `glDraw*` / shader / texture upload the game issues is forwarded through to a **real GL backend** that writes real pixels into a real framebuffer. The shim supports two real-GL backends — the default host-native daemon (`GL_DAEMON=1`, see "Host-native GL daemon" below) or an in-process Mesa-aarch64 overlay (`GL_DAEMON=0`, `SPIKE3_REAL_GL=1`) — and at each fake page-flip does `glReadPixels` on the active backend's framebuffer and routes the bytes to one or more sinks (frame bridge over abstract AF_UNIX, periodic on-disk capture). GBM in this flow is a handle stand-in — its BOs are `calloc(256)` scratch pointers used as opaque tokens passed between layers; the only GBM BOs that actually carry pixel data are the special 1024×256 DMD path (`gbm_bo_map` returns `calloc(stride*height)` storage and `gbm_bo_unmap` captures it).
+**Data flow at a glance.** The game does its own real GLES rendering — no synthesized frames are fed to it. We intercept the hardware-specific framebuffer presentation parts (DRM/KMS ioctls + GBM allocation calls) and replace them with stand-ins, but every `glClear` / `glDraw*` / shader / texture upload the game issues is forwarded through to a **real GL backend** that writes real pixels into a real framebuffer. The shim supports a host-native daemon backend and an in-process Mesa-aarch64 overlay; launcher selection and defaults live in `_emulation/run_game.sh`. At each fake page-flip, the shim does `glReadPixels` on the active backend's framebuffer and routes the bytes to one or more sinks (frame bridge over abstract AF_UNIX, periodic on-disk capture). GBM in this flow is a handle stand-in — its BOs are `calloc(256)` scratch pointers used as opaque tokens passed between layers; the only GBM BOs that actually carry pixel data are the special 1024×256 DMD path (`gbm_bo_map` returns `calloc(stride*height)` storage and `gbm_bo_unmap` captures it).
 
 The game presents frames via Linux's KMS/DRM stack with EGL on top of GBM. Three layers in the shim:
 
 1. **`/dev/dri/card1`** — DRM ioctls intercepted before they'd reach the real device
 2. **GBM library hooks** — every `gbm_*` call goes to the shim
-3. **EGL + GLES library hooks** — three modes (stub / Mesa-aarch64 overlay / host-native daemon) controlled by `SPIKE3_REAL_GL` and `GL_DAEMON`
+3. **EGL + GLES library hooks** — three modes: stub, Mesa-aarch64 overlay, and host-native daemon. Runtime selection lives in `_emulation/run_game.sh`.
 
 All three layers cooperate so the game's normal display pipeline (allocate GBM BO → wrap as EGL image → bind as GL texture → render → page-flip) succeeds end-to-end without real GPU hardware.
 
@@ -1433,9 +1443,9 @@ Each BO is registered in a side-table (32 slots, mutex-guarded) holding its `(wi
 
 | Mode | Set via | Behavior |
 |---|---|---|
-| Stub | `REAL_GL=0 GL_DAEMON=0 ./run_game.sh` | Every GLES/EGL/GBM call returns plausible defaults. Shaders "compile". Draws are no-op. Produces no real pixels |
-| Mesa-aarch64 overlay | `GL_DAEMON=0 ./run_game.sh` | `FWD_RET` / `FWD_VOID` macros tail-call `dlsym(RTLD_NEXT, ...)` into the Mesa overlay at `mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/`. Game's EGL/GLES calls run inside qemu-aarch64 against an in-process Mesa → llvmpipe → a real EGL pbuffer (1920×1080) |
-| Host-native daemon (default) | `./run_game.sh` | Shim's GL/EGL hooks marshal opcodes over abstract AF_UNIX `@spike3_gl` to `gl_daemon.py` running natively on the host. Daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context and replays opcodes via PyOpenGL. EGL setup is synthesized in-shim (FAKE_EGL_* sentinels). `run_game.sh` auto-enables the alpha-preserving zero-blend behavior unless overridden. See "Host-native GL daemon" subsection below |
+| Stub | launcher-selectable | Every GLES/EGL/GBM call returns plausible defaults. Shaders "compile". Draws are no-op. Produces no real pixels |
+| Mesa-aarch64 overlay | launcher-selectable | `FWD_RET` / `FWD_VOID` macros tail-call `dlsym(RTLD_NEXT, ...)` into the Mesa overlay at `mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/`. Game's EGL/GLES calls run inside qemu-aarch64 against an in-process Mesa → llvmpipe → a real EGL pbuffer (1920×1080) |
+| Host-native daemon | launcher-selectable | Shim's GL/EGL hooks marshal opcodes over abstract AF_UNIX `@spike3_gl` to `gl_daemon.py` running natively on the host. Daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context and replays opcodes via PyOpenGL. EGL setup is synthesized in-shim (FAKE_EGL_* sentinels). See "Host-native GL daemon" subsection below |
 
 #### Cross-backend translation glue
 
@@ -1453,15 +1463,9 @@ The shim normalizes EGL/GLES traffic before forwarding to whichever backend is a
 
 Tracks `libEGL` / `libGLES` / `libgbm` handles. Substitutes the shim's 3 EGLImage overrides on `dlsym(handle, "eglCreateImageKHR" / "eglDestroyImageKHR" / "glEGLImageTargetTexture2DOES")`. `eglGetProcAddress` returns the shim's stubs (never forwards).
 
-### Host-native GL daemon (`GL_DAEMON=1`)
+### Host-native GL daemon
 
-When `GL_DAEMON=1` is exported (forwarded to qemu env as `SPIKE3_GL_DAEMON=1`), the shim's GL/EGL hooks marshal opcodes to `gl_daemon.py` over abstract AF_UNIX `@spike3_gl` instead of forwarding to the in-process Mesa overlay. The daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context (config `0x31DD`) and replays opcodes via PyOpenGL; `glReadPixels` round-trips ship RGBA bytes back to the shim for the frame bridge. `run_game.sh` spawns `gl_daemon.py` alongside `decode_daemon.py`; logs at `runs/<TS>/gl_daemon.log`.
-
-Current verified Pokémon LE game-run command:
-
-```bash
-./run_game.sh
-```
+In daemon mode, the shim's GL/EGL hooks marshal opcodes to `gl_daemon.py` over abstract AF_UNIX `@spike3_gl` instead of forwarding to the in-process Mesa overlay. The daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context (config `0x31DD`) and replays opcodes via PyOpenGL; `glReadPixels` round-trips ship RGBA bytes back to the shim for the frame bridge. Launcher selection lives in `_emulation/run_game.sh`; daemon logs land at `runs/<TS>/gl_daemon.log`.
 
 #### Wire protocol
 
@@ -1489,20 +1493,9 @@ The verified daemon behavior is to ignore zero/zero blend-factor updates and lea
 GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA
 ```
 
-`SPIKE3_ZERO_BLEND_DISABLE=1` selects this behavior by default. The name is historical; it no longer disables `GL_BLEND` unless `SPIKE3_ZERO_BLEND_MODE=disable` is also set. `run_game.sh` auto-exports `SPIKE3_ZERO_BLEND_DISABLE=1` when `GL_DAEMON=1`, unless `SPIKE3_ZERO_BLEND_DISABLE`, `SPIKE3_ZERO_BLEND_IGNORE`, or `SPIKE3_ZERO_BLEND_MODE` was already supplied by the caller. `SPIKE3_ZERO_BLEND_IGNORE=1` is an explicit synonym for the default fixed behavior.
+Launcher/runtime controls for this behavior live in `_emulation/run_game.sh`.
 
-#### Diagnostic env vars (opt-in)
-
-| Env | Effect |
-|---|---|
-| `SPIKE3_ZERO_BLEND_DISABLE=1` | Ignore `glBlendFunc(0,0)` / `glBlendFuncSeparate(0,0,0,0)` and keep the previous valid alpha blend factors active. Current verified daemon game-run setting; auto-enabled by `run_game.sh` for `GL_DAEMON=1` unless overridden |
-| `SPIKE3_ZERO_BLEND_IGNORE=1` | Explicit synonym for the fixed zero-blend behavior |
-| `SPIKE3_ZERO_BLEND_MODE=disable` | Restore the older comparison behavior: apply zero/zero factors, then temporarily disable `GL_BLEND` until the next nonzero blend function |
-| `SPIKE3_DISABLE_BLEND=1` | Diagnostic only: daemon's `Renderer.enable` ignores `glEnable(GL_BLEND)` globally |
-| `SPIKE3_FORCE_MAGENTA_CLEAR=1` | Daemon overrides `glClearColor` / `glClearBufferfv` (color variant) to `(1, 0, 1, 1)`; short-circuits `glBlitFramebuffer` |
-| `SPIKE3_VIDEO_TESTPATTERN=1` | Daemon replaces RGBA uploads ≥256×256 with a hot-pink/green checkerboard |
-
-`gl_daemon.py` also emits opt-in throttled logging for `glBindFramebuffer`, `glDrawArrays`/`glDrawElements`, `glBlendFunc`/`Separate`, `glBlitFramebuffer`, `glUniform4f`, `glUniform4fv`, `glProgramBinary`/`glGetProgramBinary`, plus an `FBO_SCAN` diagnostic that samples 8 pixels of fb=0..20 on every Nth `glReadPixels` for content sniffing.
+`gl_daemon.py` also emits opt-in throttled logging for `glBindFramebuffer`, `glDrawArrays`/`glDrawElements`, `glBlendFunc`/`Separate`, `glBlitFramebuffer`, `glUniform4f`, `glUniform4fv`, `glProgramBinary`/`glGetProgramBinary`, plus an FBO-scan diagnostic that samples framebuffer pixels during readback for content sniffing. Toggle names and defaults live in `_emulation/run_game.sh`.
 
 *Verified by:* JOURNAL Step 96.1 (Phase 1–3c shim → daemon → Mesa pipeline + four self-contained probes `gles_probe3..6`), Step 96.2 (Phase 3d EGLImage marshal + frame-capture relay + `Renderer.reset`), Step 97 (Phase 3d game-run iteration: 97a EGL hook coverage, 97b query hook coverage, 97c ES3 context, 97d `glMapBufferRange` shadow buffer, 97e compressed-tex ctypes bypass, 97f full `comm -23` symbol audit closed), Step 98 plus `runs/2026-05-10T11.23.55_auto_service_back_zero_blend/gl_daemon.log` (`draw #12288` onward remains `blend=1 func=(0x302,0x303,0x302,0x303)` after Service Back).
 
@@ -1517,7 +1510,7 @@ GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA
 
 ### Frame bridge wire format
 
-When `FRAME_BRIDGE=1`, every 2nd `MODE_PAGE_FLIP` triggers `glReadPixels(0, 0, 1920, 1080)` from `shim_last_draw_fbo` (or current `READ_FRAMEBUFFER`) and writes one frame to `@pokemon_spike3_frame` (AF_UNIX abstract namespace). Under `GL_DAEMON=1`, the readback is marshalled over `@spike3_gl` as a sync `OP_GL_READ_PIXELS`; the daemon executes it on its host-native ES3 context and ships the RGBA bytes back, which the shim then forwards to the frame bridge unchanged. Wire format:
+When the frame bridge is enabled, every 2nd `MODE_PAGE_FLIP` triggers `glReadPixels(0, 0, 1920, 1080)` from `shim_last_draw_fbo` (or current `READ_FRAMEBUFFER`) and writes one frame to `@pokemon_spike3_frame` (AF_UNIX abstract namespace). Under the host-native GL daemon, the readback is marshalled over `@spike3_gl` as a sync `OP_GL_READ_PIXELS`; the daemon executes it on its host-native ES3 context and ships the RGBA bytes back, which the shim then forwards to the frame bridge unchanged. Wire format:
 
 ```
 +0x00  uint32 LE  magic = 0xF00FBABA
@@ -1615,7 +1608,7 @@ uintptr_t sw_struct = arr + sw_id * 0x30;     // live heap struct
 
 #### Runtime switch table — full sw_id → channel/byte/bit mapping
 
-`g_switch_state_array @ 0x4480220` (heap-allocated by `FUN_00650f00` at boot) holds 99 entries for Pokémon LE 0.81 — runtime probe in `shim_inject.c::shim_switch_table_probe_thread` (env-gated by `SHIM_SWITCH_TABLE_PROBE=1`) walks the array and dumps `(sw_id, channel, byte, bit, state)` tuples.
+`g_switch_state_array @ 0x4480220` (heap-allocated by `FUN_00650f00` at boot) holds 99 entries for Pokémon LE 0.81. The switch-table probe in `shim_inject.c` walks the array and dumps `(sw_id, channel, byte, bit, state)` tuples when enabled through the launcher.
 
 The "channel" each switch belongs to determines how its state is polled:
 
@@ -1725,7 +1718,9 @@ Source: `Pokemon_LE_Pre_web.pdf`, section 3.3 "Switch Reference", PDF pages 17-1
 
 Resting-state work should treat the manual's `Type` as a hardware clue, not as the final logical polarity. The game applies the per-switch config invert flag in `sub_a50850`; raw channel bytes must match the board/firmware electrical state. Known example: `0-SW-23`/`sw_id=98` is physically a restored coin-door interlock in normal play, but our channel-0 idle buffer must clear raw bit 23 (`ff ff 7f ...`) so the translated/logical state becomes restored and the 48V warning clears.
 
-`0-SW-23` maps to runtime `sw_id=98`, channel 0, bit 23. This is the Coin Door Power Interlock. In emulation the shim defaults this bit to the restored/closed state before the channel-0 SPI buffer reaches `sub_651610`; otherwise the attract overlay displays `48V DISABLED / CLOSE COIN DOOR / OR PULL INTERLOCK SWITCH / TO RESTORE POWER` and the game will not start. Set `SPIKE3_COIN_DOOR_INTERLOCK=open` to reproduce the warning state.
+`0-SW-23` maps to runtime `sw_id=98`, channel 0, bit 23. This is the Coin Door Power Interlock. The launcher exposes coin-door state control for reproducing either the playable restored state or the `48V DISABLED / CLOSE COIN DOOR / OR PULL INTERLOCK SWITCH / TO RESTORE POWER` warning state.
+
+With the coin door open/interlock active, the verified idle active switch set is manual IDs `11, 12, 15, 16, 17, 18, 19, 20, 61, 71, 72, 78, C24`. The corresponding runtime IDs are `25, 26, 27, 28, 29, 30, 31, 32, 63, 69, 70, 74, 98`. The raw channel bytes captured in the validating run were channel 0 `00 f0 80 f8 ff ff ff ff`, channel 1 `7b a6 80 ff ff ff ff ff`, channel 8 `c0 e0 e1 84 bf ff ff ff`, and channel 9 `b0 10 01 02 ff ff ff ff`; folding subsequent devbus `switch_change` events over the boot snapshot produced exactly that active set with no extras.
 
 `1-SW-16` maps to runtime `sw_id=80`, channel 1, bit 16. This is the Left Coin switch. Use this for credit insertion; Service Back (`sw_id=93`) only exits service/operator screens and is not a coin input.
 
@@ -1740,12 +1735,11 @@ Resting-state work should treat the manual's `Type` as a hardware clue, not as t
 | `+0x30` | flag byte (u8) | misc per-switch flags |
 | `+0x34` | `event_id` (u16) | tag passed to `sub_729c10` (mostly `0x0005` = generic switch-event tag) |
 
-Shim probes:
-- `SHIM_SWITCH_TABLE_PROBE=1` — diagnostic only; dumps the (sw_id → channel, byte, bit, state, handler_fn, event_id, flags) table once after `SHIM_SWITCH_TABLE_PROBE_DELAY_S` (default 65s).
-- `SHIM_EDGE_SNAPSHOT=1` (with `SHIM_EDGE_SNAPSHOT_DELAY_S` / `_INTERVAL_S` / `_CYCLES`) — periodic snapshot of each switch's `edge_counter` (`+0x26`); logs only switches whose counter changed. Identifies which switches are firing edges continuously.
-- **Press injection (host → shim).** The canonical switch-control path is file-backed and intentionally simple. `run_game.sh`'s `SHIM_AUTO_PRESS=1` schedules a single timed switch press (default `sw_id=93` Service Back at T+60s; override with `SHIM_AUTO_PRESS_DELAY_S` / `SHIM_AUTO_PRESS_SW_ID` / `SHIM_AUTO_PRESS_LABEL`). `marker_button.py` (`TIMER=ON`) provides interactive holdable switches through `runs/latest/press_request.txt`; its Switch Test Menu mode adds `[switch_test] START/STOP`, per-command, and observed-toggle log lines without changing the switch-command format. The request file accepts legacy numeric `sw_id` lines as taps plus explicit `down <sw_id>`, `up <sw_id>`, and `tap <sw_id> [hold_ms]` lines; writers append under advisory lock, and the shim consumes by truncating rather than unlinking. `shim_manual_press_thread` is auto-enabled only when `TIMER=ON`, `TIMER=EXTERNAL`, or `SHIM_AUTO_PRESS=1` unless `SHIM_MANUAL_PRESS` is explicitly set. It updates a held-switch overlay mask and immediately calls `sub_651610(channel, buf)` so the runtime switch array sees the edge; the SPI and nodebus poll synth paths also apply the overlay, so multiple buttons can remain held simultaneously until matching `up` commands arrive. Channel 0 held bits clear raw CPU-SPI idle bits; remote node channels XOR held bits relative to the saved idle bytes, matching the prior one-shot press behavior. See §2 for full env-knob defaults.
+Shim probes and switch-injection toggles are launcher configuration, so their names/defaults live in `_emulation/run_game.sh`.
 
-*Verified by:* JOURNAL Step 93 — runtime probe output captured 2026-05-08 with all 99 entries enumerated; per-channel summary cross-checked against the Pokémon LE Lite manual's switch matrix.
+**Press injection (host → shim).** The canonical switch-control path is file-backed and intentionally simple. `marker_button.py` provides interactive holdable switches through `runs/latest/press_request.txt`; its Switch Test Menu mode adds `[switch_test] START/STOP`, per-command, and observed-toggle log lines without changing the switch-command format. The request file accepts legacy numeric `sw_id` lines as taps plus explicit `down <sw_id>`, `up <sw_id>`, and `tap <sw_id> [hold_ms]` lines; writers append under advisory lock, and the shim consumes by truncating rather than unlinking. It also accepts `coin_door open` / `coin_door closed` through the same file, and the TIMER UI exposes matching Coin Door Open/Closed controls. The shim updates a held-switch overlay mask and immediately calls `sub_651610(channel, buf)` so the runtime switch array sees the edge; the SPI and nodebus poll synth paths also apply the overlay, so multiple buttons can remain held simultaneously until matching `up` commands arrive. Held switch bits invert the target raw bit relative to the current corrected idle buffer; this produces a real transition for both inactive-at-idle switches (`0 -> 1 -> 0`) and active-at-idle switches (`1 -> 0 -> 1`).
+
+*Verified by:* JOURNAL Step 93 — runtime probe output captured 2026-05-08 with all 99 entries enumerated; per-channel summary cross-checked against the Pokémon LE Lite manual's switch matrix. JOURNAL Step 103 — folded `devbus.log` snapshot and `switch_change` events from the switch-idle run.
 
 ### `fire_event` dispatcher
 
@@ -1993,7 +1987,7 @@ To simulate a switch event from an external source:
 3. Handlers call vtable methods on the 42 cmodes; cmode state changes
 4. Next tick, `sub_94f140` iterates and each cmode's `+0xd8` updates its display
 
-The shim's `state_bridge` (when `STATE_BRIDGE=1`) polls cmode `+0x308` at 10 Hz and emits JSON deltas on `@pokemon_spike3_bridge`.
+The shim's `state_bridge`, when launcher-enabled, polls cmode `+0x308` at 10 Hz and emits JSON deltas on `@pokemon_spike3_bridge`.
 
 ### Tech Alerts row dispatcher
 
@@ -2169,7 +2163,7 @@ Current status: pathing and launch tooling are sysroot-generic; runtime anchors 
 
 | Device path | fd type | Purpose | Coverage |
 |---|---|---|---|
-| `/dev/spidev4.0` | fake fd `1023` | CPU-board 8-byte SPI polling (local switches, not node bus) | `MESSAGE_1` ioctl: default `rx[2] = 0x04` advances state machine. Per-cmd override via `SPIKE3_SPI_RX_<HEX>=hexbytes` env. TX currently all-zeros (gated on bridge) |
+| `/dev/spidev4.0` | fake fd `1023` | CPU-board 8-byte SPI polling (local switches, not node bus) | `MESSAGE_1` ioctl: default `rx[2] = 0x04` advances state machine. TX currently all-zeros (gated on bridge) |
 | `/dev/i2c-10` | fake fd `1022` | EEPROM at slave 0x57 | Read/write-back works; no real state maintained. **Persistence gap: writes vanish, no SIGTERM flush** |
 | `/dev/ttyAMA5` | real `socketpair(AF_UNIX, SOCK_STREAM)` | UART to netbridge (game gets sv[0], shim holds sv[1]) | Reads block naturally on the socketpair. Writes are intercepted by `shim_io.c::write` and routed to `synthesize_bridge_response` (see §4) |
 | `/dev/ttyAMA2` | real `socketpair(AF_UNIX, SOCK_STREAM)` | secondary UART path; no decoded protocol coverage in this document | Pass-through |
@@ -2188,7 +2182,7 @@ The game's HEVC and H.264 video decode paths are intercepted in-shim and routed 
 |---|---|---|
 | Shim client | `_emulation/shim_avforward.c` | C library inside `spi_shim.so`. 8-slot session table; each `avcodec_open2(HEVC \| H.264)` from the game allocates a slot and connects to `@spike3_decode`. `avcodec_send_packet` / `avcodec_receive_frame` (in `shim_patches.c`) dispatch into this TU. Every successful `avcodec_receive_frame` registers the decoded RGBA buffer in a sentinel-keyed side-table that `shim_gl::eglCreateImageKHR` later reads via the `EGL_DMA_BUF_PLANE0_FD_EXT` attrib. Builds a single-plane `AVDRMFrameDescriptor` (`DRM_FORMAT_ABGR8888`) into the per-session 528-byte buffer, points `frame->data[0]` at it. |
 | Host daemon | `_emulation/decode_daemon.py` | AF_UNIX server. Per-connection `Session` opens `av.codec.CodecContext.create("hevc_cuvid" \| "h264_cuvid", "r")` (codec_id mapped from the OPEN payload). NVDEC outputs are downloaded via `frame.reformat(format="rgba")` + `to_ndarray(format="rgba")` and sent back as a single tightly-packed RGBA8 plane (W·H·4 bytes). Doing the YUV→RGB on the host saves the cross-arch TCG translation cost of running the conversion inside qemu-aarch64 |
-| Launcher | `_emulation/run_game.sh` | When `FORWARD_DECODE=1` (default), launches the daemon before qemu and forwards `SPIKE3_FORWARD_DECODE=1` into the game env |
+| Launcher | `_emulation/run_game.sh` | Owns forward-decode daemon selection/defaults and launches the daemon before qemu when enabled |
 
 **Wire protocol** (length-prefixed messages on `@spike3_decode`):
 
@@ -2219,14 +2213,14 @@ When the daemon is unreachable, `avcodec_send_packet` / `avcodec_receive_frame` 
 
 ### Host-native GL daemon (host Mesa)
 
-The game's GL/EGL traffic routes to a host-native daemon over an abstract AF_UNIX socket by default (`GL_DAEMON=1`, forwarded as `SPIKE3_GL_DAEMON=1`). Set `GL_DAEMON=0` to fall back to the in-process Mesa overlay path. `run_game.sh` auto-enables the zero-blend fix unless overridden. See §10 "Host-native GL daemon" for full wire protocol + EGL synthesis + zero-blend handling.
+The game's GL/EGL traffic can route to a host-native daemon over an abstract AF_UNIX socket, or fall back to the in-process Mesa overlay path. Launcher selection/defaults live in `_emulation/run_game.sh`. See §10 "Host-native GL daemon" for full wire protocol + EGL synthesis + zero-blend handling.
 
 | Component | File | Role |
 |---|---|---|
 | Shim marshaller | `_emulation/shim_gl_marshal.c` | `shim_gl_marshal_active()` (lazy connect with 3× retry + dlsym fallback), `_send_async()`, `_send_sync()` with mutex |
 | Wire format | `_emulation/gl_proto.h` (C) + `_emulation/gl_proto.py` (Python) | 8-byte LE header `{u16 op, u16 flags, u32 payload_len}` + payload; opcode set covers EGL setup, state, objects, uploads, uniforms, draws, sync replies, and readback |
 | Host daemon | `_emulation/gl_daemon.py` | `Renderer` binds `EGL_PLATFORM_SURFACELESS_MESA` ES3 context (config `0x31DD`) and replays opcodes via PyOpenGL; `Session` is single-client; `Renderer.reset()` runs on every bind after the first. Compressed-tex uploads bypass PyOpenGL's `CompressedImageConverter` and call `libGLESv2.so.2` via raw ctypes |
-| Launcher | `_emulation/run_game.sh` | When `GL_DAEMON=1`, spawns daemon before qemu and forwards `SPIKE3_GL_DAEMON=1` into game env |
+| Launcher | `_emulation/run_game.sh` | Owns GL-daemon selection/defaults and spawns the daemon before qemu when enabled |
 
 Coverage as of JOURNAL Step 97f: `comm -23` of every `gl*` / `egl*` symbol referenced in `game.elf` against `nm -D spi_shim.so` exports returns no rows — every gl/egl entry-point the game can call has a hook with a marshal path. Step 98 verified Pokémon LE attract after Service Back with daemon-mode alpha compositing preserved by the zero-blend handler.
 
@@ -2237,12 +2231,12 @@ Coverage as of JOURNAL Step 97f: `comm -23` of every `gl*` / `egl*` symbol refer
 | Patch | Gate | Target |
 |---|---|---|
 | memcpy NULL-guard | always on | silently no-op when src/dst NULL — fixes Godot DisplayRenderer thread crash on un-initialized TLS |
-| `avcodec_find_decoder_by_name` remap | `SPIKE3_DECODER_PATCH=1` (default-on) | `"hevc_v4l2request"` / `"hevc_v4l2m2m"` → `"hevc"` |
-| `get_format` callback NOP | `SPIKE3_DECODER_PATCH=1` (default-on) | At game VA `0x920cf0`, write `0xd503201f` (NOP) over `0x54ffff81` (`b.ne 0x920ce0`). Patched by `shim_patch_get_format_callback`, called from `shim_inject.c::shim_discovery_init_thread` after a 2 s sleep |
+| `avcodec_find_decoder_by_name` remap | launcher-controlled | `"hevc_v4l2request"` / `"hevc_v4l2m2m"` → `"hevc"` |
+| `get_format` callback NOP | launcher-controlled | At game VA `0x920cf0`, write `0xd503201f` (NOP) over `0x54ffff81` (`b.ne 0x920ce0`). Patched by `shim_patch_get_format_callback`, called from `shim_inject.c::shim_discovery_init_thread` after a 2 s sleep |
 
 In addition to the gated patches above, `shim_patches.c` installs:
 - **Passthrough hooks** for `avcodec_get_hw_config` and `av_hwdevice_ctx_create` — resolve via `dlvsym`, log call activity, forward to real libavcodec.
-- **Forward-decode interceptors** for `avcodec_send_packet` / `avcodec_receive_frame` — route to the host daemon via `shim_avforward.c` when `SPIKE3_FORWARD_DECODE=1` (default-on). Bridge unreachable returns `-EIO`. See "Forward-decode bridge" above.
+- **Forward-decode interceptors** for `avcodec_send_packet` / `avcodec_receive_frame` — route to the host daemon via `shim_avforward.c` when launcher-enabled. Bridge unreachable returns `-EIO`. See "Forward-decode bridge" above.
 
 ### Other hooks (in `spi_shim.c` + `shim_net.c`)
 
@@ -2253,7 +2247,7 @@ In addition to the gated patches above, `shim_patches.c` installs:
 | termios family | UART fd gets fake-OK because glibc INLINE_SYSCALLs bypass our ioctl hook |
 | ALSA | Full set of fake-success stubs; `snd_pcm_writei` captures + paces. See §8 |
 | GStreamer | passthrough+log on `init_check`/`factory_make`/`parse_launch`/`bin_add`/`element_link`/`set_state`/`deinit`. **Linked but unused in PLE 0.81** — no static callers in the game binary; gstreamer init never fires. The actual video path is 100% direct libavcodec via Stern's `spi_video_player` (`SpiVideoStreamDecoderBase` class) plus Radium's own `VideoStreamDecoder` |
-| `connect` / `getaddrinfo` (`shim_net.c`) | log-only passthrough gated by `SPIKE3_OFFLINE=1` |
+| `connect` / `getaddrinfo` (`shim_net.c`) | log-only passthrough for offline runs |
 
 ### Hardware reference: Stern Spike 3 nodes
 

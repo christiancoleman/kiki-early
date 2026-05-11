@@ -1,9 +1,27 @@
 #!/usr/bin/env bash
+# run_game.sh — launch Pokémon LE under qemu-aarch64 with the shim preloaded,
+# plus the live frame viewer by default. Optional helpers are env-gated below.
 #
 # The repo layout is the Spike 3 SD-card filesystem used as a sysroot. This
 # script auto-detects everything from its own location — no env setup needed
 # in the normal case. Clone the repo anywhere, run ./run_game.sh.
 #
+# USAGE:
+#   ./run_game.sh                 # play: game + viewer.
+#                                   No timeout. Press Ctrl+C to stop.
+#   ./run_game.sh --debug         # route every subsystem to its own log file
+#                                   in a fresh runs/<TS>/ folder
+#   ./run_game.sh --note "trying X"  # add a slug to the run folder name +
+#                                     a note line to run_info.txt
+#   TIMEOUT=185 ./run_game.sh     # cap at 185 s (useful for smoke runs)
+#   VIEWER=0 ./run_game.sh        # game only, no Tk viewer window
+#   AUDIO_PLAYER=0 ./run_game.sh  # game only, no ffplay audio
+#   TIMER=ON ./run_game.sh        # spawn marker_button.py (Tk switch panel)
+#   TIMER=EXTERNAL ./run_game.sh  # enable external switch client, no WSL Tk
+#   LOGFILE=myrun.log ./run_game.sh  # capture only game stdout+stderr
+#   REAL_GL=0 ./run_game.sh       # use stub EGL (no Mesa forwarding)
+#   ./run_game.sh --help          # pass --help through to qemu-aarch64
+#   ./run_game.sh -strace 2>trace.txt   # pass extra flags straight to qemu
 #
 # TUNABLE ENV OVERRIDES (defaults in []):
 #   TIMEOUT=<sec>           [0]     cap run duration; 0 = no limit (default play)
@@ -11,7 +29,7 @@
 #   VIEWER_MAXIMIZED=<0|1>  [1]     open the viewer maximized
 #   VIEWER_FULLSCREEN=<0|1> [0]     open the viewer fullscreen rather than
 #                                   maximized/in a 1920×1080 window
-#   AUDIO_PLAYER=<0|1>      [1]     auto-launch audio_subscriber.py | ffplay
+#   AUDIO_PLAYER=<0|1>      [0]     auto-launch audio_subscriber.py | ffplay
 #   TIMER=<OFF|ON|EXTERNAL> [OFF]   ON auto-launches marker_button.py — a Tk
 #                                   switch panel that writes switch commands to
 #                                   runs/latest/press_request.txt. EXTERNAL
@@ -21,7 +39,16 @@
 #                                   without the TIMER UI. Defaults to Service
 #                                   Back at T+60s when enabled; override with
 #                                   SHIM_AUTO_PRESS_DELAY_S / _SW_ID / _LABEL.
-#   BOOT_DISPLAY=<0|1>      [1]     run spike3/bin/boot_display for ~1.5 s
+#   SHIM_EXPECTED_SWITCH_IDLE=<0|1> [0] apply the manual expected idle bits to
+#                                   synthesized switch channel buffers.
+#   SPIKE3_COIN_DOOR_INTERLOCK=<closed|open|1|0>
+#                             [open] synthetic coin-door interlock state.
+#                                   unset/open/0 = open/interlock active;
+#                                   closed/restored/1 = restored/closed.
+#   DEVBUS=<0|1>           [1]     enable switch-observability IPC bridge.
+#   DEVBUS_TAIL=<auto|0|1> [auto]  auto=1 for --debug when DEVBUS=1, else 0.
+#                                   When enabled, writes devbus.log in debug runs.
+#   BOOT_DISPLAY=<0|1>      [0]     run spike3/bin/boot_display for ~1.5 s
 #                                   pre-game, then kill it (mimics
 #                                   etc/init.d/game_monitor). Lets boot_display
 #                                   write /games/data/boot_display_cmd which the
@@ -61,6 +88,9 @@
 #                                   missing or mounted to a different sysroot,
 #                                   run setup_bind_mounts.sh --switch "$SYSROOT"
 #                                   via sudo before launching.
+#   SKIP_BIND_MOUNT_CHECK=<0|1> [0]  skip bind-mount validation entirely.
+#                                   Debug-only: absolute /games paths may resolve
+#                                   to the wrong tree if mounts are stale.
 #   QEMU=<bin>              [qemu-aarch64]     override qemu binary
 #
 # RUN ARCHIVING:
@@ -118,8 +148,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GAME_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SYSROOT="$(cd "$GAME_DIR/../.." && pwd)"
 AUTO_BIND_MOUNTS="${AUTO_BIND_MOUNTS:-1}"
+SKIP_BIND_MOUNT_CHECK="${SKIP_BIND_MOUNT_CHECK:-0}"
 
-if ! "$SCRIPT_DIR/scripts/setup_bind_mounts.sh" --check "$SYSROOT" >/dev/null 2>&1; then
+if [[ "$SKIP_BIND_MOUNT_CHECK" == "1" ]]; then
+    printf '[run_game] SKIP_BIND_MOUNT_CHECK=1; not validating /games, /connectivity, /data\n' >&2
+elif ! "$SCRIPT_DIR/scripts/setup_bind_mounts.sh" --check "$SYSROOT" >/dev/null 2>&1; then
     if [[ "$AUTO_BIND_MOUNTS" == "1" ]]; then
         printf '[run_game] bind mounts do not match SYSROOT=%s; switching via sudo\n' "$SYSROOT" >&2
         if sudo "$SCRIPT_DIR/scripts/setup_bind_mounts.sh" --switch "$SYSROOT"; then
@@ -139,7 +172,8 @@ EOF
     fi
 fi
 
-if ! "$SCRIPT_DIR/scripts/setup_bind_mounts.sh" --check "$SYSROOT" >/dev/null 2>&1; then
+if [[ "$SKIP_BIND_MOUNT_CHECK" != "1" ]] &&
+   ! "$SCRIPT_DIR/scripts/setup_bind_mounts.sh" --check "$SYSROOT" >/dev/null 2>&1; then
     cat <<EOF >&2
 [run_game] ERROR: bind mounts are not active for this sysroot.
 
@@ -207,7 +241,7 @@ OFFLINE_MODE="${OFFLINE_MODE:-1}"
 VIEWER="${VIEWER:-1}"
 VIEWER_MAXIMIZED="${VIEWER_MAXIMIZED:-1}"
 VIEWER_FULLSCREEN="${VIEWER_FULLSCREEN:-0}"
-AUDIO_PLAYER="${AUDIO_PLAYER:-1}"
+AUDIO_PLAYER="${AUDIO_PLAYER:-0}"
 TIMER="${TIMER:-OFF}"
 case "$TIMER" in
     ON)
@@ -229,10 +263,14 @@ case "$TIMER" in
         exit 2
         ;;
 esac
-DEVBUS="${DEVBUS:-0}"
+DEVBUS="${DEVBUS:-1}"
 DEVBUS_TAIL="${DEVBUS_TAIL:-auto}"
 if [[ "$DEVBUS_TAIL" == "auto" ]]; then
-    DEVBUS_TAIL=0
+    if [[ "$DEBUG" == "1" && "$DEVBUS" == "1" ]]; then
+        DEVBUS_TAIL=1
+    else
+        DEVBUS_TAIL=0
+    fi
 fi
 SWITCH_NOISE_TEST="${SWITCH_NOISE_TEST:-0}"
 SWITCH_NOISE_WATCH="${SWITCH_NOISE_WATCH:-77-98}"
@@ -244,7 +282,8 @@ if [[ "$SWITCH_NOISE_TEST" == "auto" ]]; then
         SWITCH_NOISE_TEST=0
     fi
 fi
-BOOT_DISPLAY="${BOOT_DISPLAY:-1}"
+BOOT_DISPLAY="${BOOT_DISPLAY:-0}"
+SPIKE3_COIN_DOOR_INTERLOCK="${SPIKE3_COIN_DOOR_INTERLOCK:-open}"
 BOOT_DISPLAY_DURATION="${BOOT_DISPLAY_DURATION:-3}"
 STALE_KILL="${STALE_KILL:-1}"
 LOGFILE="${LOGFILE:-}"
@@ -697,6 +736,7 @@ fi
              SWITCH_NOISE_TEST SWITCH_NOISE_WATCH SWITCH_NOISE_TEST_STRICT \
              VIEWER VIEWER_MAXIMIZED VIEWER_FULLSCREEN AUDIO_PLAYER TIMER  BOOT_DISPLAY \
              BOOT_DISPLAY_DURATION STALE_KILL SHIM_MANUAL_PRESS SHIM_MANUAL_PRESS_MS \
+             SHIM_EXPECTED_SWITCH_IDLE \
              SHIM_SWITCH_TABLE_PROBE SHIM_AUTO_PRESS \
              SHIM_AUTO_PRESS_DELAY_S SHIM_AUTO_PRESS_SW_ID \
              SHIM_AUTO_PRESS_LABEL DEBUG LOGFILE; do

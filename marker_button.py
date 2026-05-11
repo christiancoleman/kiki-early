@@ -15,7 +15,6 @@ A live "T+M:SS.x" elapsed timer updates every 100 ms at the top of the window.
 """
 
 import datetime
-import fcntl
 import os
 import pathlib
 import subprocess
@@ -24,7 +23,8 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-from switch_inventory import MANUAL_SWITCHES, SWITCH_BY_MANUAL_ID
+from switch_command import append_locked
+from switch_inventory import MANUAL_SWITCHES, SWITCH_BY_MANUAL_ID, SWITCH_BY_RUNTIME_ID
 
 # run_game.sh passes explicit paths so a symlinked _emulation directory can
 # drive multiple sysroots without pathlib resolving back to the canonical tree.
@@ -42,18 +42,11 @@ def now_timestamp():
 
 
 def append_to_game_log(line: str) -> tuple[bool, str]:
-    """Raw O_APPEND write — atomic per line on Linux for sub-PIPE_BUF writes."""
     try:
-        fd = os.open(GAME_LOG_PATH, os.O_WRONLY | os.O_APPEND)
-    except OSError as e:
-        return False, f"open: {e}"
-    try:
-        os.write(fd, line.encode("utf-8"))
-        return True, "ok"
+        append_locked(pathlib.Path(GAME_LOG_PATH), line)
     except OSError as e:
         return False, f"write: {e}"
-    finally:
-        os.close(fd)
+    return True, "ok"
 
 
 def log_error(detail: str):
@@ -62,6 +55,14 @@ def log_error(detail: str):
             f.write(f"{now_timestamp()} - {detail}\n")
     except OSError:
         pass
+
+
+def _switch_metadata(sw_id: int, fallback_name: str):
+    row = SWITCH_BY_RUNTIME_ID.get(sw_id)
+    if row is None:
+        return "-", "-", fallback_name
+    manual_id, address, _runtime_sw_id, name, _conn, _location, _switch_type = row
+    return manual_id, address, name
 
 
 def write_switch_command(action: str, sw_id: int, name: str,
@@ -74,21 +75,17 @@ def write_switch_command(action: str, sw_id: int, name: str,
     """
     try:
         line_out = f"{action} {sw_id}\n"
-        fd = os.open(PRESS_REQUEST_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            os.write(fd, line_out.encode("ascii"))
-        finally:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(fd)
+        append_locked(pathlib.Path(PRESS_REQUEST_PATH), line_out)
         count_ref[0] += 1
         elapsed = elapsed_var.get()
         log_action = action.upper()
+        manual_id, address, resolved_name = _switch_metadata(sw_id, name)
         line = f"{now_timestamp()} - [marker] {elapsed} event #{count_ref[0]} ({log_action} {name} sw_id={sw_id})\n"
         append_to_game_log(line)
+        append_to_game_log(
+            f"{now_timestamp()} - [external_switch] "
+            f"{log_action} {manual_id} {address} {resolved_name} runtime_sw_id={sw_id}\n"
+        )
         if switch_test_var is not None and switch_test_var.get():
             observed = ""
             if observed_var is not None:
@@ -103,6 +100,24 @@ def write_switch_command(action: str, sw_id: int, name: str,
     except OSError as e:
         log_error(f"{action.upper()} request write failed: {e}")
         try: status_var.set(f"{action.upper()} {name} FAILED: {e}")
+        except Exception: pass
+
+
+def write_raw_command(command: str, label: str, elapsed_var, status_var, count_ref):
+    """Append a non-switch command understood by shim_manual_press_thread."""
+    try:
+        append_locked(pathlib.Path(PRESS_REQUEST_PATH), f"{command}\n")
+        count_ref[0] += 1
+        elapsed = elapsed_var.get()
+        append_to_game_log(
+            f"{now_timestamp()} - [marker] {elapsed} event #{count_ref[0]} ({label})\n"
+        )
+        log_error(f"{label} request written")
+        try: status_var.set(f"#{count_ref[0]} {elapsed} -> {label}")
+        except Exception: pass
+    except OSError as e:
+        log_error(f"{label} request write failed: {e}")
+        try: status_var.set(f"{label} FAILED: {e}")
         except Exception: pass
 
 
@@ -345,8 +360,34 @@ def main():
                                         conn, loc, typ))
         button.grid(row=0, column=col, padx=5, pady=2, sticky="nsew")
 
+    door_frame = tk.Frame(service_frame)
+    door_frame.grid(row=1, column=0, columnspan=len(_SERVICE_BUTTONS),
+                    padx=5, pady=(6, 2), sticky="ew")
+    for col in range(2):
+        door_frame.columnconfigure(col, weight=1, uniform="door")
+    tk.Button(
+        door_frame,
+        text="Coin Door Open\nC24 active",
+        command=lambda: write_raw_command(
+            "coin_door open", "COIN DOOR OPEN", elapsed_var, status_var, count_ref
+        ),
+        bg="#f9a825", fg="#111",
+        font=("monospace", 11, "bold"),
+        height=2,
+    ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
+    tk.Button(
+        door_frame,
+        text="Coin Door Closed\nC24 restored",
+        command=lambda: write_raw_command(
+            "coin_door closed", "COIN DOOR CLOSED", elapsed_var, status_var, count_ref
+        ),
+        bg="#2e7d32", fg="white",
+        font=("monospace", 11, "bold"),
+        height=2,
+    ).grid(row=0, column=1, padx=(4, 0), sticky="ew")
+
     test_frame = tk.Frame(service_frame)
-    test_frame.grid(row=1, column=0, columnspan=len(_SERVICE_BUTTONS),
+    test_frame.grid(row=2, column=0, columnspan=len(_SERVICE_BUTTONS),
                     padx=5, pady=(6, 2), sticky="ew")
     test_frame.columnconfigure(1, weight=1)
     tk.Checkbutton(
