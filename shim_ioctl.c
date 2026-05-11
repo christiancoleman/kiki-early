@@ -170,44 +170,35 @@ static uint32_t drm_next_fb_id = 100;
 volatile uint8_t shim_spi_rx_extra[8] = {0};
 
 static int shim_spi_fill_channel0_idle_rx(uint8_t *rx, uint32_t len) {
-    uintptr_t game_base = shim_resolve_game_base();
-    if (!game_base || !rx || len == 0) return 0;
+    if (!rx || len == 0) return 0;
 
-    static const uint8_t synthetic_idle[8] =
-        { 0x00, 0xff, 0xff, 0xf8, 0xff, 0xff, 0xff, 0xff };
-    uint8_t idle[8];
-    memcpy(idle, synthetic_idle, sizeof(idle));
-
-    const char *coin_door = getenv("SPIKE3_COIN_DOOR_INTERLOCK");
-    if (!coin_door || !coin_door[0] ||
-        strcmp(coin_door, "closed") == 0 ||
-        strcmp(coin_door, "restored") == 0 ||
-        strcmp(coin_door, "1") == 0) {
-        idle[2] &= (uint8_t)~0x80u;
-    } else if (strcmp(coin_door, "open") == 0 || strcmp(coin_door, "0") == 0) {
-        idle[2] |= 0x80u;
-    }
-
+    uint8_t idle[SHIM_SWITCH_CHANNEL_BYTES];
+    shim_switch_make_channel0_idle(idle);
     shim_switch_hold_apply(0, idle);
 
     /* sub_8fa820 stores DAT_0450d9b0 byte N from SPI rx[N-1].
      * DAT byte 0 is a separate zero-initialized stack byte, so rx[7] is
      * ignored for channel-0 switch translation. */
-    for (uint32_t dat_i = 1; dat_i < 8 && dat_i - 1 < len; dat_i++)
+    for (uint32_t dat_i = 1; dat_i < SHIM_SWITCH_CHANNEL_BYTES && dat_i - 1 < len; dat_i++) {
         rx[dat_i - 1] = idle[dat_i];
+    }
 
-    static uint8_t last_logged[8];
+    static uint8_t last_logged[SHIM_SWITCH_CHANNEL_BYTES];
     static int logged = 0;
     if (!logged || memcmp(last_logged, idle, sizeof(idle)) != 0) {
+        uint8_t log_rx[SHIM_SWITCH_CHANNEL_BYTES] = {0};
+        uint32_t log_len = len;
+        if (log_len > SHIM_SWITCH_CHANNEL_BYTES) {
+            log_len = SHIM_SWITCH_CHANNEL_BYTES;
+        }
+        memcpy(log_rx, rx, log_len);
         memcpy(last_logged, idle, sizeof(idle));
         logged = 1;
         SHIM_LOG("[spi] channel0 idle RX source DAT=%02x %02x %02x %02x %02x %02x %02x %02x -> rx=%02x %02x %02x %02x %02x %02x %02x %02x",
                  idle[0], idle[1], idle[2], idle[3],
                  idle[4], idle[5], idle[6], idle[7],
-                 len > 0 ? rx[0] : 0, len > 1 ? rx[1] : 0,
-                 len > 2 ? rx[2] : 0, len > 3 ? rx[3] : 0,
-                 len > 4 ? rx[4] : 0, len > 5 ? rx[5] : 0,
-                 len > 6 ? rx[6] : 0, len > 7 ? rx[7] : 0);
+                 log_rx[0], log_rx[1], log_rx[2], log_rx[3],
+                 log_rx[4], log_rx[5], log_rx[6], log_rx[7]);
     }
     return 1;
 }
@@ -374,14 +365,20 @@ int ioctl(int fd, unsigned long request, ...) {
             uint32_t len = xfer->len;
 
             spi_transfer_count++;
-            uint8_t cmd = (tx && len > 0) ? tx[len - 1] : 0;
+            uint8_t cmd = 0;
+            if (tx && len > 0) {
+                cmd = tx[len - 1];
+            }
             uint32_t cmd_seen = ++spi_cmd_count[cmd];
 
             {
                 static int delay_us_cached = -1;
                 if (__builtin_expect(delay_us_cached < 0, 0)) {
                     const char *d = getenv("SPIKE3_SPI_DELAY_US");
-                    delay_us_cached = (d && d[0]) ? atoi(d) : 0;
+                    delay_us_cached = 0;
+                    if (d && d[0]) {
+                        delay_us_cached = atoi(d);
+                    }
                     if (delay_us_cached < 0) delay_us_cached = 0;
                     if (delay_us_cached > 100000) delay_us_cached = 100000;
                 }
@@ -415,16 +412,24 @@ int ioctl(int fd, unsigned long request, ...) {
                  * concurrent threads (e.g. I2C ioctls firing from another
                  * thread) can't splice into the middle of an SPI log. */
                 char line[256];
+                const char *override_text = "";
+                if (spi_rx_override_len[cmd] > 0) {
+                    override_text = " (override)";
+                }
                 int n = snprintf(line, sizeof(line),
                                  "[shim] SPI #%u cmd=0x%02x%s  TX:",
-                                 spi_transfer_count, cmd,
-                                 spi_rx_override_len[cmd] > 0 ? " (override)" : "");
+                                 spi_transfer_count, cmd, override_text);
                 for (uint32_t i = 0; i < len && i < 16 && n < (int)sizeof(line); i++)
                     n += snprintf(line + n, sizeof(line) - n, " %02x", tx[i]);
                 if (n < (int)sizeof(line))
                     n += snprintf(line + n, sizeof(line) - n, "  RX:");
-                for (uint32_t i = 0; i < len && i < 16 && n < (int)sizeof(line); i++)
-                    n += snprintf(line + n, sizeof(line) - n, " %02x", rx ? rx[i] : 0);
+                for (uint32_t i = 0; i < len && i < 16 && n < (int)sizeof(line); i++) {
+                    uint8_t rx_byte = 0;
+                    if (rx) {
+                        rx_byte = rx[i];
+                    }
+                    n += snprintf(line + n, sizeof(line) - n, " %02x", rx_byte);
+                }
                 if (is_first_of_cmd && n < (int)sizeof(line))
                     n += snprintf(line + n, sizeof(line) - n, "  [FIRST]");
                 if (n < (int)sizeof(line))
@@ -529,7 +534,10 @@ int ioctl(int fd, unsigned long request, ...) {
              * returning "connected" on both simplifies acceptance. */
             c->encoder_id = FAKE_ENCODER_ID;
             c->connector_type = 11;         /* DRM_MODE_CONNECTOR_HDMIA */
-            c->connector_type_id = (c->connector_id == FAKE_CONNECTOR_A) ? 1 : 2;
+            c->connector_type_id = 2;
+            if (c->connector_id == FAKE_CONNECTOR_A) {
+                c->connector_type_id = 1;
+            }
             c->connection = 1;              /* 1=connected */
             c->mm_width = 477;
             c->mm_height = 268;
@@ -594,9 +602,12 @@ int ioctl(int fd, unsigned long request, ...) {
 
         case DRM_IOCTL_MODE_SETCRTC: {
             struct drm_mode_crtc *c = (struct drm_mode_crtc *)arg;
+            const char *mode_name = "(none)";
+            if (c->mode_valid) {
+                mode_name = c->mode.name;
+            }
             SHIM_LOG("DRM ioctl MODE_SETCRTC crtc=%u fb=%u mode=%s",
-                     c->crtc_id, c->fb_id,
-                     c->mode_valid ? c->mode.name : "(none)");
+                     c->crtc_id, c->fb_id, mode_name);
             return 0;
         }
 
@@ -634,8 +645,11 @@ int ioctl(int fd, unsigned long request, ...) {
             /* drm_mode_fb_cmd and drm_mode_fb_cmd2 both start with fb_id. */
             uint32_t *fb_id = (uint32_t *)arg;
             *fb_id = drm_next_fb_id++;
-            SHIM_LOG("DRM ioctl MODE_ADDFB%s -> fb_id=%u",
-                     request == DRM_IOCTL_MODE_ADDFB2 ? "2" : "", *fb_id);
+            const char *fb_suffix = "";
+            if (request == DRM_IOCTL_MODE_ADDFB2) {
+                fb_suffix = "2";
+            }
+            SHIM_LOG("DRM ioctl MODE_ADDFB%s -> fb_id=%u", fb_suffix, *fb_id);
             return 0;
         }
 
@@ -697,7 +711,10 @@ int ioctl(int fd, unsigned long request, ...) {
         unsigned long nr   = request & 0xff;
         unsigned long size = (request >> 16) & 0x3fff;
         unsigned long dir  = (request >> 30) & 0x3;
-        const char *dev = (fd == FAKE_FD_V4L2_MEDIA) ? "media" : "video";
+        const char *dev = "video";
+        if (fd == FAKE_FD_V4L2_MEDIA) {
+            dev = "media";
+        }
         SHIM_LOG("V4L2 %s ioctl #%u: req=0x%lx dir=%lu type='%c' nr=0x%02lx size=%lu arg=%p  -> ENOTTY",
                  dev, v4l2_ioctl_count, request, dir, (char)type, nr, size, arg);
         errno = 25;  /* ENOTTY = inappropriate ioctl for device */
@@ -833,9 +850,12 @@ int ioctl(int fd, unsigned long request, ...) {
                 break;
             }
             if (i2c_ioctl_count <= 10) {
+                const char *rw = "W";
+                if (is_read) {
+                    rw = "R";
+                }
                 SHIM_LOG("I2C ioctl SMBUS (transfer #%u, %s size=%u cmd=0x%02x)",
-                         i2c_ioctl_count, is_read ? "R" : "W",
-                         s->size, s->command);
+                         i2c_ioctl_count, rw, s->size, s->command);
             }
             return 0;
         }

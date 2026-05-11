@@ -305,7 +305,10 @@ static void log_caller_chain(const char *prefix) {
         }
         uintptr_t next_fp = *(volatile uintptr_t*)fp;
         uintptr_t ret    = *(volatile uintptr_t*)(fp + 8);
-        const char *zone = (ret >= GAME_TEXT_LO && ret < GAME_TEXT_HI) ? "GAME" : "extn";
+        const char *zone = "extn";
+        if (ret >= GAME_TEXT_LO && ret < GAME_TEXT_HI) {
+            zone = "GAME";
+        }
         n += snprintf(line + n, sizeof(line) - n, " d%d=%s:0x%lx(fp->0x%lx)",
                       depth, zone, ret, next_fp);
         if (ret == 0) break;
@@ -335,7 +338,10 @@ static void nodebus_cipher_decrypt(uint8_t slot, uint8_t inner_len, uint8_t *buf
     uint8_t mask = (uint8_t)(((slot & 0x1F) << 4) | ((inner_len + 1) & 0x0F));
     for (int i = 0; i < inner_len; i++) {
         uint8_t k_table = nodebus_cipher_keys[slot & 0x1F][i & 0x0F];
-        uint8_t k_mask  = (i & 1) ? (uint8_t)(~mask) : mask;
+        uint8_t k_mask = mask;
+        if (i & 1) {
+            k_mask = (uint8_t)(~mask);
+        }
         buf[i] ^= (uint8_t)(k_table ^ k_mask);
     }
 }
@@ -562,7 +568,10 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
          * Both values satisfy 917264; alternation resolves the pair. */
         static unsigned int cmd27_count = 0;
         cmd27_count++;
-        uint8_t status = (cmd27_count & 1) ? 0x06 : 0x02;
+        uint8_t status = 0x02;
+        if (cmd27_count & 1) {
+            status = 0x06;
+        }
         resp[0] = 0x02;
         resp[1] = 0x27;
         resp[2] = id;
@@ -714,9 +723,13 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
         int n = snprintf(line, sizeof(line),
                          "[shim] bridge: cmd 0x41 slot=%u inner_cmd=0x%02x ilen=%u payload=[",
                          slot, inner_cmd, inner_len);
-        for (int i = 1; i < inner_len && n < (int)sizeof(line) - 4; i++)
-            n += snprintf(line + n, sizeof(line) - n,
-                          (i == 1 ? "%02x" : " %02x"), payload[2 + i]);
+        for (int i = 1; i < inner_len && n < (int)sizeof(line) - 4; i++) {
+            const char *byte_fmt = " %02x";
+            if (i == 1) {
+                byte_fmt = "%02x";
+            }
+            n += snprintf(line + n, sizeof(line) - n, byte_fmt, payload[2 + i]);
+        }
         if (n < (int)sizeof(line) - 2) {
             line[n++] = ']';
             line[n++] = '\n';
@@ -778,7 +791,11 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
                         unsigned long off = (unsigned long)
                             ((uintptr_t)bt[i] - (uintptr_t)di.dli_fbase);
                         const char *base = strrchr(di.dli_fname, '/');
-                        base = base ? base + 1 : di.dli_fname;
+                        if (base) {
+                            base++;
+                        } else {
+                            base = di.dli_fname;
+                        }
                         tn += snprintf(tline + tn, sizeof(tline) - tn,
                             "[shim]   [%02d] %s+0x%lx\n", i, base, off);
                     } else {
@@ -933,8 +950,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
          *
          * Fix: return the channel's own POST-INIT idle state. FUN_00650f00
          * wrote per-bit polarity-aware idle bytes into the channel struct's
-         * "saved state" buffer at &DAT_044804b8 + 0x18 + 0xb0*slot
-         * (= &DAT_044804d0 + 0xb0*slot). Reading those 8 bytes and sending
+         * "saved state" buffer. Reading those 8 bytes and sending
          * them as the synth payload means the FIRST translate cycle on the
          * channel sees current=idle / previous=initial-zero (one cycle of
          * edges, then steady) and SUBSEQUENT cycles see current=idle /
@@ -957,21 +973,22 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
                          slot, hint);
                 return;
             }
-            uint8_t idle[8] = {0};
+            uint8_t idle[SHIM_SWITCH_CHANNEL_BYTES] = {0};
             uintptr_t game_base = shim_resolve_game_base();
             if (game_base) {
                 if (slot < 32 && nodebus_switch_idle_baseline_valid[slot]) {
-                    memcpy(idle, nodebus_switch_idle_baseline[slot], 8);
+                    memcpy(idle, nodebus_switch_idle_baseline[slot],
+                           SHIM_SWITCH_CHANNEL_BYTES);
                 } else {
-                    memcpy(idle,
-                           (void *)(uintptr_t)(game_base + 0x44804d0ULL +
-                                               0xb0ULL * (uint64_t)slot),
-                           8);
+                    shim_switch_copy_channel_idle(game_base, slot, idle);
                     if (slot < 32) {
                         int nonzero = 0;
-                        for (int i = 0; i < 8; i++) nonzero |= idle[i];
+                        for (int i = 0; i < SHIM_SWITCH_CHANNEL_BYTES; i++) {
+                            nonzero |= idle[i];
+                        }
                         if (nonzero) {
-                            memcpy(nodebus_switch_idle_baseline[slot], idle, 8);
+                            memcpy(nodebus_switch_idle_baseline[slot], idle,
+                                   SHIM_SWITCH_CHANNEL_BYTES);
                             nodebus_switch_idle_baseline_valid[slot] = 1;
                         }
                     }
@@ -986,7 +1003,11 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             int payload_start = o;
             int inner_size = (int)hint;
             for (int i = 0; i < inner_size; i++)
-                resp[o++] = (i < 8) ? idle[i] : 0x00;
+                if (i < SHIM_SWITCH_CHANNEL_BYTES) {
+                    resp[o++] = idle[i];
+                } else {
+                    resp[o++] = 0x00;
+                }
             if (inner_size >= 2) {
                 uint32_t inner_sum = 0;
                 for (int i = 0; i < inner_size - 2; i++)

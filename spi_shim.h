@@ -93,8 +93,34 @@ extern volatile uint8_t shim_spi_rx_extra[8];
  * clear bits in the CPU SPI idle buffer; node-bus channels toggle bits
  * relative to their saved idle bytes, matching the existing manual press
  * behavior. */
+#define SHIM_SWITCH_CHANNEL_COUNT       16
+#define SHIM_SWITCH_CHANNEL_BYTES       8
+#define SHIM_SWITCH_BITS_PER_CHANNEL    64
+#define SHIM_SWITCH_MAX_RUNTIME_ID      255
+
+#define SHIM_GAME_VA_SWITCH_ARRAY_PTR   0x4480220ULL
+#define SHIM_GAME_VA_CHANNEL_IDLE_BASE  0x44804d0ULL
+#define SHIM_GAME_CHANNEL_IDLE_STRIDE   0xb0ULL
+
+#define SHIM_COIN_DOOR_INTERLOCK_BYTE   2
+#define SHIM_COIN_DOOR_INTERLOCK_MASK   0x80u
+
+#define SHIM_SWITCH_ENTRY_SIZE          0x30u
+#define SHIM_SWITCH_ENTRY_CONFIG_OFF    0x10u
+#define SHIM_SWITCH_ENTRY_ID_OFF        0x20u
+#define SHIM_SWITCH_ENTRY_BIT_IDX_OFF   0x22u
+#define SHIM_SWITCH_ENTRY_CHANNEL_OFF   0x24u
+#define SHIM_SWITCH_ENTRY_EDGE_OFF      0x26u
+#define SHIM_SWITCH_ENTRY_STATE_OFF     0x28u
+
 void shim_switch_hold_set(uint8_t channel_id, uint16_t bit_idx, int held);
-void shim_switch_hold_apply(uint8_t channel_id, uint8_t buf[8]);
+void shim_switch_hold_apply(uint8_t channel_id, uint8_t buf[SHIM_SWITCH_CHANNEL_BYTES]);
+void shim_switch_make_channel0_idle(uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]);
+void shim_switch_copy_channel_idle(uintptr_t game_base,
+                                   uint8_t channel_id,
+                                   uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]);
+uint8_t *shim_switch_array(uintptr_t game_base);
+uint8_t *shim_switch_entry(uint8_t *switch_array, int sw_id);
 
 /* Decoder compatibility patch (defined in shim_patches.c).
  * Patches the b.ne at game VA 0x920cf0 in the game's get_format callback

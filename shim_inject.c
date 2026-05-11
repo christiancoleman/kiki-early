@@ -51,14 +51,10 @@ volatile sig_atomic_t shim_event_fire_in_progress = 0;
 volatile int shim_current_sweep_event_id = -1;
 
 static pthread_mutex_t shim_switch_hold_mutex = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t shim_switch_hold_mask[16][8];
+static uint8_t shim_switch_hold_mask[SHIM_SWITCH_CHANNEL_COUNT][SHIM_SWITCH_CHANNEL_BYTES];
 
-static void shim_copy_channel_idle_buffer(uintptr_t game_base,
-                                          uint8_t channel_id,
-                                          uint8_t out[8]);
-static void shim_make_channel0_idle_buffer(uint8_t out[8]);
 static void shim_log_channel_buf(const char *tag, uint8_t channel_id,
-                                 const uint8_t buf[8]);
+                                 const uint8_t buf[SHIM_SWITCH_CHANNEL_BYTES]);
 
 static uint64_t shim_fire_event(int32_t event_id, int64_t event_data) {
     uintptr_t game_base = shim_resolve_game_base();
@@ -180,12 +176,12 @@ void shim_event_sweep(void) {
 
 
 
-/* Wait until channel-1's saved-state buffer at game_base + 0x44804d0 + 0xb0
- * is non-zero (i.e., FUN_00650f00 has populated it), then mirror changes to
+/* Wait until channel 1's saved-state buffer is non-zero (i.e., FUN_00650f00
+ * has populated it), then mirror changes to
  * DAT_0436b020 while the CPU-SPI/channel-1 state machine settles during boot. */
 static void shim_install_channel1_idle(uintptr_t game_base) {
     uint8_t *channel_1_saved = (uint8_t *)(uintptr_t)
-        (game_base + 0x44804d0ULL + 0xb0ULL);
+        (game_base + SHIM_GAME_VA_CHANNEL_IDLE_BASE + SHIM_GAME_CHANNEL_IDLE_STRIDE);
     volatile uint64_t *dat_0436b020 = (volatile uint64_t *)(uintptr_t)
         (game_base + 0x436b020ULL);
     uint64_t last_written = 0;
@@ -247,9 +243,10 @@ static void shim_event_sweep_alarm_handler(int sig, siginfo_t *info, void *uc) {
     }
 }
 
-/* SHIM_SWITCH_TABLE_PROBE=1 — read g_switch_state_array @ 0x4480220 (heap;
+/* SHIM_SWITCH_TABLE_PROBE=1 — read g_switch_state_array (heap;
  * pointer-of-pointer-to-array calloc'd by FUN_00650f00). Per FUN_00650f00,
- * each 0x30-byte entry has the resolved (channel, bit_idx) already filled
+ * each SHIM_SWITCH_ENTRY_SIZE-byte entry has resolved (channel, bit_idx)
+ * already filled.
  * in:
  *
  *   +0x20 : u16 switch_id     (== array index)
@@ -276,27 +273,25 @@ static void *shim_switch_table_probe_thread(void *arg) {
     }
     SHIM_LOG("[switch_table] === START === game_base=0x%lx", (unsigned long)game_base);
 
-    uint8_t **arr_pp = (uint8_t **)(uintptr_t)(game_base + 0x4480220ULL);
-    uint8_t *arr = *arr_pp;
+    uint8_t *arr = shim_switch_array(game_base);
     SHIM_LOG("[switch_table] g_switch_state_array @ %p", (void *)arr);
     if (!arr) {
         SHIM_LOG("[switch_table] array pointer is NULL; abort");
         return NULL;
     }
 
-    int max_sw = 256;
     int valid = 0;
-    for (int sw_id = 1; sw_id < max_sw; sw_id++) {
-        uint8_t *e = arr + (size_t)sw_id * 0x30u;
-        uint16_t recorded_sw_id = *(uint16_t *)(e + 0x20);
+    for (int sw_id = 1; sw_id <= SHIM_SWITCH_MAX_RUNTIME_ID; sw_id++) {
+        uint8_t *e = shim_switch_entry(arr, sw_id);
+        uint16_t recorded_sw_id = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_ID_OFF);
         if (recorded_sw_id != (uint16_t)sw_id) {
             SHIM_LOG("[switch_table] sw_id=%d  recorded_sw_id=%u (mismatch — end of valid entries)",
                      sw_id, recorded_sw_id);
             break;
         }
-        uint16_t bit_idx    = *(uint16_t *)(e + 0x22);
-        uint8_t  channel_id = *(uint8_t  *)(e + 0x24);
-        uint8_t  state_byte = *(uint8_t  *)(e + 0x28);
+        uint16_t bit_idx = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_BIT_IDX_OFF);
+        uint8_t channel_id = *(uint8_t *)(e + SHIM_SWITCH_ENTRY_CHANNEL_OFF);
+        uint8_t state_byte = *(uint8_t *)(e + SHIM_SWITCH_ENTRY_STATE_OFF);
 
         /* Per sub_6511c0 (drain): on transition, calls sub_729c10 with
          *   arg1 = u16 at config_ptr[+0x34]  (event_id)
@@ -306,7 +301,7 @@ static void *shim_switch_table_probe_thread(void *arg) {
          * release fire-gate is config_ptr[+0x2e]: bit 11 = fire on press,
          * bit 10 = fire on release, bit 12 = call sub_79fe00, bit 13 = call
          * sub_79fd70, bit 14 = wraps edge_counter mod 2. */
-        uint64_t config_ptr_raw = *(uint64_t *)(e + 0x10);
+        uint64_t config_ptr_raw = *(uint64_t *)(e + SHIM_SWITCH_ENTRY_CONFIG_OFF);
         uint64_t handler_fn     = 0;
         uint64_t param_2        = 0;
         uint16_t event_id       = 0;
@@ -322,7 +317,10 @@ static void *shim_switch_table_probe_thread(void *arg) {
             flags_30   = *(uint8_t  *)(cfg + 0x30);
             event_id   = *(uint16_t *)(cfg + 0x34);
         }
-        uint64_t handler_va = handler_fn ? (handler_fn - game_base) : 0;
+        uint64_t handler_va = 0;
+        if (handler_fn) {
+            handler_va = handler_fn - game_base;
+        }
 
         SHIM_LOG("[switch_table] sw_id=%3d  ch=%u byte=%u bit=%u  state=%u  cfg=%p  handler=0x%lx  param=0x%lx  evt=0x%04x  prio=0x%04x  flag2e=0x%04x  flag30=0x%02x",
                  sw_id, channel_id,
@@ -344,7 +342,10 @@ static void *shim_switch_table_probe_thread(void *arg) {
         uint8_t **mode_bitmap_pp = (uint8_t **)(uintptr_t)(game_base + 0x44cb9f0ULL);
         uint8_t *mode_bitmap = *mode_bitmap_pp;
         uint64_t mode_count_p = *(uint64_t *)(uintptr_t)(game_base + 0x43527d0ULL);
-        uint64_t mode_count = mode_count_p ? *(uint64_t *)(uintptr_t)mode_count_p : 0;
+        uint64_t mode_count = 0;
+        if (mode_count_p) {
+            mode_count = *(uint64_t *)(uintptr_t)mode_count_p;
+        }
         if (mode_bitmap) {
             uint8_t b[5] = {0};
             memcpy(b, mode_bitmap, 5);
@@ -356,10 +357,14 @@ static void *shim_switch_table_probe_thread(void *arg) {
                     n += snprintf(active + n, sizeof(active) - n, " %d", i);
                 }
             }
+            const char *active_text = " (none)";
+            if (n > 0) {
+                active_text = active;
+            }
             SHIM_LOG("[switch_table] mode_bitmap @ %p (count=%lu)  bytes=%02x %02x %02x %02x %02x  active modes:%s",
                      (void *)mode_bitmap, (unsigned long)mode_count,
                      b[0], b[1], b[2], b[3], b[4],
-                     n ? active : " (none)");
+                     active_text);
         } else {
             SHIM_LOG("[switch_table] mode_bitmap pointer NULL (sub_7a8b90 hasn't run yet?)");
         }
@@ -414,8 +419,7 @@ static void *shim_edge_snapshot_thread(void *arg) {
         return NULL;
     }
 
-    uint8_t **arr_pp = (uint8_t **)(uintptr_t)(game_base + 0x4480220ULL);
-    uint8_t *arr = *arr_pp;
+    uint8_t *arr = shim_switch_array(game_base);
     if (!arr) {
         SHIM_LOG("[edge_snap] g_switch_state_array NULL; skip");
         return NULL;
@@ -433,10 +437,10 @@ static void *shim_edge_snapshot_thread(void *arg) {
         int n = snprintf(line, sizeof(line), "[edge_snap] cycle %d:", cycle);
         int any = 0;
         for (int sw_id = 1; sw_id < MAX_SW; sw_id++) {
-            uint8_t *e = arr + (size_t)sw_id * 0x30u;
-            uint16_t recorded = *(uint16_t *)(e + 0x20);
+            uint8_t *e = shim_switch_entry(arr, sw_id);
+            uint16_t recorded = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_ID_OFF);
             if (recorded != (uint16_t)sw_id) break;
-            uint16_t cur = *(uint16_t *)(e + 0x26);
+            uint16_t cur = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_EDGE_OFF);
             if (cur != prev[sw_id]) {
                 if (n < (int)sizeof(line) - 32) {
                     n += snprintf(line + n, sizeof(line) - n,
@@ -480,20 +484,19 @@ static void *shim_machine_dump_thread(void *arg) {
     SHIM_LOG("[machine_dump] === START === switches=%zu drivers=%zu lamps=%zu",
              ple_switches_count, ple_drivers_count, ple_lamps_count);
 
-    uint8_t **arr_pp = (uint8_t **)(uintptr_t)(game_base + 0x4480220ULL);
-    uint8_t *arr = *arr_pp;
+    uint8_t *arr = shim_switch_array(game_base);
     int matched = 0, missing = 0;
 
     for (size_t i = 0; i < ple_switches_count; i++) {
         const ple_switch_t *m = &ple_switches[i];
         int found_sw_id = -1;
         if (arr) {
-            for (int sw_id = 1; sw_id < 256; sw_id++) {
-                uint8_t *e = arr + (size_t)sw_id * 0x30u;
-                uint16_t recorded = *(uint16_t *)(e + 0x20);
+            for (int sw_id = 1; sw_id <= SHIM_SWITCH_MAX_RUNTIME_ID; sw_id++) {
+                uint8_t *e = shim_switch_entry(arr, sw_id);
+                uint16_t recorded = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_ID_OFF);
                 if (recorded != (uint16_t)sw_id) break;
-                uint16_t bit_idx = *(uint16_t *)(e + 0x22);
-                uint8_t channel = *(uint8_t *)(e + 0x24);
+                uint16_t bit_idx = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_BIT_IDX_OFF);
+                uint8_t channel = *(uint8_t *)(e + SHIM_SWITCH_ENTRY_CHANNEL_OFF);
                 if (channel == m->channel && bit_idx == m->bit_idx) {
                     found_sw_id = sw_id;
                     break;
@@ -592,10 +595,14 @@ static void *shim_output_probe_thread(void *arg) {
     SHIM_LOG("[output_probe] initial: %02x %02x %02x %02x %02x %02x %02x %02x",
              prev[0], prev[1], prev[2], prev[3], prev[4], prev[5], prev[6], prev[7]);
 
-    int total_ticks = (duration_s * 1000) / (interval_ms > 0 ? interval_ms : 100);
+    int tick_interval_ms = 100;
+    if (interval_ms > 0) {
+        tick_interval_ms = interval_ms;
+    }
+    int total_ticks = (duration_s * 1000) / tick_interval_ms;
     int changes = 0;
     for (int tick = 0; tick < total_ticks; tick++) {
-        usleep((useconds_t)interval_ms * 1000);
+        usleep((useconds_t)tick_interval_ms * 1000);
         uint8_t cur[8];
         memcpy(cur, (const void *)out_state, 8);
         if (memcmp(cur, prev, 8) != 0) {
@@ -777,16 +784,16 @@ static void *shim_dispatch_watchdog_thread(void *arg) {
     }
 }
 
-static void shim_copy_channel_idle_buffer(uintptr_t game_base,
-                                          uint8_t channel_id,
-                                          uint8_t out[8]) {
-    uintptr_t channel_idle = game_base + 0x44804d0ULL
-                           + (uintptr_t)channel_id * 0xb0ULL;
-    memcpy(out, (const void *)channel_idle, 8);
+void shim_switch_copy_channel_idle(uintptr_t game_base,
+                                   uint8_t channel_id,
+                                   uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]) {
+    uintptr_t channel_idle = game_base + SHIM_GAME_VA_CHANNEL_IDLE_BASE
+                           + (uintptr_t)channel_id * SHIM_GAME_CHANNEL_IDLE_STRIDE;
+    memcpy(out, (const void *)channel_idle, SHIM_SWITCH_CHANNEL_BYTES);
 }
 
-static void shim_make_channel0_idle_buffer(uint8_t out[8]) {
-    static const uint8_t idle[8] =
+void shim_switch_make_channel0_idle(uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]) {
+    static const uint8_t idle[SHIM_SWITCH_CHANNEL_BYTES] =
         { 0x00, 0xff, 0xff, 0xf8, 0xff, 0xff, 0xff, 0xff };
     memcpy(out, idle, sizeof(idle));
 
@@ -795,43 +802,68 @@ static void shim_make_channel0_idle_buffer(uint8_t out[8]) {
         strcmp(coin_door, "closed") == 0 ||
         strcmp(coin_door, "restored") == 0 ||
         strcmp(coin_door, "1") == 0) {
-        out[2] &= (uint8_t)~0x80u;
+        out[SHIM_COIN_DOOR_INTERLOCK_BYTE] &= (uint8_t)~SHIM_COIN_DOOR_INTERLOCK_MASK;
     } else if (strcmp(coin_door, "open") == 0 || strcmp(coin_door, "0") == 0) {
-        out[2] |= 0x80u;
+        out[SHIM_COIN_DOOR_INTERLOCK_BYTE] |= SHIM_COIN_DOOR_INTERLOCK_MASK;
     }
 }
 
+uint8_t *shim_switch_array(uintptr_t game_base) {
+    if (!game_base) {
+        return NULL;
+    }
+    uint8_t **arr_pp = (uint8_t **)(uintptr_t)(game_base + SHIM_GAME_VA_SWITCH_ARRAY_PTR);
+    return *arr_pp;
+}
+
+uint8_t *shim_switch_entry(uint8_t *switch_array, int sw_id) {
+    if (!switch_array) {
+        return NULL;
+    }
+    if (sw_id < 1 || sw_id > SHIM_SWITCH_MAX_RUNTIME_ID) {
+        return NULL;
+    }
+    return switch_array + (size_t)sw_id * SHIM_SWITCH_ENTRY_SIZE;
+}
+
 void shim_switch_hold_set(uint8_t channel_id, uint16_t bit_idx, int held) {
-    if (channel_id >= 16 || bit_idx >= 64) return;
+    if (channel_id >= SHIM_SWITCH_CHANNEL_COUNT ||
+        bit_idx >= SHIM_SWITCH_BITS_PER_CHANNEL) {
+        return;
+    }
     uint8_t byte_off = (uint8_t)(bit_idx >> 3);
     uint8_t bit_mask = (uint8_t)(1u << (bit_idx & 7));
 
     pthread_mutex_lock(&shim_switch_hold_mutex);
-    if (held)
+    if (held) {
         shim_switch_hold_mask[channel_id][byte_off] |= bit_mask;
-    else
+    } else {
         shim_switch_hold_mask[channel_id][byte_off] &= (uint8_t)~bit_mask;
+    }
     pthread_mutex_unlock(&shim_switch_hold_mutex);
 }
 
-void shim_switch_hold_apply(uint8_t channel_id, uint8_t buf[8]) {
-    if (!buf || channel_id >= 16) return;
+void shim_switch_hold_apply(uint8_t channel_id, uint8_t buf[SHIM_SWITCH_CHANNEL_BYTES]) {
+    if (!buf || channel_id >= SHIM_SWITCH_CHANNEL_COUNT) {
+        return;
+    }
 
-    uint8_t mask[8];
+    uint8_t mask[SHIM_SWITCH_CHANNEL_BYTES];
     pthread_mutex_lock(&shim_switch_hold_mutex);
     memcpy(mask, shim_switch_hold_mask[channel_id], sizeof(mask));
     pthread_mutex_unlock(&shim_switch_hold_mutex);
 
-    for (int i = 0; i < 8; i++) {
-        if (channel_id == 0)
+    for (int i = 0; i < SHIM_SWITCH_CHANNEL_BYTES; i++) {
+        if (channel_id == 0) {
             buf[i] &= (uint8_t)~mask[i];
-        else
+        } else {
             buf[i] ^= mask[i];
+        }
     }
 }
 
 static void shim_log_channel_buf(const char *tag, uint8_t channel_id,
-                                 const uint8_t buf[8]) {
+                                 const uint8_t buf[SHIM_SWITCH_CHANNEL_BYTES]) {
     SHIM_LOG("%s ch=%u buf=%02x %02x %02x %02x %02x %02x %02x %02x",
              tag, channel_id,
              buf[0], buf[1], buf[2], buf[3],
@@ -846,12 +878,26 @@ static void shim_log_start_gate_snapshot(uintptr_t game_base, const char *phase,
     switch_read_fn switch_read = (switch_read_fn)(uintptr_t)(game_base + 0x650850ULL);
     mode_gate_fn mode_gate = (mode_gate_fn)(uintptr_t)(game_base + 0x7a8de0ULL);
 
-    uint8_t raw_state = switch_entry ? *(uint8_t *)(switch_entry + 0x28) : 0xff;
-    uint16_t edge = switch_entry ? *(uint16_t *)(switch_entry + 0x26) : 0xffff;
-    int logical_state = switch_read ? switch_read(78) : -1;
-    int gate2 = mode_gate ? mode_gate(2) : -1;
-    int gate3 = mode_gate ? mode_gate(3) : -1;
-    int gate4 = mode_gate ? mode_gate(4) : -1;
+    uint8_t raw_state = 0xff;
+    uint16_t edge = 0xffff;
+    if (switch_entry) {
+        raw_state = *(uint8_t *)(switch_entry + SHIM_SWITCH_ENTRY_STATE_OFF);
+        edge = *(uint16_t *)(switch_entry + SHIM_SWITCH_ENTRY_EDGE_OFF);
+    }
+
+    int logical_state = -1;
+    if (switch_read) {
+        logical_state = switch_read(78);
+    }
+
+    int gate2 = -1;
+    int gate3 = -1;
+    int gate4 = -1;
+    if (mode_gate) {
+        gate2 = mode_gate(2);
+        gate3 = mode_gate(3);
+        gate4 = mode_gate(4);
+    }
 
     uint16_t mode_flags = 0xffff;
     uintptr_t mode_flags_ptr = 0;
@@ -893,17 +939,18 @@ static void shim_log_start_gate_snapshot(uintptr_t game_base, const char *phase,
  * Env knobs:
  *   SHIM_MANUAL_PRESS=1               — enable
  *   SHIM_MANUAL_PRESS_DELAY_S=N       — wait N s before first poll (default 0)
- *   SHIM_MANUAL_PRESS_MS=N            — press hold ms (default 500) */
+ *   SHIM_MANUAL_PRESS_MS=N            — tap hold ms (default 120 from run_game.sh) */
 static void shim_translate_held_switch_state(uintptr_t game_base,
                                              uint8_t channel_id) {
     typedef int64_t (*translate_fn)(uint8_t channel_id, const uint8_t *buffer);
     translate_fn translate = (translate_fn)(game_base + 0x651610);
 
-    uint8_t buf[8];
-    if (channel_id == 0)
-        shim_make_channel0_idle_buffer(buf);
-    else
-        shim_copy_channel_idle_buffer(game_base, channel_id, buf);
+    uint8_t buf[SHIM_SWITCH_CHANNEL_BYTES];
+    if (channel_id == 0) {
+        shim_switch_make_channel0_idle(buf);
+    } else {
+        shim_switch_copy_channel_idle(game_base, channel_id, buf);
+    }
     shim_switch_hold_apply(channel_id, buf);
     shim_log_channel_buf("[manual_press] translate held", channel_id, buf);
     translate(channel_id, buf);
@@ -912,23 +959,27 @@ static void shim_translate_held_switch_state(uintptr_t game_base,
 static int shim_set_switch_held_by_sw_id(uintptr_t game_base, uint8_t *arr,
                                          int sw_id, int held,
                                          const char *action_tag) {
-    uint8_t *e = arr + (size_t)sw_id * 0x30u;
-    uint16_t recorded = *(uint16_t *)(e + 0x20);
+    uint8_t *e = shim_switch_entry(arr, sw_id);
+    if (!e) {
+        SHIM_LOG("[manual_press] sw_id=%d out of supported range; skip", sw_id);
+        return 0;
+    }
+    uint16_t recorded = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_ID_OFF);
     if (recorded != (uint16_t)sw_id) {
         SHIM_LOG("[manual_press] sw_id=%d not present (recorded=%u); skip",
                  sw_id, recorded);
         return 0;
     }
-    uint16_t bit_idx    = *(uint16_t *)(e + 0x22);
-    uint8_t  channel_id = *(uint8_t  *)(e + 0x24);
+    uint16_t bit_idx = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_BIT_IDX_OFF);
+    uint8_t channel_id = *(uint8_t *)(e + SHIM_SWITCH_ENTRY_CHANNEL_OFF);
     int byte_off = bit_idx >> 3;
-    if (byte_off >= 8) {
+    if (byte_off >= SHIM_SWITCH_CHANNEL_BYTES) {
         SHIM_LOG("[manual_press] sw_id=%d bit_idx=%u out of buffer range; skip",
                  sw_id, bit_idx);
         return 0;
     }
-    uint16_t edge_before = *(uint16_t *)(e + 0x26);
-    uint8_t  state_before = *(uint8_t *)(e + 0x28);
+    uint16_t edge_before = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_EDGE_OFF);
+    uint8_t state_before = *(uint8_t *)(e + SHIM_SWITCH_ENTRY_STATE_OFF);
     SHIM_LOG("[manual_press] %s sw_id=%d ch=%u byte=%d bit=%u  (BEFORE: state=%u edge=%u)",
              action_tag, sw_id, channel_id, byte_off, (unsigned)(bit_idx & 7),
              state_before, edge_before);
@@ -941,12 +992,16 @@ static int shim_set_switch_held_by_sw_id(uintptr_t game_base, uint8_t *arr,
     shim_translate_held_switch_state(game_base, channel_id);
 
     if (sw_id == 78) {
-        shim_log_start_gate_snapshot(game_base, held ? "pressed" : "released", e);
+        if (held) {
+            shim_log_start_gate_snapshot(game_base, "pressed", e);
+        } else {
+            shim_log_start_gate_snapshot(game_base, "released", e);
+        }
     }
 
     usleep(200000);
-    uint16_t edge_after = *(uint16_t *)(e + 0x26);
-    uint8_t  state_after = *(uint8_t *)(e + 0x28);
+    uint16_t edge_after = *(uint16_t *)(e + SHIM_SWITCH_ENTRY_EDGE_OFF);
+    uint8_t state_after = *(uint8_t *)(e + SHIM_SWITCH_ENTRY_STATE_OFF);
     SHIM_LOG("[manual_press] %s sw_id=%d AFTER: state=%u edge=%u (delta=%d)",
              action_tag, sw_id, state_after, edge_after,
              edge_after - edge_before);
@@ -1004,7 +1059,7 @@ static void *shim_manual_press_thread(void *arg) {
     if (!v || !v[0] || v[0] == '0') return NULL;
 
     int delay_s = 0;
-    int press_ms = 500;
+    int press_ms = 120;
     if ((v = getenv("SHIM_MANUAL_PRESS_DELAY_S")) != NULL && v[0]) delay_s = atoi(v);
     if ((v = getenv("SHIM_MANUAL_PRESS_MS")) != NULL && v[0]) press_ms = atoi(v);
 
@@ -1041,8 +1096,7 @@ static void *shim_manual_press_thread(void *arg) {
             continue;
         }
 
-        uint8_t **arr_pp = (uint8_t **)(uintptr_t)(game_base + 0x4480220ULL);
-        uint8_t *arr = *arr_pp;
+        uint8_t *arr = shim_switch_array(game_base);
         if (!arr) {
             SHIM_LOG("[manual_press] g_switch_state_array NULL; drop request '%.64s'", buf);
             continue;
@@ -1059,19 +1113,22 @@ static void *shim_manual_press_thread(void *arg) {
                                                        sizeof(action), &sw_id,
                                                        &press_ms_override);
             if (parsed == 0) continue;
-            if (parsed < 0 || sw_id < 1 || sw_id > 255) {
+            if (parsed < 0 || sw_id < 1 || sw_id > SHIM_SWITCH_MAX_RUNTIME_ID) {
                 SHIM_LOG("[manual_press] bogus request line '%.64s'; skip", line);
                 continue;
             }
 
-            if (strcmp(action, "down") == 0)
+            if (strcmp(action, "down") == 0) {
                 shim_set_switch_held_by_sw_id(game_base, arr, sw_id, 1, "down");
-            else if (strcmp(action, "up") == 0)
+            } else if (strcmp(action, "up") == 0) {
                 shim_set_switch_held_by_sw_id(game_base, arr, sw_id, 0, "up");
-            else
-                shim_press_one_sw_id(game_base, arr, sw_id,
-                                     press_ms_override > 0 ?
-                                     press_ms_override : press_ms);
+            } else {
+                int tap_ms = press_ms;
+                if (press_ms_override > 0) {
+                    tap_ms = press_ms_override;
+                }
+                shim_press_one_sw_id(game_base, arr, sw_id, tap_ms);
+            }
         }
     }
 }
