@@ -8,8 +8,8 @@
  *     recovery via siglongjmp. Triggered by SIGUSR2 from shim_diagnostics.c.
  *   - sigjmp_buf + "sweep in progress" globals (declared extern in
  *     spi_shim.h; read by shim_sigsegv_handler in shim_diagnostics.c).
- *   - shim_discovery_init_thread: deferred 2-second sleep then call
- *     shim_discovery_init() and runtime compatibility setup.
+ *   - shim_discovery_init_thread: deferred 2-second runtime compatibility
+ *     setup; optional BRK discovery traps when SHIM_DISCOVERY_TRAPS=1.
  *   - SIGALRM handler used by the sweep to break out of hung event handlers.
  *   - shim_inject_start(): single public entry point the constructor calls.
  *
@@ -239,13 +239,23 @@ static void shim_translate_startup_idle(uintptr_t game_base,
 static void *shim_discovery_init_thread(void *arg) {
     (void)arg;
     sleep(2);
-    shim_discovery_init();
+    const char *discovery_traps = getenv("SHIM_DISCOVERY_TRAPS");
+    if (discovery_traps && discovery_traps[0] &&
+        discovery_traps[0] != '0') {
+        shim_discovery_init();
+    }
     /* Decoder compatibility patch: NOP the b.ne at game VA 0x920cf0 so the
      * game's get_format callback accepts NV12 from forward-decode (or from
      * local SW hevc as a diagnostic). Must run after game-base is resolvable
      * — the 2 s sleep above already handles that timing. Default-on; gate
      * via SPIKE3_DECODER_PATCH=0. */
     shim_patch_get_format_callback();
+
+    /* Start-button readiness probe: if SHIM_FORCE_START_READY=1, patch
+     * FUN_0073a5f0 so the Start handler's readiness gate reports ready
+     * (event 0x32 / device sub-mode 50 forced not-queued). Default off —
+     * probe to surface the next blocker, not the fix. */
+    shim_patch_force_start_ready();
 
     uintptr_t game_base = shim_resolve_game_base();
     if (game_base) {

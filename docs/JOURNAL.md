@@ -9499,7 +9499,7 @@ Follow-up: removing the channel-1 derived-switch NOP made button spam return. Di
 
 Outstanding default-on runtime mutation/instrumentation:
 
-- `shim_discovery_init()` is still called unconditionally and installs a large BRK-trap set: Godot error, nodebus init, scene load, Start gates, multiball/event-32, clear path, and ball-count entry. These traps emulate the replaced instruction after logging, but they are still invasive. Next cleanup: gate them behind something like `SHIM_DISCOVERY_TRAPS=1`, default off.
+- `shim_discovery_init()` is now gated by `SHIM_DISCOVERY_TRAPS=1` (default off). When enabled it installs the large BRK-trap set: Godot error, nodebus init, scene load, Start gates, multiball/event-32, clear path, and ball-count entry.
 - `shim_patch_get_format_callback()` NOPs the game's video `get_format` branch by default. This is runtime support for the forward-decode path and is expected for video.
 - The previous `shim_patch_channel1_derived_switches()` NOP is removed. Channel-1 idle now explicitly matches the default CPU-SPI-derived idle transformation from `sub_674b90(0)`.
 - `shim_switches.c` applies default idle corrections for coin inputs, trough/EOS, captive ball, spinner, and Meowth down. These are intentional gameplay-I/O behavior now, but should be documented as machine-profile normalization rather than treated as a hidden debug patch.
@@ -9509,10 +9509,23 @@ Env-gated helpers such as switch-table probe, edge snapshot, output probe, machi
 
 ### 104e — Recommended next step
 
-Before continuing Start-condition RE, clean the default runtime:
+Before continuing Start-condition RE, use the cleaned default runtime:
 
-1. Gate `shim_discovery_init()` behind an explicit env var and rebuild.
-2. Run one plain default test and compare behavior/logs without the BRK trap layer.
-3. If Start still aborts, re-enable only the smallest trap set needed for the next question: probably ball count plus event-32 lifecycle, not the whole historical discovery suite.
+1. Run one plain default test and compare behavior/logs without the BRK trap layer.
+2. If Start still aborts, re-enable only the smallest trap set needed for the next question: probably ball count plus event-32 lifecycle, not the whole historical discovery suite.
 
 This keeps the useful discoveries while reducing the chance that old traps, temporary patches, or stale assumptions distort the next result.
+
+## Step 105: Service Menu Node Bus Test exposes phantom FE-probe slots (2026-05-11)
+
+User ran `TIMER=ON VIEWER=1 AUDIO_PLAYER=0 service_s_worker=0 SHIM_DISCOVERY_TRAPS=0 ./run_game.sh --debug --note nodebus_service_menu_hang` and entered the Service Menu's Node Bus Test. The run did not hit bridge cmd `0x40`; the test path used the normal cmd `0x41` encrypted nodebus relay plus FE probes.
+
+Runtime log `/games/pokemon_le/_emulation/runs/2026-05-11T21.58.33_nodebus_service_menu_hang/game.log` showed the service test scanning slots beyond the populated-machine set. The shim replied to slot 3 and slot 5 `inner_cmd=0xfe` frames as node-present with chip_id `0x041e502b`, even though cmd `0x25` enumeration only advertises populated slots `{1,2,4,7,8,9,10,12,13,14}`. That made the service test discover phantom nodes which are not part of the Pokemon LE slot inventory.
+
+Fix, first pass: added `nodebus_slot_is_populated()` in `shim_nodebus.c` and made FE-probe synthesis skip unpopulated slots instead of falling back to a generic LPC1111 chip ID. That removed the phantom node-present response, but the service test then retried slot 3 indefinitely and logged repeated cmd `0x41` timeouts.
+
+Fix, second pass: unpopulated slots now receive a syntactically valid all-zero FE response. This preserves "not populated" semantics without forcing the service-menu scan through the bridge timeout path on every absent address. Updated PROTOCOL §5.4 so "any other" slot is documented as an all-zero FE response rather than a fallback node.
+
+Follow-up from the next run: the service test progressed through absent slots 3 and 5, completed the boot/init pass through slot 14, then started a second scan and stalled after slot 2. The log showed cmd `0x41` timeouts during that second scan even though FE replies were being synthesized, pointing at contention from the fixed 200 ms synthetic delay after boot. Updated `shim_nodebus.c` so the 200 ms delay remains in force until the first switch-poll response, then subsequent synthetic replies use a shorter post-init delay for service-menu scans.
+
+Verification: `./build.sh` completed successfully after the change. Existing warnings remain unrelated (`nodebus_cipher_decrypt`, `log_caller_chain`, timestamp truncation warning, `shim_fs.c` comment warning, `openat` nonnull comparisons).

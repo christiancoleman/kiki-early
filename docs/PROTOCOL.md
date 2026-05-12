@@ -943,7 +943,7 @@ Indices 13/19, 14/20, 21/22 share chip IDs across package variants — the chip-
 
 #### Per-slot chip-ID synth (Pokémon LE)
 
-`shim_nodebus.c::nodebus_chip_id_for_slot` returns the chip_id the shim writes into `response[4..7]` of every synthesized FE-probe reply. Each chip_id matches a vtable entry whose `+0x10` (type_idx — the same value `sub_840d30` uses as `key2`) corresponds to a shipped `.hex` firmware family.
+`shim_nodebus.c::nodebus_chip_id_for_slot` returns the chip_id the shim writes into `response[4..7]` of every synthesized FE-probe reply for populated slots. `shim_nodebus.c::nodebus_slot_is_populated` is the shared slot-inventory gate: cmd `0x25` enumerates the populated nonzero slots, and cmd `0x41` inner cmd `0xFE` returns a chip/version payload for populated slots or an all-zero not-populated FE payload for other slots. Each populated-slot chip_id matches a vtable entry whose `+0x10` (type_idx — the same value `sub_840d30` uses as `key2`) corresponds to a shipped `.hex` firmware family.
 
 | Slot | Role (manual) | chip_id | vtable entry | type_idx | Firmware match |
 |---:|---|---|---|---:|---|
@@ -958,7 +958,7 @@ Indices 13/19, 14/20, 21/22 share chip IDs across package variants — the chip-
 | 12 | Topper-Lamps | `0x2C40102B` | LPC1313 (13) | 5 | `ws2812node-LPC1313-1_31_0.hex` |
 | 13 | Topper-Servo | `0x042D502B` | LPC1112_101 (2) | 1 | `pinnode-LPC1112_101-1_31_0.hex` |
 | 14 | Universal Topper | `0x2C40102B` | LPC1313 (13) | 5 | `ws2812node-LPC1313-1_31_0.hex` |
-| any other | — | `0x041E502B` | LPC1111_101 (0) | 0 | fallback (no shipped firmware match) |
+| any other | — | all-zero FE response | — | — | not populated |
 
 Result: all 11 populated slots reach `status=2 + flag=0x03` — every row hidden in Tech Alerts; game advances past Tech Alerts to the **Service Menu**. See §11 for the status writer success path and the flag-bit-1 paths driven by bridge cmd `0x25` enumeration.
 
@@ -966,7 +966,7 @@ LPC1342 entries (vtable 21/22, chip_id `0x3D01402B`) have `type_idx=0` — using
 
 Topology per cabinet manual: `0 → 10 → 9 → 8 → 4` (playfield daisy chain via CPU CN22), `0 → 1` (separate cabinet branch via CPU CN11).
 
-Synth requires a wall-clock pause before each `bridge_send_response` to preserve the timeout-driven timing real hardware imposes — empirically 200 ms (`shim_nodebus.c::NODEBUS_SYNTH_DELAY_US`). Immediate replies regress the run from frame-decode-active to "Godot init never fires".
+Synth requires a wall-clock pause before each boot-time `bridge_send_response` to preserve the timeout-driven timing real hardware imposes — empirically 200 ms (`shim_nodebus.c::NODEBUS_SYNTH_DELAY_US`). Immediate replies regress the run from frame-decode-active to "Godot init never fires". After the first nodebus switch-poll response, `shim_nodebus.c::nodebus_post_init_fast_replies` switches later synthetic nodebus replies to a shorter delay for service-menu scans and steady-state polling.
 
 *Verified by:* JOURNAL Step 92 — runtime vtable dump (`game_base + 0x42317c8`, 28 entries × 0x28) confirms `type_idx` per entry; runtime probe of all 11 populated slots reaching `flag=0x03 status=2` after shim synthesis with the chip_id table above plus bridge cmd `0x25` enumeration. Visual confirmation: Tech Alerts panel rendering empty + game advancing to the **Service Menu**. Earlier Step 90 captures of the "Not Initialized" intermediate state are archived in `_emulation/reference/` — the `tech_alerts_v*.png` filename is **legacy**: v1-v6 depict the actual Tech Alerts screen mid-init; v7_huge.png post-dates Step 92's fix and depicts the Service Menu (Tech Alerts empty by then).
 

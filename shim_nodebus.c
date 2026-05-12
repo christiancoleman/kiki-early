@@ -69,11 +69,52 @@ static uint8_t nodebus_cipher_keys[32][16] = {{0}};
 static uint8_t nodebus_switch_idle_baseline[32][8];
 static uint8_t nodebus_switch_idle_baseline_valid[32];
 
-/* Per-response delay before sending a synthetic cipher reply. Without it the
- * game races past Godot/Radium init (Step 43 "timeout is progress" — the path
- * that worked relied on the wall-clock pause from real-hardware timeouts, not
- * on the response shape). 200ms matches what's needed in practice. */
+/* Per-response delay before sending a synthetic cipher reply. During boot,
+ * removing this delay races past Godot/Radium init (Step 43 "timeout is
+ * progress" — the path that worked relied on the wall-clock pause from real-
+ * hardware timeouts, not on the response shape). Once switch polling begins,
+ * nodebus init has reached steady state; later service-menu scans need shorter
+ * latency or concurrent polling/test traffic can timeout behind our delay. */
 #define NODEBUS_SYNTH_DELAY_US 200000
+#define NODEBUS_FAST_SYNTH_DELAY_US 10000
+
+static int nodebus_post_init_fast_replies = 0;
+
+static int nodebus_deep_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("SHIM_NODEBUS_DEEP");
+        cached = (v && *v && strcmp(v, "0") != 0 &&
+                  strcasecmp(v, "false") != 0 &&
+                  strcasecmp(v, "off") != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+static void nodebus_synth_delay(void) {
+    usleep((nodebus_deep_enabled() && nodebus_post_init_fast_replies)
+           ? NODEBUS_FAST_SYNTH_DELAY_US
+           : NODEBUS_SYNTH_DELAY_US);
+}
+
+static int nodebus_slot_is_populated(uint8_t slot) {
+    switch (slot) {
+        case 0:
+        case 1:
+        case 2:
+        case 4:
+        case 7:
+        case 8:
+        case 9:
+        case 10:
+        case 12:
+        case 13:
+        case 14:
+            return 1;
+        default:
+            return 0;
+    }
+}
 
 /* Per-slot chip-ID assignment for fe_probe synthesis.
  *
@@ -83,21 +124,21 @@ static uint8_t nodebus_switch_idle_baseline_valid[32];
  * mismatch produces "Invalid" in the Tech Alerts UI; match (but no
  * post-init traffic complete) produces "Not Initialized".
  *
- * Pokémon LE board mapping (from the LE manual + games/pokemon_le/*.hex
+ * Pokémon LE board mapping (from the LE manual + game-shipped hex firmware
  * filename conventions):
  *
  *   slot 0  : CPU/bridge node    → 0x00140040 (entry 15, LPC1124JBD48/303)
  *   slot 4  : QR reader          → 0x00140040 (entry 15, LPC1124JBD48/303)
- *   slot 8  : Core Driver Lower  → 0x3D01402B (entry 21, LPC1342FHN33)
- *   slot 9  : Core Driver Upper  → 0x3D01402B (entry 21, LPC1342FHN33)
- *   slot 10 : SPI Node Board     → 0x3D01402B (entry 21, LPC1342FHN33)
- *   default : everything else    → 0x041E502B (entry 0,  LPC1111FHN33/101)
+ *   slot 8  : Core Driver Lower  → 0x042D502B (entry 2,  LPC1112FHN33/101)
+ *   slot 9  : Core Driver Upper  → 0x042D502B (entry 2,  LPC1112FHN33/101)
+ *   slot 10 : SPI Node Board     → 0x042D502B (entry 2,  LPC1112FHN33/101)
  *
  * The .hex firmware filenames (coil4node-LPC1313, tmc5041node-LPC1313, etc.)
  * suggest LPC1313 silicon for slots 8/9/10, but the in-game chip vtable's
  * 0x3D01402B is LPC1342 per PROTOCOL §5.4. The game accepts any vtable-
  * matching chip_id at this stage — empirical: all five Tech Alerts rows
- * flip from "Invalid" to "Not Initialized" with this mapping. */
+ * flip from "Invalid" to "Not Initialized" with the early mapping; the current
+ * mapping plus version lookup moves populated slots to status=2. */
 static uint32_t nodebus_chip_id_for_slot(uint8_t slot) {
     switch (slot) {
         case 0:  return 0x00140040u;  /* LPC1124_303 (vtable[15], type_idx=4) — CPU bridge */
@@ -117,7 +158,7 @@ static uint32_t nodebus_chip_id_for_slot(uint8_t slot) {
         case 7:  return 0x2c40102Bu;  /* LPC1313 — Speaker-Expression */
         case 12: return 0x2c40102Bu;  /* LPC1313 — Topper-Lamps */
         case 14: return 0x2c40102Bu;  /* LPC1313 — Universal Topper */
-        default: return 0x041E502Bu;  /* LPC1111_101 (vtable[0], type_idx=0) — default */
+        default: return 0;
     }
 }
 
@@ -334,7 +375,7 @@ static void log_caller_chain(const char *prefix) {
  * See docs/PROTOCOL.md §5.1 "Cipher algorithm" for the algorithm.
  */
 static void nodebus_cipher_decrypt(uint8_t slot, uint8_t inner_len, uint8_t *buf) {
-    uint8_t mask = (uint8_t)(((slot & 0x1F) << 4) | ((inner_len + 1) & 0x0F));
+    uint8_t mask = (uint8_t)(((slot & 0x1F) << 4) | (inner_len & 0x0F));
     for (int i = 0; i < inner_len; i++) {
         uint8_t k_table = nodebus_cipher_keys[slot & 0x1F][i & 0x0F];
         uint8_t k_mask = mask;
@@ -693,17 +734,24 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             return;
         }
 
-        /* Read the cmd byte CLEARTEXT. Important: in the BSS-init shim state,
-         * the per-slot status flag at mcp_nodebus_per_slot_status[slot]+3 is
-         * always 0, so the game's `mcp_nodebus_send_encrypted` skips the
-         * encryption loop entirely and the wire bytes ARE the original buffer
-         * bytes. (Verified 2026-04-27 via GDB BP at send_encrypted entry —
-         * captured cmd byte at offset 2 directly matches the wire byte for
-         * slots 0 and 1.) An earlier shim version applied an unconditional
-         * cipher decrypt and produced false "decoded" cmd values per slot
-         * (0xED/0xDD/0x8D/etc) — those were artifacts of XOR'ing 0xFE with
-         * (slot<<4)|((ilen+1)&F). Now we treat wire as plaintext. */
-        uint8_t inner_cmd = payload[2];
+        /* Cmd bytes are cleartext until the game marks a slot's encrypted
+         * status byte non-zero; after key fetch, send_encrypted sets payload
+         * bit 0x40 and applies NODEBUS_Cipher to inner_cmd + payload. Keep the
+         * stable default on cleartext interpretation, and enable conditional
+         * decode only in SHIM_NODEBUS_DEEP so experiments do not affect the
+         * normal "good enough" nodebus path. */
+        uint8_t decoded_inner[256];
+        const uint8_t *inner = payload + 2;
+        uint8_t wire_inner_cmd = payload[2];
+        uint8_t inner_cmd = wire_inner_cmd;
+        int cipher_decoded = 0;
+        if (nodebus_deep_enabled() && (slot_byte & 0x40) != 0) {
+            memcpy(decoded_inner, payload + 2, inner_len);
+            nodebus_cipher_decrypt(slot, inner_len, decoded_inner);
+            inner = decoded_inner;
+            inner_cmd = decoded_inner[0];
+            cipher_decoded = 1;
+        }
 
         /* Detect FUN_008f1100(0, 0) reset signal: cmd 0x41 frame with
          * slot=0, inner_cmd=0xF0, payload[3]=0x22. Resets the cmd 0x25
@@ -720,14 +768,22 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
         }
         char line[512];
         int n = snprintf(line, sizeof(line),
-                         "[shim] bridge: cmd 0x41 slot=%u inner_cmd=0x%02x ilen=%u payload=[",
-                         slot, inner_cmd, inner_len);
+                         "[shim] bridge: cmd 0x41 slot=%u inner_cmd=0x%02x ilen=%u%s",
+                         slot, inner_cmd, inner_len,
+                         cipher_decoded ? " decoded" : "");
+        if (cipher_decoded && n < (int)sizeof(line) - 24) {
+            n += snprintf(line + n, sizeof(line) - n,
+                          " wire_inner=0x%02x", wire_inner_cmd);
+        }
+        if (n < (int)sizeof(line) - 12) {
+            n += snprintf(line + n, sizeof(line) - n, " payload=[");
+        }
         for (int i = 1; i < inner_len && n < (int)sizeof(line) - 4; i++) {
             const char *byte_fmt = " %02x";
             if (i == 1) {
                 byte_fmt = "%02x";
             }
-            n += snprintf(line + n, sizeof(line) - n, byte_fmt, payload[2 + i]);
+            n += snprintf(line + n, sizeof(line) - n, byte_fmt, inner[i]);
         }
         if (n < (int)sizeof(line) - 2) {
             line[n++] = ']';
@@ -807,6 +863,51 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             }
         }
 
+        /* LPC1313 block read (inner_cmd=0xF2).
+         *
+         * FUN_008f5390 sends this eight times for type_idx=5 nodes, requesting
+         * offsets 0,8,...,56 and expecting 8 data bytes back. This is part of
+         * the deeper node classification path for ws2812/LPC1313-class slots.
+         * It is intentionally opt-in: default mode still lets these unmodeled
+         * post-key commands timeout, matching the baseline behavior that has
+         * been stable enough for gameplay switch work. */
+        if (nodebus_deep_enabled() && inner_cmd == 0xF2) {
+            int hint_idx = 2 + (int)inner_len;
+            if (hint_idx >= payload_len) {
+                SHIM_LOG("bridge: synth f2_block SKIP slot=%u (hint_idx=%d ≥ payload_len=%d)",
+                         slot, hint_idx, payload_len);
+                return;
+            }
+            uint8_t hint = payload[hint_idx];
+            if (hint == 0 || hint > 32) {
+                SHIM_LOG("bridge: synth f2_block SKIP slot=%u hint=%u (out of range)",
+                         slot, hint);
+                return;
+            }
+            if (!nodebus_slot_is_populated(slot) ||
+                nodebus_chip_id_for_slot(slot) != 0x2c40102Bu) {
+                SHIM_LOG("bridge: synth f2_block SKIP slot=%u (not LPC1313 populated)",
+                         slot);
+                return;
+            }
+            uint8_t resp[64];
+            int o = 0;
+            resp[o++] = 0x02;
+            resp[o++] = 0x41;
+            resp[o++] = id;
+            for (int i = 0; i < hint; i++)
+                resp[o++] = 0x00;
+            uint8_t cks = bridge_checksum(resp + 1, (size_t)(o - 1));
+            resp[o++] = cks;
+            resp[o++] = 0x03;
+            uint8_t offset = inner_len >= 2 ? inner[1] : 0;
+            SHIM_LOG("bridge: synth f2_block RESP slot=%u offset=%u hint=%u (zero block)",
+                     slot, offset, hint);
+            nodebus_synth_delay();
+            bridge_send_response(resp, (size_t)o, 0x41, id);
+            return;
+        }
+
         /* fe_probe synthesis (inner_cmd=0xFE).
          *
          * Wire `hint` byte the shim parses is actually __n in the game's
@@ -848,7 +949,10 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             int inner_size = (int)hint;
             for (int i = 0; i < inner_size; i++)
                 resp[o++] = 0x00;
-            if (hint >= 10) {
+            if (!nodebus_slot_is_populated(slot)) {
+                SHIM_LOG("bridge: synth fe_probe RESP slot=%u hint=%u inner_sz=%d (not populated)",
+                         slot, hint, inner_size);
+            } else if (hint >= 10) {
                 uint32_t chip_id = nodebus_chip_id_for_slot(slot);
                 uint8_t v1 = 0x01, v2 = 0x1F, v3 = 0x00, v0 = 0x00;
                 (void)nodebus_version_for_slot(slot, &v1, &v2, &v3, &v0);
@@ -879,9 +983,11 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             uint8_t cks = bridge_checksum(resp + 1, (size_t)(o - 1));
             resp[o++] = cks;
             resp[o++] = 0x03;            /* ETX */
-            SHIM_LOG("bridge: synth fe_probe RESP slot=%u hint=%u inner_sz=%d chip_id=0x%08x (node-present)",
-                     slot, hint, inner_size, nodebus_chip_id_for_slot(slot));
-            usleep(NODEBUS_SYNTH_DELAY_US);
+            if (nodebus_slot_is_populated(slot)) {
+                SHIM_LOG("bridge: synth fe_probe RESP slot=%u hint=%u inner_sz=%d chip_id=0x%08x (node-present)",
+                         slot, hint, inner_size, nodebus_chip_id_for_slot(slot));
+            }
+            nodebus_synth_delay();
             bridge_send_response(resp, (size_t)o, 0x41, id);
             return;
         }
@@ -915,7 +1021,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             resp[o++] = 0x03;
             SHIM_LOG("bridge: synth fa_probe RESP slot=%u hint=%u (all-zero)",
                      slot, hint);
-            usleep(NODEBUS_SYNTH_DELAY_US);
+            nodebus_synth_delay();
             bridge_send_response(resp, (size_t)o, 0x41, id);
             return;
         }
@@ -1019,8 +1125,9 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             SHIM_LOG("bridge: synth switch_poll RESP slot=%u hint=%u idle=%02x %02x %02x %02x %02x %02x %02x %02x",
                      slot, hint, idle[0], idle[1], idle[2], idle[3],
                      idle[4], idle[5], idle[6], idle[7]);
-            usleep(NODEBUS_SYNTH_DELAY_US);
+            nodebus_synth_delay();
             bridge_send_response(resp, (size_t)o, 0x41, id);
+            nodebus_post_init_fast_replies = 1;
             return;
         }
 
@@ -1049,7 +1156,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             resp[o++] = 0x03;            /* ETX */
             SHIM_LOG("bridge: synth key-fetch RESP slot=%u inner_cmd=0x%02x hint=%u (zero key, status OK)",
                      slot, inner_cmd, hint);
-            usleep(NODEBUS_SYNTH_DELAY_US);
+            nodebus_synth_delay();
             bridge_send_response(resp, (size_t)o, 0x41, id);
             return;
         }
