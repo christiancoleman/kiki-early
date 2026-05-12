@@ -9516,9 +9516,9 @@ Before continuing Start-condition RE, use the cleaned default runtime:
 
 This keeps the useful discoveries while reducing the chance that old traps, temporary patches, or stale assumptions distort the next result.
 
-## Step 105: Nodebus deep-mode experiment and switch-path rollback (2026-05-11)
+## Step 105: Nodebus communication-accuracy experiment and switch-path rollback (2026-05-11)
 
-This session chased two related but separable problems: the service-menu Node Bus Test still did not match real hardware semantics, and the switch layer regressed while we experimented with deeper nodebus behavior. The final state is intentionally split: normal gameplay input is back on the known-good switch path, while deeper nodebus protocol work remains behind `SHIM_NODEBUS_DEEP=1`.
+This session chased two related but separable problems: the service-menu Node Bus Test still did not match real hardware semantics, and the switch layer regressed while we iterated on nodebus communication accuracy. The final state is intentionally split: normal gameplay input is back on the known-good switch path, while nodebus protocol-accuracy work remained behind a temporary alternate path.
 
 ### 105a - Service-menu scan behavior
 
@@ -9532,19 +9532,19 @@ Added an explicit populated-slot predicate for the Pokemon LE machine inventory:
 
 FE-probe synthesis no longer fabricates fallback chip IDs for every unrecognized slot. Populated slots get chip/version data from the per-slot mapping. Absent slots are handled as absent, not as unknown hardware.
 
-The all-zero absent-slot response was a useful intermediate because it avoided long timeouts, but it still looked like a response to the service menu and therefore produced "Unknown Node" rows. The current deep-mode absent-slot behavior returns a checked FE response with status bit 2 set after the deep-mode fast-ready guard. `FUN_008ec410` rejects that immediately before copying chip data, giving fast failed-probe semantics without creating an unknown-chip node record.
+The all-zero absent-slot response was a useful intermediate because it avoided long timeouts, but it still looked like a response to the service menu and therefore produced "Unknown Node" rows. The current absent-slot behavior returns a checked FE response with status bit 2 set after the fast-ready guard. `FUN_008ec410` rejects that immediately before copying chip data, giving fast failed-probe semantics without creating an unknown-chip node record.
 
-### 105b - Deep nodebus mode
+### 105b - Nodebus communication-accuracy path
 
-Added `SHIM_NODEBUS_DEEP=1` as the opt-in branch for deeper nodebus protocol experiments. The default runtime remains on the conservative "good enough for gameplay" nodebus baseline.
+Added a temporary opt-in branch for nodebus protocol-accuracy experiments. The default runtime remained on the conservative "good enough for gameplay" nodebus baseline.
 
-Deep mode currently owns these behaviors:
+That path currently owned these behaviors:
 
 - conditional decrypt of encrypted cmd `0x41` frames when the wire slot byte has bit `0x40` set;
 - corrected zero-key decrypt mask handling for observed encrypted post-key frames;
 - synthetic all-zero `0xF2` block-read replies for populated LPC1313/type-5 nodes only;
 - synthetic checked `0xFF` discovery replies for populated nodes;
-- shorter synthetic delays only after the deep-mode fast-ready guard.
+- shorter synthetic delays only after the fast-ready guard.
 
 Ghidra confirmed `FUN_008f5390` sends `inner_cmd=0xF2` eight times for LPC1313/type-5 nodes, requesting offsets `0,8,...,56` and expecting 8 data bytes. Observed encrypted frames decoded as expected once the decrypt path used the wire inner-length nibble:
 
@@ -9553,11 +9553,11 @@ slot 2: wire inner 0xd1 -> decoded 0xf2
 slot 7: wire inner 0x81 -> decoded 0xf2
 ```
 
-An aggressive version that switched to fast replies immediately after the first successful `0xF2` response was too early: normal boot accelerated to roughly 10-15 ms replies and hung before service-menu handoff. The current compromise keeps boot conservative and allows fast replies only once deep mode is ready by elapsed time or post-init switch-poll state.
+An aggressive version that switched to fast replies immediately after the first successful `0xF2` response was too early: normal boot accelerated to roughly 10-15 ms replies and hung before service-menu handoff. The current compromise keeps boot conservative and allows fast replies only once the nodebus path is ready by elapsed time or post-init switch-poll state.
 
 ### 105c - UART write-hook fix
 
-One apparent nodebus hang was actually caused by the fake UART write hook. `shim_io.c` still wrote nodebus requests into the `/dev/ttyAMA5` socketpair before synthesis even though the request side is never drained. Slow boot traffic did not fill the buffer, but deep-mode fast scans could block before `synthesize_bridge_response()` ran.
+One apparent nodebus hang was actually caused by the fake UART write hook. `shim_io.c` still wrote nodebus requests into the `/dev/ttyAMA5` socketpair before synthesis even though the request side is never drained. Slow boot traffic did not fill the buffer, but fast service-menu scans could block before `synthesize_bridge_response()` ran.
 
 The UART hook now treats `/dev/ttyAMA5` as a pure shim endpoint: log the request, synthesize any response, restore `errno`, and return `count` without writing the request into the socketpair.
 
@@ -9581,10 +9581,10 @@ The restored switch behavior now matches that commit's shape:
 - manual channel-1 presses use direct channel translation;
 - nodebus switch-poll synthesis reads live channel idle via `shim_switch_copy_channel_idle()`.
 
-This is the important boundary going forward: `SHIM_NODEBUS_DEEP` is for nodebus protocol experiments only. It should not become the place where core gameplay switch translation diverges unless a later test proves the switch layer itself needs a new, documented machine model.
+This is the important boundary going forward: the nodebus protocol-accuracy path is for nodebus protocol work only. It should not become the place where core gameplay switch translation diverges unless a later test proves the switch layer itself needs a new, documented machine model.
 
 ### 105e - Current verification
 
 `bash -n _emulation/run_game.sh`, `git diff --check -- _emulation/shim_inject.c _emulation/shim_nodebus.c _emulation/shim_switches.c _emulation/docs/JOURNAL.md`, and `_emulation/./build.sh` all passed after the rollback. Build warnings remain the known unrelated set (`log_caller_chain` unused, timestamp truncation, `shim_fs.c` comment warning, `openat` nonnull comparisons).
 
-The deep nodebus code is still present, but the service-menu Node Bus Test needs one fresh run after the switch rollback before we can call it verified in the current tree.
+The nodebus communication-accuracy code is still present, but the service-menu Node Bus Test needs one fresh run after the switch rollback before we can call it verified in the current tree.

@@ -174,69 +174,6 @@ void shim_patch_get_format_callback(void) {
              (void *)instr, old, (unsigned)AARCH64_NOP);
 }
 
-/* Start-button readiness probe (Step 104 follow-up — see JOURNAL).
- *
- * FUN_0073a5f0 @ 0x73a5f0 is the Start handler's readiness gate. It reports
- * "ready" only if event 0x32 — the marker for "device sub-mode 50 active" —
- * is NOT queued. In our emulation sub-mode 50 is started at init and never
- * torn down (the device state our node/switch shims report doesn't satisfy
- * the teardown condition), so the gate always returns 0 and a Start press
- * aborts. This probe forces the gate to report ready so we can observe the
- * next blocker; it is NOT the fix — that belongs in the device-state
- * emulation (shim_switches.c trough/captive-ball idle, shim_nodebus.c FA).
- *
- * Surgical: the gate's "is 0x32 queued" test is `bl 0x72a5c0` at 0x73a62c
- * (encoded 0x97ffbfe5); replacing it with `mov w0, #0` makes the gate's
- * trailing `(result & 0xff) ^ 1` evaluate to 1. The 0x6d-listener and
- * 0x35..0x44 range checks above it are untouched.
- *
- * Env-gated SHIM_FORCE_START_READY=1 (default off — probe, opt-in).
- */
-#define START_READY_QUEUED32_VA   0x73a62c
-#define START_READY_QUEUED32_OLD  0x97ffbfe5u   /* bl 0x72a5c0 */
-#define AARCH64_MOV_W0_0          0x52800000u   /* mov w0, #0   */
-
-static int shim_force_start_ready_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *s = getenv("SHIM_FORCE_START_READY");
-        cached = (s && s[0] && s[0] != '0');
-    }
-    return cached;
-}
-
-void shim_patch_force_start_ready(void) {
-    if (!shim_force_start_ready_enabled()) return;
-
-    uintptr_t game_base = shim_resolve_game_base();
-    if (!game_base) {
-        SHIM_LOG("[force_start_ready] game_base unresolved; patch aborted");
-        return;
-    }
-
-    uint32_t *instr = (uint32_t *)(game_base + START_READY_QUEUED32_VA);
-    uintptr_t page = (uintptr_t)instr & ~(uintptr_t)4095;
-    if (mprotect((void *)page, 8192,
-                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        SHIM_LOG("[force_start_ready] mprotect RWX @ %p failed: %s",
-                 (void *)page, strerror(errno));
-        return;
-    }
-
-    uint32_t old = *instr;
-    if (old != START_READY_QUEUED32_OLD) {
-        SHIM_LOG("[force_start_ready] REFUSED to patch @ %p: "
-                 "expected 0x%08x (bl 0x72a5c0), got 0x%08x",
-                 (void *)instr, START_READY_QUEUED32_OLD, old);
-        return;
-    }
-    *instr = AARCH64_MOV_W0_0;
-    __builtin___clear_cache((char *)instr, (char *)instr + 4);
-    SHIM_LOG("[force_start_ready] patched FUN_0073a5f0 queued32 check @ %p: "
-             "0x%08x -> 0x%08x (mov w0,#0) — Start readiness gate forced READY",
-             (void *)instr, old, (unsigned)AARCH64_MOV_W0_0);
-}
-
 /* libavcodec HW-accel bypass. Game's spi_video_player init calls
  * avcodec_find_decoder_by_name → avcodec_get_hw_config → av_hwdevice_ctx_create
  * → avcodec_open2; on Spike 3 hardware this resolves to "hevc_v4l2request" +

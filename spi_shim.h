@@ -135,14 +135,6 @@ uint8_t *shim_switch_entry(uint8_t *switch_array, int sw_id);
  * deferred-init thread (after game-base is resolvable). */
 void shim_patch_get_format_callback(void);
 
-/* Start-button readiness probe (defined in shim_patches.c).
- * Patches FUN_0073a5f0's "is event 0x32 queued" test (bl 0x72a5c0 @ 0x73a62c)
- * to `mov w0, #0`, forcing the Start handler's readiness gate to report ready.
- * Probe only — the real fix is the device-state emulation; see JOURNAL.
- * Env-gated SHIM_FORCE_START_READY=1 (default off). Called from shim_inject.c's
- * deferred-init thread. */
-void shim_patch_force_start_ready(void);
-
 /* ---- Signal handlers (defined in shim_diagnostics.c; registered by
  *      shim_install_crash_handler in spi_shim.c) ---- */
 void shim_sigsegv_handler(int sig, siginfo_t *info, void *ucontext);

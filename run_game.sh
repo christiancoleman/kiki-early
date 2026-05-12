@@ -43,11 +43,6 @@
 #                                   synthesized switch channel buffers.
 #   SHIM_DISCOVERY_TRAPS=<0|1> [0] install the historical BRK trap suite for
 #                                   Start/multiball/scene/nodebus tracing.
-#   SHIM_NODEBUS_DEEP=<0|1> [0] enable experimental deeper nodebus emulation:
-#                                   conditional cipher decode, post-key
-#                                   LPC1313 0xF2 replies, and faster post-init
-#                                   synthetic replies. Leave unset for the
-#                                   stable "good enough" nodebus baseline.
 #   SPIKE3_COIN_DOOR_INTERLOCK=<closed|open|1|0>
 #                             [closed] synthetic coin-door interlock state.
 #                                   unset/closed/restored/1 = restored/closed;
@@ -303,7 +298,6 @@ QEMU="${QEMU:-qemu-aarch64}"
 # explicitly set by the caller.
 #
 export SHIM_AUTO_PRESS="${SHIM_AUTO_PRESS:-0}"
-export SHIM_NODEBUS_DEEP="${SHIM_NODEBUS_DEEP:-0}"
 export SHIM_AUTO_PRESS_DELAY_S="${SHIM_AUTO_PRESS_DELAY_S:-60}"
 export SHIM_AUTO_PRESS_SW_ID="${SHIM_AUTO_PRESS_SW_ID:-93}"
 export SHIM_AUTO_PRESS_LABEL="${SHIM_AUTO_PRESS_LABEL:-Service Back}"
@@ -746,7 +740,6 @@ fi
              VIEWER VIEWER_MAXIMIZED VIEWER_FULLSCREEN AUDIO_PLAYER TIMER  BOOT_DISPLAY \
              BOOT_DISPLAY_DURATION STALE_KILL SHIM_MANUAL_PRESS SHIM_MANUAL_PRESS_MS \
              SHIM_EXPECTED_SWITCH_IDLE SHIM_DISCOVERY_TRAPS \
-             SHIM_NODEBUS_DEEP \
              SHIM_SWITCH_TABLE_PROBE SHIM_AUTO_PRESS \
              SHIM_AUTO_PRESS_DELAY_S SHIM_AUTO_PRESS_SW_ID \
              SHIM_AUTO_PRESS_LABEL DEBUG LOGFILE; do

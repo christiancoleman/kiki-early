@@ -252,12 +252,6 @@ static void *shim_discovery_init_thread(void *arg) {
      * via SPIKE3_DECODER_PATCH=0. */
     shim_patch_get_format_callback();
 
-    /* Start-button readiness probe: if SHIM_FORCE_START_READY=1, patch
-     * FUN_0073a5f0 so the Start handler's readiness gate reports ready
-     * (event 0x32 / device sub-mode 50 forced not-queued). Default off —
-     * probe to surface the next blocker, not the fix. */
-    shim_patch_force_start_ready();
-
     uintptr_t game_base = shim_resolve_game_base();
     if (game_base) {
         shim_translate_startup_idle(game_base, 8, "[startup_idle] translate");

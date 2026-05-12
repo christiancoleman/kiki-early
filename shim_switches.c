@@ -96,20 +96,11 @@ static void shim_switch_apply_default_idle_corrections(uint8_t channel_id,
             switch_set_bit(buf, coin_bits[i], 1);
         }
         /* Channel 1 is also synthesized by FUN_00674b90 from CPU-SPI byte 3.
-         * The default channel-0 idle keeps byte-3 bits 0/1 high, so the game
-         * only derives bit 13 low. The deeper nodebus experiment drives the
-         * broader byte-3-low shape and must mirror the extra derived lows. */
-        static const uint8_t default_derived_low_bits[] = {13};
-        static const uint8_t deep_derived_low_bits[] = {2, 11, 13};
-        const uint8_t *derived_low_bits = default_derived_low_bits;
+         * Byte-3-low idle requires these extra derived lows to match the
+         * game's channel-1 reconstruction. */
+        static const uint8_t derived_low_bits[] = {2, 11, 13};
         size_t derived_low_count =
-            sizeof(default_derived_low_bits) / sizeof(default_derived_low_bits[0]);
-        const char *deep = getenv("SHIM_NODEBUS_DEEP");
-        if (deep && deep[0] && deep[0] != '0') {
-            derived_low_bits = deep_derived_low_bits;
-            derived_low_count =
-                sizeof(deep_derived_low_bits) / sizeof(deep_derived_low_bits[0]);
-        }
+            sizeof(derived_low_bits) / sizeof(derived_low_bits[0]);
         for (size_t i = 0; i < derived_low_count; i++) {
             switch_set_bit(buf, derived_low_bits[i], 0);
         }
@@ -194,15 +185,8 @@ void shim_switch_copy_channel_stable_idle(uintptr_t game_base,
 }
 
 void shim_switch_make_channel0_idle(uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]) {
-    static const uint8_t default_idle[SHIM_SWITCH_CHANNEL_BYTES] =
-        { 0x00, 0xff, 0xff, 0xfb, 0xff, 0xff, 0xff, 0xff };
-    static const uint8_t deep_idle[SHIM_SWITCH_CHANNEL_BYTES] =
+    static const uint8_t idle[SHIM_SWITCH_CHANNEL_BYTES] =
         { 0x00, 0xff, 0xff, 0xf8, 0xff, 0xff, 0xff, 0xff };
-    const uint8_t *idle = default_idle;
-    const char *deep = getenv("SHIM_NODEBUS_DEEP");
-    if (deep && deep[0] && deep[0] != '0') {
-        idle = deep_idle;
-    }
     memcpy(out, idle, SHIM_SWITCH_CHANNEL_BYTES);
     shim_switch_apply_expected_idle(0, out);
 

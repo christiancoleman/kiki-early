@@ -78,34 +78,21 @@ static uint8_t nodebus_switch_idle_baseline_valid[32];
  * latency or concurrent polling/test traffic can timeout behind our delay. */
 #define NODEBUS_SYNTH_DELAY_US 200000
 #define NODEBUS_FAST_SYNTH_DELAY_US 10000
-#define NODEBUS_DEEP_FAST_AFTER_S 45
+#define NODEBUS_FAST_AFTER_S 45
 
 static int nodebus_post_init_fast_replies = 0;
 static time_t nodebus_first_synth_time = 0;
 
-static int nodebus_deep_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *v = getenv("SHIM_NODEBUS_DEEP");
-        cached = (v && *v && strcmp(v, "0") != 0 &&
-                  strcasecmp(v, "false") != 0 &&
-                  strcasecmp(v, "off") != 0) ? 1 : 0;
-    }
-    return cached;
-}
-
-static int nodebus_deep_fast_ready(void) {
-    if (!nodebus_deep_enabled())
-        return 0;
+static int nodebus_fast_ready(void) {
     time_t now = time(NULL);
     if (nodebus_first_synth_time == 0)
         nodebus_first_synth_time = now;
     return nodebus_post_init_fast_replies ||
-           (now - nodebus_first_synth_time) >= NODEBUS_DEEP_FAST_AFTER_S;
+           (now - nodebus_first_synth_time) >= NODEBUS_FAST_AFTER_S;
 }
 
 static void nodebus_synth_delay(void) {
-    int fast = nodebus_deep_fast_ready();
+    int fast = nodebus_fast_ready();
     usleep(fast ? NODEBUS_FAST_SYNTH_DELAY_US : NODEBUS_SYNTH_DELAY_US);
 }
 
@@ -768,16 +755,13 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
 
         /* Cmd bytes are cleartext until the game marks a slot's encrypted
          * status byte non-zero; after key fetch, send_encrypted sets payload
-         * bit 0x40 and applies NODEBUS_Cipher to inner_cmd + payload. Keep the
-         * stable default on cleartext interpretation, and enable conditional
-         * decode only in SHIM_NODEBUS_DEEP so experiments do not affect the
-         * normal "good enough" nodebus path. */
+         * bit 0x40 and applies NODEBUS_Cipher to inner_cmd + payload. */
         uint8_t decoded_inner[256];
         const uint8_t *inner = payload + 2;
         uint8_t wire_inner_cmd = payload[2];
         uint8_t inner_cmd = wire_inner_cmd;
         int cipher_decoded = 0;
-        if (nodebus_deep_enabled() && (slot_byte & 0x40) != 0) {
+        if ((slot_byte & 0x40) != 0) {
             memcpy(decoded_inner, payload + 2, inner_len);
             nodebus_cipher_decrypt(slot, inner_len, decoded_inner);
             inner = decoded_inner;
@@ -899,11 +883,8 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
          *
          * FUN_008f5390 sends this eight times for type_idx=5 nodes, requesting
          * offsets 0,8,...,56 and expecting 8 data bytes back. This is part of
-         * the deeper node classification path for ws2812/LPC1313-class slots.
-         * It is intentionally opt-in: default mode still lets these unmodeled
-         * post-key commands timeout, matching the baseline behavior that has
-         * been stable enough for gameplay switch work. */
-        if (nodebus_deep_enabled() && inner_cmd == 0xF2) {
+         * the node classification path for ws2812/LPC1313-class slots. */
+        if (inner_cmd == 0xF2) {
             int hint_idx = 2 + (int)inner_len;
             if (hint_idx >= payload_len) {
                 SHIM_LOG("bridge: synth f2_block SKIP slot=%u (hint_idx=%d ≥ payload_len=%d)",
@@ -949,7 +930,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
          * send counter to detect stale replies. A valid response is enough
          * for the init orchestrator/service test to mark populated nodes as
          * responding. */
-        if (nodebus_deep_enabled() && inner_cmd == 0xFF &&
+        if (inner_cmd == 0xFF &&
             nodebus_slot_is_populated(slot)) {
             int hint_idx = 2 + (int)inner_len;
             if (hint_idx >= payload_len) {
@@ -1035,7 +1016,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             for (int i = 0; i < inner_size; i++)
                 resp[o++] = 0x00;
             if (!nodebus_slot_is_populated(slot)) {
-                if (nodebus_deep_fast_ready()) {
+                if (nodebus_fast_ready()) {
                     /* Service-menu Node Bus Test needs absent slots to fail
                      * quickly. A literal timeout is semantically clean but
                      * costs roughly one second per retry across many absent
