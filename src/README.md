@@ -20,7 +20,7 @@ is **QEMU user-mode** plus an **`LD_PRELOAD` shim** (`spi_shim.so`) that
 intercepts library/device calls and either emulates the missing hardware in
 software or forwards translated calls to the host. The same emulator is intended
 to boot **any Spike 3 title**; Star Wars LE 0.85.0 is the secondary test target
-(PROTOCOL §"Comparison binaries").
+(PROTOCOL "Comparison binaries").
 
 It emulates the **CPU side only**. The RS-485 node bus is stubbed in software
 (the shim's `synthesize_bridge_response` plays the part of the netbridge MCU);
@@ -159,7 +159,7 @@ internals beyond "this is the Godot PCK".
 
 **Star Wars LE 0.85.0** is the parity test target — zero Godot, same Stern Radium
 attract pipeline. A SW-LE-to-attract failure points at shared shim/node-bus code
-rather than Pokémon-port glue. See PROTOCOL §"Comparison binaries".
+rather than Pokémon-port glue. See PROTOCOL "Comparison binaries".
 
 ## Where things live
 

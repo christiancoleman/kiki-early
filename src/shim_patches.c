@@ -239,7 +239,7 @@ const void *avcodec_find_decoder_by_name(const char *name) {
      * stateless m2m slice devices the game asks for don't exist in our
      * env — without the remap, h264_v4l2m2m fails with "Could not find
      * a valid device" and the game asserts on a NULL decoder_context
-     * trying to play the 1360x768 H.264 attract clips (PROTOCOL §9
+     * trying to play the 1360x768 H.264 attract clips (PROTOCOL.md "Radium scene format"
      * "Radium video clips"). */
     const char *lookup = name;
     if (shim_decoder_patch_enabled() && name) {

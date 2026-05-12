@@ -2,7 +2,7 @@
 """test_nodebus_model.py — self-tests for nodebus_model.py.
 
 The model is the oracle for the C unit tests, so it gets its own checks
-against the values PROTOCOL §4/§5 already pins down. Run via run_tests.sh
+against the values PROTOCOL.md "CPU ↔ netbridge UART bridge protocol"/"Nodebus (cipher, hash, framing)" already pins down. Run via run_tests.sh
 (or directly: `python3 test_nodebus_model.py`).
 """
 import sys
@@ -30,14 +30,14 @@ def hx(b: bytes) -> str:
 # Framing
 # --------------------------------------------------------------------------- #
 def test_checksum_examples():
-    # PROTOCOL §4 worked examples.
+    # PROTOCOL.md "CPU ↔ netbridge UART bridge protocol" worked examples.
     check(m.sum_zero_csum(b"\x30\x01") == 0xCF, "sum_zero_csum(30 01) == cf")
     check(m.sum_zero_csum(b"\x20\x01") == 0xDF, "sum_zero_csum(20 01) == df")
     check((sum(b"\x30\x01") + m.sum_zero_csum(b"\x30\x01")) % 256 == 0, "csum zeroes the sum")
 
 
 def test_logical_frames():
-    # PROTOCOL §4: cmd 0x30 request frame is 02 30 01 cf 03; cmd 0x20 is 02 20 01 df 03.
+    # PROTOCOL.md "CPU ↔ netbridge UART bridge protocol": cmd 0x30 request frame is 02 30 01 cf 03; cmd 0x20 is 02 20 01 df 03.
     check(m.bridge_logical_frame(0x30, 0x01) == bytes.fromhex("0230 01cf 03".replace(" ", "")),
           f"cmd 0x30 logical frame ({hx(m.bridge_logical_frame(0x30, 0x01))})")
     check(m.bridge_logical_frame(0x20, 0x01) == bytes.fromhex("022001df03"),
@@ -66,10 +66,10 @@ def test_escape_roundtrip():
 
 
 # --------------------------------------------------------------------------- #
-# cmd-0x41 cipher builder (PROTOCOL §5.1 reference)
+# cmd-0x41 cipher builder (PROTOCOL.md "NODEBUS_Cipher — Stern's per-slot XOR stream cipher" reference)
 # --------------------------------------------------------------------------- #
 def test_cipher_known_vector():
-    # PROTOCOL §5.1: with zero keys (boot state),
+    # PROTOCOL.md "NODEBUS_Cipher — Stern's per-slot XOR stream cipher": with zero keys (boot state),
     #   nodebus_encrypt_frame(slot=5, inner_cmd=0xfc, payload=b'', response_len=0x10, key_block=zeros)
     # returns 85 01 ae cc — the first-ever cmd-0xfc key-fetch frame for slot 5.
     got = m.nodebus_encrypt_frame(5, 0xFC, b"", 0x10, b"\x00" * 16)

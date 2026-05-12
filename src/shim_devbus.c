@@ -9,7 +9,7 @@
  *
  * Architecture is structured so the watcher (the switch event source)
  * is swappable behind the same devbus_emit() entry point — a future
- * hook-based source would call the same function. See PROTOCOL §12 for the
+ * hook-based source would call the same function. See SHIM.md "Translation units" for the
  * current wire format and JOURNAL Step 102 for future-work notes.
  *
  * Dependencies via spi_shim.h: shim_resolve_game_base(),

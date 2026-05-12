@@ -61,7 +61,7 @@ static int nodebus_enum_idx = 0;
  * zero unless we intentionally start handing out non-zero fake keys. We keep
  * this table in the same state so any encrypted traffic decrypts consistently.
  *
- * Algorithm and full RE notes: docs/PROTOCOL.md §5.1.
+ * Algorithm and full RE notes: docs/PROTOCOL.md "NODEBUS_Cipher — Stern's per-slot XOR stream cipher".
  *
  * If key-fetch synthesis ever returns non-zero fake keys, record those bytes
  * here at the same time so subsequent traffic decrypts with those keys.
@@ -153,7 +153,7 @@ static int nodebus_slot_is_populated(uint8_t slot) {
  *
  * The .hex firmware filenames (coil4node-LPC1313, tmc5041node-LPC1313, etc.)
  * suggest LPC1313 silicon for slots 8/9/10, but the in-game chip vtable's
- * 0x3D01402B is LPC1342 per PROTOCOL §5.4. The game accepts any vtable-
+ * 0x3D01402B is LPC1342 per PROTOCOL.md "LPC chip vtable — supported node MCUs". The game accepts any vtable-
  * matching chip_id at this stage — empirical: all five Tech Alerts rows
  * flip from "Invalid" to "Not Initialized" with the early mapping; the current
  * mapping plus version lookup moves populated slots to status=2. */
@@ -390,7 +390,7 @@ static void log_caller_chain(const char *prefix) {
  * points at the first encrypted byte (inner_cmd), and is overwritten with
  * the decrypted bytes.
  *
- * See docs/PROTOCOL.md §5.1 "Cipher algorithm" for the algorithm.
+ * See docs/PROTOCOL.md "Cipher algorithm" (under "NODEBUS_Cipher") for the algorithm.
  */
 static void nodebus_cipher_decrypt(uint8_t slot, uint8_t inner_len, uint8_t *buf) {
     uint8_t mask = (uint8_t)(((slot & 0x1F) << 4) | (inner_len & 0x0F));
@@ -664,7 +664,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
      * Step 67 update: cmd 0x40 / 0x41 senders identified. Cmd 0x41 is the
      * encrypted node-bus channel (sub_8ec410 → sub_9166c0); cmd byte is
      * runtime-computed. We don't synthesize responses, but we DO decrypt the
-     * outbound payload here for visibility — see cases below + PROTOCOL.md §5.1.
+     * outbound payload here for visibility — see cases below + PROTOCOL.md "NODEBUS_Cipher — Stern's per-slot XOR stream cipher".
      */
     case 0x25: {
         /* Bridge node-enumeration. mcp_nodebus_init_orchestrator
@@ -1111,7 +1111,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
          * because the game sits in mcp_nodebus_fetch_key_* waiting for 0xfc/
          * 0xfd/0xf9 replies.
          *
-         * Fetcher chains (PROTOCOL §5.1 "Cipher-key fetchers"):
+         * Fetcher chains (PROTOCOL.md "Cipher-key fetchers" (under "NODEBUS_Cipher")):
          *   - mcp_nodebus_fetch_key_basic       : 0xfd hint=12 → 0xfc hint=16
          *   - mcp_nodebus_fetch_key_with_serial : same as basic + sprintf
          *   - mcp_nodebus_fetch_key_two_probes  : 0xf9 hint=16 → 0xf9 hint=16

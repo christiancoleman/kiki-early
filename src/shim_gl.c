@@ -2729,7 +2729,7 @@ unsigned glCheckFramebufferStatus(unsigned target) {
 }
 
 /* SCISSOR_TEST tracker: log every transition so we can correlate viewport
- * clipping with what's on screen (PROTOCOL §10 — Service Menu appears
+ * clipping with what's on screen (SHIM.md "Display pipeline" — Service Menu appears
  * clipped to 800x480 because the boot-splash Radium scene set scissor
  * there and never reset it). */
 #ifndef GL_SCISSOR_TEST

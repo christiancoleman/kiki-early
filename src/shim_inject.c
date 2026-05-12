@@ -400,7 +400,7 @@ static void *shim_switch_table_probe_thread(void *arg) {
             SHIM_LOG("[switch_table] mode_bitmap pointer NULL (sub_7a8b90 hasn't run yet?)");
         }
 
-        /* Boot-state mask at DAT_0445f838 (per PROTOCOL §3). bit 0 of this
+        /* Boot-state mask at DAT_0445f838 (per PROTOCOL.md "Boot sequence (host + game)"). bit 0 of this
          * gates sub_58ff40's Service Select path: if set, handler takes
          * sub_731930(9) path instead of firing event 0xa5. */
         uint32_t boot_mask = *(uint32_t *)(uintptr_t)(game_base + 0x445f838ULL);
@@ -661,7 +661,7 @@ static void *shim_output_probe_thread(void *arg) {
 
 /* SHIM_DISPATCH_WATCHDOG=1 — periodically check whether the procDispatch
  * thread is still ticking by reading g_timestamp_threshold_1 @ 0x44cb2e0
- * (PROTOCOL §3 Phase 5). If the timestamp doesn't advance for N seconds,
+ * (PROTOCOL.md "Boot sequence (host + game)" Phase 5). If the timestamp doesn't advance for N seconds,
  * send SIGUSR1 to the procDispatch thread (located by /proc/self/task name
  * match) — the existing signal handler dumps a backtrace ON THE STALLED
  * THREAD, telling us which subsystem call inside FUN_00720cf0 is blocked

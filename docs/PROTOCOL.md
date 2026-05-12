@@ -1,31 +1,34 @@
-# Spike 3 Emulation — Playbook & Verified Reference
+# Spike 3 platform — verified reference (PROTOCOL)
 
-**Discipline.** This is the single source of truth for everything we have *proven* about the **Spike 3 platform and the game binary** — wire protocols, file/memory formats, the game's own functions and structures, the cabinet's boot sequence, the hardware. It is **implementation-agnostic**: how *our* emulator is built, run, and structured — and what its shim actually does — lives in `../src/README.md` and `../src/SHIM.md`, not here. **Verified facts only.** Hedging language (`likely`, `probably`, `TODO`, `TBD`, `unverified`) does not belong in this document — those live in `JOURNAL.md`. Every section is **self-contained** — you should not need to chase a journal step to evaluate a claim. Each subsection ends with a `*Verified by:*` footnote naming the method (BN decompile, hexdump @ X, runtime BRK trap on date Y, runtime strace, etc.). When sources conflict, **the binary wins** — re-verify against code or a runtime test, never against file mtime.
+**Discipline.** The verified-truth reference for the **Spike 3 platform and the game binary** — wire protocols, file/memory formats, the game's own functions and structures, the cabinet's boot sequence, the hardware. **Verified facts only.** Hedging language (`likely`, `probably`, `TODO`, `TBD`, `unverified`) does not belong here — that lives in `JOURNAL.md`. Every section is **self-contained** — you should not need to chase another doc or a journal step to evaluate a claim. Each subsection ends with a `*Verified by:*` footnote naming the method (BN decompile, hexdump @ X, runtime BRK trap on date Y, runtime strace, etc.). When sources conflict, **the binary wins** — re-verify against code or a runtime test, never against file mtime. When a claim turns out wrong, **delete it** — no banner; git history is the archive.
 
-`JOURNAL.md` is the exploration/narrative log. Cite it from this document only for "why this workaround exists" historical context, never as proof of a fact.
+**This document is implementation-agnostic.** How *our* emulator is built, run, configured, and structured — and what its shim actually does — lives alongside the code in `../src/`:
 
-When a claim here turns out to be wrong, **delete it**. Do not leave a banner. Git history is the archive.
+- `../src/README.md` — orientation: repo + `src/` layout, host requirements + one-time setup, build / run / test, scope discipline, source-control hygiene.
+- `../src/SHIM.md` — the shim's internals: translation-unit map, per-device coverage, the AF_UNIX IPC bridges, the forward-decode bridge protocol, the display pipeline (DRM/GBM/EGL/GLES + host GL daemon), runtime binary patches, the nodebus synth (per-slot chip-ID table, synth timing), `spike_extract`, the Radium playback tooling.
+- `JOURNAL.md` — the chronological exploration log. Cite it only for "why this workaround exists" history, never as proof of a fact.
 
----
-
-## Table of contents
-
-1. [The Spike 3 platform](#1-the-spike-3-platform)
-3. [Boot sequence (host + game)](#3-boot-sequence-host--game)
-4. [CPU ↔ netbridge UART bridge protocol](#4-cpu--netbridge-uart-bridge-protocol)
-5. [Nodebus (cipher, hash, framing)](#5-nodebus-cipher-hash-framing)
-6. [image.bin file format](#6-imagebin-file-format)
-7. [Asset extraction (spike_extract)](#7-asset-extraction-spike_extract)
-8. [Audio pipeline](#8-audio-pipeline)
-9. [Radium scene format](#9-radium-scene-format)
-10. [Display pipeline (DRM / GBM / EGL / GLES)](#10-display-pipeline-drm--gbm--egl--gles)
-11. [Game runtime model (switches, events, modes)](#11-game-runtime-model-switches-events-modes)
-12. [Hardware shim coverage reference](#12-hardware-shim-coverage-reference)
-13. [Comparison binaries (SW LE 0.85)](#13-comparison-binaries-sw-le-085)
+**Cross-references name a doc and a heading — never a section number, never a line number.** E.g. *see "Cmd 0x41 wire format"* (a heading in this doc); *see `../src/SHIM.md` "Per-device coverage"* (another doc). Headings are the stable anchors; section numbers and line numbers churn, so this doc carries neither. Cross-refs are kept rare — each section stands on its own.
 
 ---
 
-## 1. The Spike 3 platform
+## Contents
+
+- [The Spike 3 platform](#the-spike-3-platform)
+- [Boot sequence (host + game)](#boot-sequence-host--game)
+- [CPU ↔ netbridge UART bridge protocol](#cpu--netbridge-uart-bridge-protocol)
+- [Nodebus (cipher, hash, framing)](#nodebus-cipher-hash-framing)
+- [image.bin file format](#imagebin-file-format)
+- [Audio pipeline](#audio-pipeline)
+- [Radium scene format](#radium-scene-format)
+- [Display pipeline — game-side (DRM / GBM / EGL / GLES)](#display-pipeline--game-side-drm--gbm--egl--gles)
+- [Game runtime model (switches, events, modes)](#game-runtime-model-switches-events-modes)
+- [Hardware reference (Stern Spike 3)](#hardware-reference-stern-spike-3)
+- [Comparison binaries (SW LE 0.85)](#comparison-binaries-sw-le-085)
+
+---
+
+## The Spike 3 platform
 
 ### Asset stores
 
@@ -36,13 +39,13 @@ The game has **two independent asset containers**:
 | `image.bin` | `games/pokemon_le/image.bin` | 1.05 GiB | 2452 audio assets (PCM 16-bit LE 44.1 kHz, mono + stereo); 885 scene-bytecode descriptors; animation/coordinate tables; playfield/mode grid records |
 | `main.pck` | `games/pokemon_le/assets/godot/main.pck` | 210 MB | Godot resources reachable via `res://`: `.tscn` scenes, GLSL shaders, sprite textures, H.265 battle videos, GDScripts, Godot-side fonts, project icon |
 
-Some categories live elsewhere on the filesystem (Radium scenes in `assets/lcd/`, Nuklear assets in `assets/nuk/`, the boot splash PNG in `spike3/bin/`). See §6 for the image.bin internal layout, §9 for Radium scene format.
+Some categories live elsewhere on the filesystem (Radium scenes in `assets/lcd/`, Nuklear assets in `assets/nuk/`, the boot splash PNG in `spike3/bin/`). See "image.bin file format" for the internal layout, "Radium scene format" for the LCD scenes.
 
-*Verified by:* image.bin byte size + section header parse (see §6); main.pck file byte size + Godot version banner.
+*Verified by:* image.bin byte size + section header parse (see "image.bin file format"); main.pck file byte size + Godot version banner.
 
 ---
 
-## 3. Boot sequence (host + game)
+## Boot sequence (host + game)
 
 The Pokémon LE cabinet boots Linux off an SD card, then SysV init brings up Stern's services, then `game_monitor` execs the `game` binary, which runs its own multi-phase initialization. The full chain is split into five phases below.
 
@@ -78,9 +81,9 @@ Each script handles its own subsystem. Verified against the live `/etc/init.d/` 
 
 ### Notable side effects of boot
 
-- **`init_spi_serial_bridge` is a hard gate.** Failure returns exit code `0xe2` and `game_monitor` immediately re-exec's. In emulation we synthesize the SPI/UART bridge responses (see §4 / §12) — the gate would otherwise loop forever.
-- **`mcp_init_renderer_and_scene_cache_singletons` (`0x5d7aa0`) is the canonical Stern boot sequence** for graphics + scene cache. Five steps inside (per Stern source-line assertions in the binary): `new DisplayRenderer(0x1b8) → constructor → mutex+deferred-list → wait_on_render_thread_ready → new SceneCache(0x1d0)("./assets") → post-init`. Equivalent in Star Wars LE 0.85: `0x309af0`. Equivalent in `spike_menu`: see §13.
-- **`pthread_create` with `SCHED_RR`** — the dispatch thread (`procDispatch`) needs RR scheduling. Under qemu-user without `CAP_SYS_NICE` this fails silently; the shim's `shim_pthread_create` forces `PTHREAD_INHERIT_SCHED` to skip the failing path. See §2 "Common gotchas."
+- **`init_spi_serial_bridge` is a hard gate.** Failure returns exit code `0xe2` and `game_monitor` immediately re-exec's. In emulation we synthesize the SPI/UART bridge responses (see "CPU ↔ netbridge UART bridge protocol") — the gate would otherwise loop forever.
+- **`mcp_init_renderer_and_scene_cache_singletons` (`0x5d7aa0`) is the canonical Stern boot sequence** for graphics + scene cache. Five steps inside (per Stern source-line assertions in the binary): `new DisplayRenderer(0x1b8) → constructor → mutex+deferred-list → wait_on_render_thread_ready → new SceneCache(0x1d0)("./assets") → post-init`. Equivalent in Star Wars LE 0.85: `0x309af0`. Equivalent in `spike_menu`: see "Comparison binaries (SW LE 0.85)".
+- **`pthread_create` with `SCHED_RR`** — the dispatch thread (`procDispatch`) needs RR scheduling. Under qemu-user without `CAP_SYS_NICE` this fails silently; the shim's `shim_pthread_create` forces `PTHREAD_INHERIT_SCHED` to skip the failing path. See `../src/SHIM.md` "Other hooks".
 
 ### Localized-message-table primitive (used by step 2's overlay)
 
@@ -168,7 +171,7 @@ Implication: the wait loop is **time-bounded regardless** — even if the asset 
 
 *Verified by:* BN decompile of the listed functions; `get_xrefs_to(0x445f838)` to enumerate writers, `get_xrefs_to(0x5d0930)` to confirm only the two orchestrator call-sites; `get_xrefs_to(0x4482108)` to find the `SceneCache_PreLoadRadiumAssets` writer; user-mode runs reach the post-overlay state.
 
-## 4. CPU ↔ netbridge UART bridge protocol
+## CPU ↔ netbridge UART bridge protocol
 
 ### Architecture
 
@@ -257,7 +260,7 @@ Legend for **Shim status**: ✅ = handled with deliberate engineered shape; ⚠�
 | `0x2C` | `I2S_Enable(arg & 1)` | none | ❌ never observed |
 | `0x30` | `CRC32(0, &__VECTOR_TABLE, 0x12a40)` over bridge firmware | `SendMessage(0x30, id, 4 bytes)` | ✅ shim returns precomputed `NETBRIDGE_CRC32 = 0x357f5327` (zlib CRC32 chained over `netbridge.elf` `.text → .rodata → .binary_info`). Game prints `netbridge image okay, CRC32=0x357f5327` |
 | `0x40` | nodebus-passthrough subprotocol (cleartext path) | varies | ✅ sent at runtime, log only. See "Cmd 0x40 nodebus subprotocol" below |
-| `0x41` | node-bus query (encrypted transport) | varies | ✅ sent at runtime, encrypted. Shim logs decoded inner cmd + payload. See §5 for cipher; see "Cmd 0x41 wire format" below |
+| `0x41` | node-bus query (encrypted transport) | varies | ✅ sent at runtime, encrypted. Shim logs decoded inner cmd + payload. See "Nodebus (cipher, hash, framing)" for the cipher; see "Cmd 0x41 wire format" below |
 
 ### Cmd 0x25 node enumeration (with cmd 0x41 inner cmd `0xF0` reset)
 
@@ -265,7 +268,7 @@ Legend for **Shim status**: ✅ = handled with deliberate engineered shape; ⚠�
 
 Each enumeration cycle is bracketed by `sub_8f1100(0, 0)` reset calls — cmd `0x41` frame with slot=0, inner cmd `0xF0`, payload byte `0x22` (the `0x20` variant is per-slot ack-advance, sent once per detected slot during the loop). The bridge resets its enumeration cursor on the `0x22` variant; without the reset, retry cycles would return 0 immediately and `sub_7da920(list, 32, 2)` (called once per cycle) would clear flag bit 1 on previously-set slots.
 
-The list built from this enumeration drives `sub_7da920`'s flag-bit-1 path for Tech Alerts row hide (see §11 "Flag-bit-1 paths").
+The list built from this enumeration drives `sub_7da920`'s flag-bit-1 path for Tech Alerts row hide (see "Flag-bit-1 paths").
 
 *Verified by:* JOURNAL Step 92 — Ghidra decompile of `sub_675110`/`sub_674600`/`sub_8ede50`/`sub_8f1100` plus runtime confirmation that shim synthesis of cmd `0x25` (yielding `{1, 2, 4, 7, 8, 9, 10, 12, 13, 14, 0}`) plus cmd `0xF0` reset detection drives all 11 populated slots to flag bit 1 set across three consecutive enumeration cycles per boot.
 
@@ -337,7 +340,7 @@ Sub-cmd at `data[0]`. All replies use `SendMessage(0x40, id, ...)`.
 | `0x09` | `BBL_Set(data[2], data[3] << 4, 0)` (when len==2) | none |
 | `0x0a` | `BBL_Get` | 2 bytes (`{0x00, bbl}`) |
 | `0x0c` | infinite loop (factory test trap / watchdog test) | never returns |
-| `0x0d` | **NODEBUS_Hash** (4 secret seeds, 5 sub-sub-cases) — see §5 | 4 bytes |
+| `0x0d` | **NODEBUS_Hash** (4 secret seeds, 5 sub-sub-cases) — see "Nodebus (cipher, hash, framing)" | 4 bytes |
 
 Senders observed at runtime: `mcp_nodebus_query_bridge_status` (sub-cmd 0x05), `mcp_nodebus_factory_test_trap @ 0x8f5f4c` (sub-cmd 0x0c, sends frame `{0x0c, 0x00, 0x00}`).
 
@@ -372,7 +375,7 @@ STX | 0x41 | id | rx_bytes[rx_length-1] | bridgeStatus | csum | ETX
 
 The actual node-bus message format (what's inside `tx_bytes` / `rx_bytes`) is determined by the **node firmware** (`pinnode-LPC1124_303-X.Y.Z.hex`, `coil4node-...`, etc.). The bridge is just a transparent UART relay — it doesn't know what "switch 57" means.
 
-The encrypted variant of cmd 0x41 — used for node firmware flashing and 160+ per-(slot, inner_cmd) wrappers — is documented in §5.
+The encrypted variant of cmd 0x41 — used for node firmware flashing and 160+ per-(slot, inner_cmd) wrappers — is documented in "Nodebus (cipher, hash, framing)".
 
 ### Game-side response dispatch (`sub_d15aa8 @ 0xd15aa8`)
 
@@ -462,7 +465,7 @@ These fire only when the main switch didn't already dispatch (when `POWERDIST_Is
 
 ---
 
-## 5. Nodebus (cipher, hash, framing)
+## Nodebus (cipher, hash, framing)
 
 Two **separate** Stern-custom primitives share the "nodebus" name family but live on different layers.
 
@@ -471,9 +474,9 @@ Two **separate** Stern-custom primitives share the "nodebus" name family but liv
 | **NODEBUS_Cipher** | XOR stream cipher applied to outbound cmd-`0x41` (encrypted node-bus query) traffic | **ACTIVE.** 160+ wrappers around `mcp_nodebus_send_with_retry`. 4 distinct (slot, inner_cmd) pairs observed in boot-time capture |
 | **NODEBUS_Hash** | Stern's custom integer-mixer polynomial. Bridge implements it for cmd-`0x40 / sub 0x0d`; some games inline it CPU-side | **ABSENT.** Game does not send cmd `0x40 / 0x0d`, and exhaustive ARM64 lowering scans turned up no inlined polynomial |
 
-Bridge wire format for cmds 0x40 (cleartext) and 0x41 (encrypted) is in §4. This section covers the cipher and hash algorithms themselves.
+Bridge wire format for cmds 0x40 (cleartext) and 0x41 (encrypted) is in "CPU ↔ netbridge UART bridge protocol". This section covers the cipher and hash algorithms themselves.
 
-### 5.1 NODEBUS_Cipher — Stern's per-slot XOR stream cipher
+### NODEBUS_Cipher — Stern's per-slot XOR stream cipher
 
 #### Caller chain
 
@@ -664,7 +667,7 @@ Verified against BN HLIL byte-for-byte. With zero keys (boot state), `nodebus_en
 
 ---
 
-### 5.2 NODEBUS_Hash — Stern's custom integer mixer
+### NODEBUS_Hash — Stern's custom integer mixer
 
 #### Status in Pokémon LE 0.81
 
@@ -759,7 +762,7 @@ When scanning `games/pokemon_le/game`, several functions trip individual polynom
 | `sub_1042214` | `SUB W6, W8, W8, LSL #11` (the only self-shift `SUB-LSL-#11` in the binary) AND `MOVN W14, #0x07FE` (loading `0xFFFFF801`) | Signed Q-format audio-sample saturation. `x - (x << 11) = x * -0x7FF` is being used as a Q-format magnitude scaler; `0xf801` halfword stores are bit-pack endpoints of the +/-0x7FF saturation range |
 | `sub_9b7590`, `sub_9b9820`, `sub_9bba80`, `sub_9bd9a8` | `MOVZ #0x7FFF` + `MOVN #0x7FFE` register-paired loads, plus X-reg `LSR #10` + `LSR #16` shift co-locations | Bespoke audio codec rounds. `MOVZ #0x7FFF` / `MOVN #0x7FFE` load the +/-0x7FFF saturation clamps for 15-bit signed PCM samples. The `0x4000` rounding bias and `(1 << (width-1)) - 1` overflow check give it away as a sample bit-width normalizer. The `0x1b` constants nearby are GF(2^8) reduction (AES MixColumns coefficient) |
 
-### 5.4 LPC chip vtable — supported node MCUs
+### LPC chip vtable — supported node MCUs
 
 Each downstream node on the RS-485 bus reports a 32-bit chip ID via the cmd `0xfe` "fe_probe" response (in `response[4..7]`, var_34). `mcp_node_query_status_and_classify @ 0x8f38e0` matches that ID against `mcp_lpc_chip_vtable @ 0x42317c8`, a 28-entry × 0x28-byte table of supported node MCUs. A miss falls through to the default entry at `0x42317a0` (most function-pointer slots NULL) — synthesizing a fake "node present" response without a matching chip ID hits a NULL deref on subsequent vtable dispatch.
 
@@ -814,38 +817,9 @@ Indices 13/19, 14/20, 21/22 share chip IDs across package variants — the chip-
 
 *Verified by:* JOURNAL Step 89f — direct binary read at file offset `0x42307c8` (VA `0x42317c8`, `.data.rel.ro` segment, off-by-`0x1000` from VA-equals-file-offset assumption), all 28 chip-name strings re-read from binary's own `.rodata` (not from BN annotation), plus public-source spot-checks: `0x041E502B` matches NXP LPC1111FHN33/101 datasheet; `0x411FD210` matches ARM Cortex-M33 r1p0 CPUID per ARM Technical Reference Manual.
 
-#### Per-slot chip-ID synth (Pokémon LE)
-
-`shim_nodebus.c::nodebus_chip_id_for_slot` returns the chip_id the shim writes into `response[4..7]` of every synthesized FE-probe reply for populated slots. `shim_nodebus.c::nodebus_slot_is_populated` is the shared slot-inventory gate: cmd `0x25` enumerates the populated nonzero slots, and cmd `0x41` inner cmd `0xFE` returns a chip/version payload for populated slots or an all-zero not-populated FE payload for other slots. Each populated-slot chip_id matches a vtable entry whose `+0x10` (type_idx — the same value `sub_840d30` uses as `key2`) corresponds to a shipped `.hex` firmware family.
-
-| Slot | Role (manual) | chip_id | vtable entry | type_idx | Firmware match |
-|---:|---|---|---|---:|---|
-| 0  | CPU bridge | `0x00140040` | LPC1124_303 (15) | 4 | host-side bridge LPC on CPU board |
-| 1  | Cabinet | `0x042D502B` | LPC1112_101 (2) | 1 | `pinnode-LPC1112_101-1_31_0.hex` |
-| 2  | Cabinet-Express | `0x2C40102B` | LPC1313 (13) | 5 | `ws2812node-LPC1313-1_31_0.hex` |
-| 4  | QR Reader (Bottom Arch) | `0x00140040` | LPC1124_303 (15) | 4 | `node4-LPC1124_303-1_31_0.hex` |
-| 7  | Speaker-Expression | `0x2C40102B` | LPC1313 (13) | 5 | `ws2812node-LPC1313-1_31_0.hex` |
-| 8  | Core Driver Lower Playfield | `0x042D502B` | LPC1112_101 (2) | 1 | `pinnode-LPC1112_101-1_31_0.hex` |
-| 9  | Core Driver Upper Playfield | `0x042D502B` | LPC1112_101 (2) | 1 | (same record as slot 8) |
-| 10 | SPI Servo Node Board | `0x042D502B` | LPC1112_101 (2) | 1 | (same record as slot 8) |
-| 12 | Topper-Lamps | `0x2C40102B` | LPC1313 (13) | 5 | `ws2812node-LPC1313-1_31_0.hex` |
-| 13 | Topper-Servo | `0x042D502B` | LPC1112_101 (2) | 1 | `pinnode-LPC1112_101-1_31_0.hex` |
-| 14 | Universal Topper | `0x2C40102B` | LPC1313 (13) | 5 | `ws2812node-LPC1313-1_31_0.hex` |
-| any other | — | all-zero FE response | — | — | not populated |
-
-Result: all 11 populated slots reach `status=2 + flag=0x03` — every row hidden in Tech Alerts; game advances past Tech Alerts to the **Service Menu**. See §11 for the status writer success path and the flag-bit-1 paths driven by bridge cmd `0x25` enumeration.
-
-LPC1342 entries (vtable 21/22, chip_id `0x3D01402B`) have `type_idx=0` — using that chip_id causes `sub_840d30` lookup miss (no shipped firmware record has `key2=0`) → status 4. Pinnode slots therefore take the simple chip_id path via LPC1112_101 (type_idx=1), which bypasses the LPC1313 special branch (`sub_8f5390` cmd `0xF2 × 8`) in `sub_674680`. ws2812node slots take the real LPC1313 chip_id (`0x2C40102B`, vtable entry 13) since the only ws2812node firmware shipped is LPC1313.
-
-Topology per cabinet manual: `0 → 10 → 9 → 8 → 4` (playfield daisy chain via CPU CN22), `0 → 1` (separate cabinet branch via CPU CN11).
-
-Synth requires a wall-clock pause before each boot-time `bridge_send_response` to preserve the timeout-driven timing real hardware imposes — empirically 200 ms (`shim_nodebus.c::NODEBUS_SYNTH_DELAY_US`). Immediate replies regress the run from frame-decode-active to "Godot init never fires". After the first nodebus switch-poll response, `shim_nodebus.c::nodebus_post_init_fast_replies` switches later synthetic nodebus replies to a shorter delay for service-menu scans and steady-state polling.
-
-*Verified by:* JOURNAL Step 92 — runtime vtable dump (`game_base + 0x42317c8`, 28 entries × 0x28) confirms `type_idx` per entry; runtime probe of all 11 populated slots reaching `flag=0x03 status=2` after shim synthesis with the chip_id table above plus bridge cmd `0x25` enumeration. Visual confirmation: Tech Alerts panel rendering empty + game advancing to the **Service Menu**. Earlier Step 90 captures of the "Not Initialized" intermediate state are archived in `_emulation/reference/` — the `tech_alerts_v*.png` filename is **legacy**: v1-v6 depict the actual Tech Alerts screen mid-init; v7_huge.png post-dates Step 92's fix and depicts the Service Menu (Tech Alerts empty by then).
-
 ---
 
-## 6. image.bin file format
+## image.bin file format
 
 `image.bin` is Stern's proprietary asset container. **1.05 GiB** in Pokémon LE 0.81 (`0x42f323ee` bytes). Memory-mapped at runtime via `mmap64` in `load_image_bin_file`. The file holds two **independent lookup systems** (audio + scenes) plus a handful of header/manifest blocks.
 
@@ -876,8 +850,8 @@ The runtime hashmap `g_asset_registry @ 0x48ca4d0` (a libstdc++ `std::unordered_
 | 0 | `0x0001b800` | — | EULA + version manifest. First 8 bytes: `40 00 00 00` and `8e 70 f3 42`. Then ASCII: `"STERN PINBALL\nEND USER LICENSE AGREEMENT\n\nThis limite…"` | partial — header bytes uncharacterized |
 | 1 | `0x0001b7e0` | — | Audio/asset config header. uint32 LE @ +0 = `44100` (audio sample rate). **Byte +7 = `0x05` is the per-asset variant stride** used by `get_asset_ptr_by_packed_id` to index section 5 | partial — beyond byte +7, fields uncharacterized |
 | 2 | `0x000189b8` | 0x2E28 (11,816 B) | Playfield/mode grid records. 1,477 uint64 pointers into section 0 (and adjacent regions). Most records are 408-byte `{record_id:u32, flag:u32, w:u16=17, h:u16=23, pad[5], cells[391]}` grids; records with non-408-byte deltas are not decoded here | verified — see "Section 2: playfield grid records" below |
-| 3 | `0x00018658` | — | Aliases section 8 (same offset); both registers resolve to the same data | aliased to §8 |
-| 4 | `0x000000f8` | — | Aliases section 5 (same offset) | aliased to §5 |
+| 3 | `0x00018658` | — | Aliases section 8 (same offset); both registers resolve to the same data | alias → section 8 |
+| 4 | `0x000000f8` | — | Aliases section 5 (same offset) | alias → section 5 |
 | 5 | `0x000000f8` | 12,568 × 8 B = 100,544 B | **Per-asset bytecode descriptor table.** uint64 file offsets to bytecode in the bulk region, grouped in 5-tuples (one per language variant). 2,492 unique offsets in `[0x42EEEB3C, 0x42F23E06)` | verified — see "Section 5: per-asset descriptor table" below |
 | 6 | `0x42f323ea` | 4 B | File trailer. Last 4 bytes of the file are `96 19 d0 f5` in Pokémon LE 0.81 | partial — bytes confirmed; semantic decoding not recorded |
 | 7 | `0x42f23e06` | 2,452 × 24 B = 58,848 B | **Asset directory** (audio in PLE 0.81). 2,452 fixed-size records per `spike_extract`. Verified 100% intersection with runtime `g_asset_registry` hashmap | verified — see "Section 7: asset directory" below |
@@ -1038,86 +1012,7 @@ Pokémon LE 0.81 ships **only `image.bin`** — no `image-sc??.bin` files. The 1
 
 ---
 
-## 7. Asset extraction (spike_extract)
-
-`_extraction/tools/spike_extract/` is a pure-Python standalone extractor for `image.bin`. **No emulator, no QEMU, no game binary required at extraction time** — parses `image.bin` section 7 directly and writes classified output. See §6 for the file format the tool consumes.
-
-### Usage
-
-```bash
-# Extract every asset from image.bin into out/
-python -m spike_extract --image games/pokemon_le/image.bin --out out/
-
-# With registry-dump validation (optional; confirms section-7 parse against runtime)
-python -m spike_extract \
-    --image games/pokemon_le/image.bin \
-    --registry games/pokemon_le/_emulation/asset_registry.bin \
-    --out out/ --csv out/index.csv
-
-# Dry-run — print summary + histogram, write nothing
-python -m spike_extract --image games/pokemon_le/image.bin --dry-run
-```
-
-`asset_registry.bin` (optional input) is produced by the emulation shim's `shim_dump_sound_globals` — it walks the runtime `_Hashtable` struct + `_M_nxt` chain and dumps a binary file the registry parser can consume. Used only as validation that the section-7 parser recovered the same 2,452 entries the runtime hashmap holds. On a correct parse: 100% intersection, zero mismatches.
-
-*Verified by:* `_extraction/tools/spike_extract/__main__.py` argument handling; verified-working extraction in `_extraction/spike_extract_out/`.
-
-### Output layout
-
-```
-out/
-├── audio_stereo_music/         # 35 WAVs (4-byte/elem stereo, duration ≥ 30 s)
-├── audio_stereo_sfx/           # 312 WAVs (4-byte/elem stereo, duration < 30 s)
-├── audio_mono/                 # 2,105 WAVs (2-byte/elem, audio shape)
-└── index.csv                   # 2,453 lines (header + 2,452 records)
-```
-
-Subdirectories are created lazily — empty categories leave no folder.
-
-### `index.csv` schema
-
-```
-index, file_offset, asset_id_low, flags, encoded_id, size_elements, element_bytes, byte_size, hash_or_cksum, category
-```
-
-| Column | Type | Source field |
-|---|---|---|
-| `index` | int (0-based) | position in section 7 |
-| `file_offset` | hex `0x…` | record bytes 0-7 |
-| `asset_id_low` | hex `0x…` (low 32) | record bytes 8-11 |
-| `flags` | hex `0x…` (high 32 of bytes 8-15) | record bytes 12-15 |
-| `encoded_id` | hex `0x…` (full 64-bit composite) | `(flags << 32) \| asset_id_low` |
-| `size_elements` | int | record bytes 16-19 (low 32) — **element count, NOT bytes** |
-| `element_bytes` | int | derived: 4 if `asset_id_low & 0x40` else 2 |
-| `byte_size` | int | `size_elements * element_bytes` |
-| `hash_or_cksum` | hex `0x…` | record bytes 20-23 (high 32 of bytes 16-23) |
-| `category` | string | classification: `audio_stereo_music` / `audio_stereo_sfx` / `audio_mono` (see §6) |
-
-### Pokémon LE 0.81 extraction summary
-
-| Category | Count | Total size | Notes |
-|---|---:|---:|---|
-| `audio_stereo_music` | 35 | 331 MB | All 3 originally-confirmed music tracks included |
-| `audio_stereo_sfx` | 312 | 180 MB | Stereo SFX pool. Classification rule = `id_low & 0x20040` bit pattern |
-| `audio_mono` | 2,105 | 566 MB | **All confirmed audio** — user-validated, no animation false-positives |
-| **Total** | **2,452** | **1.1 GB** | Matches image.bin section-7 record count exactly |
-
-Every section-7 record is audio in this build. Nothing is encrypted.
-
-*Verified by:* `_extraction/spike_extract_out/index.csv` (2,452 rows + header) + manual audition of representative samples per category.
-
-### Open gaps
-
-- **SE_PK_* name → asset_id mapping is NOT in compiled code.** Token resolution happens at runtime via type-0x0b records during scene-bytecode walking (see §8 audio pipeline + §6 image.bin format). Static extraction recovers (asset_id_low, flags, size, file_offset) but not the SE_PK_* names. Only runtime capture or a CM4 hardware memory dump yields the full name → asset_id table.
-- **Non-audio content in image.bin** (scene bytecode in section 5, playfield grids in section 2) is not extracted by this tool. The tool's scope is section 7.
-
-### Portability to other Spike 3 games
-
-The section-7 format is stable across Stern's Spike 3 codebase, so the parser works on any `image.bin` from any Spike 3 game. Per-game tuning needed only on the classification heuristic — different games may use different `flags` encodings. For games shipping `image-sc??.bin` sub-files (see §6 multi-image), each is parsed the same way with its own section-7 directory.
-
----
-
-## 8. Audio pipeline
+## Audio pipeline
 
 ### Game-side ALSA imports
 
@@ -1142,19 +1037,6 @@ Game-side functions:
 Game calls `snd_pcm_open` which returns nonzero error (no `/dev/snd/*` in qemu-user-mode), ignores the return code, then calls `snd_pcm_prepare` with the uninitialized PCM pointer. Glibc's `snd_pcm_prepare` asserts `pcm != NULL` and aborts. The shim's full ALSA stub (below) prevents this.
 
 *Verified by:* direct observation of un-shimmed run (Step 25); BN decompile of `alsa_pcm_init` and `alsa_audio_thread`.
-
-### Shim ALSA stubs
-
-All 18 symbols are stubbed in `_emulation/shim_inject.c`:
-- `snd_pcm_open` returns a `calloc(256)` scratch handle with return value `0`
-- `hw_params` setters/getters: no-op success
-- `rate_near` writes 44100 to `*val`
-- `get_rate` / `get_channels` return 44100 / 2
-- `snd_pcm_writei` paces with `usleep(size * 1e6 / 44100)` (46.4 ms per 2048-frame buffer), appends the raw S16_LE interleaved stereo buffer to `_emulation/captures/audio/stream.s16le`, flushes every 64 writes, and tees to the audio bridge if `AUDIO_BRIDGE=1`
-
-To convert the captured stream to WAV: `ffmpeg -f s16le -ar 44100 -ac 2 -i stream.s16le stream.wav`.
-
-*Verified by:* Step 27 run — 11.7 MB / 66.4 s of real-time audio captured in a single run, audio thread did NOT spin (CPU usage stayed bounded), game progressed into scene-loader territory.
 
 ### Sound event registration (game-side)
 
@@ -1228,7 +1110,7 @@ GDScript call pattern: `Spike.play_sound(SpikeSoundIds.SE_PK_FX_<NAME>)` passes 
 |---|---|---|
 | 1 | `sub_8d3460` (static init) | Name string → uint16_t token, into hashmap at `data_48c56d0` (25 entries only) |
 | 2 | `sub_b09660` | Name lookup in the hashmap; returns hash node with token at offset `+0x28` |
-| 3 | **NONE — runtime only** | Token → asset_id: NOT in compiled code. Populated from scene bytecodes (type-0x0b records, see §6) by `load_scene_assets` at `0x7321d0` when each scene loads |
+| 3 | **NONE — runtime only** | Token → asset_id: NOT in compiled code. Populated from scene bytecodes (type-0x0b records; the token→asset_id pipeline is in "Audio pipeline") by `load_scene_assets` at `0x7321d0` when each scene loads |
 | 4 | `asset_registry_find` over `g_asset_registry` at `data_48ca4d0` | Encoded asset_id → `{file_offset, size, type}` |
 | 5 | `get_asset_ptr_by_packed_id` → `image_mapped_base_plus_offset` | File offset → absolute pointer inside mmap'd `image.bin` |
 
@@ -1240,177 +1122,13 @@ No `uint32_t token_to_asset[]` array exists in the binary; token constants never
 
 ### Encryption status
 
-**Pokémon LE 0.81: NOT encrypted.** All 2,452 section-7 records extract clean (manual audition + duration analysis confirms playable PCM). The hash polynomial is also absent in this build — see §5.2.
+**Pokémon LE 0.81: NOT encrypted.** All 2,452 section-7 records extract clean (manual audition + duration analysis confirms playable PCM). The hash polynomial is also absent in this build — see "NODEBUS_Hash — Stern’s custom integer mixer".
 
 ---
 
-## 10. Display pipeline (DRM / GBM / EGL / GLES)
+## Display pipeline — game-side (DRM / GBM / EGL / GLES)
 
-**Data flow at a glance.** The game does its own real GLES rendering — no synthesized frames are fed to it. We intercept the hardware-specific framebuffer presentation parts (DRM/KMS ioctls + GBM allocation calls) and replace them with stand-ins, but every `glClear` / `glDraw*` / shader / texture upload the game issues is forwarded through to a **real GL backend** that writes real pixels into a real framebuffer. The shim supports a host-native daemon backend and an in-process Mesa-aarch64 overlay; launcher selection and defaults live in `_emulation/run_game.sh`. At each fake page-flip, the shim does `glReadPixels` on the active backend's framebuffer and routes the bytes to one or more sinks (frame bridge over abstract AF_UNIX, periodic on-disk capture). GBM in this flow is a handle stand-in — its BOs are `calloc(256)` scratch pointers used as opaque tokens passed between layers; the only GBM BOs that actually carry pixel data are the special 1024×256 DMD path (`gbm_bo_map` returns `calloc(stride*height)` storage and `gbm_bo_unmap` captures it).
-
-The game presents frames via Linux's KMS/DRM stack with EGL on top of GBM. Three layers in the shim:
-
-1. **`/dev/dri/card1`** — DRM ioctls intercepted before they'd reach the real device
-2. **GBM library hooks** — every `gbm_*` call goes to the shim
-3. **EGL + GLES library hooks** — three modes: stub, Mesa-aarch64 overlay, and host-native daemon. Runtime selection lives in `_emulation/run_game.sh`.
-
-All three layers cooperate so the game's normal display pipeline (allocate GBM BO → wrap as EGL image → bind as GL texture → render → page-flip) succeeds end-to-end without real GPU hardware.
-
-### `/dev/dri/card1` socketpair
-
-`/dev/dri/card1` is opened as a real `socketpair(AF_UNIX, SOCK_STREAM)` (game gets `sv[0]`, shim holds `sv[1]`). DRM ioctls are intercepted in `shim_ioctl.c` before they'd reach the socketpair (which would reject them):
-
-| ioctl | Shim response |
-|---|---|
-| `DRM_IOCTL_VERSION` | Mesa-shaped version string |
-| `DRM_IOCTL_GET_CAP` / `SET_CLIENT_CAP` | success |
-| `DRM_IOCTL_MODE_GETRESOURCES` | 1 CRTC, 2 connectors (both reporting connected), 1 encoder, 1920×1080@60 |
-| `DRM_IOCTL_MODE_GETCONNECTOR` / `GETENCODER` / `GETCRTC` / `SETCRTC` | matching modes |
-| `DRM_IOCTL_MODE_CREATE_DUMB` / `ADDFB2` | new FB IDs |
-| `DRM_IOCTL_MODE_PAGE_FLIP` (with `DRM_MODE_PAGE_FLIP_EVENT` flag 1) | writes a 32-byte `drm_event_vblank`-shaped event to `sv[1]` so the game's `select()` and `drmHandleEvent` advance. **Frame capture trigger** lives here (calls `shim_frame_capture_at_page_flip` every 2nd flip) |
-| `DRM_IOCTL_MODE_MAP_DUMB` | `ENOTSUP` |
-| `DRM_IOCTL_MODE_GEM_CLOSE` | success |
-
-*Verified by:* JOURNAL Step 21, 24.
-
-### GBM hooks
-
-| Function | Behavior |
-|---|---|
-| `gbm_create_device`, `gbm_surface_create` (+`_with_modifiers`), `gbm_bo_create` (+`_with_modifiers`), `gbm_bo_destroy`, `gbm_bo_get_{width,height,stride,format,handle,modifier,fd}`, `gbm_bo_map`, `gbm_bo_unmap`, `gbm_surface_lock_front_buffer`, `gbm_surface_release_buffer`, `gbm_surface_has_free_buffers`, `gbm_device_destroy`, `gbm_device_get_{fd,backend_name}`, `gbm_device_is_format_supported` | Returns `calloc(256)` scratch-backed pointers so the game can dereference fields without SEGV |
-
-Each BO is registered in a side-table (32 slots, mutex-guarded) holding its `(width, height, format, stride=width*4)` and an `is_dmd` flag. `gbm_bo_get_*` consult the table so the DMD BO correctly reports 1024×256 ABGR8888 instead of the screen default. `gbm_bo_map` returns `calloc(stride*height)` backing on first map; `gbm_bo_unmap` dumps `is_dmd` BOs to `_emulation/dmd/frame_NNNNNN.bgra` (1024×256×4 = 1 MB per frame) and frees the backing.
-
-### EGL hooks
-
-| Function | Behavior |
-|---|---|
-| `eglGetDisplay` / `eglGetPlatformDisplay(EXT)` | Drops the game's GBM_KHR query; asks Mesa for `EGL_PLATFORM_SURFACELESS_MESA` |
-| `eglInitialize`, `eglTerminate`, `eglBindAPI`, `eglQueryString` | success / Mesa-default strings |
-| `eglChooseConfig` / `eglGetConfigs` / `eglGetConfigAttrib` | RGBA8 + `NATIVE_VISUAL_ID=0x34325258` (XR24); patches `EGL_SURFACE_TYPE: WINDOW_BIT → PBUFFER_BIT` (Mesa surfaceless has no window configs) |
-| `eglCreateContext` / `eglDestroyContext`, `eglCreateWindowSurface` (redirected to `eglCreatePbufferSurface` 1920×1080), `eglCreatePbufferSurface`, `eglDestroySurface` | fake handles in stub mode; forwarded to Mesa in real-GL mode |
-| `eglMakeCurrent` (with `draw=NULL` → fabricates fallback pbuffer from `shim_last_real_config`), `eglSwapBuffers`, `eglSwapInterval`, `eglQuerySurface`, `eglSurfaceAttrib` | normal |
-| `eglGetError` | always `EGL_SUCCESS` |
-| `eglGetProcAddress` | routes to shim-owned stubs for `eglGetPlatformDisplayEXT`, `eglCreateImageKHR` / `DestroyImageKHR`, `eglCreateSyncKHR` / `DestroySyncKHR` / `WaitSyncKHR` / `ClientWaitSyncKHR`, `glEGLImageTargetTexture2DOES`. Never forwards |
-| `eglCreateImageKHR` (shim-owned) | Never forwards to Mesa. Parses `EGL_DMA_BUF_PLANE0_FD_EXT`; if the fd is one of `shim_avforward`'s sentinels, looks up the live RGBA buffer pointer + stride. Registers `{w, h, fourcc, rgba_ptr, stride}` in a side-table and returns a counter-cast opaque handle (`(void *)(0xdeadbeef0000 + 8N)`) — never `malloc`'d, never freed |
-| `eglDestroyImageKHR` (shim-owned) | Drops the entry from the side-table. Sentinel handles are not freed (counter-cast pointers, not heap allocations) |
-| `glEGLImageTargetTexture2DOES` | Demotes EXTERNAL_OES → TEXTURE_2D. If the entry has an `rgba_ptr`, uploads via real `glTexImage2D` on first call for that bound `tex_id` at this `(w, h)`, then `glTexSubImage2D` on subsequent calls (per a 128-slot per-`tex_id` allocation table that preserves storage across frames). Else uploads `NULL` storage for FBO color-attachment use. Tracks via `shim_frametex_record` for capture targeting |
-
-### GLES 3 hooks (~70 entry points)
-
-| Family | Functions | Behavior |
-|---|---|---|
-| Query | `glGetError`, `glGetString`, `glGetIntegerv`, `glGetShaderiv`, `glGetProgramiv` | Defaults; `compile/link status` always `GL_TRUE` so Radium pipeline doesn't bail |
-| Object create | `glGen*` / `glCreate*` families | Incrementing object IDs |
-| Bind | all binding functions | Tracking only |
-| Texture upload | `glTexImage2D`, `glTexSubImage2D`, `glCompressedTexImage2D`, `glCompressedTexSubImage2D`, `glTexParameteri`, `glPixelStorei` | Forward to Mesa in real-GL mode; capture data to disk |
-| Shader | `glShaderSource`, `glCompileShader`, `glAttachShader`, `glLinkProgram`, `glUseProgram` | Compile/link always succeed |
-| Uniforms | uniform family | tracking |
-| Vertex | `glVertexAttribPointer`, `glEnableVertexAttribArray` | tracking |
-| Framebuffer | family + `glCheckFramebufferStatus → GL_FRAMEBUFFER_COMPLETE` | success |
-| State | enable/disable/blend/viewport/clear | tracking |
-| Draw | `glDrawArrays`, `glDrawElements` | no-op in stub mode; forward in real-GL |
-| Read | `glReadPixels` | the frame-bridge capture path uses this |
-
-### GL execution modes
-
-| Mode | Set via | Behavior |
-|---|---|---|
-| Stub | launcher-selectable | Every GLES/EGL/GBM call returns plausible defaults. Shaders "compile". Draws are no-op. Produces no real pixels |
-| Mesa-aarch64 overlay | launcher-selectable | `FWD_RET` / `FWD_VOID` macros tail-call `dlsym(RTLD_NEXT, ...)` into the Mesa overlay at `mesa_sw_overlay/pkg/usr/lib/aarch64-linux-gnu/`. Game's EGL/GLES calls run inside qemu-aarch64 against an in-process Mesa → llvmpipe → a real EGL pbuffer (1920×1080) |
-| Host-native daemon | launcher-selectable | Shim's GL/EGL hooks marshal opcodes over abstract AF_UNIX `@spike3_gl` to `gl_daemon.py` running natively on the host. Daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context and replays opcodes via PyOpenGL. EGL setup is synthesized in-shim (FAKE_EGL_* sentinels). See "Host-native GL daemon" subsection below |
-
-#### Cross-backend translation glue
-
-The shim normalizes EGL/GLES traffic before forwarding to whichever backend is active. The first five bullets (EGL setup) apply only to the Mesa-overlay backend; the daemon path synthesizes EGL state in-shim. The texture-target demotion and shader rewrite apply to both real-GL backends.
-
-- `eglGetDisplay` / `PlatformDisplay[EXT]` → drops game's GBM_KHR query, asks Mesa for `EGL_PLATFORM_SURFACELESS_MESA`
-- `eglChooseConfig` → patches `EGL_SURFACE_TYPE: WINDOW_BIT → PBUFFER_BIT`
-- `eglCreateWindowSurface` → redirects to `eglCreatePbufferSurface(1920×1080)`
-- `eglMakeCurrent(draw=NULL)` → fabricates fallback pbuffer from `shim_last_real_config`
-- `eglGetConfigAttrib(EGL_NATIVE_VISUAL_ID)` → forces XR24 fourcc
-- All texture-target hooks (`glBindTexture`, `glTexImage2D`, `glTexSubImage2D`, `glCompressedTex{,Sub}Image2D`, `glTexParameter{i,f}`, `glGenerateMipmap`, `glFramebufferTexture2D/Layer`, and the upload inside `glEGLImageTargetTexture2DOES`) demote `GL_TEXTURE_EXTERNAL_OES` (`0x8D65`) to `GL_TEXTURE_2D` (`0x0DE1`). Mesa swrast llvmpipe rejects every state-setting operation other than `glEGLImageTargetTexture2DOES` on EXTERNAL_OES with `GL_INVALID_ENUM` (per the `GL_OES_EGL_image_external` spec); demotion lets the texture object live as a 2D RGBA8 throughout the upload chain.
-- `glShaderSource` → concatenates the input strings; if the source references `samplerExternalOES`, injects `#define samplerExternalOES sampler2D` after the matching `#extension GL_OES_EGL_image_external` line (else after `#version`, else at top), then forwards a single rewritten string to Mesa. Required because Mesa swrast llvmpipe samples `samplerExternalOES` from a 2D-bound texture as zero — the OES extension's distinguishing behavior is YUV→RGB on DMA-BUF-imported YUV textures, irrelevant for our RGBA-from-host data path. The game's own Godot shaders use this same `#define` pattern unconditionally; Stern's Radium video shader doesn't, so the shim adds it.
-
-#### dlopen/dlsym interception (in `spi_shim.c`)
-
-Tracks `libEGL` / `libGLES` / `libgbm` handles. Substitutes the shim's 3 EGLImage overrides on `dlsym(handle, "eglCreateImageKHR" / "eglDestroyImageKHR" / "glEGLImageTargetTexture2DOES")`. `eglGetProcAddress` returns the shim's stubs (never forwards).
-
-### Host-native GL daemon
-
-In daemon mode, the shim's GL/EGL hooks marshal opcodes to `gl_daemon.py` over abstract AF_UNIX `@spike3_gl` instead of forwarding to the in-process Mesa overlay. The daemon binds an `EGL_PLATFORM_SURFACELESS_MESA` ES3 context (config `0x31DD`) and replays opcodes via PyOpenGL; `glReadPixels` round-trips ship RGBA bytes back to the shim for the frame bridge. Launcher selection lives in `_emulation/run_game.sh`; daemon logs land at `runs/<TS>/gl_daemon.log`.
-
-#### Wire protocol
-
-Header is 8 bytes little-endian: `{u16 op, u16 flags, u32 payload_len}` + payload. Flags: bit 0 = SYNC, bit 1 = HAS_DATA. Sync ops carry typed replies (`REP_OK`, `REP_VALUE`, `REP_LOC`, `REP_IDS`, `REP_PIXELS`, `REP_ERR`). Async ops are fire-and-forget. The opcode set covers EGL setup, GL state, object lifecycle, upload, draw + sync, uniforms, replies, and readback.
-
-#### Shim-side EGL synthesis
-
-The daemon owns the real EGL state. The shim returns FAKE_EGL_* sentinel handles for every EGL setup/query/teardown call (`eglGetDisplay`, `eglGetPlatformDisplay[EXT]`, `eglInitialize`, `eglBindAPI`, `eglChooseConfig`, `eglGetConfigs`, `eglGetConfigAttrib`, `eglQueryString`, `eglCreateContext`, `eglCreatePbufferSurface`, `eglCreateWindowSurface`, `eglMakeCurrent`, `eglSwapBuffers`, `eglSwapInterval`, `eglSurfaceAttrib`, `eglQuerySurface`, `eglGetError`, `eglTerminate`, `eglDestroyContext`, `eglDestroySurface`) so the qemu-side game/probe never sees the real EGL state on host. `glGet*` query hooks (`glGetIntegerv`, `glGetFloatv`, `glGetBooleanv`, `glGetString`, `glGetStringi`) return canned stub values in daemon mode — forwarding to uninit Mesa overlay returns garbage.
-
-#### Renderer state
-
-Daemon's `Renderer` tracks every id it hands out (programs, shaders, buffers, vaos, textures, framebuffers). On every `Session.bind()` after the first, `Renderer.reset()` deletes them all so each new client connection starts with a fresh GL state. Single-connection assumption: `Session.serve()` is called inline from accept loop, so two clients can't connect simultaneously, but state across sequential connections is reset.
-
-#### Buffer mapping (shadow path)
-
-`glMapBufferRange` / `glUnmapBuffer` cannot round-trip a host pointer. The shim instead allocates per-target scratch buffers (`shim_gl_map_table[8]`), returns the scratch pointer to the game, and on `glUnmapBuffer` with `GL_MAP_WRITE_BIT` set marshals the scratch contents via `OP_GL_BUFFER_SUB_DATA(target, offset, len, scratch)`.
-
-#### Zero/zero blend-factor handling
-
-During GL-daemon game runs, the renderer receives repeated `glBlendFunc(GL_ZERO, GL_ZERO)` calls. Applying that state literally keeps `GL_BLEND` enabled but makes subsequent draws compute `src * 0 + dst * 0`, which renders the attract scene black. Disabling `GL_BLEND` instead makes the scene visible but draws RGBA textures opaquely, exposing alpha-zero texels as black/white rectangular backgrounds around images and fonts.
-
-The verified daemon behavior is to ignore zero/zero blend-factor updates and leave the previous valid alpha blend state active:
-
-```text
-GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA
-```
-
-Launcher/runtime controls for this behavior live in `_emulation/run_game.sh`.
-
-`gl_daemon.py` also emits opt-in throttled logging for `glBindFramebuffer`, `glDrawArrays`/`glDrawElements`, `glBlendFunc`/`Separate`, `glBlitFramebuffer`, `glUniform4f`, `glUniform4fv`, `glProgramBinary`/`glGetProgramBinary`, plus an FBO-scan diagnostic that samples framebuffer pixels during readback for content sniffing. Toggle names and defaults live in `_emulation/run_game.sh`.
-
-*Verified by:* JOURNAL Step 96.1 (Phase 1–3c shim → daemon → Mesa pipeline + four self-contained probes `gles_probe3..6`), Step 96.2 (Phase 3d EGLImage marshal + frame-capture relay + `Renderer.reset`), Step 97 (Phase 3d game-run iteration: 97a EGL hook coverage, 97b query hook coverage, 97c ES3 context, 97d `glMapBufferRange` shadow buffer, 97e compressed-tex ctypes bypass, 97f full `comm -23` symbol audit closed), Step 98 plus `runs/2026-05-10T11.23.55_auto_service_back_zero_blend/gl_daemon.log` (`draw #12288` onward remains `blend=1 func=(0x302,0x303,0x302,0x303)` after Service Back).
-
-### Capture pipeline
-
-| Asset | Hook | Output |
-|---|---|---|
-| **DMD frames** (1024×256 BGRA) | `gbm_bo_map` detects 1024×256 ABGR8888 BO, returns `calloc(stride*height)`; capture in `gbm_bo_unmap` | `_emulation/dmd/frame_NNNNNN.bgra` (1 MB each) |
-| **Radium shaders** (12 programs / 24 shader objects per init) | `glShaderSource` — concatenate `count × string × length` args; type recorded in `glCreateShader` | `_emulation/shaders/shader_NNN_idM_typeXXXX.glsl` |
-| **Scene textures** (`StreamingImage` path, `glTexSubImage2D` at game VA `0x8a769c`) | `glTexImage2D` / `glTexSubImage2D` — dump `data` arg sized via GLES bytes-per-pixel table | `_emulation/textures/tex_NNNNNN_WxH_fmtXXXX_typeYYYY.raw` |
-| **Compressed textures** | `glCompressedTexImage2D` / `glCompressedTexSubImage2D` | `_emulation/textures/tex_compressed_NNNNNN_WxH_fmtXXXX.bin` |
-
-### Frame bridge wire format
-
-When the frame bridge is enabled, every 2nd `MODE_PAGE_FLIP` triggers `glReadPixels(0, 0, 1920, 1080)` from `shim_last_draw_fbo` (or current `READ_FRAMEBUFFER`) and writes one frame to `@pokemon_spike3_frame` (AF_UNIX abstract namespace). Under the host-native GL daemon, the readback is marshalled over `@spike3_gl` as a sync `OP_GL_READ_PIXELS`; the daemon executes it on its host-native ES3 context and ships the RGBA bytes back, which the shim then forwards to the frame bridge unchanged. Wire format:
-
-```
-+0x00  uint32 LE  magic = 0xF00FBABA
-+0x04  uint32 LE  seq number
-+0x08  uint16 LE  width  (= 1920)
-+0x0a  uint16 LE  height (= 1080)
-+0x0c  uint16 LE  fourcc (RGBA8)
-+0x0e  uint16 LE  flags
-+0x10  W*H*4 bytes  RGBA payload
-```
-
-Subscriber: `frame_viewer.py` (Tk + numpy + Pillow). Self-resolves the abstract socket name. Shows live frames in a 1920×1080 window (or fullscreen with `VIEWER_FULLSCREEN=1`).
-
-### Observed at runtime
-
-| Asset | Counts |
-|---|---|
-| Shader programs | 12 (24 shader objects: 12 vertex `type=0x8b31` + 12 fragment `type=0x8b30`) |
-| RGBA texture uploads | 16 textures at 1024×{64,128,256,512} for SternLogo splash (1920×1080) + UI surfaces |
-| `GL_LUMINANCE_ALPHA` 256×256 atlases | 79 — Nuklear font glyph atlases |
-| GBM BO sizes | 1024×256 (DMD), 1920×1080 (display) |
-
-The DMD pipeline (`DMDEmulationScene` ctor at `0x68ca40`): allocates 1 MB BGRA buffer at object offset +0x30 → `create_gbm_bo_and_upload @ 0x8ffe80` → `gbm_bo_map` writes pixel data row-by-row (with stride) → `gbm_bo_unmap` → `gbm_bo_get_fd` → DMA-BUF fd → `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` → `glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES)`.
-
-Shim's `gbm_bo_map` returns `calloc(stride*height)` backing; `gbm_bo_unmap` dumps to `_emulation/dmd/frame_NNNNNN.bgra` (1024 × 256 × 4 = 1 MB raw BGRA).
-
-*Verified by:* JOURNAL Step 24, 25.
+The game presents frames via Linux KMS/DRM with EGL on top of GBM and does its own real GLES rendering — no synthesized frames are fed to it. These are the game-binary functions in that path; how the shim stands in for the missing GPU (DRM ioctl synthesis, GBM/EGL/GLES hooks, the host GL daemon, frame capture) is in `../src/SHIM.md` "Display pipeline".
 
 ### Game-binary VA reference points
 
@@ -1426,7 +1144,7 @@ Shim's `gbm_bo_map` returns `calloc(stride*height)` backing; `gbm_bo_unmap` dump
 
 ---
 
-## 11. Game runtime model (switches, events, modes)
+## Game runtime model (switches, events, modes)
 
 The game runtime is built around three coupled subsystems:
 1. **Switch state array** — the in-memory mirror of every physical switch
@@ -1437,7 +1155,7 @@ Switches feed into events feed into cmodes; cmodes drive scene/display updates b
 
 ### Switch state array
 
-The game maintains an in-memory mirror of each physical switch's state. The array is populated by the UART cmd `0x27` receive path (netbridge → CPU, 1-byte status payload per poll cycle — see §4 Cmd 0x27); the specific decoder function that writes into this array is `sub_651610` (the "translator").
+The game maintains an in-memory mirror of each physical switch's state. The array is populated by the UART cmd `0x27` receive path (netbridge → CPU, 1-byte status payload per poll cycle — see "Cmd 0x27 LCD subprotocol (bridge handler)"); the specific decoder function that writes into this array is `sub_651610` (the "translator").
 
 `g_switch_state_array @ 0x4480220` is **an 8-byte POINTER**, not the array itself. The actual per-switch state structs live on the **heap** at `*(uint64_t*)0x4480220 + sw_id * 0x30`.
 
@@ -1851,17 +1569,6 @@ The remaining ~35 slots in the BDLMode vtable are uncategorized.
 - **Event registry** at `data_485ea80` — 206 event slots (indexed 0..0xce per `sub_9c11d0`'s bounds check). Each slot is the head of a priority-sorted linked list of `{callback_fn, priority, next_ptr}` triples. `sub_9c11d0` inserts by descending priority.
 - **Update registry** at `data_48c52c0` — 5 update-type slots (indexed 0-4). Each slot is a linked list of `{UpdateObject*, callback_fn, max_count, priority}`.
 
-### Driving cmode state from outside
-
-To simulate a switch event from an external source:
-
-1. Determine the event_id corresponding to the switch
-2. Call the linked list at `data_485ea80 + (event_id * 8)` — every registered handler fires in priority order
-3. Handlers call vtable methods on the 42 cmodes; cmode state changes
-4. Next tick, `sub_94f140` iterates and each cmode's `+0xd8` updates its display
-
-The shim's `state_bridge`, when launcher-enabled, polls cmode `+0x308` at 10 Hz and emits JSON deltas on `@pokemon_spike3_bridge`.
-
 ### Tech Alerts row dispatcher
 
 The Tech Alerts screen (rendered while the operator is in service mode) lists per-slot node-bus issues. Each row is formatted by `sub_7da460` as `"Check Node Board %d : %s"` (msgid `0x37f`). The screen reads from a per-slot struct array, applies a filter, and indexes into a 10-entry msgid table for the status string.
@@ -2001,128 +1708,11 @@ Status alone doesn't hide a row — `sub_7da460`'s "Not Responding/Not Registere
 
 ---
 
-## 12. Hardware shim coverage reference
+## Hardware reference (Stern Spike 3)
 
-The shim (`spi_shim.so`) intercepts every device the game expects and emulates it in software. The bulk of FS-level path remapping has been moved out of the shim entirely (see PROTOCOL §2 "One-time setup: bind-mount the sysroot") — the kernel resolves `/games`, `/connectivity`, `/data` via the mount table, and the shim now focuses on hardware emulation.
+Stern Spike 3 hardware, per the "SPIKE System and Node Guide" (Fall of the Empire manual §2). Platform-generic; Pokémon LE uses the same node architecture. This emulator runs the CPU side; the downstream nodes are not present, so the shim synthesizes their bus responses (`../src/SHIM.md`).
 
-### Game profile roadmap
-
-`_emulation/games/` is the start of the per-game abstraction layer. Today it contains `pokemon_le_machine.c/.h`, which acts as the Pokémon LE machine profile for cabinet inventory: switch IDs, driver IDs, lamp IDs, channel/bit mappings, manual IDs, and human-readable names.
-
-Long-term, this should evolve into the shim's explicit profile boundary rather than creating a second `profiles/` tree:
-
-```text
-_emulation/games/
-  machine_profile.h
-  pokemon_le.c
-  pokemon_le.h
-  starwars_le.c
-  starwars_le.h
-```
-
-The public shim-facing API should expose one selected runtime profile, for example:
-
-```c
-const machine_profile_t *shim_machine_profile_current(void);
-```
-
-That profile should contain both stable cabinet inventory data and per-binary runtime anchors: switch-array pointer VA, switch translator VA, boot-state mask VA, output-state VA, Start/coin/interlock helpers, and any other game-version-specific addresses currently hardcoded in the shim.
-
-Pattern scanning fits behind this boundary. Startup should identify the loaded game binary/version, select the best exact profile by hash/build/version, then resolve or verify runtime anchors with known byte/code patterns. If a required anchor cannot be resolved, the shim should fail closed with a clear log rather than silently applying a Pokémon LE 0.81 address to another binary.
-
-Current status: pathing and launch tooling are sysroot-generic; runtime anchors are still Pokémon LE 0.81-specific unless explicitly documented otherwise.
-
-### Per-device coverage
-
-| Device path | fd type | Purpose | Coverage |
-|---|---|---|---|
-| `/dev/spidev4.0` | fake fd `1023` | CPU-board 8-byte SPI polling (local switches, not node bus) | `MESSAGE_1` ioctl: default `rx[2] = 0x04` advances state machine. TX currently all-zeros (gated on bridge) |
-| `/dev/i2c-10` | fake fd `1022` | EEPROM at slave 0x57 | Read/write-back works; no real state maintained. **Persistence gap: writes vanish, no SIGTERM flush** |
-| `/dev/ttyAMA5` | real `socketpair(AF_UNIX, SOCK_STREAM)` | UART to netbridge (game gets sv[0], shim holds sv[1]) | Reads block naturally on the socketpair. Writes are intercepted by `shim_io.c::write` and routed to `synthesize_bridge_response` (see §4) |
-| `/dev/ttyAMA2` | real `socketpair(AF_UNIX, SOCK_STREAM)` | secondary UART path; no decoded protocol coverage in this document | Pass-through |
-| `/dev/dri/card1` | real `socketpair(AF_UNIX, SOCK_STREAM)` | DRM KMS display | DRM ioctls intercepted before they'd reach the socketpair. See §10 for the full DRM/GBM/EGL/GLES coverage |
-| `/dev/shim-v4l2-*` | fake fds `FAKE_FD_V4L2_MEDIA=1021` / `FAKE_FD_V4L2_VIDEO=1020` | V4L2 video device probes (Step 44) | All ioctls return `ENOTTY` |
-| `/dev/boot_display` | fake fd `FAKE_FD_BOOT_DISPLAY=1019` | boot_display ioctl surface | ioctls return 0; writes swallowed |
-| `/dev/snd/*` | (full ALSA stub via libasound symbols) | audio output | See §8 — 18 symbols stubbed; `snd_pcm_writei` paces, captures, optionally tees to bridge |
-| GPIO sysfs (`/sys/class/gpio/*/value`, `direction`, etc.) | fake fd pool `1000..1015` | direct GPIO access (e.g. for libgpiod) | Synthetic reads: `"0\n"` value, `"out\n"` direction. One-shot latch reset by `lseek(0)` |
-| libgpiod chardev (`/dev/gpiochip*`) | (Stub) | newer GPIO interface | output-only; reads not modeled |
-
-### Forward-decode bridge (host NVDEC)
-
-The game's HEVC and H.264 video decode paths are intercepted in-shim and routed to a host-side daemon over an abstract AF_UNIX socket, where decoding happens via NVDEC and the resulting RGBA frames (post-conversion) are shipped back to the game.
-
-| Component | File | Role |
-|---|---|---|
-| Shim client | `_emulation/shim_avforward.c` | C library inside `spi_shim.so`. 8-slot session table; each `avcodec_open2(HEVC \| H.264)` from the game allocates a slot and connects to `@spike3_decode`. `avcodec_send_packet` / `avcodec_receive_frame` (in `shim_patches.c`) dispatch into this TU. Every successful `avcodec_receive_frame` registers the decoded RGBA buffer in a sentinel-keyed side-table that `shim_gl::eglCreateImageKHR` later reads via the `EGL_DMA_BUF_PLANE0_FD_EXT` attrib. Builds a single-plane `AVDRMFrameDescriptor` (`DRM_FORMAT_ABGR8888`) into the per-session 528-byte buffer, points `frame->data[0]` at it. |
-| Host daemon | `_emulation/decode_daemon.py` | AF_UNIX server. Per-connection `Session` opens `av.codec.CodecContext.create("hevc_cuvid" \| "h264_cuvid", "r")` (codec_id mapped from the OPEN payload). NVDEC outputs are downloaded via `frame.reformat(format="rgba")` + `to_ndarray(format="rgba")` and sent back as a single tightly-packed RGBA8 plane (W·H·4 bytes). Doing the YUV→RGB on the host saves the cross-arch TCG translation cost of running the conversion inside qemu-aarch64 |
-| Launcher | `_emulation/run_game.sh` | Owns forward-decode daemon selection/defaults and launches the daemon before qemu when enabled |
-
-**Wire protocol** (length-prefixed messages on `@spike3_decode`):
-
-Each message is `[u32 type][u32 length][payload]` little-endian. Length is payload bytes only (header excluded).
-
-| Direction | Message (opcode) | Payload |
-|---|---|---|
-| Game → daemon | `REQ_OPEN` (0x01) | `u32 codec_id`, `u32 extradata_len`, extradata bytes |
-| | `REQ_PACKET` (0x02) | `i64 pts`, `i64 dts`, `u32 flags`, `u32 size`, packet bytes |
-| | `REQ_RECEIVE` (0x03) | (no payload) |
-| | `REQ_CLOSE` (0x04) | (no payload) |
-| | `REQ_FLUSH` (0x05) | (no payload — issued after `avcodec_flush_buffers`; resets the daemon's PyAV codec context for a post-seek packet stream) |
-| Daemon → game | `REP_OPEN_OK` (0x81) | (no payload) |
-| | `REP_PACKET_OK` (0x82) | (no payload — ack for `REQ_PACKET`) |
-| | `REP_FRAME` (0x83) | `i32 width`, `i32 height`, `i32 fmt` (`AV_PIX_FMT_RGBA` = 26), `i64 pts`, `u32 n_planes` = 1, then plane[0]: `u32 stride` = W·4, `u32 size` = W·H·4, RGBA bytes |
-| | `REP_OK` (0x84) | (no payload — ack for `REQ_CLOSE` and `REQ_FLUSH`) |
-| | `REP_ERR` (0xF0) | `i32 errno_or_avcode`, `u32 msg_len`, msg bytes |
-| | `REP_EAGAIN` (0xF1) | (no payload — packet queue empty, retry later) |
-| | `REP_EOF` (0xF2) | (no payload — codec drained, no more frames coming) |
-
-**libavcodec ABI offsets** the shim pokes (defined in `shim_avforward.c`):
-- `AVPacket`: `pts=8`, `dts=16`, `data=24`, `size=32`, `flags=40`
-- `AVFrame`: `data[8]=0`, `linesize[8]=64`, `width=104`, `height=108`, `format=116`, `pts=136`, `pkt_dts=144`
-
-When the daemon is unreachable, `avcodec_send_packet` / `avcodec_receive_frame` return `-EIO` and the game raises `SIGABRT` from `SpiVideoStreamDecoderBase`.
-
-*Verified by:* JOURNAL Step 87 — daemon round-trip 49 fps NVDEC against `Lake_01_22_26_h265.mp4` (1940×1100, extradata=2490B); real game run `runs/2026-05-06T12.45.39_hw_refactor` shows 449/551 frame/EAGAIN ratio across 1000 `avcodec_receive_frame` calls. RGBA single-plane wire format + host-side `frame.reformat('rgba')` introduced in JOURNAL Step 95 (alongside the `samplerExternalOES` shader-source rewrite that unblocks Mesa swrast sampling — see PROTOCOL §10 "Real-GL translation glue"); H.264 attract clips at 1360×768 and HEVC in-game clips at 1940×1100 / 1920×1080 confirmed flowing through the pipeline.
-
-### Host-native GL daemon (host Mesa)
-
-The game's GL/EGL traffic can route to a host-native daemon over an abstract AF_UNIX socket, or fall back to the in-process Mesa overlay path. Launcher selection/defaults live in `_emulation/run_game.sh`. See §10 "Host-native GL daemon" for full wire protocol + EGL synthesis + zero-blend handling.
-
-| Component | File | Role |
-|---|---|---|
-| Shim marshaller | `_emulation/shim_gl_marshal.c` | `shim_gl_marshal_active()` (lazy connect with 3× retry + dlsym fallback), `_send_async()`, `_send_sync()` with mutex |
-| Wire format | `_emulation/gl_proto.h` (C) + `_emulation/gl_proto.py` (Python) | 8-byte LE header `{u16 op, u16 flags, u32 payload_len}` + payload; opcode set covers EGL setup, state, objects, uploads, uniforms, draws, sync replies, and readback |
-| Host daemon | `_emulation/gl_daemon.py` | `Renderer` binds `EGL_PLATFORM_SURFACELESS_MESA` ES3 context (config `0x31DD`) and replays opcodes via PyOpenGL; `Session` is single-client; `Renderer.reset()` runs on every bind after the first. Compressed-tex uploads bypass PyOpenGL's `CompressedImageConverter` and call `libGLESv2.so.2` via raw ctypes |
-| Launcher | `_emulation/run_game.sh` | Owns GL-daemon selection/defaults and spawns the daemon before qemu when enabled |
-
-Coverage as of JOURNAL Step 97f: `comm -23` of every `gl*` / `egl*` symbol referenced in `game.elf` against `nm -D spi_shim.so` exports returns no rows — every gl/egl entry-point the game can call has a hook with a marshal path. Step 98 verified Pokémon LE attract after Service Back with daemon-mode alpha compositing preserved by the zero-blend handler.
-
-*Verified by:* JOURNAL Step 96.1 (initial stack landing — shim → daemon → host Mesa pipeline), Step 96.2 (frame-capture relay + `Renderer.reset` + EGLImage marshal), Step 97f (full game-vs-shim symbol audit + closed coverage gaps), Step 98 plus `runs/2026-05-10T11.23.55_auto_service_back_zero_blend`.
-
-### Runtime binary patches (`shim_patches.c`)
-
-| Patch | Gate | Target |
-|---|---|---|
-| memcpy NULL-guard | always on | silently no-op when src/dst NULL — fixes Godot DisplayRenderer thread crash on un-initialized TLS |
-| `avcodec_find_decoder_by_name` remap | launcher-controlled | `"hevc_v4l2request"` / `"hevc_v4l2m2m"` → `"hevc"` |
-| `get_format` callback NOP | launcher-controlled | At game VA `0x920cf0`, write `0xd503201f` (NOP) over `0x54ffff81` (`b.ne 0x920ce0`). Patched by `shim_patch_get_format_callback`, called from `shim_inject.c::shim_discovery_init_thread` after a 2 s sleep |
-
-In addition to the gated patches above, `shim_patches.c` installs:
-- **Passthrough hooks** for `avcodec_get_hw_config` and `av_hwdevice_ctx_create` — resolve via `dlvsym`, log call activity, forward to real libavcodec.
-- **Forward-decode interceptors** for `avcodec_send_packet` / `avcodec_receive_frame` — route to the host daemon via `shim_avforward.c` when launcher-enabled. Bridge unreachable returns `-EIO`. See "Forward-decode bridge" above.
-
-### Other hooks (in `spi_shim.c` + `shim_net.c`)
-
-| Hook | Behavior |
-|---|---|
-| `system()` | Blocks `openocd` and `/games/spike3/` shell-outs (returns 0 so the game thinks RP2040 flashing succeeded); rewrites `/connectivity/` paths in commands to `$SYSROOT/connectivity/` |
-| `pthread_create` | Forces `PTHREAD_INHERIT_SCHED` when caller passed `EXPLICIT_SCHED` (qemu-user lacks `CAP_SYS_NICE`; otherwise glibc would silently drop the thread → `data_4882108` never set → orchestrator loops forever). See §2 "Common gotchas" |
-| termios family | UART fd gets fake-OK because glibc INLINE_SYSCALLs bypass our ioctl hook |
-| ALSA | Full set of fake-success stubs; `snd_pcm_writei` captures + paces. See §8 |
-| GStreamer | passthrough+log on `init_check`/`factory_make`/`parse_launch`/`bin_add`/`element_link`/`set_state`/`deinit`. **Linked but unused in PLE 0.81** — no static callers in the game binary; gstreamer init never fires. The actual video path is 100% direct libavcodec via Stern's `spi_video_player` (`SpiVideoStreamDecoderBase` class) plus Radium's own `VideoStreamDecoder` |
-| `connect` / `getaddrinfo` (`shim_net.c`) | log-only passthrough for offline runs |
-
-### Hardware reference: Stern Spike 3 nodes
+### Node bus and node types
 
 Per Stern's "SPIKE System and Node Guide" (Fall of the Empire manual §2). Platform-generic; Pokémon LE uses the same node architecture.
 
@@ -2168,7 +1758,7 @@ Hex files in `games/pokemon_le/*.hex` follow `{function}node-{MCU_variant}-{vers
 | `tmc2590` | LPC1313 |
 | `tmc5041` | LPC1313 |
 
-Power-distribution firmware is separate at `spike3/powerdist/powerdist_ext.hex` (programmed via the powerdist node, not the main RS-485 bus). These hex files are flashed onto remote node MCUs by `mcp_nodebus_flash_node_firmware @ 0x8f5484` over the encrypted node-bus channel (see §5.1) during commissioning. Not emulated by the shim.
+Power-distribution firmware is separate at `spike3/powerdist/powerdist_ext.hex` (programmed via the powerdist node, not the main RS-485 bus). These hex files are flashed onto remote node MCUs by `mcp_nodebus_flash_node_firmware @ 0x8f5484` over the encrypted node-bus channel (see "NODEBUS_Cipher — Stern’s per-slot XOR stream cipher") during commissioning. Not emulated by the shim.
 
 *Verified by:* `ls games/pokemon_le/*.hex` — 17 files matching the table above.
 
@@ -2192,7 +1782,7 @@ CN6 LCD resolution jumpers (JP1):
 | JMP1 | 1024 × 600 | Spike 3 10" Home Edition |
 | JMP0 + JMP1 | 800 × 480 | Spike 2 7.6" Home Edition |
 
-This **directly matches** the Radium FrameSize distribution (§9): 1920×1080 (12 scenes, HDMI 1), 1360×768 (22 scenes, CN6 default for PLE), 800×480 (1 scene, boot-splash), 454×256 (1 scene, speaker panel — separate from CN6).
+This **directly matches** the Radium FrameSize distribution (see "FrameSize distribution"): 1920×1080 (12 scenes, HDMI 1), 1360×768 (22 scenes, CN6 default for PLE), 800×480 (1 scene, boot-splash), 454×256 (1 scene, speaker panel — separate from CN6).
 
 The shim's current `/dev/dri/card1` reports 1 CRTC + 2 connectors both connected at 1920×1080. That covers the primary backbox; HDMI 0 (AUX), CN6 (playfield LCD), and DMD (1024×256 / 454×256) are handled via separate paths (GBM/EGL for DMD, GL pipeline for everything else).
 
@@ -2211,7 +1801,7 @@ Status LED (D2) blink codes (real-hardware debug only):
 - Runtime mode: 1 Hz slow blink, 75% duty
 - Error: pattern of blinks with long pauses
 
-**Emulation:** the shim returns synthetic pwrdist responses for cmds 0x10/0x15/0x16/0x18/0x1c/0x1d (see §4). The visible 48V gameplay gate is currently satisfied by the CPU switch-matrix interlock (`0-SW-23` / `sw_id=98`) rather than by the `0x1d` four-byte payload alone; `0x1d=ff ff ff ff` still shows the warning if `sw_id=98` remains open.
+**Emulation:** the shim returns synthetic pwrdist responses for cmds 0x10/0x15/0x16/0x18/0x1c/0x1d (see "CPU ↔ netbridge UART bridge protocol"). The visible 48V gameplay gate is currently satisfied by the CPU switch-matrix interlock (`0-SW-23` / `sw_id=98`) rather than by the `0x1d` four-byte payload alone; `0x1d=ff ff ff ff` still shows the warning if `sw_id=98` remains open.
 
 ### Persistence gap
 
@@ -2230,7 +1820,7 @@ Persistence follow-up experiments belong in `JOURNAL.md` until verified.
 
 ---
 
-## 13. Comparison binaries (SW LE 0.85)
+## Comparison binaries (SW LE 0.85)
 
 The emulator's correctness target is "boot ANY Spike 3 game to attract." Every claim about Stern-shared code (proc system, IScene base class, DisplayRenderer, SceneCache, RadiumScene, node-bus, SPI, audio) should reproduce in **Star Wars LE 0.85.0** because both games run the same Stern stack. SW LE has **zero Godot** in its binary (vs Pokémon LE's 457 "godot" string hits) — making it the cleanest A/B target for "what is Pokémon-port glue vs. shared Stern?"
 
@@ -2271,6 +1861,6 @@ The DisplayRenderer / SceneCache / RadiumScene / proc-system / node-bus / SPI / 
 
 ### Per-game firmware versions
 
-Each Spike 3 game ships its own set of node firmware `.hex` files (the per-family files described in §11). Pokémon LE 0.81 ships `1_31_0` for every node family. The shim's FE-probe synth reads version bytes from the loaded firmware records at runtime (`shim_nodebus.c::nodebus_version_for_slot()` walks `data_44df838`, mirrors `sub_8f88b0`'s simple/complex path logic), so the version response is sourced from the running game's loaded firmware records instead of a Pokémon-specific version constant.
+Each Spike 3 game ships its own set of node firmware `.hex` files (the per-family files described in "Node firmware files (this build)"). Pokémon LE 0.81 ships `1_31_0` for every node family. The shim's FE-probe synth reads version bytes from the loaded firmware records at runtime (`shim_nodebus.c::nodebus_version_for_slot()` walks `data_44df838`, mirrors `sub_8f88b0`'s simple/complex path logic), so the version response is sourced from the running game's loaded firmware records instead of a Pokémon-specific version constant.
 
 *Verified by:* JOURNAL Step 92 — runtime version-byte probe of all 6 loaded records in PLE 0.81 producing `(V1, V2, V3, V0)` matching the shipped `1_31_0` filenames; shim implementation in `shim_nodebus.c::nodebus_version_for_slot()`.

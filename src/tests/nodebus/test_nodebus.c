@@ -11,7 +11,7 @@
  *
  * This is the layer-1+2 pilot from the nodebus TDD plan: the framing
  * primitives (escape codec, sum-zero checksum) and the bridge-level command
- * contracts that PROTOCOL §4 already pins down. cmd-0x41 inner-command
+ * contracts that PROTOCOL.md "CPU ↔ netbridge UART bridge protocol" already pins down. cmd-0x41 inner-command
  * contracts come in a later increment, after the live-capture catalog and
  * after the relevant game-side validators are re-verified against the binary.
  *
@@ -155,7 +155,7 @@ static void expect_no_reply(uint8_t cmd, uint8_t id, const uint8_t *reqp, size_t
 
 static void test_bridge_checksum(void) {
     g_begin("bridge_checksum");
-    /* PROTOCOL §4 worked examples: (CMD + ID + cksum) ≡ 0 (mod 256). */
+    /* PROTOCOL.md "CPU ↔ netbridge UART bridge protocol" worked examples: (CMD + ID + cksum) ≡ 0 (mod 256). */
     CHECK(bridge_checksum((const uint8_t[]){0x30, 0x01}, 2) == 0xcf, "0x30+0x01 -> 0xcf");
     CHECK(bridge_checksum((const uint8_t[]){0x20, 0x01}, 2) == 0xdf, "0x20+0x01 -> 0xdf");
     CHECK(bridge_checksum((const uint8_t[]){0x10, 0x01}, 2) == 0xef, "0x10+0x01 -> 0xef");
@@ -178,7 +178,7 @@ static void test_escape_decode(void) {
      * logical = 02 1b 05 e0 03; wire = 02 1b 9b 05 e0 03. */
     n = bridge_decode_escape((const uint8_t[]){0x02,0x1b,0x9b,0x05,0xe0,0x03}, 6, out, sizeof out);
     CHECK(n == 5 && out[1]==0x1b && out[2]==0x05, "0x1b9b in payload -> 0x1b");
-    /* a frame with no reserved bytes passes through unchanged (PROTOCOL §4 example) */
+    /* a frame with no reserved bytes passes through unchanged (PROTOCOL.md "CPU ↔ netbridge UART bridge protocol" example) */
     CHECK(bridge_decode_escape((const uint8_t[]){0x02,0x30,0x01,0xcf,0x03}, 5, out, sizeof out) == 5
           && out[0]==0x02 && out[1]==0x30 && out[2]==0x01 && out[3]==0xcf && out[4]==0x03,
           "02 30 01 cf 03 unchanged");
@@ -228,7 +228,7 @@ static void test_cipher_involution(void) {
     g_begin("nodebus_cipher_decrypt (involution)");
     /* XOR cipher is its own inverse regardless of key/mask details, so a
      * double-apply must be the identity. (The exact mask formula vs. the
-     * §5.1 reference still needs binary re-verification — phase 2.) */
+     * "NODEBUS_Cipher — Stern's per-slot XOR stream cipher" reference still needs binary re-verification — phase 2.) */
     for (uint8_t slot = 0; slot < 16; slot += 3) {
         for (uint8_t ilen = 1; ilen <= 17; ilen += 4) {
             uint8_t orig[32], buf[32];
@@ -255,21 +255,21 @@ static void test_cmd_27_alternates(void) {
 
 static void test_cmd_30_crc32(void) {
     g_begin("cmd 0x30 (netbridge CRC32 handshake)");
-    /* PROTOCOL §4: response cmd 0x20, payload = NETBRIDGE_CRC32 little-endian. */
+    /* PROTOCOL.md "CPU ↔ netbridge UART bridge protocol": response cmd 0x20, payload = NETBRIDGE_CRC32 little-endian. */
     uint8_t crc_le[4] = {0x27, 0x53, 0x7f, 0x35};   /* 0x357f5327 LE */
     expect_reply(0x30, 0x01, NULL, 0, 0x20, crc_le, 4, "cmd 0x30 -> cmd 0x20 + CRC32 LE");
 }
 
 static void test_cmd_10_pwrdist_version(void) {
     g_begin("cmd 0x10 (pwrdist version)");
-    /* PROTOCOL §4 "Pwrdist 'present' response payload": 7 bytes, byte0=0x01. */
+    /* PROTOCOL.md "CPU ↔ netbridge UART bridge protocol" "Pwrdist 'present' response payload": 7 bytes, byte0=0x01. */
     uint8_t pl[7] = {0x01, 0, 0, 0, 0, 0, 0};
     expect_reply(0x10, 0x01, NULL, 0, 0x10, pl, 7, "cmd 0x10 -> 7-byte present payload");
 }
 
 static void test_cmd_16_status(void) {
     g_begin("cmd 0x16 (pwrdist boot/runtime version)");
-    /* PROTOCOL §4 "Cmd 0x16 response payload": 01 00 02 00 (rx[0]>0, rx[2]==2). */
+    /* PROTOCOL.md "CPU ↔ netbridge UART bridge protocol" "Cmd 0x16 response payload": 01 00 02 00 (rx[0]>0, rx[2]==2). */
     uint8_t reqp[1] = {0x00};
     expect_reply(0x16, 0x01, reqp, 1, 0x16, (const uint8_t[]){0x01, 0x00, 0x02, 0x00}, 4, "cmd 0x16 -> 01 00 02 00");
 }
@@ -296,7 +296,7 @@ static void test_cmd_11_1c_zero_acks(void) {
 static void test_cmd_20_hw_version(void) {
     g_begin("cmd 0x20 (hw version — note: replies with cmd 0x10)");
     /* The shim answers cmd 0x20 with response cmd 0x10 + 4 zero bytes. PROTOCOL
-     * §4 flags this as a divergence from the bridge's real reply; the test
+     * "CPU ↔ netbridge UART bridge protocol" flags this as a divergence from the bridge's real reply; the test
      * pins the current behavior so a future fix is a deliberate change. */
     uint8_t z4[4] = {0, 0, 0, 0};
     expect_reply(0x20, 0x01, NULL, 0, 0x10, z4, 4, "cmd 0x20 -> cmd 0x10 + 4 zero bytes");
