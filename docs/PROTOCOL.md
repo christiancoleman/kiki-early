@@ -1210,7 +1210,7 @@ So channels 0 and 1 (CPU SPI) are re-read at the tail of each enumeration pass �
 
 `translate_switch_state_changes(channel, buf8) @ 0x651610` is the one that mutates `g_switch_state_array`: holds mutex `0x4480240`, diffs `buf8` against the per-channel raw-byte cache at `0x44804b8`, maps each changed `(channel, byte, bit)` to a `sw_id` via the lookup table at `0x44804e0`, and for a non-disabled switch (`+0x2a & 1 == 0` and disable-mask `0x4480228[sw_id] & 1 == 0`) increments `+0x26 edge_counter` and — if it was 0 — links the entry onto the pending-edge queue (head `0x4480278`, linked via `+0x08`). `drain_pending_switch_events @ 0x6511c0` walks that queue and calls `sub_729c10(event_id, handler_fn, priority)` per entry (Stage 2 below).
 
-*Verified by:* JOURNAL Step 112 — BN/Ghidra call-graph walk from `read_switch_state` / `translate_switch_state_changes` up to `primary_initialization_orchestrator`; decompiles of `mcp_nodebus_thread_main` / `mcp_poll_all_node_switch_channels` / `poll_hardware_switches`.
+*Verified by:* JOURNAL Step 112 — BN/Ghidra call-graph walk from `read_switch_state` / `translate_switch_state_changes` up to `primary_initialization_orchestrator`; decompiles of `mcp_nodebus_thread_main` / `mcp_poll_all_node_switch_channels` / `poll_hardware_switches`. JOURNAL Step 116 — the shim's switch dump (which calls the live `read_switch_state`) over a Service-Menu run: 0 logical/raw mismatches across all switches, and the `logical=1` set matched the on-screen switch-test grid switch-for-switch.
 
 #### Runtime switch table — full sw_id → channel/byte/bit mapping
 

@@ -347,27 +347,36 @@ void shim_switch_dump(uintptr_t game_base, const char *reason) {
         uint8_t okv     = shim_switch_read_ok(game_base, sw_id);
         uint8_t expect  = shim_switch_logical_from_raw(raw_state, invert);
         const ple_switch_t *m = ple_lookup_switch_by_channel_bit(channel_id, bit_idx);
-        const char *manual    = m ? m->manual_id : "?";
-        const char *name      = m ? m->name : "(unknown)";
-        uint64_t handler_va   = handler_fn ? handler_fn - game_base : 0;
-        const char *flagtxt   = (logical == expect) ? "" : " MISMATCH";
+        const char *id      = m ? m->manual_id : "?";   /* switch-test callout, e.g. "93" / "C24" */
+        const char *addr    = m ? m->address   : "?";   /* wiring address, e.g. "1-SW-11" */
+        const char *name    = m ? m->name      : "(unknown)";
+        uint64_t handler_va = handler_fn ? handler_fn - game_base : 0;
+        const char *flagtxt = (logical == expect) ? "" : " MISMATCH";
         if (logical != expect) mismatches++;
 
-        SHIM_LOG("[switch_dump] sw_id=%3d %-8s ch=%u byte=%u bit=%u  raw=%u logical=%u ok=%u invert=%u%s  cfg=%p handler=0x%lx param=0x%lx evt=0x%04x prio=0x%04x flag2e=0x%04x flag30=0x%02x  \"%s\"",
-                 sw_id, manual, channel_id,
+        SHIM_LOG("[switch_dump] id=%-4s %-8s ch=%u byte=%u bit=%u  raw=%u logical=%u ok=%u invert=%u%s  cfg=%p handler=0x%lx param=0x%lx evt=0x%04x prio=0x%04x flag2e=0x%04x flag30=0x%02x  \"%s\" (slot %d)",
+                 id, addr, channel_id,
                  (unsigned)(bit_idx >> 3), (unsigned)(bit_idx & 7),
                  raw_state, logical, okv, invert, flagtxt,
                  (void *)(uintptr_t)config_ptr_raw, (unsigned long)handler_va,
                  (unsigned long)param_2, event_id, priority, flags_2e, flags_30,
-                 name);
+                 name, sw_id);
 
-        if (logical && alen < (int)sizeof(active_log) - 8) {
-            int n = snprintf(active_log + alen, sizeof(active_log) - alen, " %d", sw_id);
-            if (n > 0) alen += n;
-        }
-        if (logical && okv && aolen < (int)sizeof(active_ok) - 8) {
-            int n = snprintf(active_ok + aolen, sizeof(active_ok) - aolen, " %d", sw_id);
-            if (n > 0) aolen += n;
+        /* The summaries list switch-test callouts (what's on the menu), not
+         * heap-array indices. Switches with no manual entry (ch4) fall back to
+         * "ch<c>b<b>" so they're still identifiable. */
+        if (logical) {
+            char tag[16];
+            if (m) snprintf(tag, sizeof(tag), " %s", m->manual_id);
+            else   snprintf(tag, sizeof(tag), " ch%ub%u", channel_id, bit_idx);
+            if (alen < (int)sizeof(active_log) - (int)sizeof(tag)) {
+                int n = snprintf(active_log + alen, sizeof(active_log) - alen, "%s", tag);
+                if (n > 0) alen += n;
+            }
+            if (okv && aolen < (int)sizeof(active_ok) - (int)sizeof(tag)) {
+                int n = snprintf(active_ok + aolen, sizeof(active_ok) - aolen, "%s", tag);
+                if (n > 0) aolen += n;
+            }
         }
         valid++;
     }
@@ -481,12 +490,16 @@ static void *shim_machine_dump_thread(void *arg) {
             }
         }
         if (found_sw_id >= 0) {
-            SHIM_LOG("[machine_dump] SW %-7s ch=%u bit=%2u sw_id=%3d  %s",
-                     m->manual_id, m->channel, m->bit_idx, found_sw_id, m->name);
+            const char *mismatch = (m->sw_id_runtime != 0 &&
+                                    (int)m->sw_id_runtime != found_sw_id)
+                                   ? "  !! profile sw_id_runtime disagrees" : "";
+            SHIM_LOG("[machine_dump] SW %-4s (%-8s) ch=%u bit=%2u  runtime=%3d (profile=%u)  %s%s",
+                     m->manual_id, m->address, m->channel, m->bit_idx,
+                     found_sw_id, m->sw_id_runtime, m->name, mismatch);
             matched++;
         } else {
-            SHIM_LOG("[machine_dump] SW %-7s ch=%u bit=%2u sw_id=---  %s  (MISSING from runtime)",
-                     m->manual_id, m->channel, m->bit_idx, m->name);
+            SHIM_LOG("[machine_dump] SW %-4s (%-8s) ch=%u bit=%2u  runtime=--- (profile=%u)  %s  (MISSING from runtime)",
+                     m->manual_id, m->address, m->channel, m->bit_idx, m->sw_id_runtime, m->name);
             missing++;
         }
     }

@@ -13,9 +13,13 @@ Usage:
 """
 
 import datetime
+import json
 import os
 import pathlib
+import queue
+import socket
 import subprocess
+import threading
 import time
 import tkinter as tk
 
@@ -36,6 +40,13 @@ _SYSROOT = pathlib.Path(os.environ.get("SPIKE3_SYSROOT", _HERE.parent.parent.par
 GAME_LOG_PATH = os.environ.get("SPIKE3_GAME_LOG_PATH", str(_HERE / "runs" / "latest" / "game.log"))
 PRESS_REQUEST_PATH = os.environ.get("SHIM_PRESS_REQUEST_PATH", str(_HERE / "runs" / "latest" / "press_request.txt"))
 ERROR_LOG_PATH = str(_SYSROOT / "tmp" / "marker_button_errors.log")
+
+# Live switch-state feed: the shim's devbus bridge (see nodebus/shim_devbus.c /
+# devbus_subscriber.py). We connect read-only, take the initial `snapshot`, and
+# then apply `switch_change` events to colour the canvas by the game's actual
+# state. Unavailable until ~5 s into the run (the watcher binds late) and absent
+# entirely when DEVBUS=0 — the canvas just falls back to requested-state then.
+_DEVBUS_ABSTRACT = "\0pokemon_spike3_devbus"
 
 
 def now_timestamp():
@@ -402,6 +413,63 @@ def _make_round_hold_button(parent, row, label, fill, fg, held_set,
     return canvas
 
 
+def _devbus_feed_thread(state_queue: queue.Queue):
+    """Daemon thread: subscribe to @pokemon_spike3_devbus and push (sw_id, is_on).
+
+    Applies the initial `snapshot` and every `switch_change`; reconnects on drop
+    (the watcher binds ~5 s into the run, and is absent when DEVBUS=0). Pushes
+    onto state_queue rather than touching Tk directly — the GUI drains the queue
+    on its own thread via root.after.
+    """
+    while True:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(_DEVBUS_ABSTRACT)
+            log_error("devbus feed connected")
+            buf = b""
+            while True:
+                chunk = sock.recv(8192)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    ev = msg.get("event")
+                    if ev == "snapshot":
+                        switches = msg.get("switches") or []
+                        for s in switches:
+                            sid = s.get("sw_id")
+                            if sid is not None:
+                                state_queue.put((int(sid), bool(s.get("logical"))))
+                        if not switches:
+                            # Connected before the watcher seeded its shadow; the
+                            # snapshot is empty and there'll be no further events
+                            # for already-on switches. Reconnect to get a real one.
+                            raise ConnectionResetError("empty snapshot — watcher not seeded yet")
+                    elif ev == "switch_change":
+                        sid = msg.get("sw_id")
+                        if sid is not None:
+                            state_queue.put((int(sid), bool(msg.get("logical"))))
+        except (FileNotFoundError, ConnectionRefusedError, OSError):
+            pass
+        except Exception as e:  # noqa: BLE001 — log and retry, never kill the GUI
+            log_error(f"devbus feed error: {type(e).__name__}: {e}")
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        time.sleep(1.0)
+
+
 def main():
     log_error(f"STARTED pid={os.getpid()} GAME_LOG_PATH={GAME_LOG_PATH} "
               f"PRESS_REQUEST_PATH={PRESS_REQUEST_PATH} "
@@ -415,9 +483,8 @@ def main():
     elapsed_var = tk.StringVar(value="T+0:00.0")
     status_var = tk.StringVar(value="Click a switch box to toggle requested ON/OFF.")
     detail_var = tk.StringVar(
-        value="Select a switch. White = requested ON. Dark red = requested OFF. "
-              "GRAB STATE dumps the game's actual switch states to game.log ([switch_dump]); "
-              "an on-canvas overlay of that is a future devbus feed."
+        value="White = the game reads this switch ON (live devbus feed). Dark red = OFF. "
+              "Click a box to request a press; GRAB STATE also dumps the full state to game.log."
     )
     switch_test_var = tk.BooleanVar(value=False)
     observed_var = tk.StringVar(value="")
@@ -425,6 +492,9 @@ def main():
     held_switches: set[int] = set()
     requested_on: set[str] = set()
     cell_items = {}
+    game_state: dict[str, bool] = {}        # callout-key (upper) -> the game's read_switch_state
+    selected_key = [None]                   # mutable cell: the currently-selected switch's callout key
+    state_queue: queue.Queue = queue.Queue()  # (sw_id, is_on) tuples from the devbus thread
 
     title_frame = tk.Frame(root)
     title_frame.pack(padx=10, pady=(6, 2), fill=tk.X)
@@ -475,9 +545,43 @@ def main():
     hscroll.pack(side=tk.BOTTOM, fill=tk.X)
     _render_switch_canvas(switch_canvas, layout_rows, cell_items, requested_on)
 
+    def cell_fill_state(key):
+        # The game's actual state when the devbus feed has reported it; the
+        # requested state otherwise (so the canvas degrades gracefully with no
+        # game running / DEVBUS=0).
+        return game_state.get(key, key in requested_on)
+
+    def refresh_cell(key):
+        _set_canvas_switch_state(switch_canvas, cell_items, key, cell_fill_state(key))
+
+    def apply_devbus_state(sw_id, is_on):
+        row = SWITCH_BY_RUNTIME_ID.get(sw_id)
+        if row is None:
+            return
+        key = str(row[0]).upper()
+        prev = game_state.get(key)
+        game_state[key] = is_on
+        if prev != is_on:
+            refresh_cell(key)
+            if selected_key[0] == key:
+                r = SWITCH_BY_MANUAL_ID.get(key)
+                if r is not None:
+                    detail_var.set(_compact_detail(r, requested_on=(key in requested_on),
+                                                   actual_on=is_on))
+
+    def drain_state_queue():
+        try:
+            while True:
+                sid, on = state_queue.get_nowait()
+                apply_devbus_state(sid, on)
+        except queue.Empty:
+            pass
+        root.after(80, drain_state_queue)
+
     def select_switch(row, toggle=False):
         manual_id, address, sw_id, name, conn, loc, typ = row
         key = manual_id.upper()
+        selected_key[0] = key
         if toggle and sw_id is not None:
             if key in requested_on:
                 requested_on.discard(key)
@@ -489,10 +593,11 @@ def main():
                 held_switches.add(sw_id)
                 write_switch_command("down", sw_id, name, elapsed_var, status_var,
                                      count_ref, switch_test_var, observed_var)
-            _set_canvas_switch_state(switch_canvas, cell_items, key, key in requested_on)
+            refresh_cell(key)
         elif toggle:
             status_var.set(f"{manual_id} {address} is not mapped to a runtime sw_id.")
-        detail_var.set(_compact_detail(row, requested_on=(key in requested_on)))
+        detail_var.set(_compact_detail(row, requested_on=(key in requested_on),
+                                       actual_on=game_state.get(key)))
 
     for _title, row in layout_rows:
         for manual_id, switch_row in row:
@@ -599,6 +704,13 @@ def main():
                                  elapsed_var, status_var, count_ref,
                                  switch_test_var, observed_var)
         root.destroy()
+
+    # Live switch-state feed: a daemon thread subscribes to the devbus bridge
+    # and pushes (sw_id, is_on) onto state_queue; the Tk loop drains it and
+    # recolours canvas cells by the game's actual read_switch_state.
+    threading.Thread(target=_devbus_feed_thread, args=(state_queue,),
+                     daemon=True).start()
+    root.after(300, drain_state_queue)
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()

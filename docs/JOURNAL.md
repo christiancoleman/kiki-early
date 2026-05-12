@@ -10,7 +10,7 @@ Step-by-step log of the emulation exploration for running the Pokemon Pinball `g
 
 ## Reading the journal
 
-The entries present at this revision are retained, including historical numbering quirks. These are historical working notes:
+All 116 original step numbers are retained. These are historical working notes:
 hypotheses, confident conclusions and address conventions can be corrected by
 later entries. Their wording is not a fresh validation of the implementation.
 Original subsection numbers are retained even where they differ from the parent
@@ -9843,3 +9843,48 @@ Docs: `src/SHIM.md` (`shim_switches.c` + `shim_inject.c` rows — the new helper
 ### Next
 
 You do a Service-Menu run with `TIMER=ON` (coin door defaults closed = "switch off"), click **GRAB STATE** while looking at the menu, and we diff the `[switch_dump]` `active(logical=1):` set against the known coin-door-closed Service-Menu set (the coin-door-open set minus sw_id 98 — PROTOCOL "Runtime switch table" has the open set: `25,26,27,28,29,30,31,32,63,69,70,74,98`). Match ⇒ the switch-read path is verified end-to-end; mismatch ⇒ the discrepancy is in the *raw bytes* our synth puts on the wire (or the idle/correction buffers), not the read path. Then: the GUI-overlay feed, or back to nodebus proper.
+
+## Step 115: First GRAB STATE: 0 logical/raw mismatches; switch profile now carries cabinet callouts (machine_profile.c <-> switch_profile.py), dump speaks callouts; open: 1-SW-2 callout 90 vs 89 (2026-05-12)
+
+First GRAB STATE worked (run `2026-05-12T18.15.13`): `[switch_dump]` enumerated 98 valid entries, **0 logical/raw mismatches** — `read_switch_state @ 0x650850` (called live) agrees with `fold(raw +0x28, invert)` for every switch, so the read path is internally sound. `active(logical=1)` (runtime indices) = `25 26 27 28 29 30 31 32 63 69 70 74 77 78 98`. The user confirmed the on-screen Service-Menu switch-test lit set as: the expected idle group plus two anomalies (a Cabinet button and Start Button), which on the *real* machine "shouldn't be on normally" — a raw-byte/idle-correction issue for later, not a read-path issue.
+
+Two corrections came out of it:
+
+### Callout mapping — `machine_profile.c` now carries the switch-test number
+
+The switch test menu (and the TIMER GUI) label switches by their **cabinet callout** ("93" Start, "C24" Coin Door Interlock, …), not by the game's heap-array index (78, 98). `switch_profile.py` (the Python view) already had `(callout, address, runtime_sw_id, name, …)`; the C `ple_switches[]` only had the wiring address (`"1-SW-11"`) under a field misleadingly named `manual_id`. Fixed:
+- `ple_switch_t` → `{const char *manual_id /* callout, "93"/"C24" */; const char *address /* "1-SW-11" */; const char *name; uint8_t channel, bit_idx; uint16_t sw_id_runtime; }`.
+- `ple_switches[]` regenerated from `switch_profile.py` (callout + address + name + channel/bit derived from the address + runtime sw_id) — the two now hold the same data; a comment says keep them in sync. (Channel-4 / QR-Reader-node switches aren't in the printed manual and stay out; the dump shows them as `(unknown)` + raw `ch<c>b<b>`.)
+- `shim_switch_dump` now leads each line with `id=<callout> <address> … "<name>" (slot N)` — the heap index relegated to a trailing `(slot N)` — and the `active(logical=1):` / `active+ok:` summaries list **callouts** (e.g. `11 12 15 16 17 18 19 20 61 71 72 78 C24 90 93`), so the output reads against the menu directly. `shim_machine_dump_thread` likewise: `SW <callout> (<address>) … runtime=N (profile=M)` with a `!! profile sw_id_runtime disagrees` flag (now that `ple_switches[].sw_id_runtime` is populated, it's a live profile↔runtime cross-check).
+
+### Open: callout for `1-SW-2` (Action Button) — 90 (printed manual / PROTOCOL / `switch_profile.py`) vs 89 (reportedly the game's switch-test screen)
+
+The dump's `active(logical=1)` in callouts is `{11, 12, 15, 16, 17, 18, 19, 20, 61, 71, 72, 78, C24, 90, 93}` — i.e. the expected idle 13 + the two cabinet anomalies at channel-1 bit 2 (`1-SW-2`, runtime slot 77, "Action Button") and bit 11 (`1-SW-11`, slot 78, "Start Button"). Slot 78 = callout **93** in both our profile and on screen ✓. Slot 77 = callout **90** in our profile (printed manual + PROTOCOL "Manual switch inventory" both say `1-SW-2 → 90`), but the on-screen menu reportedly shows **89** for that switch. So we're reading the *right physical switches* — the disagreement is purely the *number* `1-SW-2` carries: 90 (manual) vs 89 (game). Not yet resolved — needs a screenshot/confirmation; if the game's menu genuinely says 89, the game's number wins and `switch_profile.py` + `machine_profile.c` + PROTOCOL's table get `1-SW-2 → 89`. (Note a numbering collision to be careful of: *callout* 98 = `1-SW-17` Center Coin; *runtime sw_id* 98 = `0-SW-23` / callout C24 Coin Door Interlock. The dump now always labels by callout to avoid this.)
+
+### Verification
+
+`./build.sh` → `spi_shim.so` 375568 B, clean. `tests/run_tests.sh` → 135 + 21 + 47 + 243 + 6 green. (No `[switch_dump]` re-run done — the array contents are unchanged; the next GRAB STATE will just print the new callout labels.)
+
+PROTOCOL "Switch state array" → "Manual switch inventory" already lists the callouts (`Manual ID` column); the C profile now matches it (and `switch_profile.py`). No PROTOCOL edit this step beyond what Step 114 added — the `1-SW-2 → 89?` question, if confirmed, will update PROTOCOL's table.
+
+## Step 116: Switch read path verified end-to-end (0 mismatches, dump active set == on-screen Service-Menu set; '89' was a misread for 90); TIMER GUI now overlays live game switch state via the devbus feed (2026-05-12)
+
+### Read path: verified end-to-end
+
+The first GRAB STATE dump (Step 115) had **0 logical/raw mismatches** across all 98 switches — `read_switch_state @ 0x650850` (called live) agrees with `fold(raw +0x28, invert)` everywhere. And the dump's `active(logical=1)`, re-labelled to cabinet callouts, is `{11, 12, 15, 16, 17, 18, 19, 20, 61, 71, 72, 78, C24, 90, 93}` — which the user confirmed matches the actual Service-Menu switch-test screen exactly. The "89" earlier reported as one of the anomalous-lit switches was a misread for **90** (`1-SW-2`, Action Button); the printed manual, PROTOCOL's "Manual switch inventory", and `switch_profile.py` all say `1-SW-2 → 90`, which stands — no profile change.
+
+**Conclusion: this is definitively how the game reads switch state, and it's correct in the Service Menu.** Therefore, when nodebus logic built on switch state misbehaves, the bug is *not* in the read path — it's in (i) the raw bytes our synth puts on the wire, (ii) the idle / electrical-polarity correction buffers, (iii) the nodebus protocol layer, or (iv) game logic downstream of the read. The switch-read partition is closed.
+
+(Separate, not a read-path issue, flagged for later: at idle in the Service Menu the dump shows callouts **90 (Action Button)** and **93 (Start Button)** as `logical=1` when on a real cabinet those momentary NO buttons should read off — that's the channel-1 idle-correction synthesis in `shim_switches.c::shim_switch_apply_default_idle_corrections` over-forcing ch1 bits 2 & 11 low.)
+
+### GUI: live switch-state overlay in the TIMER panel
+
+`tools/marker_button.py` now subscribes (daemon thread) to the `@pokemon_spike3_devbus` bridge — the same feed `nodebus/devbus_subscriber.py` consumes — takes the initial `snapshot`, applies every `switch_change`, and colours each canvas cell by the game's actual `read_switch_state` (white = on, dark red = off). It maps the devbus `sw_id` to a cabinet callout via `SWITCH_BY_RUNTIME_ID` (so cells key the same way the layout grid does) and wires the detail panel's "Game state:" slot (was a "future devbus feed" placeholder). Tk-thread safety: the socket thread pushes `(sw_id, is_on)` onto a `queue.Queue`; the Tk loop drains it via `root.after(80, …)`. Reconnects on drop and on an empty initial snapshot (the devbus watcher binds ~5 s into a run; absent entirely when `DEVBUS=0` — in which case the canvas just falls back to requested-state, no regression). GRAB STATE (the `[switch_dump]` dump to `game.log`) stays the authoritative one-shot; the canvas overlay is the live convenience view, and live: wiggle a switch / hold a button and watch the cell flip.
+
+### Verification
+
+`./build.sh` → `spi_shim.so` 375568 B, clean (only the pre-existing `shim_fs.c` / `spi_shim.h` / `shim_nodebus.c` warnings). `tests/run_tests.sh` → 135 + 21 + 47 + 243 + 6 green. `python3 -m py_compile tools/marker_button.py` OK; verified `SWITCH_BY_RUNTIME_ID[78]` → `("93", "1-SW-11", 78, "Start Button", …)` (the sw_id↔callout lookup the overlay uses). No PROTOCOL change — the read path is already documented (Step 112's "Switch poll path"), and `1-SW-2 → 90` is already in PROTOCOL's "Manual switch inventory" (confirmed correct, not changed).
+
+### Next
+
+The channel-1 idle-correction over-clear (the 90/93-lit-at-idle anomaly above): trace `shim_switch_apply_default_idle_corrections`'s ch1 `derived_low_bits = {2, 11, 13}` against what the game's `FUN_00674b90` channel-1 reconstruction actually expects — those were added "to match the game's channel-1 reconstruction" / silence audio spam, but they're producing two switches lit that shouldn't be. Or: back to nodebus proper.

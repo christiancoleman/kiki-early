@@ -27,11 +27,12 @@ typedef enum {
 } ple_lamp_kind_t;
 
 typedef struct {
-    const char *manual_id;
+    const char *manual_id;     /* cabinet callout shown in the switch-test menu, e.g. "93", "C24" */
+    const char *address;       /* wiring address, e.g. "1-SW-11" (channel-N, bit K) */
     const char *name;
-    uint8_t channel;
-    uint8_t bit_idx;
-    uint16_t sw_id_runtime;
+    uint8_t  channel;
+    uint8_t  bit_idx;
+    uint16_t sw_id_runtime;    /* the game's heap-array index for this switch */
 } ple_switch_t;
 
 typedef struct {
