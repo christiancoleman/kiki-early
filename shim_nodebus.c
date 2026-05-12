@@ -1,32 +1,33 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+/*
+ * shim_nodebus.c — Netbridge UART protocol emulation.
+ *
+ * Phase 4 of the refactor. The game's netbridge client (on /dev/ttyAMA5)
+ * speaks a byte-stuffed request/response protocol to the real hardware's
+ * LPC812 bridge (node 13). We intercept the socketpair write side and
+ * synthesize responses that unblock the game's polling loops:
+ *
+ *   Request:  [0x02][CMD][ID][payload][CKSUM][0x03]
+ *   Response: [0x02][RESP_CMD][ID][payload][CKSUM][0x03]
+ *
+ * Handlers implemented (command bytes):
+ *   0x10, 0x11, 0x15, 0x16, 0x18, 0x1c, 0x1d, 0x20, 0x27, 0x30, 0x41
+ *
+ * Cmd 0x41 is synthesized only for the inner commands we understand
+ * (enumeration reset, FE/FA probes, switch poll, key fetch). Unknown inner
+ * commands still fall through and time out, preserving the known "timeout is
+ * progress" behavior for unmodeled bridge traffic.
+ *
+ * External interface (declared in spi_shim.h):
+ *   void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len);
+ *
+ * Dependencies from the main source file (spi_shim.c):
+ *   int  uart_shim_fd;                           — socketpair's shim side
+ *   ssize_t (*real_write)(int, const void *, size_t);  — raw libc write
+ *
+ * Both are exposed via extern decls at the top of this file rather than
+ * spi_shim.h, to keep the header focused on cross-subsystem API (not
+ * internal plumbing shared just between nodebus and the write() hook).
+ */
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -54,17 +55,15 @@ static int nodebus_enum_idx = 0;
 
 /* Per-slot 16-byte cipher key blocks for the encrypted cmd-0x41 channel.
  * Mirrors the game binary's mcp_nodebus_cipher_keys @ 0x44fcfb8 (32 slots ×
- * 16 bytes). Zero at init = the boot state. The shim doesn't synthesize
- * responses to the key-fetch commands (inner cmds 0xfc / 0xfd / 0xf9), so the
- * game's per-slot keys also stay zero — meaning every cmd-0x41 frame the
- * game emits is encrypted under a zero key block. We reproduce that here so
- * decryption matches.
+ * 16 bytes). Zero at init = the boot state. Key-fetch synthesis returns zero
+ * bytes for inner cmds 0xfc / 0xfd / 0xf9, so the game's per-slot keys remain
+ * zero unless we intentionally start handing out non-zero fake keys. We keep
+ * this table in the same state so any encrypted traffic decrypts consistently.
  *
  * Algorithm and full RE notes: docs/PROTOCOL.md §5.1.
  *
- * If we ever start synthesizing key-fetch responses, this table is where we
- * record the (fake) key bytes we hand out, so subsequent traffic decrypts
- * with those keys instead.
+ * If key-fetch synthesis ever returns non-zero fake keys, record those bytes
+ * here at the same time so subsequent traffic decrypts with those keys.
  */
 static uint8_t nodebus_cipher_keys[32][16] = {{0}};
 static uint8_t nodebus_switch_idle_baseline[32][8];

@@ -42,9 +42,9 @@
 #   SHIM_EXPECTED_SWITCH_IDLE=<0|1> [0] apply the manual expected idle bits to
 #                                   synthesized switch channel buffers.
 #   SPIKE3_COIN_DOOR_INTERLOCK=<closed|open|1|0>
-#                             [open] synthetic coin-door interlock state.
-#                                   unset/open/0 = open/interlock active;
-#                                   closed/restored/1 = restored/closed.
+#                             [closed] synthetic coin-door interlock state.
+#                                   unset/closed/restored/1 = restored/closed;
+#                                   open/0 = open/interlock active.
 #   DEVBUS=<0|1>           [1]     enable switch-observability IPC bridge.
 #   DEVBUS_TAIL=<auto|0|1> [auto]  auto=1 for --debug when DEVBUS=1, else 0.
 #                                   When enabled, writes devbus.log in debug runs.
@@ -283,7 +283,7 @@ if [[ "$SWITCH_NOISE_TEST" == "auto" ]]; then
     fi
 fi
 BOOT_DISPLAY="${BOOT_DISPLAY:-0}"
-SPIKE3_COIN_DOOR_INTERLOCK="${SPIKE3_COIN_DOOR_INTERLOCK:-open}"
+SPIKE3_COIN_DOOR_INTERLOCK="${SPIKE3_COIN_DOOR_INTERLOCK:-closed}"
 BOOT_DISPLAY_DURATION="${BOOT_DISPLAY_DURATION:-3}"
 STALE_KILL="${STALE_KILL:-1}"
 LOGFILE="${LOGFILE:-}"

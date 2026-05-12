@@ -24,6 +24,8 @@
 
 
 
+
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -175,6 +177,10 @@ void shim_event_sweep(void) {
 
 
 
+
+
+
+
 /* Wait until channel 1's saved-state buffer is non-zero (i.e., FUN_00650f00
  * has populated it), then mirror changes to
  * DAT_0436b020 while the CPU-SPI/channel-1 state machine settles during boot. */
@@ -245,7 +251,9 @@ static void *shim_discovery_init_thread(void *arg) {
     (void)arg;
     sleep(2);
     shim_discovery_init();
+    
 
+    
     /* Decoder compatibility patch: NOP the b.ne at game VA 0x920cf0 so the
      * game's get_format callback accepts NV12 from forward-decode (or from
      * local SW hevc as a diagnostic). Must run after game-base is resolvable
@@ -862,23 +870,97 @@ static void shim_log_start_gate_snapshot(uintptr_t game_base, const char *phase,
         memcpy(&mode_flags, (const void *)mode_flags_ptr, sizeof(mode_flags));
     }
 
-    uint16_t start_arg = 0xffff;
-    uintptr_t player_outer = 0;
-    uintptr_t player_inner = 0;
-    uintptr_t player_outer_p = game_base + 0x43500c0ULL;
-    memcpy(&player_outer, (const void *)player_outer_p, sizeof(player_outer));
-    if (player_outer) {
-        memcpy(&player_inner, (const void *)player_outer, sizeof(player_inner));
-        if (player_inner) {
-            memcpy(&start_arg, (const void *)(player_inner + 0x108ULL),
-                   sizeof(start_arg));
+    typedef uint64_t (*queued_mode_fn)(int);
+    queued_mode_fn queued_mode = (queued_mode_fn)(uintptr_t)(game_base + 0x72a5c0ULL);
+    int queued_32 = -1;
+    int queued_33 = -1;
+    int queued_46 = -1;
+    int queued_49 = -1;
+    if (queued_mode) {
+        queued_32 = (int)(queued_mode(0x32) & 1);
+        queued_33 = (int)(queued_mode(0x33) & 1);
+        queued_46 = (int)(queued_mode(0x46) & 1);
+        queued_49 = (int)(queued_mode(0x49) & 1);
+    }
+
+    int gate13 = -1;
+    if (mode_gate) {
+        gate13 = mode_gate(0x13);
+    }
+
+    uintptr_t proc_head = 0;
+    uintptr_t proc_sentinel = 0;
+    memcpy(&proc_head, (const void *)(game_base + 0x44c9248ULL),
+           sizeof(proc_head));
+    memcpy(&proc_sentinel, (const void *)(game_base + 0x44c9250ULL),
+           sizeof(proc_sentinel));
+    char active_procs[256] = "";
+    int active_n = 0;
+    uintptr_t proc = proc_head;
+    for (int i = 0; proc && i < 24; i++) {
+        uint16_t proc_id = 0;
+        uintptr_t next = 0;
+        memcpy(&proc_id, (const void *)proc, sizeof(proc_id));
+        memcpy(&next, (const void *)(proc + 0xe8ULL), sizeof(next));
+        if (proc != proc_sentinel) {
+            int added = snprintf(active_procs + active_n,
+                                 sizeof(active_procs) - active_n,
+                                 " 0x%02x", proc_id);
+            if (added <= 0 || added >= (int)sizeof(active_procs) - active_n) {
+                break;
+            }
+            active_n += added;
         }
+        proc = next;
+    }
+    const char *active_proc_text = active_n ? active_procs : " (none)";
+
+    uintptr_t current_player_p = 0;
+    uintptr_t player_count_p = 0;
+    uintptr_t player_table = 0;
+    uint8_t current_player = 0xff;
+    uint64_t player_count = 0;
+    uint8_t credit_units = 0xff;
+    uint8_t player_flags_36 = 0xff;
+    memcpy(&current_player_p, (const void *)(game_base + 0x434f980ULL),
+           sizeof(current_player_p));
+    memcpy(&player_count_p, (const void *)(game_base + 0x4353220ULL),
+           sizeof(player_count_p));
+    memcpy(&player_table, (const void *)(game_base + 0x434ff10ULL),
+           sizeof(player_table));
+    if (current_player_p) {
+        memcpy(&current_player, (const void *)current_player_p,
+               sizeof(current_player));
+    }
+    if (player_count_p) {
+        memcpy(&player_count, (const void *)player_count_p,
+               sizeof(player_count));
+    }
+    if (player_table && current_player != 0 &&
+        (uint64_t)current_player < player_count) {
+        uintptr_t player_slot = player_table + (uintptr_t)current_player * 0x48ULL;
+        uintptr_t credit_record = 0;
+        memcpy(&credit_record, (const void *)player_slot,
+               sizeof(credit_record));
+        if (credit_record) {
+            memcpy(&credit_units, (const void *)(credit_record + 4ULL),
+                   sizeof(credit_units));
+        }
+        memcpy(&player_flags_36, (const void *)(player_slot + 0x36ULL),
+               sizeof(player_flags_36));
     }
 
     SHIM_LOG("[start_probe] %s raw_state=%u logical=%d edge=%u "
-             "gate2=%d gate3=%d gate4=%d mode_flags=0x%04x start_arg=%u",
+             "gate2=%d gate3=%d gate4=%d gate13=%d "
+             "mode_flags=0x%04x queued32=%d queued33=%d queued46=%d queued49=%d "
+             "cur_player=%u player_count=%lu credit_units=%u player_flags36=0x%02x "
+             "active_procs:%s",
              phase, raw_state, logical_state, edge,
-             gate2, gate3, gate4, mode_flags, start_arg);
+             gate2, gate3, gate4, gate13,
+             mode_flags, queued_32, queued_33, queued_46, queued_49,
+             current_player, (unsigned long)player_count,
+             credit_units, player_flags_36,
+             active_proc_text);
 }
 
 /* SHIM_MANUAL_PRESS=1 — poll runs/latest/press_request.txt every 200 ms.

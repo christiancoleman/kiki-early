@@ -9440,3 +9440,78 @@ Current defaults for this pass:
 - `TIMER=OFF`.
 
 The goal is to keep the active experiment as the default test state instead of stacking env knobs. If this default loses, remove or revise it rather than accumulating another permanent option.
+
+## Step 104: Step back after Start/multiball push; patch inventory and current known state (2026-05-11)
+
+We spent the last pass aggressively chasing the "credits are present but Start does nothing" blocker because the switch layer finally looked close. The useful result is that the Start button path is no longer a mystery, but the codebase also accumulated enough runtime traps and temporary patch state that continuing without an inventory would risk debugging our own instrumentation.
+
+### 104a — Start input is delivered; Start aborts on multiball/readiness state
+
+Manual Start `93` maps to runtime `sw_id=78`, and the devbus/manual-press path delivered clean Start transitions. Start reaches the game handler and passes the early credit/mode gates. The failure is later:
+
+```text
+start_trace 73a5f0 relation 72a610(0x35,0x44): ret_bit=0 -> check queued32
+start_trace 73a5f0 queued32: ret_bit=1 -> readiness returns 0
+```
+
+Binary Ninja/Ghidra context from this pass: `sub_73a5f0 @ 0x73a5f0` is a multiball/device safety validator. It fires event `0x6d`, checks queued range `0x35..0x44`, then checks exact event `0x32`. In our run the range check was clear, but `queued32=1`, so the readiness gate returns false and Start aborts.
+
+Runtime traps showed event `0x32` being fired by multiple paths:
+
+```text
+mode_id=6  parent_lr=0x678ecc  primary init path
+mode_id=1  parent_lr=0x720d1c  main/update path
+mode_id=13 parent_lr=0x76916c  device/event handler path
+```
+
+The clear-path traps at `FUN_0072a950` did not fire before Start, so the current working theory is upstream lifecycle/device state rather than "event 32 fails to unlink."
+
+### 104b — Ball count trace says "not zero", but the values are odd
+
+Added a temporary ball-count trap at `FUN_007366c0 @ 0x7366c0` to see the installed-ball state. The latest ball-count run logged:
+
+```text
+ball_trace count_entry cache=6 check=0xf9 override=6 device_idx=1 configured=7 expected=0 delta=0 device_count=5
+```
+
+Interpretation:
+
+- `device_count=5`: the multiball/device table appears to contain five ball devices.
+- `cache=6` and `override=6`: the active BALLS_IN_GAME path reports six, not zero or five.
+- `check=0xf9`: consistent with `~0x06`, so the cached value/check byte pair is internally coherent.
+- `configured=7`: the selected device/list count is seven, separate from the five-entry device table.
+- `expected=0 delta=0`: the expected-count comparison state was not populated at that trap point.
+
+This argues against "game thinks there are no balls installed" as the immediate Start blocker, but the 5/6/7 split is suspicious and should be traced only after cleaning the instrumentation surface.
+
+### 104c — Runtime patch inventory
+
+> [Redacted: an earlier startup-authorization bypass, its patch target and
+> value, and the associated key-derivation description.]
+
+At this revision the diagnostic override was disabled at its call site; the
+unused helper was still present and further cleanup was being considered.
+This is the state recorded here, before its later removal.
+
+### 104d — Active runtime patches and likely cleanup
+
+Outstanding default-on runtime mutation/instrumentation:
+
+- `shim_discovery_init()` is still called unconditionally and installs a large BRK-trap set: Godot error, nodebus init, scene load, Start gates, multiball/event-32, clear path, and ball-count entry. These traps emulate the replaced instruction after logging, but they are still invasive. Next cleanup: gate them behind something like `SHIM_DISCOVERY_TRAPS=1`, default off.
+- `shim_patch_get_format_callback()` NOPs the game's video `get_format` branch by default. This is runtime support for the forward-decode path and is expected for video.
+- `shim_patch_channel1_derived_switches()` NOPs the derived channel-1 translate call by default unless `SPIKE3_CHANNEL1_DERIVED=1`. This came from switch-spam debugging and should be renamed/gated more clearly after the input layer is stable.
+- `shim_switches.c` applies default idle corrections for coin inputs, trough/EOS, captive ball, spinner, and Meowth down. These are intentional gameplay-I/O behavior now, but should be documented as machine-profile normalization rather than treated as a hidden debug patch.
+- `shim_nodebus.c` synthesizes FE/FA probe replies, switch-poll replies, and key-fetch replies. FE/switch-poll/key-fetch are current emulation support. FA remains under-RE'd and returns all zero; keep it on the suspect list if node/device state stays strange.
+
+Env-gated helpers such as switch-table probe, edge snapshot, output probe, machine dump, dispatch watchdog, auto/manual press, and switch-noise test remain off unless requested or unless TIMER/auto-press enables the manual-press watcher. These are acceptable as tools, but the default run should not depend on them.
+
+### 104e — Recommended next step
+
+Before continuing Start-condition RE, clean the default runtime:
+
+1. Gate `shim_discovery_init()` behind an explicit env var and rebuild.
+2. Keep the diagnostic-mode poke disabled.
+3. Run one plain default test and compare behavior/logs without the BRK trap layer.
+4. If Start still aborts, re-enable only the smallest trap set needed for the next question: probably ball count plus event-32 lifecycle, not the whole historical discovery suite.
+
+This keeps the useful discoveries while reducing the chance that old traps, temporary patches, or stale assumptions distort the next result.
