@@ -23,10 +23,9 @@ from switch_command import append_locked
 from switch_inventory import (
     GAME_TITLE,
     GAME_VERSION,
-    MANUAL_SWITCHES,
     SWITCH_BY_MANUAL_ID,
     SWITCH_BY_RUNTIME_ID,
-    SWITCH_LAYOUT_ROWS,
+    SWITCH_LAYOUT,
 )
 
 # run_game.sh passes explicit paths so a symlinked _emulation directory can
@@ -239,13 +238,29 @@ def _write_tap_command(sw_id: int, name: str, elapsed_var, status_var,
 
 
 def _switch_layout_rows():
+    columns = int(SWITCH_LAYOUT.get("columns", 30))
+    row_count = int(SWITCH_LAYOUT.get("rows", 5))
+    numeric_start = int(SWITCH_LAYOUT.get("numeric_start", 1))
+    numeric_through = int(
+        SWITCH_LAYOUT.get("numeric_through", numeric_start + columns * row_count - 1)
+    )
+    extended_prefix = str(SWITCH_LAYOUT.get("extended_prefix", "C"))
+    extended_start = int(SWITCH_LAYOUT.get("extended_start", 1))
+
     rows = []
-    for title, prefix, start, end in SWITCH_LAYOUT_ROWS:
+    slot = 0
+    for row_number in range(row_count):
         row = []
-        for n in range(start, end + 1):
-            manual_id = f"{prefix}{n}" if prefix else str(n)
+        for _col in range(columns):
+            numeric_id = numeric_start + slot
+            if numeric_id <= numeric_through:
+                manual_id = str(numeric_id)
+            else:
+                extended_id = extended_start + numeric_id - numeric_through - 1
+                manual_id = f"{extended_prefix}{extended_id}"
             row.append((manual_id, SWITCH_BY_MANUAL_ID.get(manual_id.upper())))
-        rows.append((title, row))
+            slot += 1
+        rows.append((f"row {row_number + 1}", row))
     return rows
 
 

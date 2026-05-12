@@ -1,8 +1,8 @@
 """Pokemon LE 0.81.0 manual switch profile.
 
 This is a manually-authored profile from the official manual. The TIMER UI uses
-the row ranges below to match the service-menu switch layout: missing manual
-switch numbers intentionally become empty cells.
+the layout metadata below to match the service-menu switch layout: missing
+manual switch numbers intentionally become empty cells.
 """
 
 GAME_TITLE = "POKEMON_LE"
@@ -97,11 +97,14 @@ MANUAL_SWITCHES = [
     ("C24", "0-SW-23", 98, "Coin Door Power Interlock", "CN4/1", "Cabinet", "Interlock"),
 ]
 
-# Service-menu-style TIMER rows. Each row is 30 manual switch numbers wide;
-# absent IDs inside a range are rendered as empty space, not compacted away.
-SWITCH_LAYOUT_ROWS = [
-    ("SW 1-30", "", 1, 30),
-    ("SW 31-60", "", 31, 60),
-    ("SW 61-90", "", 61, 90),
-    ("SW 91-120", "", 91, 120),
-]
+# Service-menu-style TIMER layout. This is five rows of 30 slots. Numeric
+# slots consume positions 1..112; row 4 then has C1..C8 as blank slots, making
+# row 5 start at C9 like the in-game service menu.
+SWITCH_LAYOUT = {
+    "columns": 30,
+    "rows": 5,
+    "numeric_start": 1,
+    "numeric_through": 112,
+    "extended_prefix": "C",
+    "extended_start": 1,
+}
