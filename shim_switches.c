@@ -96,10 +96,9 @@ static void shim_switch_apply_default_idle_corrections(uint8_t channel_id,
             switch_set_bit(buf, coin_bits[i], 1);
         }
         /* Channel 1 is also synthesized by FUN_00674b90 from CPU-SPI byte 3.
-         * With our default channel-0 idle (byte 3 = 0xf8, low bits clear),
-         * that path clears these bits before calling sub_651610(1, ...).
-         * Match that derived idle here so nodebus switch-poll and CPU-SPI
-         * derived updates do not ping-pong channel-1 edges. */
+         * With channel-0 byte 3 bit 2 clear, that path clears bit 13 before
+         * calling sub_651610(1, ...). Match that derived idle here so nodebus
+         * switch-poll and CPU-SPI derived updates do not ping-pong edges. */
         static const uint8_t derived_low_bits[] = {13};
         for (size_t i = 0; i < sizeof(derived_low_bits) / sizeof(derived_low_bits[0]); i++) {
             switch_set_bit(buf, derived_low_bits[i], 0);
@@ -186,7 +185,7 @@ void shim_switch_copy_channel_stable_idle(uintptr_t game_base,
 
 void shim_switch_make_channel0_idle(uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]) {
     static const uint8_t idle[SHIM_SWITCH_CHANNEL_BYTES] =
-        { 0x00, 0xff, 0xff, 0xf8, 0xff, 0xff, 0xff, 0xff };
+        { 0x00, 0xff, 0xff, 0xfb, 0xff, 0xff, 0xff, 0xff };
     memcpy(out, idle, sizeof(idle));
     shim_switch_apply_expected_idle(0, out);
 

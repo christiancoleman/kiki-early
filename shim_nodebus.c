@@ -1183,7 +1183,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
                     memcpy(idle, nodebus_switch_idle_baseline[slot],
                            SHIM_SWITCH_CHANNEL_BYTES);
                 } else {
-                    shim_switch_copy_channel_idle(game_base, slot, idle);
+                    shim_switch_copy_channel_stable_idle(game_base, slot, idle);
                     if (slot < 32) {
                         int nonzero = 0;
                         for (int i = 0; i < SHIM_SWITCH_CHANNEL_BYTES; i++) {

@@ -170,44 +170,69 @@ void shim_event_sweep(void) {
     u = write(STDERR_FILENO, sum, (size_t)sl); (void)u;
 }
 
-/* Wait until channel 1's saved-state buffer is non-zero (i.e., FUN_00650f00
- * has populated it), then mirror changes to
- * DAT_0436b020 while the CPU-SPI/channel-1 state machine settles during boot. */
-static void shim_install_channel1_idle(uintptr_t game_base) {
+static void shim_publish_channel1_saved_state(uintptr_t game_base,
+                                              const char *label) {
     volatile uint64_t *dat_0436b020 = (volatile uint64_t *)(uintptr_t)
         (game_base + 0x436b020ULL);
-    typedef int64_t (*translate_fn)(uint8_t channel_id, const uint8_t *buffer);
-    translate_fn translate = (translate_fn)(game_base + 0x651610);
-    uint64_t last_written = 0;
-    int first_ms = -1;
+    typedef void (*poll_switch_fn)(uint32_t channel_id);
+    poll_switch_fn poll_switches = (poll_switch_fn)(game_base + 0x674b90);
+
+    uint8_t buf[SHIM_SWITCH_CHANNEL_BYTES];
+    uint64_t buf_u64 = 0;
+    shim_switch_copy_channel_stable_idle(game_base, 1, buf);
+    shim_switch_hold_apply(1, buf);
+    memcpy(&buf_u64, buf, sizeof(buf_u64));
+    if (buf_u64 == 0) {
+        SHIM_LOG("[channel1_idle] %s skipped; stable idle is zero", label);
+        return;
+    }
+
+    *dat_0436b020 = buf_u64;
+    shim_log_channel_buf(label, 1, buf);
+    poll_switches(0);
+}
+
+static void shim_write_channel1_saved_state(uintptr_t game_base,
+                                            const char *label) {
+    volatile uint64_t *dat_0436b020 = (volatile uint64_t *)(uintptr_t)
+        (game_base + 0x436b020ULL);
+
+    uint8_t buf[SHIM_SWITCH_CHANNEL_BYTES];
+    uint64_t buf_u64 = 0;
+    shim_switch_copy_channel_stable_idle(game_base, 1, buf);
+    shim_switch_hold_apply(1, buf);
+    memcpy(&buf_u64, buf, sizeof(buf_u64));
+    if (buf_u64 == 0) {
+        SHIM_LOG("[channel1_idle] %s skipped; stable idle is zero", label);
+        return;
+    }
+
+    *dat_0436b020 = buf_u64;
+    shim_log_channel_buf(label, 1, buf);
+}
+
+/* Seed channel 1's saved nodebus image once. FUN_00674b90(1) only refreshes
+ * DAT_0436b020; FUN_00674b90(0) owns the derived channel-1 translate after it
+ * folds in the CPU-SPI cabinet bits. At boot we only seed the saved image; an
+ * immediate derived translate can turn already-resting cabinet buttons into
+ * active switch-test entries before any real input occurs. */
+static void shim_seed_channel1_saved_idle(uintptr_t game_base) {
     for (int i = 0; i < 300; i++) {
         uint8_t idle[SHIM_SWITCH_CHANNEL_BYTES];
         uint64_t idle_u64 = 0;
-        shim_switch_copy_channel_idle(game_base, 1, idle);
+        shim_switch_copy_channel_stable_idle(game_base, 1, idle);
         memcpy(&idle_u64, idle, 8);
         if (idle_u64 != 0) {
             int now_ms = i * 100;
-            if (first_ms < 0) first_ms = now_ms;
-            if (idle_u64 != last_written) {
-                *dat_0436b020 = idle_u64;
-                translate(1, idle);
-                last_written = idle_u64;
-                SHIM_LOG("[channel1_idle] wrote+translated 0x%016lx to DAT_0436b020 after %dms (FUN_00674b90 spam fix)",
-                         (unsigned long)idle_u64, now_ms);
-            }
-            if (now_ms >= first_ms + 15000) {
-                SHIM_LOG("[channel1_idle] settled at 0x%016lx after %dms",
-                         (unsigned long)last_written, now_ms);
-                return;
-            }
+            SHIM_LOG("[channel1_idle] seeding DAT_0436b020=0x%016lx after %dms",
+                     (unsigned long)idle_u64, now_ms);
+            shim_write_channel1_saved_state(game_base,
+                                            "[channel1_idle] seed saved");
+            return;
         }
         usleep(100000);
     }
-    if (last_written)
-        SHIM_LOG("[channel1_idle] stopped monitoring at 0x%016lx after 30s",
-                 (unsigned long)last_written);
-    else
-        SHIM_LOG("[channel1_idle] gave up after 30s — channel 1 saved state stayed zero");
+    SHIM_LOG("[channel1_idle] gave up after 30s — channel 1 saved state stayed zero");
 }
 
 static void shim_translate_startup_idle(uintptr_t game_base,
@@ -261,7 +286,7 @@ static void *shim_discovery_init_thread(void *arg) {
     if (game_base) {
         shim_translate_startup_idle(game_base, 8, "[startup_idle] translate");
         shim_translate_startup_idle(game_base, 9, "[startup_idle] translate");
-        shim_install_channel1_idle(game_base);
+        shim_seed_channel1_saved_idle(game_base);
     }
     return NULL;
 }
@@ -974,6 +999,12 @@ static void shim_log_start_gate_snapshot(uintptr_t game_base, const char *phase,
  *   SHIM_MANUAL_PRESS_MS=N            — tap hold ms (default 120 from run_game.sh) */
 static void shim_translate_held_switch_state(uintptr_t game_base,
                                              uint8_t channel_id) {
+    if (channel_id == 1) {
+        shim_publish_channel1_saved_state(game_base,
+                                          "[manual_press] derive held");
+        return;
+    }
+
     typedef int64_t (*translate_fn)(uint8_t channel_id, const uint8_t *buffer);
     translate_fn translate = (translate_fn)(game_base + 0x651610);
 
