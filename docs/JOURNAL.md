@@ -9516,53 +9516,75 @@ Before continuing Start-condition RE, use the cleaned default runtime:
 
 This keeps the useful discoveries while reducing the chance that old traps, temporary patches, or stale assumptions distort the next result.
 
-## Step 105: Service Menu Node Bus Test exposes phantom FE-probe slots (2026-05-11)
+## Step 105: Nodebus deep-mode experiment and switch-path rollback (2026-05-11)
 
-User ran `TIMER=ON VIEWER=1 AUDIO_PLAYER=0 service_s_worker=0 SHIM_DISCOVERY_TRAPS=0 ./run_game.sh --debug --note nodebus_service_menu_hang` and entered the Service Menu's Node Bus Test. The run did not hit bridge cmd `0x40`; the test path used the normal cmd `0x41` encrypted nodebus relay plus FE probes.
+This session chased two related but separable problems: the service-menu Node Bus Test still did not match real hardware semantics, and the switch layer regressed while we experimented with deeper nodebus behavior. The final state is intentionally split: normal gameplay input is back on the known-good switch path, while deeper nodebus protocol work remains behind `SHIM_NODEBUS_DEEP=1`.
 
-Runtime log `/games/pokemon_le/_emulation/runs/2026-05-11T21.58.33_nodebus_service_menu_hang/game.log` showed the service test scanning slots beyond the populated-machine set. The shim replied to slot 3 and slot 5 `inner_cmd=0xfe` frames as node-present with chip_id `0x041e502b`, even though cmd `0x25` enumeration only advertises populated slots `{1,2,4,7,8,9,10,12,13,14}`. That made the service test discover phantom nodes which are not part of the Pokemon LE slot inventory.
+### 105a - Service-menu scan behavior
 
-Fix, first pass: added `nodebus_slot_is_populated()` in `shim_nodebus.c` and made FE-probe synthesis skip unpopulated slots instead of falling back to a generic LPC1111 chip ID. That removed the phantom node-present response, but the service test then retried slot 3 indefinitely and logged repeated cmd `0x41` timeouts.
+The first Node Bus Test run used the normal cmd `0x41` nodebus relay path, not bridge cmd `0x40`. The service test scanned slots beyond the advertised Pokemon LE populated set. The shim was still replying to absent slots such as 3 and 5 as generic node-present LPC1111 devices, which made the service menu report phantom nodes.
 
-Fix, second pass: unpopulated slots now receive a syntactically valid all-zero FE response. This preserves "not populated" semantics without forcing the service-menu scan through the bridge timeout path on every absent address. Updated PROTOCOL §5.4 so "any other" slot is documented as an all-zero FE response rather than a fallback node.
+Added an explicit populated-slot predicate for the Pokemon LE machine inventory:
 
-Follow-up from the next run: the service test progressed through absent slots 3 and 5, completed the boot/init pass through slot 14, then started a second scan and stalled after slot 2. The log showed cmd `0x41` timeouts during that second scan even though FE replies were being synthesized, pointing at contention from the fixed 200 ms synthetic delay after boot. Updated `shim_nodebus.c` so the 200 ms delay remains in force until the first switch-poll response, then subsequent synthetic replies use a shorter post-init delay for service-menu scans.
+```text
+0,1,2,4,7,8,9,10,12,13,14
+```
 
-Verification: `./build.sh` completed successfully after the change. Existing warnings remain unrelated (`nodebus_cipher_decrypt`, `log_caller_chain`, timestamp truncation warning, `shim_fs.c` comment warning, `openat` nonnull comparisons).
+FE-probe synthesis no longer fabricates fallback chip IDs for every unrecognized slot. Populated slots get chip/version data from the per-slot mapping. Absent slots are handled as absent, not as unknown hardware.
 
-## Step 106: Deep nodebus mode for encrypted 0xF2 traffic (2026-05-11)
+The all-zero absent-slot response was a useful intermediate because it avoided long timeouts, but it still looked like a response to the service menu and therefore produced "Unknown Node" rows. The current deep-mode absent-slot behavior returns a checked FE response with status bit 2 set after the deep-mode fast-ready guard. `FUN_008ec410` rejects that immediately before copying chip data, giving fast failed-probe semantics without creating an unknown-chip node record.
 
-Clarification from the latest run: the user had not entered the service-menu Node Bus Test; the slot scan and follow-up cmd `0x41` traffic happened during normal boot/runtime. This means the Step 105 post-init fast-reply change affects the ordinary baseline, not only the service-test path.
+### 105b - Deep nodebus mode
 
-Added `SHIM_NODEBUS_DEEP=1` as an opt-in mode for deeper protocol experiments while keeping the default runtime on the existing "good enough" behavior. `run_game.sh` now exports/records the flag and documents it in the launcher env table.
+Added `SHIM_NODEBUS_DEEP=1` as the opt-in branch for deeper nodebus protocol experiments. The default runtime remains on the conservative "good enough for gameplay" nodebus baseline.
 
-In deep mode, `shim_nodebus.c` conditionally decodes cmd `0x41` frames when the wire slot byte has bit `0x40` set. That is the game's encrypted-post-key path. The earlier `nodebus_cipher_decrypt()` helper had been unused and still used the pre-increment mask formula; it now uses the wire `inner_len` nibble, which decodes the observed frames correctly:
+Deep mode currently owns these behaviors:
+
+- conditional decrypt of encrypted cmd `0x41` frames when the wire slot byte has bit `0x40` set;
+- corrected zero-key decrypt mask handling for observed encrypted post-key frames;
+- synthetic all-zero `0xF2` block-read replies for populated LPC1313/type-5 nodes only;
+- synthetic checked `0xFF` discovery replies for populated nodes;
+- shorter synthetic delays only after the deep-mode fast-ready guard.
+
+Ghidra confirmed `FUN_008f5390` sends `inner_cmd=0xF2` eight times for LPC1313/type-5 nodes, requesting offsets `0,8,...,56` and expecting 8 data bytes. Observed encrypted frames decoded as expected once the decrypt path used the wire inner-length nibble:
 
 ```text
 slot 2: wire inner 0xd1 -> decoded 0xf2
 slot 7: wire inner 0x81 -> decoded 0xf2
 ```
 
-Ghidra confirms `FUN_008f5390` emits `inner_cmd=0xF2` eight times for LPC1313/type_idx=5 nodes, requesting offsets `0,8,...,56` and expecting 8 data bytes. Deep mode now synthesizes all-zero `0xF2` block replies for populated LPC1313/ws2812 slots only (`2,7,12,14`). Non-deep mode still lets those post-key commands time out, preserving the stable gameplay-switch baseline.
+An aggressive version that switched to fast replies immediately after the first successful `0xF2` response was too early: normal boot accelerated to roughly 10-15 ms replies and hung before service-menu handoff. The current compromise keeps boot conservative and allows fast replies only once deep mode is ready by elapsed time or post-init switch-poll state.
 
-Also moved the Step 105 fast synthetic reply behavior behind `SHIM_NODEBUS_DEEP`: default replies keep the conservative 200 ms delay even after switch polling starts; deep mode switches to the shorter post-init delay after the first switch-poll response. A follow-up test showed that making the first successful `0xF2` block-read response switch immediately to fast replies was too aggressive: normal boot hit slot-2 `0xF2`, accelerated the rest of nodebus init to ~10-15 ms replies, and hung just before the service menu handoff. The current deep-mode compromise keeps `0xF2` replies enabled but only allows elapsed-time fast replies after a 45s guard, so boot keeps the conservative timing while a human-driven service-menu Node Bus Test can still avoid the 200 ms-per-response scan latency.
+### 105c - UART write-hook fix
 
-Next follow-up run reached the service menu again and entered the Node Bus Test, then stalled during the fast FE-probe scan. The last successful synth responses were repeated slot-5 `inner_cmd=0xFE` "not populated" replies; the final logged UART write had no matching `bridge: cmd 0x41` decode. Root cause was in the fake UART write hook, not the nodebus response shape: `shim_io.c` still called `real_write(fd, request)` before synthesis even though the request side of the socketpair is not drained by the shim. At slow boot volumes that buffer never filled; after the deep-mode fast scan it filled and blocked before `synthesize_bridge_response()` could run. The UART write hook now treats `/dev/ttyAMA5` as a pure shim endpoint: log the request, synthesize any response, restore errno, and return `count` without writing the request into the socketpair.
+One apparent nodebus hang was actually caused by the fake UART write hook. `shim_io.c` still wrote nodebus requests into the `/dev/ttyAMA5` socketpair before synthesis even though the request side is never drained. Slow boot traffic did not fill the buffer, but deep-mode fast scans could block before `synthesize_bridge_response()` ran.
 
-The next service-menu Node Bus Test completed, but displayed absent slots `3,5,6,11,15-31` as "Unknown Node" and all other nodes as `Responding: No`. The log matched that exactly: absent slots received our all-zero FE response, which is still a response and therefore classifies as unknown hardware; populated slots were mostly being tested with `inner_cmd=0xFF` (`FUN_008f5cd0` / `mcp_node_discovery_query`), which the shim only logged and let time out. Deep mode now synthesizes a checked 10-byte `0xFF` discovery response for populated slots.
+The UART hook now treats `/dev/ttyAMA5` as a pure shim endpoint: log the request, synthesize any response, restore `errno`, and return `count` without writing the request into the socketpair.
 
-First attempt at fixing absent slots used literal no-response after the 45s service-test guard. That avoided "Unknown Node" semantics, but the test became impractically slow: the latest run spent roughly one second per FE retry on absent slots 6 and 11 and did not finish before the user closed it. Updated the absent-slot service-test path again: instead of timing out, it returns a checked FE response whose status byte has bit 2 set. `FUN_008ec410` rejects that immediately before copying chip data, giving us fast failed-probe semantics without creating an unknown-chip node record.
+### 105d - Switch-path regression and rollback
 
-Follow-up service-test run completed, but Switch Test showed `93` (Start Button) and another low channel-1 value active at idle; pressing Start then spammed. Runtime log showed Start is channel 1 bit 11 (`sw_id=78`, manual display `93`) and the synthesized slot-1 switch-poll idle was `fb d7 ...`, so bit 11 was held low before and after the press. Root cause was our Step 104 channel-1 derived-idle workaround forcing bits `{2,11,13}` low to match an earlier `sub_674b90(0)` observation. That workaround is now too broad for the cleaned nodebus path. Narrowed it to bit `{13}` only; Start and the nearby gameplay-visible bit now rest high again.
+The nodebus experiment led into several switch-layer attempts that were not stable:
 
-User then saw button spam return in a big way. Static re-check in Ghidra plus the latest log pointed at the remaining boot helper, not the nodebus protocol shape: `sub_674b90(1)` only stores the slot-1 poll result in `DAT_0436b020`; `sub_674b90(0)` later applies the CPU-SPI byte-3 derived bits and calls `sub_651610(1, ...)`. Our `shim_install_channel1_idle()` helper was writing `DAT_0436b020` and directly calling `sub_651610(1, ...)` every time the copied idle changed. The run showed it oscillating between `0xffffffffffffdfff` and `0xffffffffffffd7fb` every 100 ms, which manufactured channel-1 edges during boot. Reworked it into a one-shot `shim_seed_channel1_saved_idle()` that seeds `DAT_0436b020` from the latched stable idle and leaves translation to `sub_674b90(0)`. Nodebus switch-poll synthesis now also reads through `shim_switch_copy_channel_stable_idle()` so it does not chase the translator-mutated live buffer.
+- narrowing channel-1 derived-low bits from `{2,11,13}` to `{13}`;
+- changing CPU-SPI channel-0 idle byte 3 from `0xf8` to `0xfb`;
+- replacing the channel-1 boot mirror/translate loop with a `DAT_0436b020` seed plus `sub_674b90(0)`;
+- routing manual channel-1 presses through the same derived path;
+- making nodebus switch-poll synthesis read a latched stable idle image.
 
-Follow-up test still spammed when TIMER pressed channel-1 switches. Devbus showed the whole runtime `sw_id=77..89` block flapping around coin-button presses. That exposed the same sequencing bug in the manual press path: it updated the held overlay, then called `sub_651610(1, raw_slot1_buf)` directly, while the game later called `sub_674b90(0)` and translated the CPU-SPI-derived channel-1 image. Updated channel-1 manual publishes to write the held slot-1 image into `DAT_0436b020` and call `sub_674b90(0)` instead. The one-shot channel-1 seed now also invokes that derived path once so initial state and manual presses use the same interpretation.
+Those changes could make one run look cleaner but then reintroduced Start/Action default-on states or broad button spam. The user correctly pointed out that the last trusted gameplay-input state was before the nodebus-board rabbit hole. Instead of reconstructing that state from memory, the switch path was re-anchored directly to known-good commit `4553c54` (`game worked`).
 
-Next run was much cleaner, but Switch Test still showed exactly two incorrect default-on cabinet switches: Action Button (`sw_id=77`, manual 90 / `1-SW-2`) and Start Button (`sw_id=78`, manual 93 / `1-SW-11`). Devbus snapshot showed channel 1 as `fb d7 ...`, so bits 2 and 11 were low. Static `sub_674b90(0)` explains why: CPU-SPI channel-0 byte 3 was `0xf8`, which has bits 0, 1, and 2 low. In the `bit2 == 0` branch, bit0 low clears channel-1 bit 2, bit1 low clears channel-1 bit 11, and bit2 low clears channel-1 bit 13. Updated the channel-0 idle byte 3 from `0xf8` to `0xfb`, leaving bit2 low so the known bit-13 derived behavior remains, but resting Action/Start high.
+The restored switch behavior now matches that commit's shape:
 
-Follow-up no-deep testing showed that the literal "old switch path" was not a stable branch: `SHIM_NODEBUS_DEEP=0` produced CPU-SPI byte 3 `0xf8`, channel 1 `fb d7 ...`, and once-per-second `sw_id=77/78` edge churn. That confirmed the legacy channel-1 boot mirror/translate loop is itself the spam source because it directly calls `sub_651610(1, ...)` while the game also derives channel 1 through `sub_674b90(0)`. Promoted the switch fixes to the default gameplay path instead of keeping a known-bad branch: default now uses channel-0 byte 3 `0xfb`, channel-1 one-shot saved-state publish through `sub_674b90(0)`, manual channel-1 publishes through the same derived path, and stable-idle switch-poll synthesis. `SHIM_NODEBUS_DEEP` remains the branch point for deeper nodebus protocol experiments, not for the core switch-translation fixes needed by normal gameplay input.
+- channel-1 derived-low bits are `{2,11,13}`;
+- channel-0 CPU-SPI idle byte 3 is `0xf8`;
+- `shim_install_channel1_idle()` uses the direct mirror/translate loop;
+- manual channel-1 presses use direct channel translation;
+- nodebus switch-poll synthesis reads live channel idle via `shim_switch_copy_channel_idle()`.
 
-Next default-path test had no broad `77/78` spam, but Switch Test again showed manual `93` (Start, runtime `sw_id=78`) and likely manual `89` active. The log isolated this to boot seeding: before `[channel1_idle]`, `sw_id=77/78` were off; the seed wrote `DAT_0436b020=0xffffffffffffdfff` and immediately called `sub_674b90(0)`, after which the runtime state for the channel-1 button class was already active, so later Start/Action presses produced no edge. Adjusted the seed to write `DAT_0436b020` only. Manual channel-1 presses still publish the held saved image and call `sub_674b90(0)`, but boot no longer forces an initial derived translate.
+This is the important boundary going forward: `SHIM_NODEBUS_DEEP` is for nodebus protocol experiments only. It should not become the place where core gameplay switch translation diverges unless a later test proves the switch layer itself needs a new, documented machine model.
 
-Verification: `bash -n _emulation/run_game.sh`, `git diff --check -- _emulation/shim_inject.c _emulation/shim_nodebus.c _emulation/shim_switches.c _emulation/docs/JOURNAL.md`, and `_emulation/./build.sh` all passed. Build warnings remain the known unrelated set (`log_caller_chain` unused, timestamp truncation, `shim_fs.c` comment warning, `openat` nonnull comparisons).
+### 105e - Current verification
+
+`bash -n _emulation/run_game.sh`, `git diff --check -- _emulation/shim_inject.c _emulation/shim_nodebus.c _emulation/shim_switches.c _emulation/docs/JOURNAL.md`, and `_emulation/./build.sh` all passed after the rollback. Build warnings remain the known unrelated set (`log_caller_chain` unused, timestamp truncation, `shim_fs.c` comment warning, `openat` nonnull comparisons).
+
+The deep nodebus code is still present, but the service-menu Node Bus Test needs one fresh run after the switch rollback before we can call it verified in the current tree.

@@ -2041,6 +2041,22 @@ void glShaderSource(unsigned shader, int count, const char *const *string, const
     }
     buf[off] = '\0';
 
+    /* VideoPlayerSpi materials sample a `color_texture` uniform fed from the
+     * decoded video frame (see modules/spi_video_player/video_player_spi.cpp).
+     * Surface every such shader as it's compiled-from-source so we can confirm
+     * whether the bg-video shader actually reaches glShaderSource (vs. being
+     * served from a stale program-binary cache, which would skip the rewrite
+     * below). Reports whether it still carries samplerExternalOES (→ rewritten)
+     * or is already sampler2D (→ matches the demoted GL_TEXTURE_2D as-is). */
+    if (strstr(buf, "color_texture")) {
+        SHIM_LOG("[shader_patch] glShaderSource shader=%u carries `color_texture` "
+                 "(samplerExternalOES: %s) -- VideoPlayerSpi material",
+                 shader,
+                 strstr(buf, "samplerExternalOES")
+                     ? "present -> will rewrite to sampler2D"
+                     : "absent (already sampler2D)");
+    }
+
     /* Stern's video fragment shader uses `samplerExternalOES textureSampler`
      * unconditionally, expecting the OES extension's YUV-aware sampler.
      * Under Mesa swrast llvmpipe a samplerExternalOES sampling a 2D-bound
@@ -2080,9 +2096,12 @@ void glShaderSource(unsigned shader, int count, const char *const *string, const
             free(buf);
             buf = new_buf;
             static int log_count = 0;
-            if (log_count < 4) {
-                SHIM_LOG("[shader_patch] injected sampler2D define for shader=%u (rewrite #%d)",
-                         shader, ++log_count);
+            ++log_count;
+            int is_video_material = strstr(buf, "color_texture") != NULL;
+            if (log_count <= 24 || is_video_material) {
+                SHIM_LOG("[shader_patch] injected sampler2D define for shader=%u (rewrite #%d)%s",
+                         shader, log_count,
+                         is_video_material ? " [VideoPlayerSpi color_texture material]" : "");
             }
         }
     }
