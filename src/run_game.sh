@@ -108,7 +108,7 @@
 # PREREQS (see docs/PROTOCOL.md §2 for details):
 #   - qemu-user (provides qemu-aarch64 + binfmt_misc)
 #   - gcc-aarch64-linux-gnu (only if you modify the shim — run ./build.sh)
-#   - Mesa overlay built: cd mesa_sw_overlay && ./build_overlay.sh
+#   - Mesa overlay built: cd src/mesa_sw_overlay && ./build_overlay.sh
 #   - Optional: python3 + numpy + Pillow + tk   (live viewer)
 #   - Optional: ffplay                           (live audio)
 
@@ -141,13 +141,17 @@ if [[ -n "$NOTE" ]]; then
 fi
 
 # ---- Auto-detect paths ----
+# This script lives in _emulation/src/.  SRC_DIR holds the shim source + the
+# helper daemons/tools; EMU_ROOT is the _emulation/ project dir (runs/, docs/,
+# captures/ live there).  EMU_ROOT auto-detects as the parent of src/; a
+# collaborator with a non-standard checkout can pin it via SPIKE3_EMULATION_DIR.
+# Then EMU_ROOT → <game_name> → games → sysroot — auto-detected (not hardcoded
+# to "pokemon_le") so the same run_game.sh drives any Spike 3 game; each game
+# keeps its own _emulation/ dir (symlinked from the canonical PLE one).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# _emulation → <game_name> → games → sysroot.
-# Auto-detect from SCRIPT_DIR rather than hardcoding "pokemon_le" so the same
-# shim/run_game.sh can drive any Spike 3 game (Pokémon LE 0.81, Star Wars LE
-# 0.85, ...). Each game keeps its own _emulation/ dir (symlinked from the
-# canonical PLE one); SCRIPT_DIR resolves to whichever game we're launching.
-GAME_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SRC_DIR="$SCRIPT_DIR"
+EMU_ROOT="${SPIKE3_EMULATION_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+GAME_DIR="$(cd "$EMU_ROOT/.." && pwd)"
 SYSROOT="$(cd "$GAME_DIR/../.." && pwd)"
 AUTO_BIND_MOUNTS="${AUTO_BIND_MOUNTS:-1}"
 SKIP_BIND_MOUNT_CHECK="${SKIP_BIND_MOUNT_CHECK:-0}"
@@ -191,15 +195,15 @@ EOF
 fi
 RUN_TS="$(date +%Y-%m-%dT%H.%M.%S)"
 RUN_DIRNAME="$RUN_TS${NOTE_SLUG:+_$NOTE_SLUG}"
-RUN_DIR="$SCRIPT_DIR/runs/$RUN_DIRNAME"
+RUN_DIR="$EMU_ROOT/runs/$RUN_DIRNAME"
 LATEST_DIR="$RUN_DIR"
 mkdir -p "$RUN_DIR"
-ln -sfn "$RUN_DIRNAME" "$SCRIPT_DIR/runs/latest"
-printf '%s\n' "$RUN_DIRNAME" > "$SCRIPT_DIR/runs/latest_path.txt"
+ln -sfn "$RUN_DIRNAME" "$EMU_ROOT/runs/latest"
+printf '%s\n' "$RUN_DIRNAME" > "$EMU_ROOT/runs/latest_path.txt"
 
 export SPIKE3_SYSROOT="$SYSROOT"
 export SPIKE3_GAME_DIR="$GAME_DIR"
-export SPIKE3_EMULATION_DIR="$SCRIPT_DIR"
+export SPIKE3_EMULATION_DIR="$EMU_ROOT"
 export SPIKE3_RUN_DIR="$RUN_DIR"
 export SPIKE3_GAME_LOG_PATH="$LATEST_DIR/game.log"
 export SHIM_PRESS_REQUEST_PATH="$RUN_DIR/press_request.txt"
@@ -366,7 +370,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 [[ -f "$SHIM" ]]          || die "shim not built. Run ./build.sh first."
 command -v "$QEMU" >/dev/null || die "$QEMU not in PATH. Install qemu-user."
 if [[ "$REAL_GL" == "1" && ! -d "$OVERLAY" ]]; then
-    die "Mesa overlay not built at $OVERLAY. Run: (cd mesa_sw_overlay && ./build_overlay.sh)"
+    die "Mesa overlay not built at $OVERLAY. Run: (cd \"$SRC_DIR/mesa_sw_overlay\" && ./build_overlay.sh)"
 fi
 if [[ "$BOOT_DISPLAY" == "1" && ! -x "$BOOT_DISPLAY_BIN" ]]; then
     printf '[run_game] BOOT_DISPLAY=1 but %s not found/executable; disabling\n' "$BOOT_DISPLAY_BIN" >&2
@@ -467,7 +471,7 @@ if [[ "$BOOT_DISPLAY" == "1" ]]; then
             -E "LD_LIBRARY_PATH=$OVERLAY:$SYSROOT/usr/lib64:$SYSROOT/usr/lib:$SYSROOT/lib64:$SYSROOT/lib" \
             -E "SPIKE3_SYSROOT=$SYSROOT" \
             -E "SPIKE3_GAME_DIR=$GAME_DIR" \
-            -E "SPIKE3_EMULATION_DIR=$SCRIPT_DIR" \
+            -E "SPIKE3_EMULATION_DIR=$EMU_ROOT" \
             -E "SPIKE3_RUN_DIR=$RUN_DIR" \
             -E "SPIKE3_GAME_LOG_PATH=$GAME_DBG_LOG" \
             -E "SHIM_PRESS_REQUEST_PATH=$SHIM_PRESS_REQUEST_PATH" \
@@ -614,7 +618,7 @@ fi
 if [[ "$SHIM_AUTO_PRESS" == "1" ]]; then
     (
         sleep "$SHIM_AUTO_PRESS_DELAY_S"
-        request_path="$SCRIPT_DIR/runs/latest/press_request.txt"
+        request_path="$EMU_ROOT/runs/latest/press_request.txt"
         printf '%s\n' "$SHIM_AUTO_PRESS_SW_ID" > "$request_path"
         if [[ -f "$GAME_DBG_LOG" ]]; then
             printf '%s - [auto_press] T+%ss PRESS %s sw_id=%s -> %s\n' \
@@ -638,7 +642,7 @@ args=(
     -E "LD_LIBRARY_PATH=$OVERLAY:$SYSROOT/usr/lib64:$SYSROOT/usr/lib:$SYSROOT/lib64:$SYSROOT/lib"
     -E "SPIKE3_SYSROOT=$SYSROOT"
     -E "SPIKE3_GAME_DIR=$GAME_DIR"
-    -E "SPIKE3_EMULATION_DIR=$SCRIPT_DIR"
+    -E "SPIKE3_EMULATION_DIR=$EMU_ROOT"
     -E "SPIKE3_RUN_DIR=$RUN_DIR"
     -E "SPIKE3_GAME_LOG_PATH=$GAME_DBG_LOG"
     -E "SHIM_PRESS_REQUEST_PATH=$SHIM_PRESS_REQUEST_PATH"

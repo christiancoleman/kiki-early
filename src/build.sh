@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # build.sh — compile spi_shim.so from all translation units.
 #
+# Sources live in this directory (= _emulation/src/). Carved-out modules get
+# their own subdir — currently nodebus/. Add new subdir paths to SOURCES below
+# as more modules are split out; -I"$SRC_DIR" lets every TU keep
+# `#include "spi_shim.h"` regardless of which subdir it lives in.
+#
 # USAGE:
 #   ./build.sh                # optimized build (-O2)
 #   DEBUG=1 ./build.sh        # debug build (-O0 -g)
@@ -10,8 +15,10 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+# SRC_DIR is _emulation/src/ — auto-located from this script. (Collaborators
+# with a non-standard checkout can run from anywhere; the script self-locates.)
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SRC_DIR"
 
 CC="${CC:-aarch64-linux-gnu-gcc}"
 if [[ "${DEBUG:-0}" == "1" ]]; then
@@ -25,12 +32,12 @@ command -v "$CC" >/dev/null || {
     exit 1
 }
 
-# Source list — update as modules are carved out of spi_shim.c.
+# Source list — paths relative to SRC_DIR. Carved-out modules live in subdirs.
 SOURCES=(
     spi_shim.c
     shim_bridges.c
     shim_diagnostics.c
-    shim_nodebus.c
+    nodebus/shim_nodebus.c
     shim_discovery.c
     shim_fs.c
     shim_gl.c
@@ -46,11 +53,11 @@ SOURCES=(
     games/pokemon_le_machine.c
 )
 
-VERSION_SCRIPT="$SCRIPT_DIR/spi_shim.ver"
+VERSION_SCRIPT="$SRC_DIR/spi_shim.ver"
 
-echo "[build] $CC $CFLAGS"
+echo "[build] $CC $CFLAGS -I$SRC_DIR"
 echo "[build] sources: ${SOURCES[*]}"
-$CC $CFLAGS -o spi_shim.so "${SOURCES[@]}" \
+$CC $CFLAGS -I"$SRC_DIR" -o spi_shim.so "${SOURCES[@]}" \
     -Wl,--version-script="$VERSION_SCRIPT" \
     -ldl -lpthread
 printf '[build] OK — spi_shim.so: %s bytes\n' "$(stat -c%s spi_shim.so)"

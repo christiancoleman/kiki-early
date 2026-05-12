@@ -9583,8 +9583,32 @@ The restored switch behavior now matches that commit's shape:
 
 This is the important boundary going forward: the nodebus protocol-accuracy path is for nodebus protocol work only. It should not become the place where core gameplay switch translation diverges unless a later test proves the switch layer itself needs a new, documented machine model.
 
-### 105e - Current verification
+## Step 106: Nodebus unit-test pilot + `_emulation/src/` reorganization (2026-05-12)
 
-`bash -n _emulation/run_game.sh`, `git diff --check -- _emulation/shim_inject.c _emulation/shim_nodebus.c _emulation/shim_switches.c _emulation/docs/JOURNAL.md`, and `_emulation/./build.sh` all passed after the rollback. Build warnings remain the known unrelated set (`log_caller_chain` unused, timestamp truncation, `shim_fs.c` comment warning, `openat` nonnull comparisons).
+Two related housekeeping moves ahead of the accurate-CPU-send/receive nodebus work: a host-side unit-test harness for the bridge layer (so subsequent protocol work is TDD-able), and a `src/` directory split so the shim code stops cluttering the `_emulation/` root.
 
-The nodebus communication-accuracy code is still present, but the service-menu Node Bus Test needs one fresh run after the switch rollback before we can call it verified in the current tree.
+### 106a — Host-side unit-test harness for `shim_nodebus.c`
+
+Stood up `src/tests/` — host-`gcc`-compiled C tests that `#include` a shim TU directly to reach its `static` helpers, with the externs it expects from the rest of the shim (`uart_shim_fd`, `real_write`, `shim_resolve_game_base`, `shim_switch_*`, `usleep`) supplied as test doubles; `real_write` is redirected to a capture buffer so each case feeds a request frame to `synthesize_bridge_response()` and asserts on the bytes that come back. `synthesize_bridge_response` is almost a pure function — the only impurities are `time()` (fast/slow synth delay) and `shim_resolve_game_base()`-backed reads — both mockable.
+
+Pilot coverage (156 assertions, all green via `src/tests/run_tests.sh`):
+- **Framing primitives:** `bridge_checksum`, `bridge_{encode,decode}_escape`, `nodebus_fill_checked_inner`, `nodebus_cipher_decrypt` involution.
+- **Bridge-level command contracts** (derived from PROTOCOL §4 + the game-side consumer's shape): cmd `0x10 / 0x11 / 0x15 / 0x16 / 0x18 / 0x1c / 0x1d / 0x20 / 0x25 (+ 0xF0 enum-reset) / 0x27 / 0x30`, plus the deliberate-timeout cases (unknown cmd, cmd `0x40`, short cmd-`0x41` frame).
+- **Python golden model** (`src/tests/nodebus/nodebus_model.py`, self-tested by `test_nodebus_model.py`): bridge frame framing, the netbridge CRC32 constant, the cmd-0x41 cipher builder verbatim from PROTOCOL §5.1 (verified it produces the documented `85 01 ae cc` slot-5 cmd-`0xfc` frame), and the cmd-0x41 inbound 3-gate reply validator. This is the oracle for cmd-0x41 contract tests once the catalog phase starts.
+
+Two doc inconsistencies the pilot surfaced, flagged for the catalog phase (not fixed): (1) PROTOCOL §5.1 and `shim_nodebus.c` both call a byte "hint" but mean two values differing by 2 — the wrapper's expected payload length vs. the on-wire response-length byte (`__n` = hint + 2, which is what the shim's parser actually reads); (2) the §5.1 prose ("`mcp_nodebus_send_encrypted` increments the ilen byte by one") vs. the §5.1 Python reference (which appends `inner_len`, not `+1`, yet returns `85 01 ae cc`) vs. `nodebus_cipher_decrypt`'s mask formula (`inner_len & 0x0F` vs. the reference's `(inner_len+1) & 0x0F`) — these agree only if the wire `inner_len` byte is the post-increment value. Needs a read of `mcp_nodebus_send_encrypted @ 0x8ec410`.
+
+Next nodebus phase (held for go-ahead): a fresh-state boot run with full per-frame nodebus logging → harvest the `(slot, inner_cmd)` catalog at each boot phase + through the Service-Menu Node Bus Test → RE each sender/consumer → write the first cmd-0x41 contract vectors (the slot-1 `0xed`/`0xee` poll loop, Step 68's "opaque" pair, is a prime target since it currently times out every cycle) → build the `shim_resolve_game_base()` fixture region the harness needs for the version-lookup / switch-idle paths.
+
+### 106b — `_emulation/src/` directory split
+
+The shim's ~20 `shim_*.c`/`.h` files, the build/launch scripts, the Python daemons/tools, and the existing `games/` / `mesa_sw_overlay/` / `scripts/` / `tests/` subdirs all moved into `_emulation/src/` (the conventional C-project `src/` layout, with `_emulation/` as the project root). The non-code dirs stay at `_emulation/`: `docs/`, `runs/`, `captures/`, `reference/`, `_ghidra/`, `.claude/`, `.gitignore`. The one carved-out module so far is `src/nodebus/shim_nodebus.c` (with `src/tests/nodebus/` mirroring it); everything else stays flat in `src/` and gets split into `src/<module>/` as TDD/refactor work touches it.
+
+Mechanical fixups in the same change:
+- `src/build.sh` — `SOURCES` entry `shim_nodebus.c` → `nodebus/shim_nodebus.c`; added `-I"$SRC_DIR"` so any TU keeps a bare `#include "spi_shim.h"`; `SCRIPT_DIR` renamed `SRC_DIR`. Verified: `./build.sh` produces `spi_shim.so` clean (pre-existing `-Wnonnull-compare` warnings in `shim_fs.c` only).
+- `src/run_game.sh` — split `EMU_ROOT` (= `_emulation/`, where `runs/` etc. live; configurable via `SPIKE3_EMULATION_DIR`, defaults to the parent of `src/`) from `SRC_DIR` (= `_emulation/src/`); re-derived `GAME_DIR`/`SYSROOT` for the extra directory level; moved the `runs/`-relative paths and the `SPIKE3_EMULATION_DIR` export/`-E` lines to `$EMU_ROOT`. The `cd /games && exec /games/game` launch is unchanged — that's the canonical absolute cwd, not relative to anything (Step 94k). Verified: `bash -n` clean.
+- `src/tests/run_tests.sh` + `src/tests/nodebus/test_nodebus.c` — re-pathed includes (`#include "spi_shim.h"` and `#include "nodebus/shim_nodebus.c"` via `-I.../src`); `.build/` is now `src/tests/.build/`. Verified: `./run_tests.sh` still green (135 C + 21 Python).
+- `.gitignore` (both `_emulation/.gitignore` and `games/pokemon_le/.gitignore`) — `spi_shim.so` / `tests/.build/` / probe-binary patterns re-pathed under `src/`.
+- New `src/README.md` — the implementation-facing project README (layout, build, run, test, the module/test convention, the `EMU_ROOT`/`SRC_DIR` distinction, pointers to PROTOCOL/JOURNAL).
+
+PROTOCOL update deferred: per the user, PROTOCOL is to become strictly RE / Spike-3-platform facts (implementation-agnostic), with the project/implementation description moving to `src/README.md`. So PROTOCOL §1 "Repository layout", §2 "Quick-start", and §12 "Translation units" still show the pre-`src/` paths; those get reconciled when PROTOCOL is re-scoped. The codex permission rules (`./build.sh`, `./run_game.sh`, etc. in `~/.codex/rules/default.rules`) match command strings, not paths, so they're unaffected; the `/lore` / `/protocol` / `/log` skill scripts reference `_emulation/docs/` and `_emulation/runs/`, which didn't move, so they're unaffected too.
