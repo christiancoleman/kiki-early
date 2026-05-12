@@ -167,17 +167,15 @@ ssize_t write(int fd, const void *buf, size_t count) {
             fprintf(stderr, " %02x", data[i]);
         if (count > 32) fprintf(stderr, " ...");
         fprintf(stderr, "\n");
-        ssize_t ret = real_write(fd, buf, count);
-        /* Save/restore errno around response synthesis so our extra
-         * real_write() into uart_shim_fd can't pollute the game's view of
-         * the primary write(). (The previous drain-via-real_read also had
-         * this problem because non-blocking read on an empty socket sets
-         * errno=EAGAIN, which leaked out as "failed to initialize bridge:
-         * Resource temporarily unavailable".) */
+        /* This is a fake UART endpoint: the game only needs write() to
+         * succeed and a matching response to become readable. Do not write
+         * the request into the socketpair. The shim side does not drain game
+         * requests, and fast service-menu nodebus scans can otherwise fill
+         * the socket buffer and block here before response synthesis. */
         int saved_errno = errno;
         synthesize_bridge_response((const uint8_t *)buf, count);
         errno = saved_errno;
-        return ret;
+        return (ssize_t)count;
     }
 
     if (fd == FAKE_FD_SPI && spi_active) {
@@ -408,4 +406,3 @@ int munmap(void *addr, size_t length) {
     }
     return ret;
 }
-

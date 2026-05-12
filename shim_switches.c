@@ -100,7 +100,7 @@ static void shim_switch_apply_default_idle_corrections(uint8_t channel_id,
          * that path clears these bits before calling sub_651610(1, ...).
          * Match that derived idle here so nodebus switch-poll and CPU-SPI
          * derived updates do not ping-pong channel-1 edges. */
-        static const uint8_t derived_low_bits[] = {2, 11, 13};
+        static const uint8_t derived_low_bits[] = {13};
         for (size_t i = 0; i < sizeof(derived_low_bits) / sizeof(derived_low_bits[0]); i++) {
             switch_set_bit(buf, derived_low_bits[i], 0);
         }

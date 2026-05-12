@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/types.h>
 #include <execinfo.h>
 #include <dlfcn.h>
@@ -77,8 +78,10 @@ static uint8_t nodebus_switch_idle_baseline_valid[32];
  * latency or concurrent polling/test traffic can timeout behind our delay. */
 #define NODEBUS_SYNTH_DELAY_US 200000
 #define NODEBUS_FAST_SYNTH_DELAY_US 10000
+#define NODEBUS_DEEP_FAST_AFTER_S 45
 
 static int nodebus_post_init_fast_replies = 0;
+static time_t nodebus_first_synth_time = 0;
 
 static int nodebus_deep_enabled(void) {
     static int cached = -1;
@@ -91,10 +94,38 @@ static int nodebus_deep_enabled(void) {
     return cached;
 }
 
+static int nodebus_deep_fast_ready(void) {
+    if (!nodebus_deep_enabled())
+        return 0;
+    time_t now = time(NULL);
+    if (nodebus_first_synth_time == 0)
+        nodebus_first_synth_time = now;
+    return nodebus_post_init_fast_replies ||
+           (now - nodebus_first_synth_time) >= NODEBUS_DEEP_FAST_AFTER_S;
+}
+
 static void nodebus_synth_delay(void) {
-    usleep((nodebus_deep_enabled() && nodebus_post_init_fast_replies)
-           ? NODEBUS_FAST_SYNTH_DELAY_US
-           : NODEBUS_SYNTH_DELAY_US);
+    int fast = nodebus_deep_fast_ready();
+    usleep(fast ? NODEBUS_FAST_SYNTH_DELAY_US : NODEBUS_SYNTH_DELAY_US);
+}
+
+static void nodebus_fill_checked_inner(uint8_t *dst, int inner_size) {
+    if (inner_size >= 2) {
+        uint32_t inner_sum = 0;
+        for (int i = 0; i < inner_size - 2; i++)
+            inner_sum += dst[i];
+        dst[inner_size - 2] = (uint8_t)(-(int32_t)inner_sum);
+    }
+}
+
+static uint32_t nodebus_observed_send_counters[32] = {0};
+
+static void nodebus_note_send_counter(uint8_t slot) {
+    nodebus_observed_send_counters[slot & 0x1F]++;
+}
+
+static uint32_t nodebus_current_send_counter(uint8_t slot) {
+    return nodebus_observed_send_counters[slot & 0x1F];
 }
 
 static int nodebus_slot_is_populated(uint8_t slot) {
@@ -724,6 +755,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
         uint8_t slot_byte = payload[0];
         uint8_t slot      = slot_byte & 0x1F;
         uint8_t inner_len = payload[1];
+        nodebus_note_send_counter(slot);
         if (2 + (int)inner_len + 1 > payload_len) {
             SHIM_LOG("bridge: cmd 0x41 slot=%u inner_len=%u doesn't fit in payload (%d)",
                      slot, inner_len, payload_len);
@@ -908,6 +940,59 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             return;
         }
 
+        /* Discovery query (inner_cmd=0xFF).
+         *
+         * FUN_008f5cd0 sends `{slot|0x80, 1, 0xff, 8}` and expects a
+         * 10-byte inner response. The validator copies the first 8 bytes to
+         * two uint32 outputs, validates byte[8] as the inner checksum and
+         * byte[9] as the status byte, then compares word0 to the per-slot
+         * send counter to detect stale replies. A valid response is enough
+         * for the init orchestrator/service test to mark populated nodes as
+         * responding. */
+        if (nodebus_deep_enabled() && inner_cmd == 0xFF &&
+            nodebus_slot_is_populated(slot)) {
+            int hint_idx = 2 + (int)inner_len;
+            if (hint_idx >= payload_len) {
+                SHIM_LOG("bridge: synth discovery_ff SKIP slot=%u (hint_idx=%d ≥ payload_len=%d)",
+                         slot, hint_idx, payload_len);
+                return;
+            }
+            uint8_t hint = payload[hint_idx];
+            if (hint == 0 || hint > 32) {
+                SHIM_LOG("bridge: synth discovery_ff SKIP slot=%u hint=%u (out of range)",
+                         slot, hint);
+                return;
+            }
+            uint8_t resp[64];
+            int o = 0;
+            resp[o++] = 0x02;
+            resp[o++] = 0x41;
+            resp[o++] = id;
+            int payload_start = o;
+            int inner_size = (int)hint;
+            for (int i = 0; i < inner_size; i++)
+                resp[o++] = 0x00;
+            if (inner_size >= 8) {
+                uint32_t counter = nodebus_current_send_counter(slot);
+                /* High bit selects FUN_008ec410's checked-response path,
+                 * which strips the checksum/status trailer before copying
+                 * the first 8 bytes to the caller's output buffer. */
+                resp[payload_start + 0] = (uint8_t)(counter | 0x80);
+                resp[payload_start + 1] = (uint8_t)(counter >> 8);
+                resp[payload_start + 2] = (uint8_t)(counter >> 16);
+                resp[payload_start + 3] = (uint8_t)(counter >> 24);
+            }
+            nodebus_fill_checked_inner(resp + payload_start, inner_size);
+            uint8_t cks = bridge_checksum(resp + 1, (size_t)(o - 1));
+            resp[o++] = cks;
+            resp[o++] = 0x03;
+            SHIM_LOG("bridge: synth discovery_ff RESP slot=%u hint=%u counter=%u",
+                     slot, hint, nodebus_current_send_counter(slot));
+            nodebus_synth_delay();
+            bridge_send_response(resp, (size_t)o, 0x41, id);
+            return;
+        }
+
         /* fe_probe synthesis (inner_cmd=0xFE).
          *
          * Wire `hint` byte the shim parses is actually __n in the game's
@@ -950,8 +1035,24 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
             for (int i = 0; i < inner_size; i++)
                 resp[o++] = 0x00;
             if (!nodebus_slot_is_populated(slot)) {
-                SHIM_LOG("bridge: synth fe_probe RESP slot=%u hint=%u inner_sz=%d (not populated)",
-                         slot, hint, inner_size);
+                if (nodebus_deep_fast_ready()) {
+                    /* Service-menu Node Bus Test needs absent slots to fail
+                     * quickly. A literal timeout is semantically clean but
+                     * costs roughly one second per retry across many absent
+                     * slots. Return a checked-response frame with status bit
+                     * 2 set; FUN_008ec410 rejects it immediately before
+                     * copying chip data, so it behaves like a failed probe
+                     * without creating an "Unknown Node" chip record. */
+                    if (inner_size > 0) {
+                        resp[payload_start + 0] = 0x80;
+                        resp[payload_start + inner_size - 1] = 0x04;
+                    }
+                    SHIM_LOG("bridge: synth fe_probe ERR_RESP slot=%u hint=%u inner_sz=%d (not populated)",
+                             slot, hint, inner_size);
+                } else {
+                    SHIM_LOG("bridge: synth fe_probe RESP slot=%u hint=%u inner_sz=%d (not populated, boot all-zero)",
+                             slot, hint, inner_size);
+                }
             } else if (hint >= 10) {
                 uint32_t chip_id = nodebus_chip_id_for_slot(slot);
                 uint8_t v1 = 0x01, v2 = 0x1F, v3 = 0x00, v0 = 0x00;
@@ -975,10 +1076,7 @@ void synthesize_bridge_response(const uint8_t *raw_req, size_t raw_len) {
                 }
             }
             if (inner_size >= 2) {
-                uint32_t inner_sum = 0;
-                for (int i = 0; i < inner_size - 2; i++)
-                    inner_sum += resp[payload_start + i];
-                resp[payload_start + inner_size - 2] = (uint8_t)(-(int32_t)inner_sum);
+                nodebus_fill_checked_inner(resp + payload_start, inner_size);
             }
             uint8_t cks = bridge_checksum(resp + 1, (size_t)(o - 1));
             resp[o++] = cks;
