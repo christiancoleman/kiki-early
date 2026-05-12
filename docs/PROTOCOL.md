@@ -1,6 +1,6 @@
 # Spike 3 Emulation — Playbook & Verified Reference
 
-**Discipline.** This is the single source of truth for everything we have *proven* about the Spike 3 platform and our emulation of it. **Verified facts only.** Hedging language (`likely`, `probably`, `TODO`, `TBD`, `unverified`) does not belong in this document — those live in `JOURNAL.md`. Every section is **self-contained** — you should not need to chase a journal step to evaluate a claim. Each subsection ends with a `*Verified by:*` footnote naming the method (BN decompile, hexdump @ X, runtime BRK trap on date Y, runtime strace, etc.). When sources conflict, **the binary wins** — re-verify against code or a runtime test, never against file mtime.
+**Discipline.** This is the single source of truth for everything we have *proven* about the **Spike 3 platform and the game binary** — wire protocols, file/memory formats, the game's own functions and structures, the cabinet's boot sequence, the hardware. It is **implementation-agnostic**: how *our* emulator is built, run, and structured — and what its shim actually does — lives in `../src/README.md` and `../src/SHIM.md`, not here. **Verified facts only.** Hedging language (`likely`, `probably`, `TODO`, `TBD`, `unverified`) does not belong in this document — those live in `JOURNAL.md`. Every section is **self-contained** — you should not need to chase a journal step to evaluate a claim. Each subsection ends with a `*Verified by:*` footnote naming the method (BN decompile, hexdump @ X, runtime BRK trap on date Y, runtime strace, etc.). When sources conflict, **the binary wins** — re-verify against code or a runtime test, never against file mtime.
 
 `JOURNAL.md` is the exploration/narrative log. Cite it from this document only for "why this workaround exists" historical context, never as proof of a fact.
 
@@ -10,8 +10,7 @@ When a claim here turns out to be wrong, **delete it**. Do not leave a banner. G
 
 ## Table of contents
 
-1. [Project overview & architecture](#1-project-overview--architecture)
-2. [Quick-start: build & run the emulator](#2-quick-start-build--run-the-emulator)
+1. [The Spike 3 platform](#1-the-spike-3-platform)
 3. [Boot sequence (host + game)](#3-boot-sequence-host--game)
 4. [CPU ↔ netbridge UART bridge protocol](#4-cpu--netbridge-uart-bridge-protocol)
 5. [Nodebus (cipher, hash, framing)](#5-nodebus-cipher-hash-framing)
@@ -26,11 +25,7 @@ When a claim here turns out to be wrong, **delete it**. Do not leave a banner. G
 
 ---
 
-## 1. Project overview & architecture
-
-### What this project does
-
-Run the **Pokémon LE 0.81.0** game binary, an ARM aarch64 ELF originally written for Stern's **Spike 3 platform**, on an x86_64 Linux dev workstation. The approach is **QEMU user-mode** plus an **`LD_PRELOAD` shim** (`spi_shim.so`) that intercepts library and device calls and either emulates the missing hardware in software or forwards translated calls to the host. The same emulator is intended to boot **any Spike 3 title** (Star Wars LE 0.85.0 is the secondary test target — see §13).
+## 1. The Spike 3 platform
 
 ### Asset stores
 
@@ -41,133 +36,11 @@ The game has **two independent asset containers**:
 | `image.bin` | `games/pokemon_le/image.bin` | 1.05 GiB | 2452 audio assets (PCM 16-bit LE 44.1 kHz, mono + stereo); 885 scene-bytecode descriptors; animation/coordinate tables; playfield/mode grid records |
 | `main.pck` | `games/pokemon_le/assets/godot/main.pck` | 210 MB | Godot resources reachable via `res://`: `.tscn` scenes, GLSL shaders, sprite textures, H.265 battle videos, GDScripts, Godot-side fonts, project icon |
 
-Some categories live elsewhere on the filesystem (Radium scenes in `assets/lcd/`, Nuklear assets in `assets/nuk/`, the boot splash PNG in `spike3/bin/`). See §6 for the image.bin internal layout, §7 for extraction, §9 for Radium scene format.
+Some categories live elsewhere on the filesystem (Radium scenes in `assets/lcd/`, Nuklear assets in `assets/nuk/`, the boot splash PNG in `spike3/bin/`). See §6 for the image.bin internal layout, §9 for Radium scene format.
 
 *Verified by:* image.bin byte size + section header parse (see §6); main.pck file byte size + Godot version banner.
 
-### Scope discipline
-
-**In scope** (Stern platform code, applies to every Spike 3 game):
-- Node-bus / UART / SPI / I2C bridge synthesis
-- image.bin file format and asset resolution
-- Radium scene format and the IScene shared abstract base
-- DisplayRenderer render loop, SceneCache initialization, proc dispatch system
-- Stern's audio pipeline (ALSA + sound-event registration)
-- Hardware shim coverage (DRM/GBM/EGL/GLES/V4L2/GPIO/ALSA/fontconfig)
-
-**Out of scope** for active investigation (Pokémon-port glue specific to this title's Godot bridge):
-- `VideoPlayerSpi` `is_inside_tree()` errors and related vtable assertions
-- `ManualGodotScene`, `PokemonGodotScene`, `godot_switch_scene`
-- `GodotRenderer` pre-warm cycles
-- `/tmp/godot_logs` content
-- `./assets/godot/main.pck` internal structure beyond "this is the Godot PCK"
-
-**Star Wars LE 0.85.0** is the parity test target. It has zero Godot and runs the same Stern Radium attract pipeline as PLE 0.81. A SW-LE-to-attract failure points at shared shim/node-bus code rather than Pokémon-port glue. See §13.
-
 ---
-
-## 2. Quick-start: build & run the emulator
-
-### Host requirements
-
-WSL2 with Debian 13 (trixie) on Windows 11, or native Linux on x86_64. ~5 GB free disk (game + extraction artifacts + Mesa overlay), ~4 GB RAM free at runtime. No KVM, no GPU passthrough — we render via Mesa llvmpipe (software raster). No `sudo` needed after the initial package install.
-
-```bash
-sudo apt install -y \
-    qemu-user gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-    python3 curl dpkg-dev file
-```
-
-Confirm `binfmt_misc` is registered for aarch64:
-
-```bash
-cat /proc/sys/fs/binfmt_misc/qemu-aarch64
-# expected first two lines:
-#   enabled
-#   interpreter /usr/libexec/qemu-binfmt/aarch64-binfmt-P
-```
-
-If missing: `sudo systemctl restart systemd-binfmt` or reinstall `qemu-user`.
-
-*Verified by:* fresh Debian 13 setup.
-
-### One-time setup: Mesa software-raster overlay
-
-The shim's real-GL mode forwards EGL/GLES calls to a sysroot-private Mesa overlay. Build it once:
-
-```bash
-cd "$SYSROOT/games/pokemon_le/_emulation/mesa_sw_overlay"
-./build_overlay.sh
-```
-
-Downloads ~63 MB of Debian arm64 `.deb`s, extracts them into `pkg/` (~365 MB, gitignored). The script also patches `24.0.8-1 → 24.0.9` in each `*_dri.so` so the sysroot's Mesa 24.0.9 libEGL accepts them. Re-runnable safely.
-
-Validate end-to-end render:
-
-```bash
-aarch64-linux-gnu-gcc -o gles_probe2 gles_probe2.c -ldl
-OVERLAY="$PWD/pkg/usr/lib/aarch64-linux-gnu"
-qemu-aarch64 -L "$SYSROOT" \
-    -E LD_LIBRARY_PATH="$OVERLAY:$SYSROOT/usr/lib64:$SYSROOT/usr/lib:$SYSROOT/lib64:$SYSROOT/lib" \
-    -E LIBGL_DRIVERS_PATH="$OVERLAY/dri" \
-    -E MESA_LOADER_DRIVER_OVERRIDE=swrast \
-    -E LIBGL_ALWAYS_SOFTWARE=1 \
-    -E EGL_PLATFORM=surfaceless \
-    ./gles_probe2
-```
-
-Expected last line: `VERDICT: ALL PASS — llvmpipe is really rasterizing`.
-
-### Build the shim (only needed after editing)
-
-```bash
-cd "$SYSROOT/games/pokemon_le/_emulation"
-./build.sh
-# or directly:
-aarch64-linux-gnu-gcc -shared -fPIC -O2 \
-    -o spi_shim.so spi_shim.c -ldl -lpthread
-```
-
-`build.sh` cross-compiles the shim TUs. The shim as checked in is already built — only rebuild after editing `spi_shim.c` or any `shim_*.c`.
-
-### One-time setup: bind-mount the sysroot to native paths
-
-The game is compiled to read absolute paths like `/games/pokemon_le/...`, `/connectivity/...`, `/data/...`. Rather than intercepting every filesystem call in the shim and rewriting these paths, we use kernel-level bind mounts so the paths resolve natively. **One-shot setup, persists until reboot:**
-
-```bash
-sudo _emulation/scripts/setup_bind_mounts.sh                  # default: pokemon_le
-sudo _emulation/scripts/setup_bind_mounts.sh /mnt/c/Workspace/starwars-le-0.85.0   # other Spike-3 game
-_emulation/scripts/setup_bind_mounts.sh --check               # verify (no sudo)
-sudo _emulation/scripts/setup_bind_mounts.sh --umount         # tear down
-sudo _emulation/scripts/setup_bind_mounts.sh --switch <sysroot>  # umount + remount elsewhere
-```
-
-After setup, `/games`, `/connectivity`, `/data` are kernel-resolved into the sysroot — game absolute-path references work without any LD_PRELOAD remapping. Idempotent (skips already-mounted), validates source dirs exist, refuses sysroots outside `/mnt/c/Workspace/`.
-
-**Why this matters:** before the bind-mount approach, the shim had ~50 path-related hooks (`open` / `__openat64_2` / `fopen` / `stat` / `__xstat64` / `opendir` / `readdir` / `getcwd` / `chmod` / `unlink` / `rename` / etc.) and a `remap_path` helper that prefixed every absolute path with `$SYSROOT`. Many of those hooks couldn't catch all libc-internal call paths — strace consistently showed the shim missing real `.radium` opens. With bind mounts, the **kernel** resolves the paths and every libc / direct-syscall / asm path goes through the same bind-mount table simultaneously. Result: more dependable runs, fewer phantom "file not found" issues.
-
-**Caveats:**
-- Bind mounts on `/mnt/c` (9p) only succeed at host level, not inside an unprivileged user namespace (verified — standard Linux user-namespace behavior, not a WSL quirk).
-- The shim's `remap_path` and most FS hooks have been removed (see §12 — only GPIO sysfs / libgpiod chardev FS-style hooks remain because those are hardware-related, not file-resolution).
-- The setup script creates `/games`, `/connectivity`, `/data` at root as zero-content mountpoint directories. They persist after `--umount`; remove with `sudo rmdir` if you want them gone.
-
-*Verified by:* `_emulation/scripts/setup_bind_mounts.sh` source; `findmnt /games /connectivity /data` against a live setup; JOURNAL Step 82 POC validation.
-
-### Launcher configuration
-
-`_emulation/run_game.sh` is the source of truth for launcher toggles, defaults, and helper process selection. This document intentionally does not mirror that table to avoid drift.
-
-`devbus_snapshot.py` is the one-shot switch-state client. Run it while the game is active to print raw channel buffers joined with decoded switch state, edge/flap counters, raw/state relation, manual address, and switch name. Use `--from-file runs/latest/devbus.log` to analyze a saved debug log; saved-log mode folds later `switch_change` lines over the snapshot before printing. Use `--mismatches` to show only rows where the manual `N-SW-K` address disagrees with runtime channel/bit.
-
-The `--debug` flag splits stdout/stderr per subsystem into the run dir (default behavior is to inherit the terminal). The `--note "describe"` flag adds a slug to the run-dir name and a note line to `run_info.txt`.
-
-*Verified by:* `_emulation/run_game.sh` source.
-
-### `/etc/init.d/shared` propagation
-
-The launcher sources `$SYSROOT/etc/init.d/shared` and passes the resulting game environment through qemu, matching how the real init scripts launch cabinet binaries. The kernel-level bind mounts above resolve absolute paths like `/games/pokemon_le/...` to the sysroot natively.
-
-*Verified by:* `_emulation/run_game.sh` source.
 
 ## 3. Boot sequence (host + game)
 

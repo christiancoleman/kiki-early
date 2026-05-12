@@ -1,104 +1,165 @@
-# `_emulation/src/` — the Spike 3 emulator shim
+# `_emulation/src/` — the Spike 3 emulator
 
 This directory holds everything that builds or runs as part of the emulator: the
 `LD_PRELOAD` shim (`spi_shim.so`), the build/launcher scripts, the host-side
 runtime daemons, the dev/operator tools, and the host-compiled unit tests.
 
-It's the implementation. **The verified reverse-engineering and Spike-3 platform
-facts live in [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md); the chronological
-record of how we got here lives in [`../docs/JOURNAL.md`](../docs/JOURNAL.md).**
-This README is the entry point for "how is the code laid out / how do I build /
-how do I run it."
+It's the **implementation**. The verified reverse-engineering and Spike-3
+**platform** facts live in [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md); the
+chronological record of how we got here lives in
+[`../docs/JOURNAL.md`](../docs/JOURNAL.md). The shim's internals (translation
+units, IPC bridge wire formats, the forward-decode / GL-daemon protocols, the
+asset extractor, etc.) are documented in [`SHIM.md`](SHIM.md). This README is
+the entry point: what this is, how it's laid out, how to build & run it.
 
-## Layout
+## What this is
 
-`_emulation/` is the project root. It splits into `src/` (this dir — code) and
-the non-code dirs that stay at `_emulation/`:
+Run the **Pokémon LE 0.81.0** game binary — an ARM aarch64 ELF written for
+Stern's **Spike 3 platform** — on an x86_64 Linux dev workstation. The approach
+is **QEMU user-mode** plus an **`LD_PRELOAD` shim** (`spi_shim.so`) that
+intercepts library/device calls and either emulates the missing hardware in
+software or forwards translated calls to the host. The same emulator is intended
+to boot **any Spike 3 title**; Star Wars LE 0.85.0 is the secondary test target
+(PROTOCOL §"Comparison binaries").
 
+It emulates the **CPU side only**. The RS-485 node bus is stubbed in software
+(the shim's `synthesize_bridge_response` plays the part of the netbridge MCU);
+the downstream nodes themselves are not present. Power-distribution responses are
+synthesized too.
+
+## Host requirements & one-time setup
+
+WSL2 with Debian 13 (trixie) on Windows 11, or native Linux x86_64. ~5 GB free
+disk (game + extraction artifacts + Mesa overlay), ~4 GB RAM free at runtime. No
+KVM, no GPU passthrough — render via Mesa llvmpipe (software raster). `sudo` only
+for the initial package install + the bind-mount setup.
+
+```bash
+sudo apt install -y qemu-user gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu python3 curl dpkg-dev file
+# confirm binfmt_misc is registered for aarch64:
+cat /proc/sys/fs/binfmt_misc/qemu-aarch64    # first lines: "enabled" / "interpreter /usr/libexec/qemu-binfmt/aarch64-binfmt-P"
+# if missing: sudo systemctl restart systemd-binfmt   (or reinstall qemu-user)
 ```
-_emulation/
-├── src/                       ← everything code/build/run (this dir)
-│   ├── nodebus/                ← carved-out module: netbridge UART protocol
-│   │   └── shim_nodebus.c
-│   ├── games/                  ← per-game machine profiles (switches/drivers/lamps)
-│   │   └── pokemon_le_machine.{c,h}
-│   ├── tests/                  ← host-compiled unit tests, mirroring src/'s modules
-│   │   ├── nodebus/{test_nodebus.c, nodebus_model.py, test_nodebus_model.py}
-│   │   └── run_tests.sh
-│   ├── mesa_sw_overlay/        ← self-contained sub-build: the GL_DAEMON=0 fallback
-│   ├── scripts/                ← setup_bind_mounts.sh, reset_run_state.sh
-│   ├── spi_shim.c  spi_shim.h  shim_*.{c,h}  gl_proto.h  spi_shim.ver   ← shim TUs (flat for now)
-│   ├── gles_probe{3..6}.c      ← one-off GL probe utilities
-│   ├── build.sh  run_game.sh  nuke_emulation.sh                         ← build / launch / cleanup
-│   ├── gl_daemon.py  decode_daemon.py  gl_proto.py                      ← host-side runtime daemons
-│   └── marker_button.py  switch_command.py  switch_inventory.py  devbus_snapshot.py
-│       *_subscriber.py  frame_viewer.py  snap_frame.py  switch_noise_test.py  decode_daemon_test.py
-│                                                                        ← dev/operator tools
-├── docs/        PROTOCOL.md (verified RE/platform), JOURNAL.md (history)
-├── runs/        per-run logs — runs/<TS>/, runs/latest/ symlink (git-ignored)
-├── captures/    on-disk frame/audio dumps (git-ignored)
-├── reference/   BN notebook exports, manuals, screenshots
-└── _ghidra/     Ghidra project (git-ignored)
+
+**Bind-mount the sysroot to native paths (once per WSL session — persists until reboot).**
+The game reads absolute paths like `/games/pokemon_le/…`, `/connectivity/…`,
+`/data/…`. Rather than intercepting and rewriting every filesystem call, kernel
+bind mounts resolve them natively:
+
+```bash
+sudo src/scripts/setup_bind_mounts.sh                                # default: pokemon_le
+sudo src/scripts/setup_bind_mounts.sh /mnt/c/Workspace/starwars-le-0.85.0   # other Spike-3 game
+     src/scripts/setup_bind_mounts.sh --check                        # verify (no sudo)
+sudo src/scripts/setup_bind_mounts.sh --umount                       # tear down
+sudo src/scripts/setup_bind_mounts.sh --switch <sysroot>             # umount + remount elsewhere
 ```
 
-**Module convention.** As subsystems get a TDD pass or a refactor, they're
-carved out of the flat `shim_*.c` set into `src/<module>/` with a matching
-`tests/<module>/`. `nodebus/` is the first; `gl/`, `io/`, `audio/`, `core/`,
-etc. follow. `build.sh` passes `-I"$SRC_DIR"` so a TU in any subdir keeps a bare
-`#include "spi_shim.h"`.
+After setup, `/games`, `/connectivity`, `/data` are kernel-resolved into the
+sysroot. Idempotent; validates the source dirs exist; refuses sysroots outside
+`/mnt/c/Workspace/`. Bind mounts on `/mnt/c` (9p) only succeed at host level, not
+in an unprivileged user namespace (standard Linux behaviour, not a WSL quirk).
+The `run_game.sh` launcher auto-runs `--switch` for you if the active mounts
+don't match its sysroot (disable with `AUTO_BIND_MOUNTS=0`, or
+`SKIP_BIND_MOUNT_CHECK=1` to skip the check entirely).
+
+**Build the Mesa software-raster overlay (once).** The `GL_DAEMON=0` fallback
+path forwards EGL/GLES to a sysroot-private Mesa:
+
+```bash
+cd src/mesa_sw_overlay && ./build_overlay.sh
+```
+
+Downloads ~63 MB of Debian arm64 `.deb`s, extracts into `pkg/` (~365 MB,
+git-ignored), patches the DRI version string so the sysroot's Mesa accepts them.
+Re-runnable. (The default backend is the host-native GL daemon — `GL_DAEMON=1` —
+which doesn't need this overlay; build it only if you want the in-qemu fallback.)
 
 ## Build
 
-```sh
+```bash
 cd _emulation/src
 ./build.sh                # cross-compiles spi_shim.so (-O2)
 DEBUG=1 ./build.sh        # -O0 -g
 ```
 
-Prereq: `gcc-aarch64-linux-gnu` (`sudo apt install gcc-aarch64-linux-gnu`). The
-shim ships pre-built; only rebuild after editing a TU. (The Mesa overlay used by
-`GL_DAEMON=0` is built separately and once — see PROTOCOL §2 and
-`mesa_sw_overlay/build_overlay.sh`.)
-
-## Run
-
-```sh
-cd _emulation/src
-./run_game.sh             # launch the game under qemu-aarch64 with the shim LD_PRELOAD'd
-./run_game.sh --debug --note "what i'm testing"
-```
-
-`run_game.sh` self-locates and auto-detects the sysroot from its own path. It is
-the source of truth for runtime toggles (env vars) — see the comment block at
-the top of the script; PROTOCOL deliberately doesn't mirror that list. A fresh
-`../runs/<TS>[_<note>]/` is created per run, with `../runs/latest/` symlinked to
-it.
-
-**Configurable project path.** `run_game.sh` and `build.sh` self-locate, so they
-work from any checkout without configuration. If you need to point them at a
-different `_emulation/` tree (unusual), set `SPIKE3_EMULATION_DIR=/path/to/_emulation`
-— that's the override knob. Internally the scripts distinguish `SRC_DIR`
-(= `_emulation/src/`, where the code + helpers live) from `EMU_ROOT`
-(= `_emulation/`, where `runs/`, `docs/`, `captures/` live); `SPIKE3_EMULATION_DIR`
-is `EMU_ROOT` and is what gets exported to the shim.
-
-**Canonical exec path.** `run_game.sh` does `cd /games && exec /games/game …`
-(a relative symlink to `pokemon_le/game`) to match real-cabinet behaviour. This
-is *not* relative to `src/` — `/games/` is the bind-mounted sysroot path, the
-same for every checkout. Running from any other cwd / exec path produces
-markedly less stable runs — see PROTOCOL §2 and JOURNAL Step 94k.
+Prereq: `gcc-aarch64-linux-gnu`. The shim ships pre-built; only rebuild after
+editing a TU. (Pre-existing `-Wnonnull-compare` warnings in `shim_fs.c` are
+benign.)
 
 ## Test
 
-```sh
+```bash
 cd _emulation/src/tests
 ./run_tests.sh            # host-compiled unit tests + Python golden model; non-zero exit on failure
 ```
 
-These run on the **host** compiler (not the aarch64 cross-compiler) and Python —
-no game binary, no `/games` bind mount, no qemu. Test sources mirror `src/`'s
-module layout (`tests/nodebus/` tests `src/nodebus/`). See
-[`tests/README.md`](tests/README.md) for the TDD discipline and what's covered.
+Host compiler + Python, no game binary, no `/games` bind mount, no qemu. Test
+sources mirror `src/`'s module layout (`tests/nodebus/` tests `src/nodebus/`).
+See [`tests/README.md`](tests/README.md) for the TDD discipline and coverage.
+
+## Architecture at a glance
+
+```
+       host (x86_64 Linux / WSL2)
+  ┌──────────────────────────────────────┐
+  │  qemu-aarch64 -L $SYSROOT            │
+  │  └─ ./game (ARM aarch64 ELF)         │
+  │     ├─ statically linked: Godot 4.4, │
+  │     │   Radium, Nuklear              │
+  │     ├─ dynamically links: libasound, │
+  │     │   libavcodec, libdrm, libgbm,  │
+  │     │   libEGL, libGLESv2, libcurl…  │
+  │     └─ LD_PRELOAD = spi_shim.so      │
+  │                                      │
+  │  spi_shim.so intercepts:             │
+  │    – /dev/ttyAMA5 (netbridge UART)   │
+  │    – /dev/spidev4.0  (CPU SPI)       │
+  │    – /dev/i2c-10     (EEPROM)        │
+  │    – /dev/dri/card1  (DRM/KMS)       │
+  │    – /dev/snd/* (ALSA, full stub)    │
+  │    – GPIO sysfs, libgpiod chardev    │
+  │    – V4L2 video devices              │
+  │                                      │
+  │  AF_UNIX abstract namespaces:        │
+  │    Listeners (subscribers connect):  │
+  │      @pokemon_spike3_bridge (state)  │
+  │      @pokemon_spike3_frame  (RGBA)   │
+  │      @pokemon_spike3_audio  (S16LE)  │
+  │      @pokemon_spike3_devbus (switch) │
+  │    Client (shim → host daemon):      │
+  │      @spike3_decode (HEVC NVDEC)     │
+  │      @spike3_gl     (host GLES)      │
+  │                                      │
+  │  Host processes:                     │
+  │    decode_daemon.py — NVDEC server   │
+  │    gl_daemon.py — host GLES server   │
+  │    frame_viewer.py, audio_subscriber │
+  │    devbus_subscriber.py, …           │
+  └──────────────────────────────────────┘
+```
+
+Per-translation-unit coverage, the IPC bridge wire formats, the forward-decode
+and GL-daemon protocols, the runtime binary patches, and the per-device
+emulation details are in [`SHIM.md`](SHIM.md).
+
+## Scope discipline
+
+**In scope** (Stern platform code — applies to every Spike 3 game):
+node-bus / UART / SPI / I2C bridge synthesis; `image.bin` format + asset
+resolution; Radium scene format and the `IScene` shared abstract base;
+DisplayRenderer render loop, SceneCache init, proc dispatch system; Stern's audio
+pipeline (ALSA + sound-event registration); hardware shim coverage
+(DRM/GBM/EGL/GLES/V4L2/GPIO/ALSA/fontconfig).
+
+**Out of scope** for active investigation (Pokémon-port glue specific to this
+title's Godot bridge): `VideoPlayerSpi` `is_inside_tree()` errors + related
+vtable assertions; `ManualGodotScene` / `PokemonGodotScene` / `godot_switch_scene`;
+`GodotRenderer` pre-warm cycles; `/tmp/godot_logs` content; `assets/godot/main.pck`
+internals beyond "this is the Godot PCK".
+
+**Star Wars LE 0.85.0** is the parity test target — zero Godot, same Stern Radium
+attract pipeline. A SW-LE-to-attract failure points at shared shim/node-bus code
+rather than Pokémon-port glue. See PROTOCOL §"Comparison binaries".
 
 ## Where things live
 
@@ -108,10 +169,11 @@ module layout (`tests/nodebus/` tests `src/nodebus/`). See
 | Build / launch / cleanup | `src/build.sh`, `src/run_game.sh`, `src/nuke_emulation.sh` |
 | Host runtime daemons (NVDEC decode, native GLES) | `src/decode_daemon.py`, `src/gl_daemon.py` (+ `gl_proto.{h,py}`) |
 | Dev/operator tools (TIMER panel, switch injection, devbus, viewers) | `src/marker_button.py`, `src/switch_command.py`, `src/switch_inventory.py`, `src/devbus_snapshot.py`, `src/*_subscriber.py`, `src/frame_viewer.py`, `src/snap_frame.py` |
-| Per-game machine inventory (switches/drivers/lamps) | `src/games/<game>_machine.{c,h}` |
+| Per-game machine inventory | `src/games/<game>_machine.{c,h}` |
 | Bind-mount + run-state setup | `src/scripts/setup_bind_mounts.sh`, `src/scripts/reset_run_state.sh` |
 | GL_DAEMON=0 Mesa overlay | `src/mesa_sw_overlay/` |
 | Host-side unit tests | `src/tests/<module>/` |
+| Shim internals reference | `src/SHIM.md` |
 | Verified RE / platform facts | `../docs/PROTOCOL.md` |
 | Chronological investigation log | `../docs/JOURNAL.md` |
 | Run logs / captures / Ghidra | `../runs/`, `../captures/`, `../_ghidra/` |
