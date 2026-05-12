@@ -95,6 +95,15 @@ static void shim_switch_apply_default_idle_corrections(uint8_t channel_id,
         for (size_t i = 0; i < sizeof(coin_bits) / sizeof(coin_bits[0]); i++) {
             switch_set_bit(buf, coin_bits[i], 1);
         }
+        /* Channel 1 is also synthesized by FUN_00674b90 from CPU-SPI byte 3.
+         * With our default channel-0 idle (byte 3 = 0xf8, low bits clear),
+         * that path clears these bits before calling sub_651610(1, ...).
+         * Match that derived idle here so nodebus switch-poll and CPU-SPI
+         * derived updates do not ping-pong channel-1 edges. */
+        static const uint8_t derived_low_bits[] = {2, 11, 13};
+        for (size_t i = 0; i < sizeof(derived_low_bits) / sizeof(derived_low_bits[0]); i++) {
+            switch_set_bit(buf, derived_low_bits[i], 0);
+        }
     } else if (channel_id == 8) {
         /* These normally-resting closed switches appear active in the
          * cabinet's Switch Test. In this game build their config is not

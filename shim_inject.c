@@ -1,30 +1,25 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+/*
+ * shim_inject.c — game-memory probing + always-on init helpers.
+ *
+ * Active content:
+ *   - Event-sweep machinery (Step 51): shim_fire_event trampoline to the
+ *     game's in-binary fire_event at BN VA 0x5c12a0, cmode-snapshot diff,
+ *     and the blind 0..0xce sweep with per-event SIGALRM timeout + SEGV
+ *     recovery via siglongjmp. Triggered by SIGUSR2 from shim_diagnostics.c.
+ *   - sigjmp_buf + "sweep in progress" globals (declared extern in
+ *     spi_shim.h; read by shim_sigsegv_handler in shim_diagnostics.c).
+ *   - shim_discovery_init_thread: deferred 2-second sleep then call
+ *     shim_discovery_init() and runtime compatibility setup.
+ *   - SIGALRM handler used by the sweep to break out of hung event handlers.
+ *   - shim_inject_start(): single public entry point the constructor calls.
+ *
+ * Cross-TU dependencies resolved via spi_shim.h:
+ *   - SHIM_LOG macro.
+ *   - shim_resolve_game_base() (shim_diagnostics.c).
+ *   - shim_cmode_table[] / shim_cmode_table_count (shim_diagnostics.c).
+ *   - shim_event_sweep() exported here, called from the SIGUSR2 handler
+ *     in shim_diagnostics.c.
+ */
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -175,12 +170,6 @@ void shim_event_sweep(void) {
     u = write(STDERR_FILENO, sum, (size_t)sl); (void)u;
 }
 
-
-
-
-
-
-
 /* Wait until channel 1's saved-state buffer is non-zero (i.e., FUN_00650f00
  * has populated it), then mirror changes to
  * DAT_0436b020 while the CPU-SPI/channel-1 state machine settles during boot. */
@@ -251,16 +240,12 @@ static void *shim_discovery_init_thread(void *arg) {
     (void)arg;
     sleep(2);
     shim_discovery_init();
-    
-
-    
     /* Decoder compatibility patch: NOP the b.ne at game VA 0x920cf0 so the
      * game's get_format callback accepts NV12 from forward-decode (or from
      * local SW hevc as a diagnostic). Must run after game-base is resolvable
      * — the 2 s sleep above already handles that timing. Default-on; gate
      * via SPIKE3_DECODER_PATCH=0. */
     shim_patch_get_format_callback();
-    shim_patch_channel1_derived_switches();
 
     uintptr_t game_base = shim_resolve_game_base();
     if (game_base) {

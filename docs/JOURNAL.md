@@ -9489,9 +9489,11 @@ This argues against "game thinks there are no balls installed" as the immediate 
 > [Redacted: an earlier startup-authorization bypass, its patch target and
 > value, and the associated key-derivation description.]
 
-At this revision the diagnostic override was disabled at its call site; the
-unused helper was still present and further cleanup was being considered.
-This is the state recorded here, before its later removal.
+This pass removed that diagnostic override from live code. The point of the
+inventory was to separate necessary emulation from temporary experiments
+before investigating the Start-button failure further.
+
+Follow-up: removing the channel-1 derived-switch NOP made button spam return. Disassembly of `sub_674b90(0)` showed why: channel 1 is synthesized from `DAT_0436b020` plus CPU-SPI byte-3 state bits, then translated immediately. With our default channel-0 idle (`byte3 = 0xf8`), that path clears channel-1 bits 2, 11, and 13. Updated `shim_switches.c` so synthesized channel-1 idle applies the same derived-low bits, then removed the NOP patch again.
 
 ### 104d — Active runtime patches and likely cleanup
 
@@ -9499,7 +9501,7 @@ Outstanding default-on runtime mutation/instrumentation:
 
 - `shim_discovery_init()` is still called unconditionally and installs a large BRK-trap set: Godot error, nodebus init, scene load, Start gates, multiball/event-32, clear path, and ball-count entry. These traps emulate the replaced instruction after logging, but they are still invasive. Next cleanup: gate them behind something like `SHIM_DISCOVERY_TRAPS=1`, default off.
 - `shim_patch_get_format_callback()` NOPs the game's video `get_format` branch by default. This is runtime support for the forward-decode path and is expected for video.
-- `shim_patch_channel1_derived_switches()` NOPs the derived channel-1 translate call by default unless `SPIKE3_CHANNEL1_DERIVED=1`. This came from switch-spam debugging and should be renamed/gated more clearly after the input layer is stable.
+- The previous `shim_patch_channel1_derived_switches()` NOP is removed. Channel-1 idle now explicitly matches the default CPU-SPI-derived idle transformation from `sub_674b90(0)`.
 - `shim_switches.c` applies default idle corrections for coin inputs, trough/EOS, captive ball, spinner, and Meowth down. These are intentional gameplay-I/O behavior now, but should be documented as machine-profile normalization rather than treated as a hidden debug patch.
 - `shim_nodebus.c` synthesizes FE/FA probe replies, switch-poll replies, and key-fetch replies. FE/switch-poll/key-fetch are current emulation support. FA remains under-RE'd and returns all zero; keep it on the suspect list if node/device state stays strange.
 
@@ -9510,8 +9512,7 @@ Env-gated helpers such as switch-table probe, edge snapshot, output probe, machi
 Before continuing Start-condition RE, clean the default runtime:
 
 1. Gate `shim_discovery_init()` behind an explicit env var and rebuild.
-2. Keep the diagnostic-mode poke disabled.
-3. Run one plain default test and compare behavior/logs without the BRK trap layer.
-4. If Start still aborts, re-enable only the smallest trap set needed for the next question: probably ball count plus event-32 lifecycle, not the whole historical discovery suite.
+2. Run one plain default test and compare behavior/logs without the BRK trap layer.
+3. If Start still aborts, re-enable only the smallest trap set needed for the next question: probably ball count plus event-32 lifecycle, not the whole historical discovery suite.
 
 This keeps the useful discoveries while reducing the chance that old traps, temporary patches, or stale assumptions distort the next result.
