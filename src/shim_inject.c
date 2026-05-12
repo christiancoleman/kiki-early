@@ -39,7 +39,7 @@
 
 #include "spi_shim.h"
 #include "shim_discovery.h"
-#include "games/pokemon_le_machine.h"
+#include "games/POKEMON_LE/0.81.0/machine_profile.h"
 
 /* Sweep globals — read by shim_sigsegv_handler (in shim_diagnostics.c) to
  * longjmp back out of a faulting sweep iteration. Externed in spi_shim.h. */
@@ -490,7 +490,8 @@ static void *shim_edge_snapshot_thread(void *arg) {
 }
 
 /* SHIM_MACHINE_DUMP=1 — join the runtime switch table against the per-game
- * mechanical inventory in games/pokemon_le_machine.{c,h}. Logs each manual
+ * mechanical inventory in games/POKEMON_LE/0.81.0/machine_profile.{c,h}.
+ * Logs each manual
  * entry's runtime sw_id (or "missing" if the manual lists a switch not in
  * the runtime array), plus the full driver and lamp tables.
  *

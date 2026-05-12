@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-marker_button.py — TIMER GUI for manual switch-press triggers.
+marker_button.py — TIMER GUI for manual switch triggers.
 
-Button press/release events append down/up commands to
-runs/latest/press_request.txt; the shim's shim_manual_press_thread polls this
-file every 200 ms and updates its held-switch overlay. Legacy one-line numeric
-requests still work as taps.
+Clicking a service-menu switch box toggles the requested switch state and
+appends down/up commands to runs/latest/press_request.txt; the shim's
+shim_manual_press_thread polls this file every 200 ms and updates its
+held-switch overlay. Legacy one-line numeric requests still work as taps.
 
 Usage:
     python3 marker_button.py
@@ -24,7 +24,14 @@ import tkinter as tk
 from tkinter import ttk
 
 from switch_command import append_locked
-from switch_inventory import MANUAL_SWITCHES, SWITCH_BY_MANUAL_ID, SWITCH_BY_RUNTIME_ID
+from switch_inventory import (
+    GAME_TITLE,
+    GAME_VERSION,
+    MANUAL_SWITCHES,
+    SWITCH_BY_MANUAL_ID,
+    SWITCH_BY_RUNTIME_ID,
+    SWITCH_LAYOUT_ROWS,
+)
 
 # run_game.sh passes explicit paths so a symlinked _emulation directory can
 # drive multiple sysroots without pathlib resolving back to the canonical tree.
@@ -239,6 +246,83 @@ def _switch_tabs():
     return tabs
 
 
+def _switch_layout_rows():
+    rows = []
+    for title, prefix, start, end in SWITCH_LAYOUT_ROWS:
+        row = []
+        for n in range(start, end + 1):
+            manual_id = f"{prefix}{n}" if prefix else str(n)
+            row.append((manual_id, SWITCH_BY_MANUAL_ID.get(manual_id.upper())))
+        rows.append((title, row))
+    return rows
+
+
+def _compact_detail(row, requested_on=False, actual_on=None) -> str:
+    manual_id, address, sw_id, name, conn, location, switch_type = row
+    runtime = "not mapped" if sw_id is None else f"runtime sw_id {sw_id}"
+    requested = "ON" if requested_on else "OFF"
+    actual = "not wired yet" if actual_on is None else ("ON" if actual_on else "OFF")
+    return (f"{manual_id}  {address}  {runtime}\n"
+            f"{name}\n"
+            f"{location}  {conn}  {switch_type}\n"
+            f"Requested: {requested}   Game state: {actual}")
+
+
+def _render_switch_canvas(canvas, layout_rows, cell_items, requested_on):
+    canvas.delete("all")
+    cell_items.clear()
+
+    cell = 38
+    gap = 10
+    row_gap = 30
+    label_w = 84
+    top = 26
+    bg = "#7b0000"
+    outer = "#8f8f8f"
+    middle = "#cfcfcf"
+    off = "#780000"
+    on = "#f8f8f8"
+    disabled = "#4d0000"
+    text = "#d9d9d9"
+
+    max_cols = max((len(row) for _title, row in layout_rows), default=0)
+    width = label_w + max_cols * cell + max(0, max_cols - 1) * gap + 28
+    height = top + len(layout_rows) * cell + max(0, len(layout_rows) - 1) * row_gap + 22
+    canvas.configure(width=width, height=height, bg=bg, scrollregion=(0, 0, width, height))
+
+    for r, (title, row) in enumerate(layout_rows):
+        y = top + r * (cell + row_gap)
+        canvas.create_text(10, y + cell / 2, anchor="w", text=title,
+                           fill=text, font=("monospace", 9, "bold"))
+        for c, (manual_id, switch_row) in enumerate(row):
+            if switch_row is None:
+                continue
+            x = label_w + c * (cell + gap)
+            requested = manual_id.upper() in requested_on
+            fill = on if requested else off
+            if switch_row[2] is None:
+                fill = disabled
+            outer_id = canvas.create_rectangle(x, y, x + cell, y + cell,
+                                               outline=outer, width=2, fill=bg)
+            mid_id = canvas.create_rectangle(x + 4, y + 4, x + cell - 4, y + cell - 4,
+                                             outline=middle, width=2, fill=fill)
+            inner_id = canvas.create_rectangle(x + 9, y + 9, x + cell - 9, y + cell - 9,
+                                               outline="#3f3f3f", width=1, fill=fill)
+            if switch_row[2] is None:
+                canvas.create_line(x + 9, y + cell - 9, x + cell - 9, y + 9,
+                                   fill="#9a9a9a", width=2)
+            cell_items[manual_id.upper()] = (outer_id, mid_id, inner_id)
+
+
+def _set_canvas_switch_state(canvas, cell_items, manual_id, is_on, disabled=False):
+    items = cell_items.get(manual_id.upper())
+    if not items:
+        return
+    fill = "#4d0000" if disabled else ("#f8f8f8" if is_on else "#780000")
+    for item in items[1:]:
+        canvas.itemconfigure(item, fill=fill)
+
+
 class _ToolTip:
     def __init__(self, widget, text: str):
         self.widget = widget
@@ -318,15 +402,21 @@ def main():
               f"writable={os.access(GAME_LOG_PATH, os.W_OK)}")
 
     root = tk.Tk()
-    root.title("Spike 3 TIMER Switches")
-    root.geometry("820x720")
+    root.title(f"Spike 3 TIMER Switches - {GAME_TITLE} {GAME_VERSION}")
+    root.geometry("1540x640")
 
     elapsed_var = tk.StringVar(value="T+0:00.0")
-    status_var = tk.StringVar(value="Hold a switch button.")
+    status_var = tk.StringVar(value="Click a switch box to toggle requested ON/OFF.")
+    detail_var = tk.StringVar(
+        value="Select a switch. White = requested ON. Dark red = requested OFF. "
+              "Actual game state overlay is reserved for a future devbus feed."
+    )
     switch_test_var = tk.BooleanVar(value=False)
     observed_var = tk.StringVar(value="")
     count_ref = [0]
     held_switches: set[int] = set()
+    requested_on: set[str] = set()
+    cell_items = {}
 
     # Top: live elapsed timer (updates every 100ms via root.after).
     tk.Label(
@@ -340,8 +430,10 @@ def main():
     start_time = time.monotonic()
     _tick_timer(root, start_time, elapsed_var)
 
-    service_frame = tk.Frame(root)
-    service_frame.pack(padx=12, pady=(8, 6), fill=tk.X)
+    control_frame = tk.Frame(root)
+    control_frame.pack(padx=12, pady=(8, 6), fill=tk.X)
+    service_frame = tk.Frame(control_frame)
+    service_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
     for col, (label, manual_id, address, sw_id, name, conn, loc, typ, bg, fg) in enumerate(_SERVICE_BUTTONS):
         service_frame.columnconfigure(col, weight=1, uniform="service")
         button = tk.Button(
@@ -349,8 +441,8 @@ def main():
             text=f"{label}\n{manual_id}\n{address}",
             bg=bg, fg=fg,
             activebackground=bg, activeforeground=fg,
-            font=("monospace", 18, "bold"),
-            height=3,
+            font=("monospace", 16, "bold"),
+            height=2,
         )
         if sw_id is not None:
             _bind_hold_button(button, sw_id, name, held_switches,
@@ -358,11 +450,10 @@ def main():
                               switch_test_var, observed_var)
         _ToolTip(button, _button_detail(manual_id, address, sw_id, name,
                                         conn, loc, typ))
-        button.grid(row=0, column=col, padx=5, pady=2, sticky="nsew")
+        button.grid(row=0, column=col, padx=4, sticky="nsew")
 
-    door_frame = tk.Frame(service_frame)
-    door_frame.grid(row=1, column=0, columnspan=len(_SERVICE_BUTTONS),
-                    padx=5, pady=(6, 2), sticky="ew")
+    door_frame = tk.Frame(control_frame)
+    door_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
     for col in range(2):
         door_frame.columnconfigure(col, weight=1, uniform="door")
     tk.Button(
@@ -386,9 +477,8 @@ def main():
         height=2,
     ).grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
-    test_frame = tk.Frame(service_frame)
-    test_frame.grid(row=2, column=0, columnspan=len(_SERVICE_BUTTONS),
-                    padx=5, pady=(6, 2), sticky="ew")
+    test_frame = tk.Frame(root)
+    test_frame.pack(padx=12, pady=(0, 6), fill=tk.X)
     test_frame.columnconfigure(1, weight=1)
     tk.Checkbutton(
         test_frame,
@@ -422,34 +512,57 @@ def main():
         "Example: 90, 93, 8-SW-25, left flipper"
     )
 
-    notebook = ttk.Notebook(root)
-    notebook.pack(padx=12, pady=(4, 8), fill=tk.BOTH, expand=True)
-    for tab_name, rows in _switch_tabs():
-        tab = tk.Frame(notebook)
-        notebook.add(tab, text=tab_name)
-        for col in range(2):
-            tab.columnconfigure(col, weight=1, uniform=f"{tab_name}-switch")
-        for idx, (manual_id, address, sw_id, name, conn, loc, typ) in enumerate(rows):
-            row, col = divmod(idx, 2)
-            tab.rowconfigure(row, weight=1, uniform=f"{tab_name}-row")
-            disabled = sw_id is None
-            button = tk.Button(
-                tab,
-                text=_button_label(manual_id, address, name),
-                bg="#eceff1" if not disabled else "#e0e0e0",
-                fg="#111" if not disabled else "#777",
-                activebackground="#cfd8dc", activeforeground="#111",
-                font=("monospace", 16, "bold"),
-                height=5,
-                state=(tk.DISABLED if disabled else tk.NORMAL),
-            )
-            if not disabled:
-                _bind_hold_button(button, sw_id, name, held_switches,
-                                  elapsed_var, status_var, count_ref,
-                                  switch_test_var, observed_var)
-            _ToolTip(button, _button_detail(manual_id, address, sw_id, name,
-                                            conn, loc, typ))
-            button.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+    layout_rows = _switch_layout_rows()
+    canvas_frame = tk.Frame(root, bg="#7b0000")
+    canvas_frame.pack(padx=12, pady=(4, 8), fill=tk.BOTH, expand=True)
+    switch_canvas = tk.Canvas(canvas_frame, bg="#7b0000", highlightthickness=0)
+    hscroll = tk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL,
+                           command=switch_canvas.xview)
+    switch_canvas.configure(xscrollcommand=hscroll.set)
+    switch_canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+    hscroll.pack(side=tk.BOTTOM, fill=tk.X)
+    _render_switch_canvas(switch_canvas, layout_rows, cell_items, requested_on)
+
+    def select_switch(row, toggle=False):
+        manual_id, address, sw_id, name, conn, loc, typ = row
+        key = manual_id.upper()
+        if toggle and sw_id is not None:
+            if key in requested_on:
+                requested_on.discard(key)
+                held_switches.discard(sw_id)
+                write_switch_command("up", sw_id, name, elapsed_var, status_var,
+                                     count_ref, switch_test_var, observed_var)
+            else:
+                requested_on.add(key)
+                held_switches.add(sw_id)
+                write_switch_command("down", sw_id, name, elapsed_var, status_var,
+                                     count_ref, switch_test_var, observed_var)
+            _set_canvas_switch_state(switch_canvas, cell_items, key, key in requested_on)
+        elif toggle:
+            status_var.set(f"{manual_id} {address} is not mapped to a runtime sw_id.")
+        detail_var.set(_compact_detail(row, requested_on=(key in requested_on)))
+
+    for _title, row in layout_rows:
+        for manual_id, switch_row in row:
+            if switch_row is None:
+                continue
+            key = manual_id.upper()
+            for item in cell_items.get(key, ()):
+                switch_canvas.tag_bind(item, "<Button-1>",
+                                       lambda _event, r=switch_row: select_switch(r, True))
+                switch_canvas.tag_bind(item, "<Enter>",
+                                       lambda _event, r=switch_row: select_switch(r, False))
+                switch_canvas.tag_bind(item, "<Enter>",
+                                       lambda _event: switch_canvas.configure(cursor="hand2"),
+                                       add="+")
+                switch_canvas.tag_bind(item, "<Leave>",
+                                       lambda _event: switch_canvas.configure(cursor=""),
+                                       add="+")
+
+    detail_label = tk.Label(root, textvariable=detail_var, justify=tk.LEFT,
+                            anchor="w", bg="#1f1f1f", fg="#f5f5f5",
+                            font=("monospace", 10), padx=10, pady=7)
+    detail_label.pack(padx=12, pady=(0, 4), fill=tk.X)
 
     tk.Button(
         root, text="KILL GAME (SIGTERM → SIGKILL)",

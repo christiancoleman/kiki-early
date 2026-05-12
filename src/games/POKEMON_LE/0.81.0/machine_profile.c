@@ -1,4 +1,4 @@
-#include "pokemon_le_machine.h"
+#include "machine_profile.h"
 
 #include <stddef.h>
 #include <string.h>

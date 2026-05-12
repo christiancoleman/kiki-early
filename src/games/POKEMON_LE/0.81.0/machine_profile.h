@@ -1,5 +1,5 @@
-#ifndef POKEMON_LE_MACHINE_H
-#define POKEMON_LE_MACHINE_H
+#ifndef SPIKE3_GAMES_POKEMON_LE_0_81_0_MACHINE_PROFILE_H
+#define SPIKE3_GAMES_POKEMON_LE_0_81_0_MACHINE_PROFILE_H
 
 #include <stddef.h>
 #include <stdint.h>

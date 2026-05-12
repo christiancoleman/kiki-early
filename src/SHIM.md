@@ -31,15 +31,21 @@ delete it — git history is the archive.
 ## Game profile roadmap
 
 `src/games/` is the per-game abstraction layer. Today it contains
-`pokemon_le_machine.c/.h`, the Pokémon LE machine profile (cabinet inventory:
-switch IDs, driver IDs, lamp IDs, channel/bit mappings, manual IDs, names).
+`POKEMON_LE/0.81.0/`, the Pokémon LE 0.81.0 machine profile (cabinet inventory:
+switch IDs, service-menu switch layout, driver IDs, lamp IDs, channel/bit
+mappings, manual IDs, names).
 Long-term shape:
 
 ```text
 src/games/
-  machine_profile.h
-  pokemon_le.{c,h}
-  starwars_le.{c,h}
+  POKEMON_LE/
+    0.81.0/
+      machine_profile.{c,h}
+      switch_profile.py
+  STARWARS_LE/
+    <version>/
+      machine_profile.{c,h}
+      switch_profile.py
 ```
 
 The public shim-facing API should expose one selected runtime profile, e.g.

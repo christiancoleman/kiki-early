@@ -51,7 +51,7 @@ SOURCES=(
     shim_switches.c
     shim_inject.c
     shim_net.c
-    games/pokemon_le_machine.c
+    games/POKEMON_LE/0.81.0/machine_profile.c
 )
 
 VERSION_SCRIPT="$SRC_DIR/spi_shim.ver"
