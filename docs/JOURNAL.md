@@ -9716,3 +9716,25 @@ No facts were changed in the moves — content was relocated, with cross-ref poi
 ### Still open (from Step 107)
 
 `/protocol audit` over the doc set; then the nodebus catalog phase (fresh-state boot run with full per-frame nodebus logging → harvest the `(slot, inner_cmd)` catalog → cmd-0x41 inner-command test vectors).
+
+## Step 110: reset_run_state.sh root-anchor fix (broken by Step-106 reorg); confirmed run_game.sh does not auto-call it (2026-05-12)
+
+Quick verification + a reorg-debt fix found while checking it.
+
+**`run_game.sh` does NOT call `reset_run_state.sh`** — it never has. The fresh-state baseline is a deliberate two-command chain (`./scripts/reset_run_state.sh && ./run_game.sh`), documented in the reset script's own header. No change there.
+
+**`reset_run_state.sh` was broken by the Step-106 reorg** (which pushed `scripts/` one level deeper, from `_emulation/scripts/` to `_emulation/src/scripts/`), and hadn't been fixed:
+- `SYSROOT="$SCRIPT_DIR/../../../.."` resolved to `.../pokemon-le-0.81.0/games` instead of the repo root, so `NVRAM_DIR="$SYSROOT/data/nv/pokemon_le"` pointed at the nonexistent `games/data/nv/pokemon_le` → the NVRAM and `tmp/cache/{mesa,shader_cache}` clears were silently no-ops. The script would print "not present (already clean)" and exit having cleared nothing. Fix: `SYSROOT="${SPIKE3_SYSROOT:-$(cd "$SCRIPT_DIR/../../../../.." && pwd)}"` (one more `..`; also honours an env override now, like the other scripts). Verified it now resolves to the repo root and `NVRAM_DIR` lists the real tiers (FRRAM/LKRAM/NVM/NVRAM/PIN_NVRAM/PTRAM/SYS_NVRAM/…).
+- The stale-daemon reaper used `pgrep -f "_emulation/$proc"`, which no longer matched the daemons now living under `src/display/` / `src/nodebus/` / etc. Fix: match by trailing path component (`pgrep -f "/$proc"`); also added `devbus_subscriber.py` to the reap list.
+
+Spot-checked the other `src/scripts/` and launcher root-anchor logic: `run_game.sh` (`SCRIPT_DIR=src/`, `EMU_ROOT=src/..`, `GAME_DIR`, `SYSROOT=GAME_DIR/../..`) is correct; `setup_bind_mounts.sh` uses a hardcoded `PLE_DEFAULT` so the reorg didn't touch it. `bash -n` clean.
+
+## Step 111: Stopped chaining reset_run_state.sh before runs — fresh-state no longer required (clean smoke run); script kept as troubleshooting reset (2026-05-12)
+
+Process change: stopped chaining `reset_run_state.sh` before runs. A clean smoke run today (post-Step-110 fix, which made the script actually work again) confirmed the game reaches its stable attract loop *without* a fresh-state reset — the Step-94m stale-NVRAM → audio-singleton-vtable[5] corruption that made the reset mandatory is no longer reproducing.
+
+- **No code removed from `run_game.sh`** — it never invoked `reset_run_state.sh`; the "fresh state before every run" discipline was always a hand-chained `./scripts/reset_run_state.sh && ./run_game.sh`. The change is to that *workflow*, not to the launcher.
+- **`reset_run_state.sh` stays in `src/scripts/`** as a troubleshooting reset (clears `/data/nv/pokemon_le`, `/tmp/cache/{mesa,shader_cache}`, reaps stale daemons). If attract-time crashes ever return, the chain is the known-good clean-state path; reinstate it as a hard requirement then.
+- Memory updated: `feedback_baseline_runs_ask_first.md` operational-requirement #2 ("must run BEFORE every run") softened to "no longer chained; troubleshooting reset"; `MEMORY.md`'s CURRENT-INVESTIGATION line ditto. The still-load-bearing pillar `cd /games && exec /games/game` (via the symlink) is unaffected.
+
+Caveat: this rests on one smoke run + the user's call, not a multi-run regression sweep. Watch for attract-time crashes in upcoming runs; if they come back, the cause is almost certainly stale NVRAM again and the reset chain goes back on.

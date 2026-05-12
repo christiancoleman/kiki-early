@@ -28,7 +28,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SYSROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+# Repo root (the cabinet-filesystem snapshot — holds /data, /tmp, /games).
+# scripts/ -> src/ -> _emulation/ -> pokemon_le/ -> games/ -> repo root.
+SYSROOT="${SPIKE3_SYSROOT:-$(cd "$SCRIPT_DIR/../../../../.." && pwd)}"
 
 NVRAM_DIR="$SYSROOT/data/nv/pokemon_le"
 MESA_CACHE="$SYSROOT/tmp/cache/mesa"
@@ -75,8 +77,10 @@ clear_dir "$SHADER_CACHE"
 # Reap stale daemons that hold abstract AF_UNIX sockets across runs. If a
 # prior run was killed mid-flight (SIGKILL / Ctrl+C in the wrong window),
 # these survive and the next run's daemon launches fail with EADDRINUSE.
-for proc in decode_daemon.py gl_daemon.py marker_button.py audio_subscriber.py frame_viewer.py; do
-    pids=$(pgrep -f "_emulation/$proc" 2>/dev/null || true)
+# Match by trailing path component — the daemons live under src/display/,
+# src/nodebus/, src/tools/, or flat in src/.
+for proc in decode_daemon.py gl_daemon.py marker_button.py audio_subscriber.py frame_viewer.py devbus_subscriber.py; do
+    pids=$(pgrep -f "/$proc" 2>/dev/null || true)
     if [[ -n "$pids" ]]; then
         # shellcheck disable=SC2086
         kill -9 $pids 2>/dev/null || true

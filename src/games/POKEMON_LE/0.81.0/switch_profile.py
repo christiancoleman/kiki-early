@@ -97,12 +97,11 @@ MANUAL_SWITCHES = [
     ("C24", "0-SW-23", 98, "Coin Door Power Interlock", "CN4/1", "Cabinet", "Interlock"),
 ]
 
-# Service-menu-style TIMER rows. Each range is authoritative manual layout:
+# Service-menu-style TIMER rows. Each row is 30 manual switch numbers wide;
 # absent IDs inside a range are rendered as empty space, not compacted away.
 SWITCH_LAYOUT_ROWS = [
-    ("SW 1-25", "", 1, 25),
-    ("SW 26-50", "", 26, 50),
-    ("SW 51-76", "", 51, 76),
-    ("SW 77-105", "", 77, 105),
-    ("CPU/Coin Door", "C", 9, 24),
+    ("SW 1-30", "", 1, 30),
+    ("SW 31-60", "", 31, 60),
+    ("SW 61-90", "", 61, 90),
+    ("SW 91-120", "", 91, 120),
 ]

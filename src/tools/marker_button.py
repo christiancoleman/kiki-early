@@ -10,18 +10,14 @@ held-switch overlay. Legacy one-line numeric requests still work as taps.
 Usage:
     python3 marker_button.py
     (or via run_game.sh's TIMER=ON path — needs DISPLAY/WAYLAND_DISPLAY)
-
-A live "T+M:SS.x" elapsed timer updates every 100 ms at the top of the window.
 """
 
 import datetime
 import os
 import pathlib
 import subprocess
-import sys
 import time
 import tkinter as tk
-from tkinter import ttk
 
 from switch_command import append_locked
 from switch_inventory import (
@@ -180,31 +176,13 @@ _SERVICE_BUTTONS = [
     ]
 ]
 _SERVICE_MANUAL_IDS = set(_SERVICE_BY_ACTION.values())
-_GRID_SWITCHES = [row for row in MANUAL_SWITCHES
-                  if row[0] not in _SERVICE_MANUAL_IDS]
-_TAB_ORDER = ("Coin Door", "Cabinet", "Playfield", "CPU Node")
-_TAB_SHORT_NAME = {
-    "Coin Door": "Coin",
-    "Cabinet": "Cab",
-    "Playfield": "PF",
-    "CPU Node": "CPU",
-}
-
-
-def _button_label(manual_id: str, address: str, name: str) -> str:
-    short_name = name
-    if len(short_name) > 18:
-        short_name = short_name[:17] + "."
-    return f"{manual_id}\n{address}\n{short_name}"
-
-
-def _button_detail(manual_id: str, address: str, runtime_sw_id, name: str,
-                   conn: str, location: str, switch_type: str) -> str:
-    runtime = "not mapped" if runtime_sw_id is None else f"runtime sw_id {runtime_sw_id}"
-    return (f"{manual_id}  {address}\n"
-            f"{name}\n"
-            f"{location}  {conn}  {switch_type}\n"
-            f"{runtime}")
+_QUICK_BUTTONS = [
+    ("L FLIP", "9", "#263238", "#f5f5f5"),
+    ("START", "93", "#0d47a1", "#f5f5f5"),
+    ("ACTION", "90", "#1b5e20", "#f5f5f5"),
+    ("R FLIP", "10", "#263238", "#f5f5f5"),
+]
+_ENTER_COIN_ID = "96"
 
 
 def _bind_hold_button(button, sw_id: int, name: str, held_set: set[int],
@@ -232,18 +210,32 @@ def _bind_hold_button(button, sw_id: int, name: str, held_set: set[int],
     button.bind("<KeyRelease-space>", on_up)
 
 
-def _switch_tabs():
-    grouped = {name: [] for name in _TAB_ORDER}
-    for row in _GRID_SWITCHES:
-        loc = row[5]
-        grouped.setdefault(loc, []).append(row)
-
-    tabs = []
-    for name, rows in grouped.items():
-        short = _TAB_SHORT_NAME.get(name, name)
-        for idx in range(0, len(rows), 4):
-            tabs.append((f"{short} {idx // 4 + 1}", rows[idx:idx + 4]))
-    return tabs
+def _write_tap_command(sw_id: int, name: str, elapsed_var, status_var,
+                       count_ref, switch_test_var=None, observed_var=None,
+                       hold_ms=120):
+    try:
+        append_locked(pathlib.Path(PRESS_REQUEST_PATH), f"tap {sw_id} {hold_ms}\n")
+        count_ref[0] += 1
+        elapsed = elapsed_var.get()
+        manual_id, address, resolved_name = _switch_metadata(sw_id, name)
+        append_to_game_log(
+            f"{now_timestamp()} - [marker] {elapsed} event #{count_ref[0]} "
+            f"(TAP {name} sw_id={sw_id})\n"
+        )
+        append_to_game_log(
+            f"{now_timestamp()} - [external_switch] "
+            f"TAP {manual_id} {address} {resolved_name} runtime_sw_id={sw_id}\n"
+        )
+        if switch_test_var is not None and switch_test_var.get():
+            observed = observed_var.get().strip() if observed_var is not None else ""
+            append_to_game_log(
+                f"{now_timestamp()} - [switch_test] {elapsed} event #{count_ref[0]} "
+                f"command=TAP sw_id={sw_id} name=\"{name}\" observed=\"{observed}\"\n"
+            )
+        status_var.set(f"#{count_ref[0]} {elapsed} -> TAP {name} (sw_id={sw_id})")
+    except OSError as e:
+        log_error(f"TAP request write failed: {e}")
+        status_var.set(f"TAP {name} FAILED: {e}")
 
 
 def _switch_layout_rows():
@@ -272,32 +264,29 @@ def _render_switch_canvas(canvas, layout_rows, cell_items, requested_on):
     canvas.delete("all")
     cell_items.clear()
 
-    cell = 38
-    gap = 10
-    row_gap = 30
-    label_w = 84
-    top = 26
+    cell = 28
+    gap = 8
+    row_gap = 18
+    left = 12
+    top = 12
     bg = "#7b0000"
     outer = "#8f8f8f"
     middle = "#cfcfcf"
     off = "#780000"
     on = "#f8f8f8"
     disabled = "#4d0000"
-    text = "#d9d9d9"
 
     max_cols = max((len(row) for _title, row in layout_rows), default=0)
-    width = label_w + max_cols * cell + max(0, max_cols - 1) * gap + 28
-    height = top + len(layout_rows) * cell + max(0, len(layout_rows) - 1) * row_gap + 22
+    width = left * 2 + max_cols * cell + max(0, max_cols - 1) * gap
+    height = top * 2 + len(layout_rows) * cell + max(0, len(layout_rows) - 1) * row_gap
     canvas.configure(width=width, height=height, bg=bg, scrollregion=(0, 0, width, height))
 
     for r, (title, row) in enumerate(layout_rows):
         y = top + r * (cell + row_gap)
-        canvas.create_text(10, y + cell / 2, anchor="w", text=title,
-                           fill=text, font=("monospace", 9, "bold"))
         for c, (manual_id, switch_row) in enumerate(row):
             if switch_row is None:
                 continue
-            x = label_w + c * (cell + gap)
+            x = left + c * (cell + gap)
             requested = manual_id.upper() in requested_on
             fill = on if requested else off
             if switch_row[2] is None:
@@ -321,41 +310,6 @@ def _set_canvas_switch_state(canvas, cell_items, manual_id, is_on, disabled=Fals
     fill = "#4d0000" if disabled else ("#f8f8f8" if is_on else "#780000")
     for item in items[1:]:
         canvas.itemconfigure(item, fill=fill)
-
-
-class _ToolTip:
-    def __init__(self, widget, text: str):
-        self.widget = widget
-        self.text = text
-        self.tip = None
-        widget.bind("<Enter>", self._show)
-        widget.bind("<Leave>", self._hide)
-
-    def _show(self, _event=None):
-        if self.tip or not self.text:
-            return
-        x = self.widget.winfo_rootx() + 16
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
-        self.tip = tk.Toplevel(self.widget)
-        self.tip.wm_overrideredirect(True)
-        self.tip.wm_geometry(f"+{x}+{y}")
-        tk.Label(
-            self.tip,
-            text=self.text,
-            justify=tk.LEFT,
-            bg="#fffde7",
-            fg="#111",
-            relief=tk.SOLID,
-            borderwidth=1,
-            font=("monospace", 9),
-            padx=6,
-            pady=4,
-        ).pack()
-
-    def _hide(self, _event=None):
-        if self.tip:
-            self.tip.destroy()
-            self.tip = None
 
 
 def _fmt_elapsed(secs: float) -> str:
@@ -395,6 +349,44 @@ def _log_observed_switches(elapsed_var, status_var, observed_var):
         pass
 
 
+def _make_round_hold_button(parent, row, label, fill, fg, held_set,
+                            elapsed_var, status_var, count_ref,
+                            switch_test_var, observed_var):
+    manual_id, address, sw_id, name, _conn, _loc, _typ = row
+    canvas = tk.Canvas(parent, width=74, height=74, bg=parent["bg"],
+                       highlightthickness=0)
+    oval = canvas.create_oval(7, 7, 67, 67, fill=fill, outline="#eceff1", width=2)
+    text = canvas.create_text(37, 37, text=label, fill=fg,
+                              font=("monospace", 9, "bold"), justify=tk.CENTER)
+
+    def on_down(_event, s=sw_id, n=name):
+        if s is None or s in held_set:
+            return "break"
+        held_set.add(s)
+        canvas.itemconfigure(oval, fill="#ffffff")
+        canvas.itemconfigure(text, fill="#111111")
+        write_switch_command("down", s, n, elapsed_var, status_var, count_ref,
+                             switch_test_var, observed_var)
+        return "break"
+
+    def on_up(_event, s=sw_id, n=name):
+        if s is None or s not in held_set:
+            return "break"
+        held_set.discard(s)
+        canvas.itemconfigure(oval, fill=fill)
+        canvas.itemconfigure(text, fill=fg)
+        write_switch_command("up", s, n, elapsed_var, status_var, count_ref,
+                             switch_test_var, observed_var)
+        return "break"
+
+    for item in (oval, text):
+        canvas.tag_bind(item, "<ButtonPress-1>", on_down)
+        canvas.tag_bind(item, "<ButtonRelease-1>", on_up)
+    canvas.bind("<ButtonPress-1>", on_down)
+    canvas.bind("<ButtonRelease-1>", on_up)
+    return canvas
+
+
 def main():
     log_error(f"STARTED pid={os.getpid()} GAME_LOG_PATH={GAME_LOG_PATH} "
               f"PRESS_REQUEST_PATH={PRESS_REQUEST_PATH} "
@@ -402,8 +394,8 @@ def main():
               f"writable={os.access(GAME_LOG_PATH, os.W_OK)}")
 
     root = tk.Tk()
-    root.title(f"Spike 3 TIMER Switches - {GAME_TITLE} {GAME_VERSION}")
-    root.geometry("1540x640")
+    root.title(f"Service Switch Panel - {GAME_TITLE} {GAME_VERSION}")
+    root.geometry("1180x560")
 
     elapsed_var = tk.StringVar(value="T+0:00.0")
     status_var = tk.StringVar(value="Click a switch box to toggle requested ON/OFF.")
@@ -418,103 +410,47 @@ def main():
     requested_on: set[str] = set()
     cell_items = {}
 
-    # Top: live elapsed timer (updates every 100ms via root.after).
+    title_frame = tk.Frame(root)
+    title_frame.pack(padx=10, pady=(6, 2), fill=tk.X)
     tk.Label(
-        root,
-        textvariable=elapsed_var,
-        font=("monospace", 24, "bold"),
-        fg="#000",
-        bg="#e3f2fd",
-        height=2,
-    ).pack(padx=8, pady=(8, 4), fill=tk.X)
+        title_frame,
+        text=f"Service Switch Panel  {GAME_TITLE} {GAME_VERSION}",
+        font=("monospace", 14, "bold"),
+        fg="#111",
+    ).pack(side=tk.LEFT)
     start_time = time.monotonic()
     _tick_timer(root, start_time, elapsed_var)
 
-    control_frame = tk.Frame(root)
-    control_frame.pack(padx=12, pady=(8, 6), fill=tk.X)
-    service_frame = tk.Frame(control_frame)
-    service_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+    quick_frame = tk.Frame(root, bg="#111111")
+    quick_frame.pack(padx=10, pady=(0, 3))
+    for col, (label, manual_id, fill, fg) in enumerate(_QUICK_BUTTONS):
+        row = SWITCH_BY_MANUAL_ID[manual_id]
+        quick = _make_round_hold_button(quick_frame, row, label, fill, fg,
+                                        held_switches, elapsed_var, status_var,
+                                        count_ref, switch_test_var, observed_var)
+        quick.grid(row=0, column=col, padx=16, pady=3)
+
+    service_frame = tk.Frame(root)
+    service_frame.pack(padx=10, pady=(0, 4), fill=tk.X)
     for col, (label, manual_id, address, sw_id, name, conn, loc, typ, bg, fg) in enumerate(_SERVICE_BUTTONS):
         service_frame.columnconfigure(col, weight=1, uniform="service")
         button = tk.Button(
             service_frame,
-            text=f"{label}\n{manual_id}\n{address}",
+            text=label,
             bg=bg, fg=fg,
             activebackground=bg, activeforeground=fg,
-            font=("monospace", 16, "bold"),
-            height=2,
+            font=("monospace", 15, "bold"),
+            height=1,
         )
         if sw_id is not None:
             _bind_hold_button(button, sw_id, name, held_switches,
                               elapsed_var, status_var, count_ref,
                               switch_test_var, observed_var)
-        _ToolTip(button, _button_detail(manual_id, address, sw_id, name,
-                                        conn, loc, typ))
-        button.grid(row=0, column=col, padx=4, sticky="nsew")
-
-    door_frame = tk.Frame(control_frame)
-    door_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-    for col in range(2):
-        door_frame.columnconfigure(col, weight=1, uniform="door")
-    tk.Button(
-        door_frame,
-        text="Coin Door Open\nC24 active",
-        command=lambda: write_raw_command(
-            "coin_door open", "COIN DOOR OPEN", elapsed_var, status_var, count_ref
-        ),
-        bg="#f9a825", fg="#111",
-        font=("monospace", 11, "bold"),
-        height=2,
-    ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
-    tk.Button(
-        door_frame,
-        text="Coin Door Closed\nC24 restored",
-        command=lambda: write_raw_command(
-            "coin_door closed", "COIN DOOR CLOSED", elapsed_var, status_var, count_ref
-        ),
-        bg="#2e7d32", fg="white",
-        font=("monospace", 11, "bold"),
-        height=2,
-    ).grid(row=0, column=1, padx=(4, 0), sticky="ew")
-
-    test_frame = tk.Frame(root)
-    test_frame.pack(padx=12, pady=(0, 6), fill=tk.X)
-    test_frame.columnconfigure(1, weight=1)
-    tk.Checkbutton(
-        test_frame,
-        text="Switch Test Menu",
-        variable=switch_test_var,
-        command=lambda: _log_switch_test_mode(
-            switch_test_var.get(), elapsed_var, status_var, observed_var
-        ),
-        font=("monospace", 11, "bold"),
-    ).grid(row=0, column=0, padx=(0, 8), sticky="w")
-    observed_entry = tk.Entry(
-        test_frame,
-        textvariable=observed_var,
-        font=("monospace", 11),
-    )
-    observed_entry.grid(row=0, column=1, padx=(0, 8), sticky="ew")
-    observed_entry.insert(0, "")
-    observed_entry.bind(
-        "<Return>",
-        lambda _event: (_log_observed_switches(elapsed_var, status_var, observed_var), "break")[1],
-    )
-    tk.Button(
-        test_frame,
-        text="Log Observed",
-        command=lambda: _log_observed_switches(elapsed_var, status_var, observed_var),
-        font=("monospace", 10, "bold"),
-    ).grid(row=0, column=2, sticky="e")
-    _ToolTip(
-        observed_entry,
-        "Comma-separated switches the game UI showed as toggled after the press.\n"
-        "Example: 90, 93, 8-SW-25, left flipper"
-    )
+        button.grid(row=0, column=col, padx=3, sticky="nsew")
 
     layout_rows = _switch_layout_rows()
     canvas_frame = tk.Frame(root, bg="#7b0000")
-    canvas_frame.pack(padx=12, pady=(4, 8), fill=tk.BOTH, expand=True)
+    canvas_frame.pack(padx=10, pady=(2, 5), fill=tk.BOTH, expand=True)
     switch_canvas = tk.Canvas(canvas_frame, bg="#7b0000", highlightthickness=0)
     hscroll = tk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL,
                            command=switch_canvas.xview)
@@ -551,8 +487,6 @@ def main():
                 switch_canvas.tag_bind(item, "<Button-1>",
                                        lambda _event, r=switch_row: select_switch(r, True))
                 switch_canvas.tag_bind(item, "<Enter>",
-                                       lambda _event, r=switch_row: select_switch(r, False))
-                switch_canvas.tag_bind(item, "<Enter>",
                                        lambda _event: switch_canvas.configure(cursor="hand2"),
                                        add="+")
                 switch_canvas.tag_bind(item, "<Leave>",
@@ -561,19 +495,74 @@ def main():
 
     detail_label = tk.Label(root, textvariable=detail_var, justify=tk.LEFT,
                             anchor="w", bg="#1f1f1f", fg="#f5f5f5",
-                            font=("monospace", 10), padx=10, pady=7)
-    detail_label.pack(padx=12, pady=(0, 4), fill=tk.X)
+                            font=("monospace", 9), padx=8, pady=4)
+    detail_label.pack(padx=10, pady=(0, 3), fill=tk.X)
 
+    bottom = tk.Frame(root)
+    bottom.pack(padx=10, pady=(0, 6), fill=tk.X)
+    bottom.columnconfigure(0, weight=1, uniform="bottom")
+    bottom.columnconfigure(1, weight=1, uniform="bottom")
+    bottom.columnconfigure(2, weight=1, uniform="bottom")
+
+    door_frame = tk.Frame(bottom)
+    door_frame.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+    door_frame.columnconfigure(0, weight=1)
+    door_frame.columnconfigure(1, weight=1)
     tk.Button(
-        root, text="KILL GAME (SIGTERM → SIGKILL)",
-        command=lambda: kill_game(root, status_var),
-        bg="#b00020", fg="white",
+        door_frame,
+        text="DOOR OPEN",
+        command=lambda: write_raw_command(
+            "coin_door open", "COIN DOOR OPEN", elapsed_var, status_var, count_ref
+        ),
+        bg="#f9a825", fg="#111",
         font=("monospace", 10, "bold"),
         height=1,
-    ).pack(padx=12, pady=(8, 2), fill=tk.X)
+    ).grid(row=0, column=0, padx=(0, 3), sticky="ew")
+    tk.Button(
+        door_frame,
+        text="DOOR CLOSED",
+        command=lambda: write_raw_command(
+            "coin_door closed", "COIN DOOR CLOSED", elapsed_var, status_var, count_ref
+        ),
+        bg="#2e7d32", fg="white",
+        font=("monospace", 10, "bold"),
+        height=1,
+    ).grid(row=0, column=1, padx=(3, 0), sticky="ew")
 
-    tk.Label(root, textvariable=status_var, wraplength=480, fg="#444",
-             font=("monospace", 9)).pack(pady=4, padx=10)
+    coin_row = SWITCH_BY_MANUAL_ID[_ENTER_COIN_ID]
+    tk.Button(
+        bottom,
+        text="ENTER COIN",
+        command=lambda r=coin_row: _write_tap_command(
+            r[2], r[3], elapsed_var, status_var, count_ref,
+            switch_test_var, observed_var
+        ),
+        bg="#004d40", fg="white",
+        font=("monospace", 12, "bold"),
+        height=1,
+    ).grid(row=0, column=1, sticky="ew", padx=5)
+
+    tk.Label(
+        bottom,
+        textvariable=elapsed_var,
+        font=("monospace", 15, "bold"),
+        fg="#000",
+        bg="#e3f2fd",
+        height=1,
+    ).grid(row=0, column=2, sticky="ew", padx=(5, 0))
+
+    footer = tk.Frame(root)
+    footer.pack(padx=10, pady=(0, 5), fill=tk.X)
+    footer.columnconfigure(0, weight=1)
+    tk.Label(footer, textvariable=status_var, anchor="w", fg="#444",
+             font=("monospace", 9)).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    tk.Button(
+        footer, text="KILL GAME",
+        command=lambda: kill_game(root, status_var),
+        bg="#b00020", fg="white",
+        font=("monospace", 9, "bold"),
+        height=1,
+    ).grid(row=0, column=1, sticky="e")
 
     def on_close():
         if switch_test_var.get():
