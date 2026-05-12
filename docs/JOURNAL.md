@@ -9529,3 +9529,22 @@ Fix, second pass: unpopulated slots now receive a syntactically valid all-zero F
 Follow-up from the next run: the service test progressed through absent slots 3 and 5, completed the boot/init pass through slot 14, then started a second scan and stalled after slot 2. The log showed cmd `0x41` timeouts during that second scan even though FE replies were being synthesized, pointing at contention from the fixed 200 ms synthetic delay after boot. Updated `shim_nodebus.c` so the 200 ms delay remains in force until the first switch-poll response, then subsequent synthetic replies use a shorter post-init delay for service-menu scans.
 
 Verification: `./build.sh` completed successfully after the change. Existing warnings remain unrelated (`nodebus_cipher_decrypt`, `log_caller_chain`, timestamp truncation warning, `shim_fs.c` comment warning, `openat` nonnull comparisons).
+
+## Step 106: Deep nodebus mode for encrypted 0xF2 traffic (2026-05-11)
+
+Clarification from the latest run: the user had not entered the service-menu Node Bus Test; the slot scan and follow-up cmd `0x41` traffic happened during normal boot/runtime. This means the Step 105 post-init fast-reply change affects the ordinary baseline, not only the service-test path.
+
+Added `SHIM_NODEBUS_DEEP=1` as an opt-in mode for deeper protocol experiments while keeping the default runtime on the existing "good enough" behavior. `run_game.sh` now exports/records the flag and documents it in the launcher env table.
+
+In deep mode, `shim_nodebus.c` conditionally decodes cmd `0x41` frames when the wire slot byte has bit `0x40` set. That is the game's encrypted-post-key path. The earlier `nodebus_cipher_decrypt()` helper had been unused and still used the pre-increment mask formula; it now uses the wire `inner_len` nibble, which decodes the observed frames correctly:
+
+```text
+slot 2: wire inner 0xd1 -> decoded 0xf2
+slot 7: wire inner 0x81 -> decoded 0xf2
+```
+
+Ghidra confirms `FUN_008f5390` emits `inner_cmd=0xF2` eight times for LPC1313/type_idx=5 nodes, requesting offsets `0,8,...,56` and expecting 8 data bytes. Deep mode now synthesizes all-zero `0xF2` block replies for populated LPC1313/ws2812 slots only (`2,7,12,14`). Non-deep mode still lets those post-key commands time out, preserving the stable gameplay-switch baseline.
+
+Also moved the Step 105 fast synthetic reply behavior behind `SHIM_NODEBUS_DEEP`: default replies keep the conservative 200 ms delay even after switch polling starts; deep mode switches to the shorter post-init delay after the first switch-poll response.
+
+Verification: `bash -n _emulation/run_game.sh`, `git diff --check -- _emulation/run_game.sh _emulation/shim_nodebus.c`, and `_emulation/./build.sh` all passed. Build warnings remain the known unrelated set (`log_caller_chain` unused, timestamp truncation, `shim_fs.c` comment warning, `openat` nonnull comparisons).
