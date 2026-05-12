@@ -9681,3 +9681,38 @@ The third script category (not runtime-pipeline, not auto-test): a human runs th
 ### Not done yet
 
 A real TDD pass on `display/` (golden model + game-free `tests/display/` like `tests/nodebus/`) — `decode_daemon_test.py` needs a live daemon, so it can't move under `tests/` until that exists. The remaining PROTOCOL polish from Step 107 (the `§4` "Shim status" column, the "Persistence gap" / "BN database naming" subsections) and `/protocol audit` over the doc set are still open. Then the nodebus catalog phase.
+
+## Step 109: nuke_emulation.sh → scripts/; tests/display/ pilot (gl_proto C+Python consistency); PROTOCOL→SHIM.md/README.md moves (cmd-map shim-status / NV persistence / BN db naming) (2026-05-12)
+
+Three follow-ups, all doc/test housekeeping (no shim behavior change): moved `nuke_emulation.sh` into `scripts/`, added the first `tests/display/` unit-test pilot, and closed the three PROTOCOL→implementation-doc moves left over from Step 107. Build clean; tests now 135 + 21 (nodebus) + 47 + 243 (display) green.
+
+### `nuke_emulation.sh` → `scripts/`
+
+It's a cleanup utility, sibling to `setup_bind_mounts.sh` / `reset_run_state.sh` — moved into `scripts/`. Not referenced by `run_game.sh`; only `README.md` (layout tree, "where things live") and `SHIM.md` (one mention) needed the path update.
+
+### `tests/display/` — first pilot (mirrors `tests/nodebus/`)
+
+The high-value, game-free target in `display/` is the `@spike3_gl` wire format, declared twice (`gl_proto.h` C side / `gl_proto.py` Python side) — drift between them is a silent wire mismatch.
+
+- `tests/display/test_gl_proto.c` — host-compiled, `#include "display/gl_proto.h"`, no shim externs. Asserts: 8-byte message header (op@0 / flags@2 / payload_len@4, field widths), reply ops live in the `0x0F00..0x0FFF` band, `#pragma pack(push,1)` is actually effective, and ~30 payload struct sizes. **47 checks.**
+- `tests/display/test_gl_proto_consistency.py` — parses `gl_proto.h` as source-of-truth (regex the `#define GL_OP_*` / `GL_FLAG_*`; a tiny field-type parser for `struct gl_payload_*` packed sizes), imports `gl_proto.py`, asserts: the `GL_OP_*` / `GL_FLAG_*` constant sets match both ways; op values are all distinct (name↔value bijection) with reply ops in the reply band; `HEADER_FMT == "<HHI"` and the framing helpers round-trip; a curated `{struct: (FMT, expected_bytes)}` map agrees three ways (parsed-from-`.h` size == `struct.calcsize(FMT)` == the literal `test_gl_proto.c` uses); `OP_NAMES` keys are real ops. **243 checks.**
+- `run_tests.sh` gained a `# ---- display module ----` block (build `test_gl_proto`, run it, run the consistency test). `tests/README.md` updated: "what's here" rows, the coverage list (nodebus + display pilots), and "not covered yet" — `shim_gl_marshal.c` framing + `shim_avforward.c` need `socket`/`connect`/`write` mocked like `test_nodebus.c` mocks `write`; `shim_gl.c` itself is mostly stubs/marshalling, not high-value to unit-test yet.
+- `decode_daemon_test.py` stays in `tools/` (needs a live daemon — can't be a game-free `tests/` test until `display/` gets a real TDD pass with a golden model).
+
+### PROTOCOL → SHIM.md / README.md moves (closing Step 107's leftover)
+
+PROTOCOL.md is the implementation-agnostic platform/binary reference; three subsections still carried emulator-specific content:
+
+1. **"CPU ↔ netbridge UART bridge protocol" → "Top-level cmd map":** dropped the "Shim status" column (the ✅/⚠️/❌ legend + per-cmd "what the shim sends"). PROTOCOL's table is now `Cmd | Bridge handler | Reply shape` — pure bridge/game RE — with a one-line pointer to `../src/SHIM.md` for the shim side and to "Game's outbound cmd usage" for which cmds the game actually sends. The shim status table moved verbatim (re-laid-out as `Cmd | Shim status | What the shim sends / why`) into a new `## Bridge command synthesis status (synthesize_bridge_response)` section in `SHIM.md`.
+2. **"Hardware reference (Stern Spike 3)" → "Persistence gap" → renamed "NV storage":** PROTOCOL now states only the RE facts (the NV areas — `PIN_NVRAM/`, `SYS_NVRAM/`, `NVRAM/`, `FRRAM/`, `PTRAM/`, `LKRAM/`, `NVM/`, the i2c-`0x57` EEPROM — are NFI2-structured; PIN_NVRAM gets a fresh sequential `.crc32`-sidecar'd file per run) + a pointer. The emulation-status bullets (PIN_NVRAM advances, settings tiers stale in our runs, EEPROM/SIGTERM-flush unverified, "follow-ups in JOURNAL") moved into a new `## NV persistence (shim writeback)` section in `SHIM.md`; the `/dev/i2c-10` row in SHIM.md's per-device table now points there. PROTOCOL's "Visible boot sequence" cross-ref `see "Persistence gap"` → `see "NV storage"`.
+3. **"Comparison binaries (SW LE 0.85)" → "BN database naming convention":** the whole subsection (it's a workflow/source-control thing — how `.bndb` files are named/located, that they aren't committed) moved to a new `### Binary Ninja / Ghidra databases` subsection under `../src/README.md` "Source-control hygiene". PROTOCOL keeps a one-line pointer.
+
+No facts were changed in the moves — content was relocated, with cross-ref pointers in both directions. `freshness.py` / `audit_section.py --list` still parse PROTOCOL's `##` headings; `audit_section.py "NV storage"` resolves.
+
+### Verification
+
+`./build.sh` → `spi_shim.so` clean (375432 B, only the pre-existing `-Wnonnull-compare` warnings). `tests/run_tests.sh` → 135 + 21 (nodebus) + 47 + 243 (display) all green. `python3 -m py_compile` on the new test scripts → OK. `freshness.py`, `audit_section.py --list` / `"NV storage"` → OK. Searched `_emulation/` + `.claude/` for dangling refs to the moved/renamed headings → only the one PROTOCOL cross-ref (fixed) and the MEMORY.md `BN database naming convention` pointer (left — it's a memory index line, not a doc cross-ref).
+
+### Still open (from Step 107)
+
+`/protocol audit` over the doc set; then the nodebus catalog phase (fresh-state boot run with full per-frame nodebus logging → harvest the `(slot, inner_cmd)` catalog → cmd-0x41 inner-command test vectors).
