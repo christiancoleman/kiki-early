@@ -9638,3 +9638,46 @@ Closes item (1) above. The `/lore`, `/protocol`, `/log` skills + the `lore-keepe
 - **Docs** — `lore/SKILL.md`, `protocol/SKILL.md` (incl. frontmatter triggers), `log/SKILL.md`, `agents/lore-keeper.md`, `agents/log-reader.md`: heading-text addressing, `schema_version` 2, `_emulation/src/run_game.sh`, system-mode-archived notes, every `§N` → heading text. `code-review` skill + `journal_watcher.py` were already clean. `.codex/tools/knowledge/{log,lore,protocol}` are symlinks into the `.claude/skills/.../scripts/` copies, so they pick this up for free — verified.
 - **Smoke-tested:** index regen · `corpus_search nodebus` / `--topic cipher` (PROTOCOL grouping) · `audit_section --list` / `"Nodebus"` / `"NODEBUS_Cipher"` · `freshness` table + `--section "Nodebus"` · `journal_writer next-id` · all the above re-run through the `.codex/` symlinks. Shim untouched (no rebuild needed).
 - Also (clean-on-sight): `games/pokemon_le/CLAUDE.md` pointed at PROTOCOL as "the single source of truth" — updated to name the doc set (PROTOCOL = RE truth; `_emulation/src/README.md` + `SHIM.md` = how the emulator is built/run).
+
+## Step 108: src/display/ extraction + tools/ split — second subsystem carved out, runtime-vs-tooling separation (2026-05-12)
+
+Second subsystem carved out of the flat `src/` shim set (after `nodebus/` in Step 106), plus a runtime-vs-tooling split. Doc/layout change; the only code touched is `#include` paths, `build.sh` SOURCES, `run_game.sh` script paths, and a `__file__`-fallback fix in five tools. Shim builds clean; nodebus tests still 135 C + 21 Python green.
+
+### `src/display/` — the display / GL / video subsystem
+
+Moved in (mirrors `src/nodebus/`):
+- **Shim TUs:** `shim_gl.c` (151 KB — DRM/GBM/EGL/GLES, three execution modes), `shim_gl_marshal.c` (daemon marshaller), `shim_avforward.c` (forward-decode bridge → AVFrame → GL texture handoff), `gl_proto.h` (wire format).
+- **Host-side runtime daemons** (spawned by `run_game.sh`): `gl_daemon.py` (70 KB — host-native GLES executor over `@spike3_gl`), `gl_proto.py` (the Python view of `gl_proto.h`, imported by `gl_daemon.py` from the same dir), `decode_daemon.py` (NVDEC HEVC server over `@spike3_decode`), `frame_viewer.py` (Tk RGBA capture viewer).
+- `build.sh` SOURCES now lists `display/shim_gl.c`, `display/shim_gl_marshal.c`, `display/shim_avforward.c`. The three `#include "gl_proto.h"` (in `shim_gl.c`, `shim_gl_marshal.c`, and `shim_bridges.c` which stays flat) became `#include "display/gl_proto.h"` — `-I"$SRC_DIR"` already resolves it. (Established the subdir-local-header convention: `#include "<module>/<file>.h"`.)
+- **Stays flat (cross-cutting, not display-specific):** `shim_ioctl.c` (DRM ioctls live here but so do i2c/spi/termios), `shim_bridges.c` (the generic AF_UNIX subscriber framework — frame *and* audio *and* state bridges all use it), DRM-card-open glue in `shim_fs.c`/`shim_io.c`.
+
+### `src/nodebus/` — finished the half-started pattern
+
+`shim_devbus.c` (devbus AF_UNIX listener + 1 ms switch-array watcher) and its `devbus_subscriber.py` runtime daemon moved from flat `src/` into `nodebus/`. `build.sh` SOURCES gains `nodebus/shim_devbus.c`.
+
+### `src/tools/` — human-run probes & utilities (NEW)
+
+The third script category (not runtime-pipeline, not auto-test): a human runs these by hand against a live game/daemon. Moved in: `marker_button.py` (TIMER Tk panel), `switch_command.py` (inject a press), `switch_inventory.py` (dump the switch manifest), `devbus_snapshot.py` (one-shot / saved-log switch-state tables), `snap_frame.py` (one-shot frame grab — only referenced in README; kept rather than deleted, may be wanted later), `historical-state-subscriber.py` (cmode-delta tail — looks superseded by `devbus_subscriber.py`; kept for now), the `*_test.py` smoke probes that need a live process (`switch_noise_test.py`, `decode_daemon_test.py` — these are *not* under `tests/`, which is strictly game-free pure-logic), and `gles_probe{3..6}.c` (one-off GL capability sniffers, never built by `build.sh`). `run_game.sh` spawning `tools/marker_button.py` (TIMER mode) and `tools/switch_noise_test.py` (DEVBUS integration) is fine — they're observation aids.
+
+### What stayed put
+
+`audio_subscriber.py` stays flat — there's no `shim_audio.c` to anchor an `audio/` module yet (the ALSA stubs live in `shim_inject.c`). The core shim TUs (`spi_shim.c`, `shim_io.c`, `shim_ioctl.c`, `shim_fs.c`, `shim_net.c`, `shim_bridges.c`, `shim_inject.c`, `shim_patches.c`, `shim_switches.c`, `shim_discovery.c`, `shim_diagnostics.c`) stay flat — per the standing rule, only carve out a subsystem when it gets a refactor/TDD pass.
+
+### Plumbing updates
+
+- `run_game.sh`: 7 `$SCRIPT_DIR/<name>.py` paths repointed (`display/frame_viewer.py`, `display/decode_daemon.py`, `display/gl_daemon.py`, `tools/marker_button.py`, `nodebus/devbus_subscriber.py`, `tools/switch_noise_test.py`, `tools/switch_command.py`); `audio_subscriber.py` left flat. The stale-process `pgrep -f` regex updated to the new paths.
+- `nuke_emulation.sh`: patterns are filename-only so they still match the moved files; also added the four daemons it was *missing* (`gl_daemon.py`, `decode_daemon.py`, `devbus_subscriber.py`, `marker_button.py`) to both the SIGTERM and SIGKILL passes — pre-existing gap.
+- `.gitignore` (both `_emulation/.gitignore` and `pokemon_le/.gitignore`): `src/gles_probe[0-9]` → `src/tools/gles_probe[0-9]`.
+- **`__file__`-fallback fix** in `marker_button.py` / `historical-state-subscriber.py` / `switch_command.py` / `frame_viewer.py` / `switch_noise_test.py`: these compute `_HERE = $SPIKE3_EMULATION_DIR or Path(__file__).parent` and then `_HERE / "runs" / "latest"`. The env var (always set by `run_game.sh`) is correct; the `__file__` fallback was already wrong when these were in flat `src/` (gave `src/`, not `_emulation/`) and the move would've made it differently wrong — changed to `Path(__file__).resolve().parents[2]` (`src/<module>/x.py` → `_emulation/`). Edge-case-only path; behaviour under `run_game.sh` unchanged.
+
+### Docs
+
+`src/README.md` (layout tree, the new "tools/ vs tests/ vs runtime daemons" paragraph, the architecture ASCII's host-process list, the gitignore line, the "Where things live" table), `src/SHIM.md` (the Translation-units table — `display/`/`nodebus/` prefixes, merged the duplicated `shim_avforward.c` row; the IPC-bridges subscriber column), `src/tests/README.md` (the "other test/diagnostic scripts" section — they're `tools/` smoke probes now, deliberately not under `tests/`). Prose mentions of bare filenames left as-is (the tables are the authoritative path source).
+
+### Verification
+
+`./build.sh` → `spi_shim.so` 375432 bytes, clean (only the pre-existing `-Wnonnull-compare` warnings in `shim_fs.c`). `tests/run_tests.sh` → 135 C + 21 Python green. `python3 -m py_compile` on every moved/edited `.py` → OK. `bash -n` on `run_game.sh` / `build.sh` / `nuke_emulation.sh` → OK. Searched `.claude/` + memory for stale `src/<flat-name>` path refs → none.
+
+### Not done yet
+
+A real TDD pass on `display/` (golden model + game-free `tests/display/` like `tests/nodebus/`) — `decode_daemon_test.py` needs a live daemon, so it can't move under `tests/` until that exists. The remaining PROTOCOL polish from Step 107 (the `§4` "Shim status" column, the "Persistence gap" / "BN database naming" subsections) and `/protocol audit` over the doc set are still open. Then the nodebus catalog phase.

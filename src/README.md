@@ -131,10 +131,11 @@ See [`tests/README.md`](tests/README.md) for the TDD discipline and coverage.
   │      @spike3_gl     (host GLES)      │
   │                                      │
   │  Host processes:                     │
-  │    decode_daemon.py — NVDEC server   │
-  │    gl_daemon.py — host GLES server   │
-  │    frame_viewer.py, audio_subscriber │
-  │    devbus_subscriber.py, …           │
+  │    display/decode_daemon.py (NVDEC)  │
+  │    display/gl_daemon.py (host GLES)  │
+  │    display/frame_viewer.py           │
+  │    audio_subscriber.py               │
+  │    nodebus/devbus_subscriber.py, …   │
   └──────────────────────────────────────┘
 ```
 
@@ -161,19 +162,3 @@ internals beyond "this is the Godot PCK".
 attract pipeline. A SW-LE-to-attract failure points at shared shim/node-bus code
 rather than Pokémon-port glue. See PROTOCOL "Comparison binaries".
 
-## Where things live
-
-| Concern | Path |
-|---|---|
-| Shim translation units | `src/*.c`, `src/*.h`, plus carved-out modules in `src/<module>/` |
-| Build / launch / cleanup | `src/build.sh`, `src/run_game.sh`, `src/nuke_emulation.sh` |
-| Host runtime daemons (NVDEC decode, native GLES) | `src/decode_daemon.py`, `src/gl_daemon.py` (+ `gl_proto.{h,py}`) |
-| Dev/operator tools (TIMER panel, switch injection, devbus, viewers) | `src/marker_button.py`, `src/switch_command.py`, `src/switch_inventory.py`, `src/devbus_snapshot.py`, `src/*_subscriber.py`, `src/frame_viewer.py`, `src/snap_frame.py` |
-| Per-game machine inventory | `src/games/<game>_machine.{c,h}` |
-| Bind-mount + run-state setup | `src/scripts/setup_bind_mounts.sh`, `src/scripts/reset_run_state.sh` |
-| GL_DAEMON=0 Mesa overlay | `src/mesa_sw_overlay/` |
-| Host-side unit tests | `src/tests/<module>/` |
-| Shim internals reference | `src/SHIM.md` |
-| Verified RE / platform facts | `../docs/PROTOCOL.md` |
-| Chronological investigation log | `../docs/JOURNAL.md` |
-| Run logs / captures / Ghidra | `../runs/`, `../captures/`, `../_ghidra/` |

@@ -76,7 +76,7 @@ def main() -> int:
 
     run_dir = Path(args.run_dir)
     if not run_dir.is_absolute():
-        run_dir = Path(__file__).resolve().parent / run_dir
+        run_dir = Path(__file__).resolve().parents[2] / run_dir  # src/tools/x.py → _emulation/
     devbus_log = run_dir / "devbus.log"
     if not devbus_log.exists():
         raise SystemExit(f"missing {devbus_log}")

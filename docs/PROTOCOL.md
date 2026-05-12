@@ -234,33 +234,33 @@ Plus **`0x40` and `0x41` via runtime-computed cmd byte** in `mcp_nodebus_send_ra
 
 ### Top-level cmd map (canonical truth)
 
-Legend for **Shim status**: ✅ = handled with deliberate engineered shape; ⚠️ = handled but shape may not match the bridge's real reply (see notes); ❓ = uncovered, but the game has been observed sending this cmd; ❌ = uncovered and never observed in any run.
+Bridge cmd → handler + reply shape. Which of these the game actually sends is in "Game's outbound cmd usage" above (plus cmd `0x25` for node enumeration, sent via `sub_8ede50` with a computed cmd byte). For what the *emulator's* shim synthesizes per cmd, see `../src/SHIM.md` "Bridge command synthesis status".
 
-| Cmd | Bridge handler | Reply shape | Shim status |
-|---|---|---|---|
-| `0x10`-`0x1F` | POWERDIST_SendCmd passthrough (when Spike 3) | async via POWERDISTUART | n/a — see per-cmd entries below |
-| `0x10` | local fallback: ADC version triple + 4th byte | `SendMessage(0x10, id, 3 bytes)` | ✅ shim sends 7-byte pwrdist version `01 00 00 00 00 00 00` (response cmd `0x10`) — game's handler at `0x916194` requires exactly 7 bytes |
-| `0x11` | POWERDIST passthrough; local fall-through (Spike 2) | undefined locally | ✅ shim sends 0-byte ACK (silent-ACK fallback at netbridge `0x915d28`) |
-| `0x12` | `ADC_GetLineFrequency` | `SendMessage(cmd, id, 1 byte)` | ❌ never observed in any run |
-| `0x15` | local fallback: `0xff` ack | `SendMessage(0x15, id, 1 byte)` | ✅ shim sends 1-byte `0x00` (pwrdist status — "all clear") |
-| `0x16` | POWERDIST passthrough; OR shared handler at `0x915d28` | game polls until `rx[0]>0 && rx[2]==2` (≤1000 × 1ms) | ✅ shim sends `01 00 02 00`. Verified satisfies the game's wrapper `sub_917b60` + polling caller at `0x675c20`; game prints "power dist. boot version / runtime version" after receipt |
-| `0x18` | POWERDIST passthrough; firmware handler at `0x91607c` records `min(existing, len)` | the value isn't read | ✅ shim sends 1-byte `0x00` |
-| `0x19` | `ADC_GetLineVoltage` | `SendMessage(cmd, id, 2 bytes)` | ❌ never observed |
-| `0x1c` | POWERDIST passthrough; shared silent-ACK at `0x915d28` | unblocks the channel | ✅ shim sends 0-byte ACK |
-| `0x1d` | POWERDIST passthrough; dedicated handler at `0x916028` | varies by len | ✅ shim sends 0-byte ACK (avoids writing stale data into per-id buffer) |
-| `0x20` | bridge version triple (strtol over rodata) + ADC version | `SendMessage(0x20, id, 4 bytes)` | ⚠️ shim returns 4 zero bytes WITH RESPONSE CMD `0x10`. Diverges from the bridge's actual reply (which uses cmd `0x20`). The cmd 0x10 game-handler requires 7 bytes so this would fail if cmd 0x20 ever fires |
-| `0x21` | `BBL_Set` / `BBL_Get` (battery backup level) | `SendMessage(cmd, id, 1 byte)` | ❌ never observed |
-| `0x22` | `resetFlags` (also sent unsolicited at boot) | `SendMessage(0x22, 0, 1 byte)` | ❌ never observed (bridge sends unsolicited at first connect — see "Async notifications" below) |
-| `0x23` | snapshot + clear `bridgeStatus` | `SendMessage(0x23, id, 4 bytes)` | ❌ never observed |
-| `0x24` | `ADC_GetVBBmV` (battery voltage) | `SendMessage(cmd, id, 4 bytes)` | ❌ never observed |
-| `0x25` | `NODEBUS_Poll` — node-enumeration query: yields next detected slot ID, 0 terminates | `SendMessage(0x25, id, 1 byte = next_slot_id_or_0)` | ✅ shim synthesizes via `enum_seq` cursor; resets on cmd `0x41` inner cmd `0xF0` slot=0 payload `0x22` (see "Cmd 0x25 node enumeration" below) |
-| `0x27` | LCD subcommands (sub-cmd at byte 0) | varies — see "Cmd 0x27 LCD subprotocol" below | ✅ shim alternates `0x06` / `0x02` per call to satisfy a paired bit-2-toggle poll loop in the game (see "Cmd 0x27 game-side polling" below) |
-| `0x28` | DMD ops (disambiguated by length) | varies | ❌ never observed |
-| `0x29` / `0x2A` / `0x2B` / `0x2F` | WS2812 LED chains | varies | ❌ never observed |
-| `0x2C` | `I2S_Enable(arg & 1)` | none | ❌ never observed |
-| `0x30` | `CRC32(0, &__VECTOR_TABLE, 0x12a40)` over bridge firmware | `SendMessage(0x30, id, 4 bytes)` | ✅ shim returns precomputed `NETBRIDGE_CRC32 = 0x357f5327` (zlib CRC32 chained over `netbridge.elf` `.text → .rodata → .binary_info`). Game prints `netbridge image okay, CRC32=0x357f5327` |
-| `0x40` | nodebus-passthrough subprotocol (cleartext path) | varies | ✅ sent at runtime, log only. See "Cmd 0x40 nodebus subprotocol" below |
-| `0x41` | node-bus query (encrypted transport) | varies | ✅ sent at runtime, encrypted. Shim logs decoded inner cmd + payload. See "Nodebus (cipher, hash, framing)" for the cipher; see "Cmd 0x41 wire format" below |
+| Cmd | Bridge handler | Reply shape |
+|---|---|---|
+| `0x10`-`0x1F` | POWERDIST_SendCmd passthrough (when Spike 3) | async via POWERDISTUART (see per-cmd entries below) |
+| `0x10` | local fallback: ADC version triple + 4th byte | `SendMessage(0x10, id, 3 bytes)`; the game's handler at `0x916194` expects a 7-byte response |
+| `0x11` | POWERDIST passthrough; local fall-through (Spike 2) | undefined locally; the game accepts a 0-byte ACK (silent-ACK fallback at netbridge `0x915d28`) |
+| `0x12` | `ADC_GetLineFrequency` | `SendMessage(cmd, id, 1 byte)` |
+| `0x15` | local fallback: `0xff` ack | `SendMessage(0x15, id, 1 byte)` |
+| `0x16` | POWERDIST passthrough; OR shared handler at `0x915d28` | game polls until `rx[0]>0 && rx[2]==2` (≤1000 × 1ms); wrapper `sub_917b60`, polling caller `0x675c20`; game then prints "power dist. boot version / runtime version" |
+| `0x18` | POWERDIST passthrough; firmware handler at `0x91607c` records `min(existing, len)` | the value isn't read |
+| `0x19` | `ADC_GetLineVoltage` | `SendMessage(cmd, id, 2 bytes)` |
+| `0x1c` | POWERDIST passthrough; shared silent-ACK at `0x915d28` | 0-byte ACK; unblocks the channel |
+| `0x1d` | POWERDIST passthrough; dedicated handler at `0x916028` | varies by len |
+| `0x20` | bridge version triple (strtol over rodata) + ADC version | `SendMessage(0x20, id, 4 bytes)` |
+| `0x21` | `BBL_Set` / `BBL_Get` (battery backup level) | `SendMessage(cmd, id, 1 byte)` |
+| `0x22` | `resetFlags` (also sent unsolicited at boot) | `SendMessage(0x22, 0, 1 byte)` — bridge sends this unsolicited at first connect (see "Async (unsolicited) bridge → host notifications" below) |
+| `0x23` | snapshot + clear `bridgeStatus` | `SendMessage(0x23, id, 4 bytes)` |
+| `0x24` | `ADC_GetVBBmV` (battery voltage) | `SendMessage(cmd, id, 4 bytes)` |
+| `0x25` | `NODEBUS_Poll` — node-enumeration query: yields next detected slot ID, 0 terminates | `SendMessage(0x25, id, 1 byte = next_slot_id_or_0)`; resets on cmd `0x41` inner cmd `0xF0` slot=0 payload `0x22` (see "Cmd 0x25 node enumeration" below) |
+| `0x27` | LCD subcommands (sub-cmd at byte 0) | varies — see "Cmd 0x27 LCD subprotocol" below; the game runs a paired bit-2-toggle poll loop on the reply (see "Cmd 0x27 game-side polling" below) |
+| `0x28` | DMD ops (disambiguated by length) | varies — see "Cmd 0x28 DMD subprotocol" below |
+| `0x29` / `0x2A` / `0x2B` / `0x2F` | WS2812 LED chains | varies — see "Cmd 0x29 / 0x2A / 0x2B / 0x2F WS2812 LED chains" below |
+| `0x2C` | `I2S_Enable(arg & 1)` | none |
+| `0x30` | `CRC32(0, &__VECTOR_TABLE, 0x12a40)` over bridge firmware | `SendMessage(0x30, id, 4 bytes)`; for `netbridge.elf` this is `0x357f5327` (zlib CRC32 chained over `.text → .rodata → .binary_info`); game prints `netbridge image okay, CRC32=0x357f5327` |
+| `0x40` | nodebus-passthrough subprotocol (cleartext path) | varies — see "Cmd 0x40 nodebus-passthrough subprotocol" below |
+| `0x41` | node-bus query (encrypted transport) | varies — see "Cmd 0x41 wire format" below; cipher in "Nodebus (cipher, hash, framing)" |
 
 ### Cmd 0x25 node enumeration (with cmd 0x41 inner cmd `0xF0` reset)
 
@@ -1803,26 +1803,27 @@ Status LED (D2) blink codes (real-hardware debug only):
 
 **Emulation:** the shim returns synthetic pwrdist responses for cmds 0x10/0x15/0x16/0x18/0x1c/0x1d (see "CPU ↔ netbridge UART bridge protocol"). The visible 48V gameplay gate is currently satisfied by the CPU switch-matrix interlock (`0-SW-23` / `sw_id=98`) rather than by the `0x1d` four-byte payload alone; `0x1d=ff ff ff ff` still shows the warning if `sw_id=98` remains open.
 
-### Persistence gap
+### NV storage
 
-Partial. Verified 2026-05-02:
+Settings and audits persist across power cycles in NFI2-structured files (magic + an NSEC-timestamp section + one or more NDAT records) under several directories on the SD card, plus the i2c EEPROM at slave `0x57` on `/dev/i2c-10`:
 
-- **PIN_NVRAM tier — works.** Each run writes a new sequential file (`PIN_NVRAM/00000065`, `66`, `67`, …) with a `.crc32` sidecar, 588 bytes each, NFI2-structured (magic + NSEC timestamp section + multiple NDAT records). The mtime of the latest file matches the run start time.
-- **SYS_NVRAM / NVRAM / FRRAM / PTRAM / LKRAM / NVM tier — content exists but stale.** Files (e.g. `SYS_NVRAM/00000000` 2068 B, `NVRAM/00000000` 740 B) are populated with NFI2-structured data but mtimes are stuck at the initial seed date in the inspected runs.
-- **EEPROM tier (i2c slave 0x57)** — no completed verification pass is recorded here.
-- **SIGTERM flush** — no completed verification pass is recorded here.
+| Area | Notes |
+|---|---|
+| `PIN_NVRAM/` | A fresh sequential file (`00000065`, `00000066`, …; ≈588 B) with a `.crc32` sidecar is written per run; the latest file's mtime tracks the run start. |
+| `SYS_NVRAM/`, `NVRAM/`, `FRRAM/`, `PTRAM/`, `LKRAM/`, `NVM/` | NFI2-structured settings/audit files (e.g. `SYS_NVRAM/00000000` ≈2068 B, `NVRAM/00000000` ≈740 B). |
+| i2c EEPROM (slave `0x57`) | small device; no decoded layout recorded here. |
 
-The shim's NV writeback machinery is at least partially working because PIN_NVRAM advances across runs. Settings-tier files did not advance in the inspected runs.
+The emulator's partial NV writeback (which tiers actually persist in our runs, what's unverified) is in `../src/SHIM.md` "NV persistence (shim writeback)".
 
-Persistence follow-up experiments belong in `JOURNAL.md` until verified.
-
-*Verified by:* PIN_NVRAM file inspection + `xxd` (NFI2 magic + records) on 2026-05-02; `stat` showing PIN_NVRAM mtimes track run starts while SYS_NVRAM/NVRAM mtimes don't.
+*Verified by:* PIN_NVRAM / SYS_NVRAM / NVRAM file inspection + `xxd` (NFI2 magic + records) on 2026-05-02.
 
 ---
 
 ## Comparison binaries (SW LE 0.85)
 
 The emulator's correctness target is "boot ANY Spike 3 game to attract." Every claim about Stern-shared code (proc system, IScene base class, DisplayRenderer, SceneCache, RadiumScene, node-bus, SPI, audio) should reproduce in **Star Wars LE 0.85.0** because both games run the same Stern stack. SW LE has **zero Godot** in its binary (vs Pokémon LE's 457 "godot" string hits) — making it the cleanest A/B target for "what is Pokémon-port glue vs. shared Stern?"
+
+(The `.bndb` analysis databases for these binaries — naming convention + paths — are listed in `../src/README.md` "Binary Ninja / Ghidra databases".)
 
 ### Cross-mapped functions (PLE ↔ SW LE)
 

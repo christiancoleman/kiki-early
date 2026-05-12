@@ -28,7 +28,7 @@ from switch_inventory import MANUAL_SWITCHES, SWITCH_BY_MANUAL_ID, SWITCH_BY_RUN
 
 # run_game.sh passes explicit paths so a symlinked _emulation directory can
 # drive multiple sysroots without pathlib resolving back to the canonical tree.
-_HERE = pathlib.Path(os.environ.get("SPIKE3_EMULATION_DIR", pathlib.Path(__file__).parent)).absolute()
+_HERE = pathlib.Path(os.environ.get("SPIKE3_EMULATION_DIR", pathlib.Path(__file__).resolve().parents[2])).absolute()
 _SYSROOT = pathlib.Path(os.environ.get("SPIKE3_SYSROOT", _HERE.parent.parent.parent)).absolute()
 
 GAME_LOG_PATH = os.environ.get("SPIKE3_GAME_LOG_PATH", str(_HERE / "runs" / "latest" / "game.log"))

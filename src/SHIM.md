@@ -18,7 +18,7 @@ delete it — git history is the archive.
 | Device path | fd type | Purpose | Coverage |
 |---|---|---|---|
 | `/dev/spidev4.0` | fake fd `1023` | CPU-board 8-byte SPI polling (local switches, not node bus) | `MESSAGE_1` ioctl: default `rx[2] = 0x04` advances the game's state machine. TX byte 7 carries `g_hardware_output_state` byte 7 (the only byte the game's `set_hardware_output_bit` writes); other TX bytes stay zero unless `write_hardware_output_byte` is called |
-| `/dev/i2c-10` | fake fd `1022` | EEPROM at slave 0x57 | Read/write-back works; no real state maintained. **Persistence gap: writes vanish, no SIGTERM flush** |
+| `/dev/i2c-10` | fake fd `1022` | EEPROM at slave 0x57 | Read/write-back works; no real state maintained — see "NV persistence (shim writeback)" below |
 | `/dev/ttyAMA5` | real `socketpair(AF_UNIX, SOCK_STREAM)` | UART to netbridge (game gets sv[0], shim holds sv[1]) | Reads block naturally on the socketpair. Writes are intercepted by `shim_io.c::write` and routed to `synthesize_bridge_response` (see PROTOCOL "CPU ↔ netbridge UART bridge protocol"). Treated as a pure shim endpoint — the request bytes are logged + synthesized, never written into the socketpair |
 | `/dev/ttyAMA2` | real `socketpair(AF_UNIX, SOCK_STREAM)` | secondary UART path; no decoded protocol coverage | Pass-through |
 | `/dev/dri/card1` | real `socketpair(AF_UNIX, SOCK_STREAM)` | DRM KMS display | DRM ioctls intercepted before they'd reach the socketpair. See "Display pipeline" below |
@@ -280,8 +280,9 @@ shim forwards unchanged. Wire format:
 ```
 
 Subscriber: `frame_viewer.py` (Tk + numpy + Pillow). Self-resolves the abstract
-socket name. Shows live frames in a 1920×1080 window (`VIEWER_FULLSCREEN=1` for
-fullscreen).
+socket name. Shows live frames fit to the Tk client area, preserving aspect
+ratio so maximized windows do not clip the 1920×1080 source frame
+(`VIEWER_FULLSCREEN=1` for fullscreen).
 
 ### Observed at runtime
 
@@ -340,7 +341,76 @@ To convert the captured stream to WAV: `ffmpeg -f s16le -ar 44100 -ac 2 -i strea
 
 *Verified by:* Step 27 run — 11.7 MB / 66.4 s of real-time audio captured in one run, audio thread did not spin, game progressed into scene-loader territory.
 
-## Nodebus synth: per-slot chip-ID table (Pokémon LE)
+## NV persistence (shim writeback)
+
+The platform's NV storage areas are in PROTOCOL "Hardware reference" → "NV
+storage". The shim's writeback is **partial** (verified 2026-05-02):
+
+- **`PIN_NVRAM/` — works.** Each run writes a new sequential file
+  (`00000065`, `66`, `67`, …) with a `.crc32` sidecar; the latest file's mtime
+  matches the run start. So the shim's NV writeback machinery is at least
+  partly live.
+- **`SYS_NVRAM/` / `NVRAM/` / `FRRAM/` / `PTRAM/` / `LKRAM/` / `NVM/` — content
+  exists but stale.** Files are populated with NFI2 data, but their mtimes are
+  stuck at the initial seed date in the inspected runs — the game doesn't
+  appear to hit the settings/audit save path in boot/attract/service-menu flows.
+- **EEPROM tier (i2c slave `0x57`)** — read/write-back works in `shim_ioctl.c`
+  but no real state is maintained, and there's no completed verification of
+  whether the game expects it to persist.
+- **SIGTERM flush** — whether a clean shutdown flushes pending NV writes is
+  unverified.
+
+Persistence follow-up experiments belong in `../docs/JOURNAL.md` until verified.
+
+*Verified by:* PIN_NVRAM / SYS_NVRAM / NVRAM file inspection + `xxd` (NFI2 magic
++ records) on 2026-05-02; `stat` showing PIN_NVRAM mtimes track run starts while
+SYS_NVRAM / NVRAM mtimes don't.
+
+## Bridge command synthesis status (`synthesize_bridge_response`)
+
+`nodebus/shim_nodebus.c::synthesize_bridge_response` is the shim's stand-in for
+the netbridge's `HOST_Update`. PROTOCOL "CPU ↔ netbridge UART bridge protocol"
+→ "Top-level cmd map" lists each bridge cmd, its bridge-side handler, and the
+reply shape the game expects; the table below is the *shim's* side — what it
+actually puts on the wire for each cmd, and how good a match that is.
+
+Legend: ✅ = handled with a deliberate engineered shape that satisfies the
+game's reader; ⚠️ = handled but the shape may not match the real bridge reply
+(see notes — works in practice for the cmds the game actually sends); ❓ = not
+handled, but the game has been observed sending this cmd; ❌ = not handled,
+never observed in any run (the game doesn't send it in the boot / attract /
+service-menu flows exercised so far).
+
+| Cmd | Shim status | What the shim sends / why |
+|---|---|---|
+| `0x10` | ✅ | 7-byte pwrdist version `01 00 00 00 00 00 00` (response cmd `0x10`) — game's handler at `0x916194` requires exactly 7 bytes |
+| `0x11` | ✅ | 0-byte ACK (silent-ACK fallback at netbridge `0x915d28`) |
+| `0x12` | ❌ | never observed |
+| `0x15` | ✅ | 1-byte `0x00` (pwrdist status — "all clear") |
+| `0x16` | ✅ | `01 00 02 00` — satisfies the game's wrapper `sub_917b60` + polling caller at `0x675c20` (`rx[0]>0 && rx[2]==2`); game prints "power dist. boot version / runtime version" after receipt |
+| `0x18` | ✅ | 1-byte `0x00` (the firmware handler at `0x91607c` records `min(existing, len)`; the value isn't read) |
+| `0x19` | ❌ | never observed |
+| `0x1c` | ✅ | 0-byte ACK (shared silent-ACK at `0x915d28`) |
+| `0x1d` | ✅ | 0-byte ACK (avoids writing stale data into the per-id buffer) |
+| `0x20` | ⚠️ | 4 zero bytes WITH RESPONSE CMD `0x10` — diverges from the bridge's actual reply (which uses cmd `0x20`); the cmd-`0x10` game-handler requires 7 bytes, so this would fail if cmd `0x20` ever fires. The game doesn't send it in observed flows |
+| `0x21`–`0x24` | ❌ | never observed |
+| `0x25` | ✅ | synthesized via the `nodebus_enum_idx` cursor → `{1, 2, 4, 7, 8, 9, 10, 12, 13, 14, 0}`; resets on cmd `0x41` inner cmd `0xF0` slot=0 payload `0x22` (PROTOCOL "Cmd 0x25 node enumeration") |
+| `0x27` | ✅ | alternates `0x06` / `0x02` per call to satisfy a paired bit-2-toggle poll loop in the game (PROTOCOL "Cmd 0x27 game-side polling") |
+| `0x28` / `0x29` / `0x2A` / `0x2B` / `0x2C` / `0x2F` | ❌ | never observed (DMD / WS2812 / I2S) |
+| `0x30` | ✅ | precomputed `NETBRIDGE_CRC32 = 0x357f5327` (zlib CRC32 chained over `netbridge.elf` `.text → .rodata → .binary_info`); game prints `netbridge image okay, CRC32=0x357f5327` |
+| `0x40` | ✅ | nodebus-passthrough (cleartext) — sent at runtime, logged only (PROTOCOL "Cmd 0x40 nodebus-passthrough subprotocol") |
+| `0x41` | ✅ | node-bus query (encrypted) — sent at runtime; shim decodes the inner cmd + payload, then FE-probe synth / `0x25`-reset detection / cmd-`0x41` reply synth as appropriate (PROTOCOL "Cmd 0x41 wire format"; cipher in PROTOCOL "Nodebus (cipher, hash, framing)"; per-slot chip-ID synth below) |
+
+Unknown / unhandled cmds (plus a too-short cmd-`0x41` frame) get **no response** —
+the game's bridge caller times out, which is itself a progress signal (PROTOCOL
+"Bridge-command timeouts as progress signal"); the shim doesn't fabricate a
+reply it can't shape correctly.
+
+*Verified by:* `nodebus/shim_nodebus.c` source; the per-cmd game-side handler
+decompiles cited above; JOURNAL Steps 90–94 (FE-probe + `0x25` + `0x27` + `0x30`
+runtime confirmation — game advances through Tech Alerts to the Service Menu).
+
+## Nodebus synth: per-slot FE-probe chip-ID table (Pokémon LE)
 
 `shim_nodebus.c::nodebus_chip_id_for_slot` returns the chip_id the shim writes
 into `response[4..7]` of every synthesized FE-probe reply for populated slots.

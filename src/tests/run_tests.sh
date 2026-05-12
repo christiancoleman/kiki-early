@@ -44,4 +44,15 @@ fi
 echo "[tests] === nodebus/test_nodebus_model.py (Python golden model) ==="
 python3 nodebus/test_nodebus_model.py
 
+# ---- display module ----
+echo "[tests] compiling display/test_gl_proto (host: $CC) ..."
+"$CC" -std=gnu11 -O0 -g -Wall -Wextra -Wno-unused-function \
+      -I.. -o "$BUILD/test_gl_proto" display/test_gl_proto.c
+
+echo "[tests] === display/test_gl_proto (C: src/display/gl_proto.h layout) ==="
+"$BUILD/test_gl_proto"
+
+echo "[tests] === display/test_gl_proto_consistency.py (gl_proto.h <-> gl_proto.py) ==="
+python3 display/test_gl_proto_consistency.py
+
 echo "[tests] all green."

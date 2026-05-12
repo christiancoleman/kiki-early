@@ -26,7 +26,8 @@
 # TUNABLE ENV OVERRIDES (defaults in []):
 #   TIMEOUT=<sec>           [0]     cap run duration; 0 = no limit (default play)
 #   VIEWER=<0|1>            [1]     auto-launch python3 frame_viewer.py
-#   VIEWER_MAXIMIZED=<0|1>  [1]     open the viewer maximized
+#   VIEWER_MAXIMIZED=<0|1>  [1]     open the viewer maximized; frames fit the
+#                                   usable window area without clipping
 #   VIEWER_FULLSCREEN=<0|1> [0]     open the viewer fullscreen rather than
 #                                   maximized/in a 1920×1080 window
 #   AUDIO_PLAYER=<0|1>      [0]     auto-launch audio_subscriber.py | ffplay
@@ -394,7 +395,7 @@ fi
 
 if [[ "$STALE_KILL" == "1" ]]; then
     stale_qemu=$(pgrep -f "qemu-aarch64.*LD_PRELOAD=$SHIM" 2>/dev/null || true)
-    stale_help=$(pgrep -f "$SCRIPT_DIR/(frame_viewer|audio_subscriber|marker_button|devbus_subscriber)\.py" 2>/dev/null || true)
+    stale_help=$(pgrep -f "$SCRIPT_DIR/(display/frame_viewer|audio_subscriber|tools/marker_button|nodebus/devbus_subscriber)\.py" 2>/dev/null || true)
     stale_fplay=$(pgrep -f "ffplay.*s16le.*44100" 2>/dev/null || true)
     stale_all="$stale_qemu $stale_help $stale_fplay"
     if [[ -n "${stale_all// }" ]]; then
@@ -522,7 +523,7 @@ if [[ "$VIEWER" == "1" && "$FRAME_BRIDGE" == "1" ]]; then
         elif [[ "$VIEWER_MAXIMIZED" == "1" ]]; then
             viewer_args+=("--maximized")
         fi
-        python3 "$SCRIPT_DIR/frame_viewer.py" "${viewer_args[@]+"${viewer_args[@]}"}" \
+        python3 "$SCRIPT_DIR/display/frame_viewer.py" "${viewer_args[@]+"${viewer_args[@]}"}" \
             >"$viewer_log_target" 2>&1 &
         HELPER_PIDS+=("$!"); HELPER_LABELS+=("frame viewer")
         printf '[run_game] spawned frame viewer (pid %d)\n' "$!" >&2
@@ -555,7 +556,7 @@ if [[ "$FORWARD_DECODE" == "1" ]]; then
         decode_log_target="$LATEST_DIR/decode_daemon.log"
         # Daemon binds an abstract AF_UNIX socket (@spike3_decode); no file
         # cleanup needed. Stays alive until cleanup_all kills it.
-        python3 -u "$SCRIPT_DIR/decode_daemon.py" \
+        python3 -u "$SCRIPT_DIR/display/decode_daemon.py" \
             >"$decode_log_target" 2>&1 &
         HELPER_PIDS+=("$!"); HELPER_LABELS+=("decode daemon")
         printf '[run_game] spawned decode daemon (pid %d) — log %s\n' \
@@ -571,7 +572,7 @@ if [[ "$GL_DAEMON" == "1" ]]; then
     if command -v python3 >/dev/null; then
         gl_daemon_log_target="$LATEST_DIR/gl_daemon.log"
         # Daemon binds abstract AF_UNIX @spike3_gl. Same lifecycle as decode_daemon.
-        python3 -u "$SCRIPT_DIR/gl_daemon.py" \
+        python3 -u "$SCRIPT_DIR/display/gl_daemon.py" \
             >"$gl_daemon_log_target" 2>&1 &
         HELPER_PIDS+=("$!"); HELPER_LABELS+=("gl daemon")
         #printf '[run_game] spawned gl daemon (pid %d) — log %s\n' \
@@ -588,7 +589,7 @@ if [[ "$TIMER_GUI" == "1" ]]; then
         # marker_button.py) — no separate timer.log needed. BUT: route
         # stderr to a sticky log file so any Python exception from the GUI
         # callback path is captured (was silently lost when /dev/null'd).
-        python3 -u "$SCRIPT_DIR/marker_button.py" \
+        python3 -u "$SCRIPT_DIR/tools/marker_button.py" \
             >>"$SYSROOT/tmp/marker_button_errors.log" 2>&1 &
         HELPER_PIDS+=("$!"); HELPER_LABELS+=("marker button")
         printf '[run_game] spawned marker button (pid %d) — TIMER=ON\n' "$!" >&2
@@ -605,7 +606,7 @@ if [[ "$DEVBUS_TAIL" == "1" ]]; then
     elif command -v python3 >/dev/null; then
         devbus_log_target=/dev/null
         [[ "$DEBUG" == "1" ]] && devbus_log_target="$LATEST_DIR/devbus.log"
-        python3 -u "$SCRIPT_DIR/devbus_subscriber.py" --retry \
+        python3 -u "$SCRIPT_DIR/nodebus/devbus_subscriber.py" --retry \
             >"$devbus_log_target" 2>&1 &
         HELPER_PIDS+=("$!"); HELPER_LABELS+=("devbus tail")
         printf '[run_game] spawned devbus tail (pid %d) — log %s\n' \
@@ -827,7 +828,7 @@ if [[ "$SWITCH_NOISE_TEST" == "1" ]]; then
         printf '[switch_noise_test] skipped: python3 not found\n' >"$noise_log"
     else
         printf '[run_game] running switch-noise test — log %s\n' "$noise_log" >&2
-        if python3 "$SCRIPT_DIR/switch_noise_test.py" \
+        if python3 "$SCRIPT_DIR/tools/switch_noise_test.py" \
                 --run-dir "$RUN_DIR" \
                 --watch "$SWITCH_NOISE_WATCH" \
                 >"$noise_log" 2>&1; then

@@ -47,7 +47,7 @@
 #include <sys/syscall.h>
 
 #include "spi_shim.h"
-#include "gl_proto.h"
+#include "display/gl_proto.h"
 
 /* Exported so shim_bridges.c's frame capture can read the game's most recent
  * draw-FBO binding. Definition still lives with glBindFramebuffer inside

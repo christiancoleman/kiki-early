@@ -30,7 +30,7 @@
 #include <sys/time.h>
 
 #include "spi_shim.h"
-#include "gl_proto.h"
+#include "display/gl_proto.h"
 
 /* Common listener creator for the three bridges. Creates an abstract
  * AF_UNIX listener at `abstract_name`. `tag` is used only in log messages.

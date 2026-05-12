@@ -30,7 +30,7 @@ except ImportError:  # POSIX
     msvcrt = None
 
 
-_HERE = Path(os.environ.get("SPIKE3_EMULATION_DIR", Path(__file__).parent)).absolute()
+_HERE = Path(os.environ.get("SPIKE3_EMULATION_DIR", Path(__file__).resolve().parents[2])).absolute()
 _DEFAULT_REQUEST = _HERE / "runs" / "latest" / "press_request.txt"
 _DEFAULT_GAME_LOG = _HERE / "runs" / "latest" / "game.log"
 

@@ -7,9 +7,15 @@ echo "Nuking all emulation processes..."
 # 1. Kill bash wrapper scripts
 pkill -f "run_game.sh" 2>/dev/null || true
 
-# 2. Kill Python subscribers and viewers
+# 2. Kill Python daemons, subscribers, viewers, and the marker panel
+#    (patterns are filename-only, so they match wherever the .py now lives:
+#     display/, nodebus/, tools/, or flat).
 pkill -f "frame_viewer.py" 2>/dev/null || true
 pkill -f "audio_subscriber.py" 2>/dev/null || true
+pkill -f "gl_daemon.py" 2>/dev/null || true
+pkill -f "decode_daemon.py" 2>/dev/null || true
+pkill -f "devbus_subscriber.py" 2>/dev/null || true
+pkill -f "marker_button.py" 2>/dev/null || true
 
 # 3. Kill ffplay audio pipelines
 pkill -f "ffplay.*s16le" 2>/dev/null || true
@@ -32,6 +38,10 @@ echo "Sending SIGKILL to any stubborn processes..."
 pkill -9 -f "run_game.sh" 2>/dev/null || true
 pkill -9 -f "frame_viewer.py" 2>/dev/null || true
 pkill -9 -f "audio_subscriber.py" 2>/dev/null || true
+pkill -9 -f "gl_daemon.py" 2>/dev/null || true
+pkill -9 -f "decode_daemon.py" 2>/dev/null || true
+pkill -9 -f "devbus_subscriber.py" 2>/dev/null || true
+pkill -9 -f "marker_button.py" 2>/dev/null || true
 pkill -9 -f "ffplay.*s16le" 2>/dev/null || true
 pkill -9 -f "qemu-aarch64.*spi_shim.so" 2>/dev/null || true
 pkill -9 -f "qemu-aarch64.*boot_display" 2>/dev/null || true

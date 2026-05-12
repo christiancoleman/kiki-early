@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 #include "spi_shim.h"
-#include "gl_proto.h"
+#include "display/gl_proto.h"
 
 static int             g_marshal_active   = -1;
 static int             g_marshal_fd       = -1;

@@ -2,9 +2,10 @@
 # build.sh — compile spi_shim.so from all translation units.
 #
 # Sources live in this directory (= _emulation/src/). Carved-out modules get
-# their own subdir — currently nodebus/. Add new subdir paths to SOURCES below
-# as more modules are split out; -I"$SRC_DIR" lets every TU keep
-# `#include "spi_shim.h"` regardless of which subdir it lives in.
+# their own subdir — currently nodebus/ and display/. Add new subdir paths to
+# SOURCES below as more modules are split out; -I"$SRC_DIR" lets every TU keep
+# `#include "spi_shim.h"` regardless of which subdir it lives in (subdir-local
+# headers are reached as `#include "<module>/<file>.h"`, e.g. display/gl_proto.h).
 #
 # USAGE:
 #   ./build.sh                # optimized build (-O2)
@@ -38,18 +39,18 @@ SOURCES=(
     shim_bridges.c
     shim_diagnostics.c
     nodebus/shim_nodebus.c
+    nodebus/shim_devbus.c
     shim_discovery.c
     shim_fs.c
-    shim_gl.c
+    display/shim_gl.c
+    display/shim_gl_marshal.c
+    display/shim_avforward.c
     shim_io.c
     shim_ioctl.c
     shim_patches.c
-    shim_avforward.c
-    shim_gl_marshal.c
     shim_switches.c
     shim_inject.c
     shim_net.c
-    shim_devbus.c
     games/pokemon_le_machine.c
 )
 

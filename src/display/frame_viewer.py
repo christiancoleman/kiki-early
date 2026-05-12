@@ -24,7 +24,7 @@ Usage:
     # start BEFORE launching the game with SPIKE3_FRAME_BRIDGE=1
     python3 frame_viewer.py
     python3 frame_viewer.py --save-every 30        # + save every 30th frame
-    python3 frame_viewer.py --scale 0.5            # half-size window
+    python3 frame_viewer.py --scale 0.5            # half-size initial window
     python3 frame_viewer.py --no-display --save-every 1  # headless capture mode
 """
 
@@ -40,7 +40,7 @@ import time
 
 # run_game.sh supplies explicit paths so symlinked _emulation dirs can drive
 # different sysroots without resolving back to the canonical tree.
-_HERE = pathlib.Path(os.environ.get("SPIKE3_EMULATION_DIR", pathlib.Path(__file__).parent)).absolute()
+_HERE = pathlib.Path(os.environ.get("SPIKE3_EMULATION_DIR", pathlib.Path(__file__).resolve().parents[2])).absolute()
 _SYSROOT = pathlib.Path(os.environ.get("SPIKE3_SYSROOT", _HERE.parent.parent.parent)).absolute()
 # Default to abstract AF_UNIX namespace (leading null) — matches the shim
 # bridge's bind. Avoids 9P/WSL bind-on-/mnt/c failures, zero filesystem
@@ -129,6 +129,29 @@ def decode_frame(frame, orient="none"):
     return seq, Image.fromarray(arr, mode)
 
 
+def fit_image_to_label(img, label, scale=1.0, fit_window=True):
+    if not fit_window:
+        new_w = max(1, int(img.width * scale))
+        new_h = max(1, int(img.height * scale))
+        if new_w == img.width and new_h == img.height:
+            return img
+        return img.resize((new_w, new_h), Image.BILINEAR)
+
+    label.update_idletasks()
+    avail_w = label.winfo_width()
+    avail_h = label.winfo_height()
+    if avail_w <= 1 or avail_h <= 1:
+        avail_w = max(1, int(img.width * scale))
+        avail_h = max(1, int(img.height * scale))
+
+    fit = min(avail_w / img.width, avail_h / img.height)
+    new_w = max(1, int(img.width * fit))
+    new_h = max(1, int(img.height * fit))
+    if new_w == img.width and new_h == img.height:
+        return img
+    return img.resize((new_w, new_h), Image.BILINEAR)
+
+
 def run_display(args, sock):
     import tkinter as tk
     from PIL import ImageTk
@@ -141,8 +164,8 @@ def run_display(args, sock):
     root = tk.Tk()
     root.title("Spike 3 frame viewer")
     # Size the window up-front so it doesn't start tiny and grow as frames
-    # arrive. The shim advertises 1920×1080 (FAKE_MODE_HDISPLAY/VDISPLAY);
-    # scale it by args.scale for the window. Fullscreen overrides both.
+    # arrive. The actual frame image is fit to the Tk client area at render
+    # time so maximized windows with shorter client height do not clip.
     if args.fullscreen:
         root.attributes("-fullscreen", True)
     elif args.maximized:
@@ -182,11 +205,8 @@ def run_display(args, sock):
             return
 
         seq, img = decode_frame(frame, orient=args.orient)
-        show = img
-        if args.scale != 1.0:
-            new_w = max(1, int(img.width  * args.scale))
-            new_h = max(1, int(img.height * args.scale))
-            show = img.resize((new_w, new_h), Image.BILINEAR)
+        show = fit_image_to_label(img, label, scale=args.scale,
+                                  fit_window=args.fit_window)
 
         photo = ImageTk.PhotoImage(show.convert("RGB"))
         label.configure(image=photo)
@@ -245,7 +265,12 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--socket", default=DEFAULT_SOCKET)
     ap.add_argument("--scale", type=float, default=1.0,
-                    help="window scale factor (1.0 = native, 0.5 = half-size)")
+                    help="initial window scale factor when not fullscreen/maximized "
+                         "(1.0 = native, 0.5 = half-size)")
+    ap.add_argument("--no-fit-window", dest="fit_window", action="store_false",
+                    help="do not dynamically fit frames to the Tk window; render "
+                         "at --scale like the old viewer")
+    ap.set_defaults(fit_window=True)
     ap.add_argument("--save-every", type=int, default=0,
                     help="save every Nth frame as PNG (0 = off)")
     ap.add_argument("--save-dir", default=DEFAULT_SAVE_DIR)
@@ -265,7 +290,8 @@ def main():
     args = ap.parse_args()
 
     print(f"[viewer] starting (socket={args.socket}, scale={args.scale}, "
-          f"save_every={args.save_every}, display={not args.no_display})", flush=True)
+          f"fit_window={args.fit_window}, save_every={args.save_every}, "
+          f"display={not args.no_display})", flush=True)
 
     sock = connect_retry(args.socket)
     print(f"[viewer] connected", flush=True)
