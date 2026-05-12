@@ -35,7 +35,11 @@
 #                                   switch panel that writes switch commands to
 #                                   runs/latest/press_request.txt. EXTERNAL
 #                                   keeps the same shim command path active
-#                                   without launching the WSL Tk panel.
+#                                   without launching the WSL Tk panel. The
+#                                   panel's GRAB STATE button writes a
+#                                   `dump_switches` line; DOOR OPEN/CLOSED write
+#                                   `coin_door open|closed` (default = closed,
+#                                   = the Service Menu's "switch off").
 #   SHIM_AUTO_PRESS=<0|1>   [0]     schedule one host-side switch press request
 #                                   without the TIMER UI. Defaults to Service
 #                                   Back at T+60s when enabled; override with
@@ -44,10 +48,6 @@
 #                                   synthesized switch channel buffers.
 #   SHIM_DISCOVERY_TRAPS=<0|1> [0] install the historical BRK trap suite for
 #                                   Start/multiball/scene/nodebus tracing.
-#   SPIKE3_COIN_DOOR_INTERLOCK=<closed|open|1|0>
-#                             [closed] synthetic coin-door interlock state.
-#                                   unset/closed/restored/1 = restored/closed;
-#                                   open/0 = open/interlock active.
 #   DEVBUS=<0|1>           [1]     enable switch-observability IPC bridge.
 #   DEVBUS_TAIL=<auto|0|1> [auto]  auto=1 for --debug when DEVBUS=1, else 0.
 #                                   When enabled, writes devbus.log in debug runs.
@@ -290,7 +290,6 @@ if [[ "$SWITCH_NOISE_TEST" == "auto" ]]; then
     fi
 fi
 BOOT_DISPLAY="${BOOT_DISPLAY:-0}"
-SPIKE3_COIN_DOOR_INTERLOCK="${SPIKE3_COIN_DOOR_INTERLOCK:-closed}"
 BOOT_DISPLAY_DURATION="${BOOT_DISPLAY_DURATION:-3}"
 STALE_KILL="${STALE_KILL:-1}"
 LOGFILE="${LOGFILE:-}"
@@ -672,7 +671,6 @@ fi
 [[ "$GL_DAEMON"        == "1" ]] && args+=(-E "SPIKE3_GL_DAEMON=1")
 [[ "$DEVBUS"           == "1" ]] && args+=(-E "SPIKE3_DEVBUS=1")
 [[ "$DEVBUS"           == "0" ]] && args+=(-E "SPIKE3_DEVBUS=0")
-[[ -n "${SPIKE3_COIN_DOOR_INTERLOCK:-}" ]] && args+=(-E "SPIKE3_COIN_DOOR_INTERLOCK=$SPIKE3_COIN_DOOR_INTERLOCK")
 [[ "$SPI_QUIET"        == "1" ]] && args+=(-E "SPIKE3_SPI_QUIET=1")
 [[ "$SPI_DELAY_US"     != "0" ]] && args+=(-E "SPIKE3_SPI_DELAY_US=$SPI_DELAY_US")
 [[ "$STATE_BRIDGE"    == "1" ]] && args+=(-E "SPIKE3_BRIDGE=1")
@@ -738,7 +736,6 @@ fi
     printf '\n# env-toggle settings (final values)\n'
     for v in TIMEOUT REAL_GL FRAME_BRIDGE AUDIO_BRIDGE FORWARD_DECODE GL_DAEMON \
              SPIKE3_ZERO_BLEND_DISABLE SPIKE3_ZERO_BLEND_IGNORE SPIKE3_ZERO_BLEND_MODE \
-             SPIKE3_COIN_DOOR_INTERLOCK \
              DEVBUS DEVBUS_TAIL \
              SPI_QUIET SPI_DELAY_US STATE_BRIDGE OFFLINE_MODE \
              SWITCH_NOISE_TEST SWITCH_NOISE_WATCH SWITCH_NOISE_TEST_STRICT \

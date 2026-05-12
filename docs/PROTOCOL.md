@@ -1155,11 +1155,11 @@ Switches feed into events feed into cmodes; cmodes drive scene/display updates b
 
 ### Switch state array
 
-The game maintains an in-memory mirror of each physical switch's state. The array is populated by the UART cmd `0x27` receive path (netbridge → CPU, 1-byte status payload per poll cycle — see "Cmd 0x27 LCD subprotocol (bridge handler)"); the specific decoder function that writes into this array is `sub_651610` (the "translator").
+The game maintains an in-memory mirror of each physical switch's state. The array is written by `translate_switch_state_changes @ 0x651610` (the "translator"): given a channel's freshly-polled 8 raw bytes it diffs them against a per-channel cache, maps each changed `(channel, byte, bit)` to a `sw_id` via a lookup table, updates that switch's struct, and (on a fresh closure) links it onto a pending-edge queue. It's fed by `poll_hardware_switches @ 0x674b90`; the queue is drained by `drain_pending_switch_events @ 0x6511c0`. See "Switch poll path" below for the full chain.
 
 `g_switch_state_array @ 0x4480220` is **an 8-byte POINTER**, not the array itself. The actual per-switch state structs live on the **heap** at `*(uint64_t*)0x4480220 + sw_id * 0x30`.
 
-`sub_651610`'s disassembly at `0x65164c` is `ldr x14, [x20, #0x220]` — a LOAD, not an LEA. To mutate live switch state correctly:
+`translate_switch_state_changes`'s disassembly at `0x65164c` is `ldr x14, [x20, #0x220]` — a LOAD, not an LEA. To mutate live switch state correctly:
 
 ```c
 uintptr_t arr = 0;
@@ -1176,26 +1176,41 @@ uintptr_t sw_struct = arr + sw_id * 0x30;     // live heap struct
 | `+0x08..+0x0f` | linked-list `prev` (or similar pointer) | |
 | `+0x10` | `config_ptr` | pointer to a config struct whose `+0x30` byte encodes flags |
 | `+0x10 → +0x30` | config flags | bit 2 (`0x04`) = invert, bits 5+6 (`0x60`) = broken/stuck masks |
-| `+0x26` | u16 `edge_counter` | incremented per closure/release; `sub_651610` pushes only when old counter == 0 |
+| `+0x26` | u16 `edge_counter` | incremented per closure/release; the translator links the entry onto the pending-edge queue only when the old counter == 0 |
 | `+0x28` | u8 `state` | current raw state byte. The reader returns `state` when the invert flag is set, otherwise `state ^ 1` |
 | `+0x2a` | u8 `disable_flag` | bit 0 = "ignore this switch" |
 
 #### Companion arrays (also pointers, parallel to the main one)
 
-- `data_4880228` — pointer to switch-disable mask base. `*(*(uint64_t*)0x4480228 + sw_id) & 1` tells whether switch is disabled.
-- `data_4880230[sw_num]` — `sw_stuck_active` flag (NVRAM-backed)
-- `data_4880238[sw_num * 2]` — `sw_alert_count` (16-bit, NVRAM-backed)
+- `data_4480228` — pointer to switch-disable mask base. `*(*(uint64_t*)0x4480228 + sw_id) & 1` tells whether switch is disabled.
+- `data_4480230[sw_num]` — `sw_stuck_active` flag (NVRAM-backed)
+- `data_4480238[sw_num * 2]` — `sw_alert_count` (16-bit, NVRAM-backed)
 
 #### Readers
 
 | Function | Behavior |
 |---|---|
-| `sub_650850(sw_num) @ 0x650850` | Returns the logical state byte: `state` when config flag `0x04` is set, otherwise `state ^ 1`. Short-circuits to 0 on `sw_num == 0` or `sw_num >= data_48cbaa0` |
-| `sub_a50350(sw_num) @ 0xa50350` | Returns 1 if the switch is "OK" (not broken, not stuck, alert count clear); 0 otherwise. Gates event firing |
+| `read_switch_state(sw_id) @ 0x650850` | Returns the logical state byte: `state` when config flag `0x04` is set, otherwise `state ^ 1`. Short-circuits to 0 on `sw_id == 0` or `sw_id >= *(*0x43505a0)` (the live switch-count cell). |
+| `sub_650350(sw_num) @ 0x650350` | Returns 1 if the switch is "OK" (not broken, not stuck, alert count clear); 0 otherwise. Gates event firing. |
 
-`data_48cbaa0` holds the runtime-determined live switch count (PLE has ~105 manual-listed switch IDs but only installed+valid switches count).
+The live switch-count cell (`*0x43505a0` in `read_switch_state`'s bound check; `get_device_switch_count_cap @ 0x7366c0` also returns it) is the runtime-determined valid-switch count — PLE lists ~105 manual switch IDs but only installed+valid ones count.
 
-*Verified by:* JOURNAL Step 51, 72f.
+*Verified by:* JOURNAL Step 51, 72f; addresses re-verified against BN in JOURNAL Step 112.
+
+#### Switch poll path
+
+A single thread polls every switch channel. During `primary_initialization_orchestrator` (boot phase 5), `mcp_nodebus_thread_start @ 0x675d10` (gated by `fire_event(0x80)`) spawns the "nodebus" pthread (`CC_mainDispatchThread`, SCHED_RR prio max−2) whose entry is `mcp_nodebus_thread_main @ 0x675f00`. That thread's loop runs `mcp_nodebus_init_orchestrator @ 0x675110` once (boot enumeration), then loops at ~1 ms cadence (`fire_event(0x84)` per iter); on a throttled sub-cadence it calls `mcp_poll_all_node_switch_channels @ 0x675df0`:
+
+- enumerate node slots: `mcp_nodebus_send_cleartext_cmd_bc_unsure @ 0x8ede50` (issues bridge cmd `0x25`) yields the next detected slot id; `sub_7da710` finds its record;
+- per detected slot in `1..0x1f` with the record's flag set: `poll_hardware_switches(slot) @ 0x674b90` — for `slot ≥ 2` this is `mcp_nodebus_poll_slot_switches(slot, &buf8) @ 0x8edfe0` (bridge cmd `0x41` inner cmd `0x11`) → `decode_channel_switch_bits @ 0x7b4d00` → `translate_switch_state_changes(slot, &buf8)`; `slot == 1` just snapshots into `0x436b020` (channel 1's raw state is *derived*, see below);
+- otherwise: `mcp_nodebus_node_mode_select_v2_unsure(slot, 1) @ 0x8f1100` (bridge cmd `0x41` inner cmd `0xF0` reset);
+- when the enumeration returns `0` (terminator): `poll_hardware_switches(0)` — `read_full_hardware_state @ 0x8fab80` reads the CPU-SPI 8-byte buffer (the one `spi_serial_bridge_thread @ 0x8fa820`, the `/dev/spidev4.0` reader, keeps fresh in `0x450d9b0`), `translate_switch_state_changes(0, …)` translates channel 0, then a state machine inside `poll_hardware_switches` *derives* channel 1's 8 bytes from channel-0 byte 3 + saved state at `0x436b020` and `translate_switch_state_changes(1, …)` translates it.
+
+So channels 0 and 1 (CPU SPI) are re-read at the tail of each enumeration pass — there's no separate channel-0 timer. (`mcp_poll_channel0_tick @ 0x6750e0`, a trivial `poll_hardware_switches(0)` wrapper, is vestigial — zero callers.) Boot-time-only CPU-SPI polls: `mcp_switch_boot_spin_channel0 @ 0x674f10` (spins until the SPI device reports ready / ~60 s) and `mcp_switch_boot_first_channel0_read @ 0x675a10`.
+
+`translate_switch_state_changes(channel, buf8) @ 0x651610` is the one that mutates `g_switch_state_array`: holds mutex `0x4480240`, diffs `buf8` against the per-channel raw-byte cache at `0x44804b8`, maps each changed `(channel, byte, bit)` to a `sw_id` via the lookup table at `0x44804e0`, and for a non-disabled switch (`+0x2a & 1 == 0` and disable-mask `0x4480228[sw_id] & 1 == 0`) increments `+0x26 edge_counter` and — if it was 0 — links the entry onto the pending-edge queue (head `0x4480278`, linked via `+0x08`). `drain_pending_switch_events @ 0x6511c0` walks that queue and calls `sub_729c10(event_id, handler_fn, priority)` per entry (Stage 2 below).
+
+*Verified by:* JOURNAL Step 112 — BN/Ghidra call-graph walk from `read_switch_state` / `translate_switch_state_changes` up to `primary_initialization_orchestrator`; decompiles of `mcp_nodebus_thread_main` / `mcp_poll_all_node_switch_channels` / `poll_hardware_switches`.
 
 #### Runtime switch table — full sw_id → channel/byte/bit mapping
 
@@ -1205,8 +1220,8 @@ The "channel" each switch belongs to determines how its state is polled:
 
 | Channel | Source | sw_id range | Manual prefix |
 |---|---|---|---|
-| 0 | CPU SPI bus (`/dev/spidev4.0`) — 8-byte RX read by `sub_8fa820`, stored in `DAT_0450d9b0`, read by `sub_8fab80` and fed to `sub_651610(0, ...)` from `sub_674b90(0)`. | 90..98 (9 entries) | `0-SW-N` |
-| 1 | Derived inside `sub_674b90`'s channel-0 path from CPU-SPI byte 3 bits + state machine. Saved-state restore from `DAT_0436b020` (BSS-zero by default; needs shim fix at `shim_inject.c::shim_install_channel1_idle` to load idle bytes). | 77..89 (13 entries) | `1-SW-N` |
+| 0 | CPU SPI bus (`/dev/spidev4.0`) — 8-byte RX kept fresh in `0x450d9b0` by `spi_serial_bridge_thread @ 0x8fa820`, read into a buffer by `read_full_hardware_state @ 0x8fab80` and fed to `translate_switch_state_changes(0, …)` from `poll_hardware_switches(0)`. | 90..98 (9 entries) | `0-SW-N` |
+| 1 | Derived inside `poll_hardware_switches`'s channel-0 path from CPU-SPI byte 3 bits + state machine. Saved-state restore from `0x436b020` (BSS-zero by default; needs shim fix at `shim_inject.c::shim_install_channel1_idle` to load idle bytes). | 77..89 (13 entries) | `1-SW-N` |
 | 4 | cmd `0x41` inner_cmd `0x11` to remote node slot 4 (QR Reader / Bottom Arch). Synthesized by shim's `synthesize_bridge_response → switch_poll RESP` since 2026-05-08. | 1..16 (16 entries) | `4-SW-N` (per BN extraction; not in Pokémon manual) |
 | 8 | cmd `0x41` inner_cmd `0x11` to remote node slot 8 (Lower Playfield Core-Driver). | 17..46 (30 entries) | `8-SW-N` |
 | 9 | cmd `0x41` inner_cmd `0x11` to remote node slot 9 (Mid-upper Playfield Core-Driver). | 47..76 (30 entries) | `9-SW-N` |
@@ -1328,7 +1343,9 @@ With the coin door open/interlock active, the verified idle active switch set is
 
 Shim probes and switch-injection toggles are launcher configuration, so their names/defaults live in `_emulation/run_game.sh`.
 
-**Press injection (host → shim).** The canonical switch-control path is file-backed and intentionally simple. `marker_button.py` provides interactive holdable switches through `runs/latest/press_request.txt`; its Switch Test Menu mode adds `[switch_test] START/STOP`, per-command, and observed-toggle log lines without changing the switch-command format. The request file accepts legacy numeric `sw_id` lines as taps plus explicit `down <sw_id>`, `up <sw_id>`, and `tap <sw_id> [hold_ms]` lines; writers append under advisory lock, and the shim consumes by truncating rather than unlinking. It also accepts `coin_door open` / `coin_door closed` through the same file, and the TIMER UI exposes matching Coin Door Open/Closed controls. The shim updates a held-switch overlay mask and immediately calls `sub_651610(channel, buf)` so the runtime switch array sees the edge; the SPI and nodebus poll synth paths also apply the overlay, so multiple buttons can remain held simultaneously until matching `up` commands arrive. Held switch bits invert the target raw bit relative to the current corrected idle buffer; this produces a real transition for both inactive-at-idle switches (`0 -> 1 -> 0`) and active-at-idle switches (`1 -> 0 -> 1`).
+**Press injection (host → shim).** The canonical switch-control path is file-backed and intentionally simple. `marker_button.py` provides interactive holdable switches through `runs/latest/press_request.txt`; its Switch Test Menu mode adds `[switch_test] START/STOP`, per-command, and observed-toggle log lines without changing the switch-command format. The request file accepts legacy numeric `sw_id` lines as taps plus explicit `down <sw_id>`, `up <sw_id>`, and `tap <sw_id> [hold_ms]` lines; writers append under advisory lock, and the shim consumes by truncating rather than unlinking. It also accepts `coin_door open` / `coin_door closed` (the coin-door interlock defaults closed — that's the Service Menu's "switch off" — and the TIMER UI's DOOR OPEN/CLOSED buttons toggle it) and `dump_switches` (the TIMER UI's GRAB STATE button) — see the verification note below. The shim updates a held-switch overlay mask and immediately calls `translate_switch_state_changes(channel, buf)` so the runtime switch array sees the edge; the SPI and nodebus poll synth paths also apply the overlay, so multiple buttons can remain held simultaneously until matching `up` commands arrive. Held switch bits invert the target raw bit relative to the current corrected idle buffer; this produces a real transition for both inactive-at-idle switches (`0 -> 1 -> 0`) and active-at-idle switches (`1 -> 0 -> 1`).
+
+**Reading a switch's state — the authoritative path.** `read_switch_state(sw_id) @ 0x650850` is *the* function game logic uses (see "Switch poll path"); its formula — raw `+0x28` byte if the config invert flag (`config_ptr +0x30 & 4`) is set, else `raw ^ 1` — is what "is this switch on?" means everywhere. To verify the emulator agrees with the game, the `dump_switches` request makes the shim call that function for every runtime switch and log `[switch_dump] sw_id=… name=… raw=… logical=… ok=… invert=…` plus an `active(logical=1):` summary; clicking it while looking at the Service Menu is the ground-truth check. A `MISMATCH` marker means `logical` (from the live `read_switch_state` call) disagrees with `raw`/`invert` — a screaming flag, since they cannot disagree if the read path is what's documented here.
 
 *Verified by:* JOURNAL Step 93 — runtime probe output captured 2026-05-08 with all 99 entries enumerated; per-channel summary cross-checked against the Pokémon LE Lite manual's switch matrix. JOURNAL Step 103 — folded `devbus.log` snapshot and `switch_change` events from the switch-idle run.
 
@@ -1388,9 +1405,9 @@ uint64_t r = fire_event(event_id, event_data);
 
 The actual design **decouples hardware input from event dispatch**:
 
-#### Stage 1 — `sub_b24f70 @ 0xb24f70` — switch-state reader / display updater
+#### Stage 1 — `process_switch_closures_for_display @ 0x724f70` — switch-state reader / display updater
 
-Reads switch state via `sub_a50850(sw_num)` at call site `0xb25438`. Iterates over switch-id arrays at `data_47643a8` (offset tables that group switches by function). **Does not call `fire_event`**. Its output is "updated game/display state" — writes to cmode fields, lamp state, display elements.
+Reads switch state via `read_switch_state(sw_id)` at call site `0x725438`. Iterates over switch-id arrays at `data_37643a8` (offset tables that group switches by function). **Does not call `fire_event`**. Its output is "updated game/display state" — writes to cmode fields, lamp state, display elements.
 
 #### Stage 2 — game logic observes state changes and fires events
 
@@ -1398,17 +1415,17 @@ Separate functions observe the state changes Stage 1 produces and call `fire_eve
 
 | Caller | VA | event_id | event_data | Purpose |
 |---|---|---:|---|---|
-| `sub_b129f0` | `0xb129f0` | `0xc2` | `0` | Mode state transitions |
-| `sub_bd39f0` | `0xbd39f0` | `0x12` | `&uint16` | Event validator — checks against lookup tables at `0x4787fa8` and `0x4780724` before firing |
-| `sub_b16f64` | `0xb16f64` | `0xc3` | `1..4` | Lamp timer events; sources data from `data_4807430` |
-| `sub_b82990` | `0xb82990` | `0x06` | `&struct` | Award / score events; reads `data_47790f8`, range-checks `0 < arg1 < 0xf0` |
-| `sub_b12760` | `0xb12760` | `0xc1` | `0` | Mode init completion — fires once at end of setup |
+| `sub_7129f0` | `0x7129f0` | `0xc2` | `0` | Mode state transitions |
+| `sub_7d39f0` | `0x7d39f0` | `0x12` | `&uint16` | Event validator — gates on a per-switch predicate fn (`*(*0x43505a8)[idx] + 8`, must return `&1`) and a per-mode `{int, u16}` "already-fired" dedup vector before firing; index LUT at `*0x4351920`, count cell `*0x4353988` |
+| `sub_716f70` | `0x716f70` | `0xc3` | `&uint16` (plus a subgroup id `1..4` in the call's local) | Per-switch hold-timer decrementer — walks the switch table (`*0x43510c0`, stride 0x38; count `*0x43538d0`/`*0x4352360`) and fires `0xc3` as each entry's timer hits a state |
+| `sub_782990` | `0x782990` | `0x06` | `&uint16` | Award / score events — reads the per-switch struct table at `*0x43503a0` (stride 0x40, fields `+8/+0xc/+0x3c`); bound `*0x43516c8` |
+| `sub_712760` | `0x712760` | `0xc1` | `0` | Mode init completion — fires once, when `mode_id` (`+0xcc`) `== 0x2a` |
 
 None of them reads the switch state array directly.
 
 #### Implications for the shim
 
-- **Direct write to the deref'd switch state byte is the correct lowest-level input** — same byte the UART cmd 0x27 receive path writes. Stage 1 (`sub_b24f70`) picks it up on its next poll iteration.
+- **Direct write to the deref'd switch state byte is the correct lowest-level input** — same byte `translate_switch_state_changes` writes off the poll path. Stage 1 (`process_switch_closures_for_display`) picks it up on its next iteration.
 - **Calling `fire_event(id, 0)` blindly bypasses Stage 1 entirely** — sidesteps all the game logic that decides *which* event to fire based on state. That's why the Step 51 blind sweep had ~1% signal.
 - **To test a specific game behaviour**, close the relevant switch via the (corrected-deref'd) state array and let the game's own Stage 2 decide what events to fire.
 
@@ -1416,18 +1433,20 @@ None of them reads the switch state array directly.
 
 | event_id | Meaning | Evidence |
 |---:|---|---|
-| `0x06` | Awards / score events | `sub_b82990` payload is a struct from `data_47790f8`; range check `0 < id < 0xf0` |
+| `0x06` | Awards / score events | `sub_782990`; payload is `&sw_id`, reads the per-switch struct table at `*0x43503a0` |
 | `0x10` | Secondary init start | fired by `secondary_initialization` (boot phase 5) |
 | `0x11` | Secondary init complete | fired by `secondary_initialization` |
-| `0x12` | Validated events (filtered through lookup tables before firing) | `sub_bd39f0` validates against tables at `0x4787fa8` + `0x4780724` |
+| `0x12` | Validated events (gated by a per-switch predicate + a per-mode "already-fired" dedup vector) | `sub_7d39f0` |
 | `0x3e` | Battle-environment activation (empirical) | activated `cmode_battle_coast` during Step 51e sweep — `+0x308: 0 → 0x100000000` |
 | `0x5c/0x5d/0x5e/0x5f` | Hardware-tier readiness events | fired by `primary_initialization_orchestrator` (boot phase 5) |
-| `0xc1` | Mode init complete | `sub_b12760` fires once at end of setup |
-| `0xc2` | Mode state transition | `sub_b129f0` fires unconditionally |
-| `0xc3` | Lamp timer event (payload 1..4 selects lamp subgroup) | `sub_b16f64` cycles values 1-4 |
+| `0xc1` | Mode init complete | `sub_712760` fires once at end of setup |
+| `0xc2` | Mode state transition | `sub_7129f0` |
+| `0xc3` | Per-switch hold-timer expiry (a subgroup id `1..4` rides alongside the payload) | `sub_716f70` walks the switch table decrementing timers |
 | `0xc5` | "Broadcast to all 42 cmodes" — calls vtable slot `+0xf0` on each | Step 50: `sub_950d60` is event-0xc5 handler |
 
 All other event_ids remain semantically unknown.
+
+*Verified by:* JOURNAL Step 51 (the two-stage observation); JOURNAL Step 112–113 (Stage-1 and Stage-2 caller addresses + the data/table addresses re-verified against BN — decompiles of each `fire_event` caller).
 
 ### Cmode registry — 42 modes, statically registered
 

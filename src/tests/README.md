@@ -3,8 +3,8 @@
 Fast, game-free tests for the shim's logic. They run on the **host** compiler
 and Python — not the aarch64 cross-compiler, and not inside qemu. Test sources
 mirror `src/`'s module layout: `tests/nodebus/` tests `src/nodebus/`,
-`tests/display/` tests `src/display/`. Run after touching a covered TU (or its
-protocol model):
+`tests/display/` tests `src/display/`, `tests/switches/` tests `src/shim_switches.c`.
+Run after touching a covered TU (or its protocol model):
 
 ```sh
 cd _emulation/src/tests && ./run_tests.sh   # build + run everything; non-zero exit on any failure
@@ -25,6 +25,7 @@ mount, no sysroot — pure logic tests. `run_tests.sh` passes `-I` pointing at
 | `nodebus/test_nodebus_model.py` | Self-tests for `nodebus_model.py` against the values PROTOCOL already pins down (`02 30 01 cf 03` checksum, `85 01 ae cc` cipher frame, the 3 validator gates, escape round-trips). |
 | `display/test_gl_proto.c` | C layout tests for `src/display/gl_proto.h` — the `@spike3_gl` wire format. The bytes on the wire *are* the packed structs, so this pins: the 8-byte message header (op@0/flags@2/payload_len@4), that `#pragma pack(push,1)` actually took effect, and a curated set of payload struct sizes. Self-contained (no shim externs). |
 | `display/test_gl_proto_consistency.py` | Keeps `gl_proto.h` and `gl_proto.py` in lockstep: parses the `.h` as source-of-truth (op/flag `#define`s + struct sizes), imports `gl_proto.py`, asserts the `GL_OP_*` / `GL_FLAG_*` constant sets match both ways, op values are distinct (name↔value bijection) with reply ops in the `0x0F00..0x0FFF` band, the header framing helpers round-trip, and the curated payload struct sizes equal `struct.calcsize` of the matching `*_FMT` strings (same literals `test_gl_proto.c` uses). |
+| `switches/test_switch_logical.c` | Pins the truth table of `shim_switch_logical_from_raw` (a `static inline` in `spi_shim.h`) — the one definition of the game's "logical switch state" (`read_switch_state @ 0x650850`'s rule: raw byte if the config invert flag is set, else `raw ^ 1`). The in-process readers (`shim_switch_read_logical` trampolines to the live function), the devbus watcher, and `shim_switch_dump`'s per-line sanity check all route through it. Self-contained. |
 | `run_tests.sh` | Builds + runs everything; add new module test sections as they appear. |
 
 ## TDD discipline
@@ -61,6 +62,13 @@ it. Sources of "the spec", in order of trust:
   sets match both ways; op values distinct (name↔value bijection); header
   framing helpers round-trip; `*_FMT` calcsizes match the C struct sizes;
   `OP_NAMES` keys are real ops.
+
+**switches:**
+- **`shim_switch_logical_from_raw` truth table:** the one definition of the
+  game's logical switch state (`read_switch_state @ 0x650850`'s rule) —
+  non-inverted `raw → raw^1`, inverted `raw → raw`. (The in-process readers
+  call the live `read_switch_state`; this pins the formula the devbus watcher
+  and `shim_switch_dump`'s sanity check use.)
 
 ## Not covered yet (next increments)
 

@@ -137,8 +137,9 @@ static void shim_switch_apply_default_idle_corrections(uint8_t channel_id,
 void shim_switch_copy_channel_idle(uintptr_t game_base,
                                    uint8_t channel_id,
                                    uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]) {
-    uintptr_t channel_idle = game_base + SHIM_GAME_VA_CHANNEL_IDLE_BASE
-                           + (uintptr_t)channel_id * SHIM_GAME_CHANNEL_IDLE_STRIDE;
+    const machine_switch_anchors_t *a = machine_switch_anchors();
+    uintptr_t channel_idle = game_base + a->channel_idle_base_va
+                           + (uintptr_t)channel_id * a->channel_idle_stride;
     memcpy(out, (const void *)channel_idle, SHIM_SWITCH_CHANNEL_BYTES);
     shim_switch_apply_default_idle_corrections(channel_id, out);
     shim_switch_apply_expected_idle(channel_id, out);
@@ -185,20 +186,14 @@ void shim_switch_copy_channel_stable_idle(uintptr_t game_base,
 }
 
 void shim_switch_make_channel0_idle(uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]) {
+    /* Byte 2 bit 7 (= channel-0 bit 23 = 0-SW-23 Coin Door Power Interlock)
+     * defaults clear — the Service Menu shows this switch OFF on a normal
+     * cabinet. The GUI's DOOR OPEN / DOOR CLOSED buttons (the `coin_door`
+     * request line -> shim_switch_set_coin_door_open) toggle it at runtime. */
     static const uint8_t idle[SHIM_SWITCH_CHANNEL_BYTES] =
-        { 0x00, 0xff, 0xff, 0xf8, 0xff, 0xff, 0xff, 0xff };
+        { 0x00, 0xff, 0x7f, 0xf8, 0xff, 0xff, 0xff, 0xff };
     memcpy(out, idle, SHIM_SWITCH_CHANNEL_BYTES);
     shim_switch_apply_expected_idle(0, out);
-
-    const char *coin_door = getenv("SPIKE3_COIN_DOOR_INTERLOCK");
-    if (!coin_door || !coin_door[0] ||
-        strcmp(coin_door, "closed") == 0 ||
-        strcmp(coin_door, "restored") == 0 ||
-        strcmp(coin_door, "1") == 0) {
-        out[SHIM_COIN_DOOR_INTERLOCK_BYTE] &= (uint8_t)~SHIM_COIN_DOOR_INTERLOCK_MASK;
-    } else if (strcmp(coin_door, "open") == 0 || strcmp(coin_door, "0") == 0) {
-        out[SHIM_COIN_DOOR_INTERLOCK_BYTE] |= SHIM_COIN_DOOR_INTERLOCK_MASK;
-    }
 
     pthread_mutex_lock(&shim_switch_hold_mutex);
     int override = shim_coin_door_open_override;
@@ -214,8 +209,30 @@ uint8_t *shim_switch_array(uintptr_t game_base) {
     if (!game_base) {
         return NULL;
     }
-    uint8_t **arr_pp = (uint8_t **)(uintptr_t)(game_base + SHIM_GAME_VA_SWITCH_ARRAY_PTR);
+    uint8_t **arr_pp = (uint8_t **)(game_base + machine_switch_anchors()->switch_array_ptr_va);
     return *arr_pp;
+}
+
+uint8_t shim_switch_read_logical(uintptr_t game_base, int sw_id) {
+    if (!game_base || !shim_switch_array(game_base)) {
+        return 0;
+    }
+    /* The game's own read_switch_state(u16 sw_id) -> u8 logical. Pure, lockless
+     * (single-byte loads); safe to call alongside the nodebus poll thread. */
+    typedef uint8_t (*read_switch_state_fn)(unsigned short);
+    read_switch_state_fn fn =
+        (read_switch_state_fn)(game_base + machine_switch_anchors()->read_switch_state_va);
+    return fn((unsigned short)sw_id);
+}
+
+uint8_t shim_switch_read_ok(uintptr_t game_base, int sw_id) {
+    if (!game_base || !shim_switch_array(game_base)) {
+        return 0;
+    }
+    typedef uint8_t (*switch_ok_fn)(unsigned short);
+    switch_ok_fn fn =
+        (switch_ok_fn)(game_base + machine_switch_anchors()->switch_ok_gate_va);
+    return fn((unsigned short)sw_id);
 }
 
 uint8_t *shim_switch_entry(uint8_t *switch_array, int sw_id) {

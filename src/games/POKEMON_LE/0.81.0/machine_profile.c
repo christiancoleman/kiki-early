@@ -1,4 +1,5 @@
 #include "machine_profile.h"
+#include "spi_shim.h"   /* machine_switch_anchors_t */
 
 #include <stddef.h>
 #include <string.h>
@@ -303,4 +304,21 @@ const ple_switch_t *ple_lookup_switch_by_manual_id(const char *manual_id) {
             return &ple_switches[i];
     }
     return NULL;
+}
+
+/* Per-binary switch-subsystem virtual addresses for Pokemon LE 0.81.0
+ * (offsets from game_base). The shim's switch helpers read these instead of
+ * hardcoding the VAs — this is the one place they live. Names per BN:
+ *   read_switch_state @ 0x650850, translate_switch_state_changes @ 0x651610,
+ *   sub_650350 (the "switch OK" gate) @ 0x650350, g_switch_state_array @ 0x4480220. */
+const machine_switch_anchors_t *machine_switch_anchors(void) {
+    static const machine_switch_anchors_t anchors = {
+        .switch_array_ptr_va  = 0x4480220ULL,
+        .channel_idle_base_va = 0x44804d0ULL,
+        .channel_idle_stride  = 0xb0ULL,
+        .read_switch_state_va = 0x650850ULL,
+        .translate_switch_va  = 0x651610ULL,
+        .switch_ok_gate_va    = 0x650350ULL,
+    };
+    return &anchors;
 }

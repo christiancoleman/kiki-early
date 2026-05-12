@@ -98,20 +98,42 @@ extern volatile uint8_t shim_spi_rx_extra[8];
 #define SHIM_SWITCH_BITS_PER_CHANNEL    64
 #define SHIM_SWITCH_MAX_RUNTIME_ID      255
 
-#define SHIM_GAME_VA_SWITCH_ARRAY_PTR   0x4480220ULL
-#define SHIM_GAME_VA_CHANNEL_IDLE_BASE  0x44804d0ULL
-#define SHIM_GAME_CHANNEL_IDLE_STRIDE   0xb0ULL
-
 #define SHIM_COIN_DOOR_INTERLOCK_BYTE   2
 #define SHIM_COIN_DOOR_INTERLOCK_MASK   0x80u
 
+/* Stern Spike-3 switch struct layout (same across games — game-agnostic). */
 #define SHIM_SWITCH_ENTRY_SIZE          0x30u
-#define SHIM_SWITCH_ENTRY_CONFIG_OFF    0x10u
-#define SHIM_SWITCH_ENTRY_ID_OFF        0x20u
-#define SHIM_SWITCH_ENTRY_BIT_IDX_OFF   0x22u
-#define SHIM_SWITCH_ENTRY_CHANNEL_OFF   0x24u
-#define SHIM_SWITCH_ENTRY_EDGE_OFF      0x26u
-#define SHIM_SWITCH_ENTRY_STATE_OFF     0x28u
+#define SHIM_SWITCH_ENTRY_CONFIG_OFF    0x10u  /* u64 config_ptr */
+#define SHIM_SWITCH_ENTRY_ID_OFF        0x20u  /* u16 sw_id (== array index) */
+#define SHIM_SWITCH_ENTRY_BIT_IDX_OFF   0x22u  /* u16 bit_idx 0..63 */
+#define SHIM_SWITCH_ENTRY_CHANNEL_OFF   0x24u  /* u8 channel */
+#define SHIM_SWITCH_ENTRY_EDGE_OFF      0x26u  /* u16 edge_counter */
+#define SHIM_SWITCH_ENTRY_STATE_OFF     0x28u  /* u8 raw state byte */
+/* config_ptr +0x30: bit 2 (0x04) = invert flag (read_switch_state's selector). */
+#define SHIM_SWITCH_CONFIG_FLAGS_OFF    0x30u
+#define SHIM_SWITCH_CONFIG_INVERT_MASK  0x04u
+
+/* The game's canonical "logical switch state" = read_switch_state's formula:
+ * raw byte if the config invert flag is set, else raw ^ 1. One definition,
+ * used by the in-process readers, the devbus watcher, and shim_switch_dump's
+ * sanity check (which verifies the live read_switch_state call agrees). */
+static inline uint8_t shim_switch_logical_from_raw(uint8_t raw, int invert) {
+    return invert ? raw : (uint8_t)(raw ^ 1u);
+}
+
+/* Per-game-binary switch-subsystem virtual addresses (offsets from game_base).
+ * The concrete instance + accessor live in the active game's machine profile
+ * (games/<TITLE>/<version>/machine_profile.c) — keeping the only Pokemon-LE-
+ * 0.81.0-specific switch addresses in one place. */
+typedef struct {
+    uintptr_t switch_array_ptr_va;     /* g_switch_state_array (a pointer to the heap array) */
+    uintptr_t channel_idle_base_va;    /* base of the per-channel idle-bytes block */
+    uintptr_t channel_idle_stride;     /* per-channel stride in that block */
+    uintptr_t read_switch_state_va;    /* read_switch_state(u16 sw_id) -> u8 logical */
+    uintptr_t translate_switch_va;     /* translate_switch_state_changes(u8 ch, u8 buf[8]) */
+    uintptr_t switch_ok_gate_va;       /* sub_650350(u16 sw_id) -> 1 if switch "OK" (gates events) */
+} machine_switch_anchors_t;
+const machine_switch_anchors_t *machine_switch_anchors(void);
 
 void shim_switch_hold_set(uint8_t channel_id, uint16_t bit_idx, int held);
 void shim_switch_hold_apply(uint8_t channel_id, uint8_t buf[SHIM_SWITCH_CHANNEL_BYTES]);
@@ -125,6 +147,15 @@ void shim_switch_copy_channel_stable_idle(uintptr_t game_base,
                                           uint8_t out[SHIM_SWITCH_CHANNEL_BYTES]);
 uint8_t *shim_switch_array(uintptr_t game_base);
 uint8_t *shim_switch_entry(uint8_t *switch_array, int sw_id);
+/* Read a switch's state the way the game does (trampolines into the game's
+ * own read_switch_state). Returns 0 on unresolved base / unallocated array. */
+uint8_t shim_switch_read_logical(uintptr_t game_base, int sw_id);
+/* Trampolines into sub_650350 — 1 if the switch is "OK" (not broken/stuck). */
+uint8_t shim_switch_read_ok(uintptr_t game_base, int sw_id);
+/* Dump every runtime switch's state (raw + logical + ok + invert + name +
+ * the static config columns) to the shim log. `reason` tags the dump line.
+ * Defined in shim_inject.c. */
+void shim_switch_dump(uintptr_t game_base, const char *reason);
 
 /* Decoder compatibility patch (defined in shim_patches.c).
  * Patches the b.ne at game VA 0x920cf0 in the game's get_format callback

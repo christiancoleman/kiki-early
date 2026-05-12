@@ -9738,3 +9738,108 @@ Process change: stopped chaining `reset_run_state.sh` before runs. A clean smoke
 - Memory updated: `feedback_baseline_runs_ask_first.md` operational-requirement #2 ("must run BEFORE every run") softened to "no longer chained; troubleshooting reset"; `MEMORY.md`'s CURRENT-INVESTIGATION line ditto. The still-load-bearing pillar `cd /games && exec /games/game` (via the symlink) is unaffected.
 
 Caveat: this rests on one smoke run + the user's call, not a multi-run regression sweep. Watch for attract-time crashes in upcoming runs; if they come back, the cause is almost certainly stale NVRAM again and the reset chain goes back on.
+
+## Step 112: Switch-read call-graph walk (leaf → primary_initialization_orchestrator); BN MCP re-enabled; BN renames + PROTOCOL 'Switch poll path' + base-0x400000 fixes (2026-05-12)
+
+Re-enabled Binary Ninja MCP, then did a full static-analysis walk of the switch-state read path — leaf reader up to "the top" — renamed the unnamed functions in BN, and folded the verified result into PROTOCOL.
+
+### BN MCP back online
+
+`.mcp.json` gained a `binary-ninja` entry (`npx binary-ninja-mcp --host 172.19.240.1 --port 9009` — the invocation from `feedback_bn_mcp_workflow`). Same WSL→Windows chain as the Ghidra MCP (the `fosdickio_binary_ninja_mcp` plugin's HTTP server on loopback `:9009` ← netsh portproxy ← WSL). Needs a Claude Code restart to load; the plugin server must be Started on the Windows side. Both BN and Ghidra MCPs are now wired (Ghidra was the "retired BN's replacement" — turns out there's room for both).
+
+### The switch-read call graph (top → bottom), all in `game` (image base 0)
+
+```
+entry → FUN_0049cba0 → FUN_00461270 → primary_initialization_orchestrator @ 0x678bc0   ← THE TOP (boot phase 5)
+  ├ mcp_switch_boot_first_channel0_read @ 0x675a10   one-shot: pwrdist version gate → poll_hardware_switches(0)
+  └ mcp_nodebus_thread_start @ 0x675d10  (the `sub_675d10` shim_discovery.c traps; gated by fire_event(0x80))
+     └ CC_mainDispatchThread(mcp_nodebus_thread_main, prio 8, "nodebus", 0)   ← spawns the SCHED_RR "nodebus" pthread
+        └ mcp_nodebus_thread_main @ 0x675f00   ← the loop. mcp_nodebus_init_orchestrator @ 0x675110 once,
+             then `while (sys_running && thread_running)` ~1ms: fire_event(0x84); fast-path subsystem updates
+             (mcp_nodebus_lamp_poll_loop @ 0x589480, FUN_00651520, FUN_00690bb0, …); throttled-path:
+           └ mcp_poll_all_node_switch_channels @ 0x675df0
+                ├ enumerate slots: mcp_nodebus_send_cleartext_cmd_bc_unsure @ 0x8ede50 (bridge cmd 0x25) → next slot id; sub_7da710 → record
+                ├ per slot 2..0x1f w/ flag: poll_hardware_switches(slot) @ 0x674b90 → mcp_nodebus_poll_slot_switches @ 0x8edfe0 (cmd 0x41 inner 0x11) → decode_channel_switch_bits @ 0x7b4d00 → translate_switch_state_changes(slot,buf)
+                ├ slot 1: poll_hardware_switches(1) just snapshots → 0x436b020 (ch1 is *derived*)
+                ├ else: mcp_nodebus_node_mode_select_v2_unsure @ 0x8f1100 (cmd 0x41 inner 0xF0 reset)
+                └ on enum-terminator (0): poll_hardware_switches(0) → read_full_hardware_state @ 0x8fab80 (reads the CPU-SPI 8B buf at 0x450d9b0, kept fresh by spi_serial_bridge_thread @ 0x8fa820) → translate ch0; then a state machine derives ch1's 8B from ch0 byte 3 + 0x436b020 → translate ch1
+─────
+translate_switch_state_changes(channel, buf8) @ 0x651610   ← THE WRITER. mutex 0x4480240; diffs buf8 vs per-channel cache 0x44804b8;
+   LUT 0x44804e0 maps (channel,byte,bit)→sw_id; for a non-disabled switch (+0x2a&1==0 && 0x4480228[sw_id]&1==0): edge_counter++ and
+   if it was 0, link entry onto pending-edge queue (head 0x4480278, via +0x08).  drain_pending_switch_events @ 0x6511c0 walks it → sub_729c10(event_id, handler, prio)
+read_switch_state(sw_id) @ 0x650850   ← THE LEAF READER (57 callers; the fan-out). state^1 unless config flag 0x04 set; 0 if sw_id==0 or sw_id ≥ *(*0x43505a0)
+```
+
+**Key findings / corrections:**
+- **One thread polls everything.** The "nodebus" thread (`mcp_nodebus_thread_main`) re-reads *all* switch channels — node slots 2/4/7/8/9/… via cmd 0x41 inner 0x11, and CPU-SPI channels 0+1 at the tail of each enumeration pass via `poll_hardware_switches(0)`. There is no separate channel-0 timer. `spi_serial_bridge_thread @ 0x8fa820` (the `/dev/spidev4.0` reader) only keeps the raw 8-byte buffer (`0x450d9b0`) fresh + handles the volume quadrature encoder (`process_hardware_state_update`); it does not touch `g_switch_state_array`.
+- **`mcp_poll_channel0_tick @ 0x6750e0` (entry `0x6750d8`) is vestigial** — a trivial `poll_hardware_switches(0)` wrapper with zero callers/xrefs. Ghidra's "DATA ref from `0x3cab3a0`" is `.eh_frame` unwind info, not a callback table — a red herring (chased it to ground per request: `0x3cab3a0` and the neighbouring entries contain DWARF CFI bytecode, e.g. `0e b0 01 … 93 0c 94 0b …`).
+- **PROTOCOL's `sub_b24f70 @ 0xb24f70` ("Stage 1 reader/display updater") was a stale base-0x400000 address.** `0xb24f70` is mid-`FUN_00b24ed0` = a Godot `PhysicsServer2D::free()`. The real function is `process_switch_closures_for_display @ 0x724f70` (= `0xb24f70 − 0x400000`); its inner `sub_a50850(sw_num)` = `read_switch_state @ 0x650850`; call site `0xb25438` = `0x725438`; `data_47643a8` = `data_37643a8`. The "Switch state array" → "Readers" `sub_a50350 @ 0xa50350` likewise = `sub_650350 @ 0x650350`. PROTOCOL also said the array is "populated by the UART cmd 0x27 receive path" — wrong (cmd 0x27 is the LCD subprotocol); it's written by `translate_switch_state_changes` off the poll path. And the "Companion arrays" addresses `data_4880228/30/38` were typos for `data_4480228/30/38` (confirmed `DAT_04480228` in the translator decompile). All fixed in PROTOCOL "Switch state array" / "Switch → event dispatch", plus a new "Switch poll path" subsection. The Stage-2 caller table in that section (`sub_b129f0` etc., `0xb…` addresses) still carries the same base-0x400000 offset and `0x4787fa8/0x4780724` lookup tables likewise — **not re-verified in this step**; a dedicated sweep is owed.
+
+### BN renames (this session — `mcp_` prefix; user to File → Save Database)
+
+`mcp_nodebus_thread_main` (was `mcp_nodebus_main_poll_loop_unsure` @ 0x675f00, entry 0x675efc — dropped `_unsure`), `mcp_nodebus_thread_start` (0x675d10), `mcp_poll_all_node_switch_channels` (0x675df0), `mcp_switch_boot_spin_channel0` (0x674f10), `mcp_switch_boot_first_channel0_read` (0x675a10), `mcp_poll_channel0_tick` (0x6750d8), `mcp_nodebus_poll_slot_switches` (0x8edfe0). Function comments added to the first/third/sixth documenting the single-thread poll model + the vestigial-stub note. Left alone (pre-existing user names): `read_switch_state`, `translate_switch_state_changes`, `poll_hardware_switches`, `decode_channel_switch_bits`, `drain_pending_switch_events`, `get_device_switch_count_cap`, `process_switch_closures_for_display`, `primary_initialization_orchestrator`, `read_full_hardware_state`, `spi_serial_bridge_thread`, `CC_mainDispatchThread` (← heads-up: this is actually a *generic* SCHED_RR named-worker-thread spawner, not "the main dispatch thread"); `mcp_nodebus_init_orchestrator` (prior AI name).
+
+### Not done
+
+The Stage-2 base-0x400000 sweep (above). `src/SHIM.md` / a `nodebus/` doc — nothing added; the shim's switch-injection path is already documented in PROTOCOL "Switch state array" → "Press injection" and SHIM.md's `shim_switches.c` / `shim_inject.c` rows.
+
+## Step 113: Stage-2 fire_event callers re-verified (all 5 addresses were +0x400000-stale; named data/table addresses all bogus); PROTOCOL 'Switch → event dispatch' fixed (2026-05-12)
+
+Followed Step 112's owed item: re-verified PROTOCOL "Switch → event dispatch is two-stage" → "Stage 2" against the binary (Ghidra + BN, base 0). Same discipline as Step 112 — no assumptions, chase every address. Result: the table's 5 caller addresses were *all* stale (recorded against an old BN db with a `+0x400000` base), and *every* literal data/table address in that subsection was bogus (not even base-shifted). PROTOCOL updated.
+
+### Stage-2 callers — verified
+
+| Old (PROTOCOL) | Real (BN, base 0) | event | notes |
+|---|---|---|---|
+| `sub_b129f0 @ 0xb129f0` | `sub_7129f0 @ 0x7129f0` — `fire_event(0xc2, 0)` | `0xc2` | exact `-0x400000`. `0xb129f0` falls inside the unrelated `FUN_00b12860` — red herring. |
+| `sub_bd39f0 @ 0xbd39f0` | `sub_7d39f0 @ 0x7d39f0` — `fire_event(0x12, &u16)` | `0x12` | exact `-0x400000`. `0xbd39f0` is inside Godot `FUN_00bd2ab0` (~0x46c0-byte fn) — red herring. **Gates** on: a per-switch predicate fn `*(*0x43505a8)[idx]+8` (must return `&1`), a per-mode `vector<{int,u16}>` "already-fired" dedup, count `*0x4353988`, index LUT `*0x4351920`. The named lookup tables `0x4787fa8`/`0x4780724` appear nowhere — pure noise. |
+| `sub_b16f64 @ 0xb16f64` | `sub_716f70 @ 0x716f70` — per-switch hold-timer decrementer; multiple `fire_event(0xc3, &u16)` calls each preceded by setting a subgroup id (`1/2/3/4`) in a stack local | `0xc3` | `0xb16f64` is inside the red-black-tree template `FUN_00b16ef0`; `-0x400000` = `0x716f64`, which is `0xc` bytes *before* the real entry `0x716f70` (and inside/after the linked-list-erase template `FUN_00716ee0`) — base-shifted **and** off-by-0xc. Real data: switch table `*0x43510c0` (stride 0x38), counts `*0x4352360`/`*0x43538d0`. `data_4807430` is bogus. Behaviourally it's a *timer* iterator, not a "lamp" thing per se — each switch entry carries hold-timer fields; when they hit conditions it fires `0xc3` with which-subgroup. |
+| `sub_b82990 @ 0xb82990` | `sub_782990 @ 0x782990` — `fire_event(6, &u16)` | `0x06` | exact `-0x400000`. `0xb82990` inside Godot `FUN_00b824e0` — red herring. Reads the per-switch struct table `*0x43503a0` (stride 0x40, fields `+8/+0xc/+0x3c`), bound `*0x43516c8`. `data_47790f8` and the `0 < arg1 < 0xf0` literal are both bogus (the bound is the runtime cell, not 0xf0). |
+| `sub_b12760 @ 0xb12760` | `sub_712760 @ 0x712760` — `fire_event(0xc1, 0)` | `0xc1` | exact `-0x400000`. `0xb12760` inside `FUN_00b125b0`. Gated on `mode_id` (`*(p+0xcc)`) `== 0x2a`. |
+
+`fire_event` is `FUN_005c12a0 @ 0x5c12a0` (PROTOCOL's `fire_event @ 0x5c12a0` — correct).
+
+### Two layers of red herring
+
+1. **Every stale `0xb…` address coincidentally lands *inside* an unrelated function** — `FUN_00b12860`, Godot's `PhysicsServer2D` stuff, the RB-tree and linked-list templates, etc. So "what's at `0xb16f64`?" gives a confident, wrong answer (an RB-tree node insert). Same trap that bit `sub_b24f70` in Step 112. **Heuristic confirmed: any `0xb…` (or ≥`0x800000`-looking) VA cited in older PROTOCOL/JOURNAL drafts is suspect — subtract `0x400000` and re-check; and even then verify the function boundary (the `0x716f70` case shows the shift isn't always exact).**
+2. **The named data/table addresses in that subsection (`0x4787fa8`, `0x4780724`, `data_47790f8`, `data_4807430`) are pure noise** — none is `-0x400000` of the real one. They were presumably copied from a much older analysis or a different binary. Following them sends you to the wrong data entirely.
+
+### PROTOCOL updates
+
+"Switch → event dispatch is two-stage" → "Stage 2" table + "Known event_id semantics" rows + a new `*Verified by:*` line: caller addresses `0xb…` → `0x7…`, the bogus data/table literals replaced with what the decompiles actually show. (Step 112's Stage-1 fix — `sub_b24f70 @ 0xb24f70` → `process_switch_closures_for_display @ 0x724f70` — was already in.)
+
+### Not done / next
+
+- BN renames for the 5 Stage-2 callers (`sub_7129f0`/`sub_7d39f0`/`sub_716f70`/`sub_782990`/`sub_712760` → `mcp_fire_event_*` / `mcp_decrement_switch_hold_timers`) — not applied; proposed to the user pending a name check + the next File→Save Database.
+- The `0x12` validator's per-switch predicate fn (`*0x43505a8[idx]+8`) and the per-mode dedup vector — not traced upward; would be the natural continuation if we want the full event-0x12 picture.
+
+## Step 114: On-demand switch-state dump (GRAB STATE button) + per-binary-VA migration to machine_profile + one logical-state formula; removed edge-snapshot probe and the SPIKE3_COIN_DOOR_INTERLOCK env var (2026-05-12)
+
+Built the on-demand switch-state dump (the "I'm looking at the Service Menu — here's what the game says is on/off" tool), did the per-binary-VA migration into the machine profile, and trimmed a redundant probe. The dump is the verification instrument: once it agrees with the known Service-Menu switch set, the switch-read path is closed and any future nodebus misbehaviour can't be blamed on it.
+
+### Migration: switch-subsystem VAs → the machine profile
+
+`spi_shim.h` gained a generic `machine_switch_anchors_t` type (`switch_array_ptr_va`, `channel_idle_base_va`/`stride`, `read_switch_state_va`, `translate_switch_va`, `switch_ok_gate_va`); the one concrete instance + `machine_switch_anchors()` accessor live in `games/POKEMON_LE/0.81.0/machine_profile.c`. The Stern-platform-generic bits stay in `spi_shim.h` as before — the switch struct offsets (`SHIM_SWITCH_ENTRY_*`, plus new `SHIM_SWITCH_CONFIG_FLAGS_OFF`/`_INVERT_MASK`) and `SHIM_COIN_DOOR_INTERLOCK_*`. Removed the `SHIM_GAME_VA_SWITCH_ARRAY_PTR`/`SHIM_GAME_VA_CHANNEL_IDLE_BASE`/`SHIM_GAME_CHANNEL_IDLE_STRIDE` macros (folded into the struct) and the bare `0x651610` (×3) / `0x650850` (×1) literals scattered in `shim_inject.c`. `shim_switches.c`, `shim_inject.c`, and (transitively, via `shim_switch_array`) `shim_devbus.c` now read all those VAs from `machine_switch_anchors()`. Net: the only Pokemon-LE-0.81.0 switch addresses live in one place. (Moving the *other* `SHIM_GAME_VA_*` macros — GL, boot — into a similar profile struct is still the SHIM.md "Game profile roadmap" item; the switch subsystem just led.)
+
+### One "logical state" definition
+
+`shim_switch_logical_from_raw(raw, invert)` — a `static inline` in `spi_shim.h` — is now the single statement of `read_switch_state @ 0x650850`'s rule (raw byte if the config invert flag `+0x30 & 4` is set, else `raw ^ 1`). The devbus watcher computes its `logical` field with it (was an inline replica — now byte-for-byte the same source); `shim_switch_dump` asserts the live `read_switch_state` call folds to it; and `shim_switches.c` exposes `shim_switch_read_logical(game_base, sw_id)` (trampolines into the game's actual `read_switch_state` — pure, lockless, safe alongside the nodebus poll thread) and `shim_switch_read_ok(...)` (trampolines into `sub_650350`, the OK-gate). `tests/switches/test_switch_logical.c` pins the truth table (6 assertions).
+
+### `shim_switch_dump` + the GRAB STATE button
+
+`shim_switch_table_probe_thread`'s body became `shim_switch_dump(game_base, reason)` (the thread is now a thin `SHIM_SWITCH_TABLE_PROBE=1` wrapper that calls it once near boot). The dump keeps every column it had (ch/byte/bit, cfg ptr, handler VA, param, event_id, prio, flag2e, flag30, the mode-bitmap / boot-state-mask / `sub_72a5c0(0x1a)` extras) and **adds**: the per-game switch name (`ple_lookup_switch_by_channel_bit` → manual id + name), `raw`, `logical` (= `shim_switch_read_logical` = the game's reader), `ok` (= `shim_switch_read_ok`), `invert`, a `MISMATCH` marker if `logical != fold(raw, invert)`, and footer lines `active(logical=1): {sw_ids}` / `active+ok: {sw_ids}`. All `[switch_dump]` lines go to `game.log` — no new log file. A new `dump_switches` (or `switch_dump`) line in `press_request.txt` triggers it on demand (handled in `shim_manual_press_thread`'s loop, next to `coin_door`). `marker_button.py` got a **GRAB STATE** button next to KILL GAME that writes `dump_switches` + a `[marker]` timestamp line to `game.log` so you can correlate with the screen. (Future, not now: parse the `[switch_dump]` lines back / subscribe to devbus → fill the GUI's `Game state:` slot + a canvas overlay — the GUI's already pre-wired with the placeholder.)
+
+### Cleanup
+
+- **`shim_edge_snapshot_thread` deleted** (env `SHIM_EDGE_SNAPSHOT*`, the periodic edge-counter-diff probe). JOURNAL grep showed it's only ever listed among the "env-gated diagnostic helpers" with no load-bearing dependency; devbus's `switch_change`/`edge`/`flap` stream + `tools/devbus_snapshot.py --from-file runs/latest/devbus.log` is a strict superset (real-time, and re-derivable from a saved log).
+- **`SPIKE3_COIN_DOOR_INTERLOCK` env var removed.** Per the Service Menu the coin-door interlock switch is OFF by default, so the default channel-0 idle now just bakes that bit clear (`idle[2] = 0x7f`); the GUI's DOOR OPEN/CLOSED buttons (the `coin_door` request line → `shim_switch_set_coin_door_open`) toggle it at runtime, which is all that's actually used. Dropped the var from `shim_switches.c`, `run_game.sh` (the doc block, the `-E` pass, the `run_info.txt` dump list), leaving the runtime path intact.
+
+### Verification
+
+`./build.sh` → `spi_shim.so` 375568 B, clean (only the pre-existing `shim_fs.c` nonnull-compare / `spi_shim.h` format-truncation / `shim_nodebus.c` unused-fn warnings). `tests/run_tests.sh` → 135 + 21 (nodebus) + 47 + 243 (display) + 6 (switches) all green. `python3 -m py_compile tools/marker_button.py`, `bash -n run_game.sh` → OK. Grepped the C source for dangling `SHIM_GAME_VA_SWITCH_ARRAY_PTR` / `0x651610` / `0x650850` literals / `shim_edge_snapshot` / `SPIKE3_COIN_DOOR_INTERLOCK` → none.
+
+Docs: `src/SHIM.md` (`shim_switches.c` + `shim_inject.c` rows — the new helpers, `shim_switch_dump`, the anchors, the edge-snapshot removal note), PROTOCOL "Switch state array" → "Press injection" (the `dump_switches` command + a "reading a switch's state — the authoritative path" note), `run_game.sh` header (TIMER section mentions GRAB STATE / `coin_door`; `SPIKE3_COIN_DOOR_INTERLOCK` lines gone), `src/README.md` + `tests/README.md` (the `tests/switches/` row + coverage).
+
+### Next
+
+You do a Service-Menu run with `TIMER=ON` (coin door defaults closed = "switch off"), click **GRAB STATE** while looking at the menu, and we diff the `[switch_dump]` `active(logical=1):` set against the known coin-door-closed Service-Menu set (the coin-door-open set minus sw_id 98 — PROTOCOL "Runtime switch table" has the open set: `25,26,27,28,29,30,31,32,63,69,70,74,98`). Match ⇒ the switch-read path is verified end-to-end; mismatch ⇒ the discrepancy is in the *raw bytes* our synth puts on the wire (or the idle/correction buffers), not the read path. Then: the GUI-overlay feed, or back to nodebus proper.

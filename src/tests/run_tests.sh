@@ -55,4 +55,12 @@ echo "[tests] === display/test_gl_proto (C: src/display/gl_proto.h layout) ==="
 echo "[tests] === display/test_gl_proto_consistency.py (gl_proto.h <-> gl_proto.py) ==="
 python3 display/test_gl_proto_consistency.py
 
+# ---- switches module ----
+echo "[tests] compiling switches/test_switch_logical (host: $CC) ..."
+"$CC" -std=gnu11 -O0 -g -Wall -Wextra -Wno-unused-function \
+      -I.. -o "$BUILD/test_switch_logical" switches/test_switch_logical.c
+
+echo "[tests] === switches/test_switch_logical (C: shim_switch_logical_from_raw truth table) ==="
+"$BUILD/test_switch_logical"
+
 echo "[tests] all green."

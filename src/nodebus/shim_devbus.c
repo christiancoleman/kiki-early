@@ -138,10 +138,13 @@ static int devbus_scan_once(uintptr_t game_base, int seeding) {
         uint16_t flags    = 0;
         long config_ptr   = *(long *)(e + SHIM_SWITCH_ENTRY_CONFIG_OFF);
         if (config_ptr) {
-            flags = *(uint16_t *)(config_ptr + 0x30);
+            flags = *(uint16_t *)(config_ptr + SHIM_SWITCH_CONFIG_FLAGS_OFF);
         }
-        uint8_t invert = (flags & 0x04) ? 1 : 0;
-        uint8_t logical = invert ? state : (uint8_t)(state ^ 1);
+        uint8_t invert = (flags & SHIM_SWITCH_CONFIG_INVERT_MASK) ? 1 : 0;
+        /* Byte-identical to the game's read_switch_state @ 0x650850 — and to
+         * shim_switch_dump's per-line `logical`, which calls that function and
+         * asserts agreement. Keep all three in sync via shim_switch_logical_from_raw. */
+        uint8_t logical = shim_switch_logical_from_raw(state, invert);
 
         sw_shadow_t *sh = &g_shadow[sw_id];
 

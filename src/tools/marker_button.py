@@ -416,7 +416,8 @@ def main():
     status_var = tk.StringVar(value="Click a switch box to toggle requested ON/OFF.")
     detail_var = tk.StringVar(
         value="Select a switch. White = requested ON. Dark red = requested OFF. "
-              "Actual game state overlay is reserved for a future devbus feed."
+              "GRAB STATE dumps the game's actual switch states to game.log ([switch_dump]); "
+              "an on-canvas overlay of that is a future devbus feed."
     )
     switch_test_var = tk.BooleanVar(value=False)
     observed_var = tk.StringVar(value="")
@@ -572,12 +573,21 @@ def main():
     tk.Label(footer, textvariable=status_var, anchor="w", fg="#444",
              font=("monospace", 9)).grid(row=0, column=0, sticky="ew", padx=(0, 6))
     tk.Button(
+        footer, text="GRAB STATE",
+        command=lambda: write_raw_command(
+            "dump_switches", "GRAB SWITCH STATE", elapsed_var, status_var, count_ref
+        ),
+        bg="#00695c", fg="white",
+        font=("monospace", 9, "bold"),
+        height=1,
+    ).grid(row=0, column=1, sticky="e", padx=(0, 6))
+    tk.Button(
         footer, text="KILL GAME",
         command=lambda: kill_game(root, status_var),
         bg="#b00020", fg="white",
         font=("monospace", 9, "bold"),
         height=1,
-    ).grid(row=0, column=1, sticky="e")
+    ).grid(row=0, column=2, sticky="e")
 
     def on_close():
         if switch_test_var.get():
