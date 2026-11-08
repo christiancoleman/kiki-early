@@ -1,4 +1,7 @@
-# `_emulation/src/` — the Spike 3 emulator
+# `src/` — the historical Spike 3 emulator
+
+These are historical build and runtime notes. This source archive does not
+include the original sysroot, game files, or a prebuilt shim.
 
 This directory holds everything that builds or runs as part of the emulator: the
 `LD_PRELOAD` shim (`spi_shim.so`), the build/launcher scripts, the host-side
@@ -9,7 +12,7 @@ It's the **implementation**. The verified reverse-engineering and Spike-3
 chronological record of how we got here lives in
 [`../docs/JOURNAL.md`](../docs/JOURNAL.md). The shim's internals (translation
 units, IPC bridge wire formats, the forward-decode / GL-daemon protocols, the
-asset extractor, etc.) are documented in [`SHIM.md`](SHIM.md). This README is
+other shim behavior) are documented in [`SHIM.md`](SHIM.md). This README is
 the entry point: what this is, how it's laid out, how to build & run it.
 
 ## What this is
@@ -82,8 +85,7 @@ cd _emulation/src
 DEBUG=1 ./build.sh        # -O0 -g
 ```
 
-Prereq: `gcc-aarch64-linux-gnu`. The shim ships pre-built; only rebuild after
-editing a TU. (Pre-existing `-Wnonnull-compare` warnings in `shim_fs.c` are
+Prereq: `gcc-aarch64-linux-gnu`. Build the shim from source; no prebuilt shim is included. (Pre-existing `-Wnonnull-compare` warnings in `shim_fs.c` are
 benign.)
 
 ## Test

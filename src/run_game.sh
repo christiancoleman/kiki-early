@@ -2,9 +2,8 @@
 # run_game.sh — launch Pokémon LE under qemu-aarch64 with the shim preloaded,
 # plus the live frame viewer by default. Optional helpers are env-gated below.
 #
-# The repo layout is the Spike 3 SD-card filesystem used as a sysroot. This
-# script auto-detects everything from its own location — no env setup needed
-# in the normal case. Clone the repo anywhere, run ./run_game.sh.
+# Historical launcher: expects the source tree inside an external Spike 3
+# filesystem used as a sysroot. That filesystem is not included in this archive.
 #
 # USAGE:
 #   ./run_game.sh                 # play: game + viewer.
