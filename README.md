@@ -7,12 +7,6 @@ Pokémon working in mid-May 2026.
 
 **[Read the story: From Two Buttons to a Pinball Emulator](https://christiancoleman.info/blog/worlds-first-spike3-emulator/)**
 
-I started Kiki to explore how far I could get building a pinball emulator with
-AI. The difficult part was deciding when its conclusions were believable and
-when to push back. I did substantial manual reverse engineering, tested my own
-theories, and checked proposed explanations against disassembly and runtime
-behavior. The journal records the experiments and the assumptions that changed.
-
 I was the sole human developer of the original Kiki code in this early snapshot,
 with Claude, Codex, and Binary Ninja assisting with implementation and analysis.
 The software and content it builds on have their own authors and terms.
