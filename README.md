@@ -1,4 +1,11 @@
-# Kiki — an early experiment in AI-assisted emulation
+# Kiki — the first Stern Spike 3 emulator
+
+Kiki began as a Windows-based emulator for Stern's Spike 3 pinball platform,
+developed with **WSL2 and QEMU**, with Pokémon LE 0.81.0 as its first game target.
+This repository preserves the early code and engineering journal leading up to
+Pokémon working in mid-May 2026.
+
+**[Read the story: From Two Buttons to a Pinball Emulator](https://christiancoleman.info/blog/worlds-first-spike3-emulator/)**
 
 I started Kiki to explore how far I could get building a pinball emulator with
 AI. The difficult part was deciding when its conclusions were believable and
@@ -18,6 +25,19 @@ for reading, rather than as a supported application to install.
 Kiki has continued well beyond this version. If you're interested in working
 on the project, [get in touch with me](https://christiancoleman.info/) about the
 current work.
+
+## The original Windows / WSL2 / QEMU setup
+
+Development used **Windows 11 with Debian running in WSL2**. Inside WSL,
+**QEMU user-mode** (`qemu-aarch64`) executed the game's AArch64 Linux program.
+An `LD_PRELOAD` shim modeled device behavior and forwarded graphics and media
+work to host-side services.
+
+This is the early Windows/WSL development setup, before the later dedicated
+native Linux and macOS launch support. The retained build and launch scripts
+are Linux shell scripts, and their historical notes also list native Linux
+x86_64 as a possible host. See [the historical host requirements](src/README.md#host-requirements--one-time-setup)
+for that environment; this archive is not a current installation guide.
 
 ## Explore the engineering
 
@@ -44,7 +64,7 @@ The journal includes hypotheses, failed experiments, and later corrections.
 Historical successful runs describe the implementation at the time; they do
 not establish that this reduced snapshot reproduces those runs or the current
 Kiki implementation. Build and launch scripts retain their historical
-Linux/WSL assumptions and require an external runtime environment.
+Windows/WSL development assumptions and require an external Linux runtime environment.
 
 ## License
 
